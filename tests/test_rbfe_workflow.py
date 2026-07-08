@@ -1,4 +1,6 @@
+import pytest
 import yaml
+from pathlib import Path
 
 
 def _write_minimal_workflow(tmp_path):
@@ -24,6 +26,12 @@ def _write_minimal_workflow(tmp_path):
             "reference_ligand": "H1Q",
             "reference_alignment_atoms": [1, 2, 3],
             "alignments_out": "alignments.yaml",
+            "setup": {
+                "protein_forcefield": ["amber14-all.xml"],
+                "solvent_forcefield": ["amber14/tip3p.xml"],
+                "ligand_forcefield": "espaloma-0.3.2",
+                "ligand_charge_model": "nn",
+            },
             "prepare_only": True,
         },
         "atom_options": {
@@ -73,11 +81,17 @@ def _test_prepare_only_writes_final_pair_yaml(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(rbfe_workflow, "calc_displ_vec", lambda receptor, ligand: [22.0, 22.0, 22.0])
 
-    def fake_setup(receptor_file, lig1_file, lig2_file, ff_json_file, options):
+    def fake_setup(receptor_file, lig1_file, lig2_file, ff_json_file, options, setup_options):
         assert receptor_file.name == "cdk2.pdb"
         assert lig1_file.name == "H1Q.sdf"
         assert lig2_file.name == "H1R.sdf"
         assert ff_json_file.name == "ff.json"
+        assert setup_options == {
+            "proteinforcefield": ["amber14-all.xml"],
+            "solventforcefield": ["amber14/tip3p.xml"],
+            "ligandforcefield": "espaloma-0.3.2",
+            "template_generator_kwargs": {"charge_method": "nn"},
+        }
         open(options["BASENAME"] + ".pdb", "w").write("generated\n")
 
     def fake_derive(options):
@@ -124,7 +138,76 @@ def _test_prepare_only_writes_final_pair_yaml(tmp_path, monkeypatch):
     options = yaml.safe_load(final_yaml.read_text())
     assert options["BASENAME"] == "cdk2-H1Q-H1R"
     assert options["WORKDIR"] == str(jobdir.resolve())
+    assert options["LIGAND_FORCE_FIELD"] == "espaloma-0.3.2"
     assert options["ALIGN_LIGAND1_REF_ATOMS"] == [0, 1, 2]
     assert options["ALIGN_LIGAND2_REF_ATOMS"] == [0, 1, 2]
     assert options["DISPLACEMENT"] == [22.0, 22.0, 22.0]
     assert options["LIGAND1_ATOMS"] == [0, 1, 2]
+
+
+def _test_normalize_setup_options_maps_charge_models():
+    from atom_openmm.rbfe_workflow import normalize_setup_options
+
+    workflow = {
+        "setup": {
+            "ligand_forcefield": "espaloma-0.3.2",
+            "ligand_charge_model": "am1-bcc",
+        }
+    }
+    setup = normalize_setup_options(workflow, {})
+    assert setup["ligandforcefield"] == "espaloma-0.3.2"
+    assert setup["template_generator_kwargs"] == {"charge_method": "am1-bcc"}
+
+    workflow = {
+        "setup": {
+            "ligand_forcefield": "gaff-2.2.20",
+            "ligand_charge_model": "am1-bcc",
+        }
+    }
+    setup = normalize_setup_options(workflow, {})
+    assert setup["ligandforcefield"] == "gaff-2.2.20"
+    assert setup["template_generator_kwargs"] is None
+
+    workflow = {
+        "setup": {
+            "solvent_forcefield": ["amber19/opc.xml"],
+            "solvent_model": "tip4pew",
+        }
+    }
+    setup = normalize_setup_options(workflow, {})
+    assert setup["solventforcefield"] == ["amber19/opc.xml"]
+    assert setup["solvent_model"] == "tip4pew"
+
+
+def _test_normalize_setup_options_rejects_unsupported_charge_models():
+    from atom_openmm.rbfe_workflow import WorkflowConfigError, normalize_setup_options
+
+    with pytest.raises(WorkflowConfigError, match="requires an espaloma"):
+        normalize_setup_options(
+            {"setup": {"ligand_forcefield": "gaff-2.2.20", "ligand_charge_model": "nn"}},
+            {},
+        )
+
+    with pytest.raises(WorkflowConfigError, match="not exposed independently for OpenFF"):
+        normalize_setup_options(
+            {"setup": {"ligand_forcefield": "openff-2.3.0", "ligand_charge_model": "am1-bcc"}},
+            {},
+        )
+
+
+def _test_explicit_solvent_adds_extra_particles_before_create_system():
+    source = Path("atom_openmm/make_atm_system_from_rcpt_lig.py").read_text()
+    add_solvent = source.index("modeller.addSolvent")
+    first_add_extra_particles = source.index("modeller.addExtraParticles")
+    second_add_extra_particles = source.index("modeller.addExtraParticles", add_solvent)
+    create_system = source.index("forcefield.createSystem", second_add_extra_particles)
+
+    assert "model=solvent_model" in source
+    assert first_add_extra_particles < add_solvent < second_add_extra_particles < create_system
+
+
+def _test_solvent_model_inference_uses_four_site_packing_for_opc():
+    from atom_openmm.make_atm_system_from_rcpt_lig import _infer_solvent_model
+
+    assert _infer_solvent_model(["amber19/opc.xml"]) == "tip4pew"
+    assert _infer_solvent_model(["amber14/tip3p.xml"]) == "tip3p"

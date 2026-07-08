@@ -33,6 +33,19 @@ from openmm.unit import angstrom, nanometer, amu, molar
 from openff.toolkit.topology import Molecule
 
 
+def _infer_solvent_model(solventforcefield):
+    solvent_files = " ".join(str(ff).lower() for ff in solventforcefield)
+    if "opc" in solvent_files:
+        return "tip4pew"
+    if "tip5p" in solvent_files:
+        return "tip5p"
+    if "tip4p" in solvent_files:
+        return "tip4pew"
+    if "spce" in solvent_files or "spc/e" in solvent_files:
+        return "spce"
+    return "tip3p"
+
+
 def boundingBoxSizes(positions):
     xmin = positions[0][0]
     xmax = positions[0][0]
@@ -106,6 +119,8 @@ def make_system(
         implsolv=None,
         hmass=1.0,
         ionicstrength=0.15,
+        solvent_model=None,
+        template_generator_kwargs=None,
         flagverbose=False
     ):
     print('Generate ATM RBFE OpenMM System')
@@ -148,7 +163,9 @@ def make_system(
     print('Receptor file name:                 ', receptorfile)
     print('Protein force field:                ', proteinforcefield)
     print('Solvent/ion force field             ', solventforcefield )
+    print('Solvent packing model:              ', solvent_model)
     print('Ligand force field:                 ', ligandforcefield)
+    print('Template generator kwargs:          ', template_generator_kwargs)
     print('Ligand 1 file name:                 ', lig1file)
     if rbfe:
         print('Ligand 2 file name:                 ', lig2file)
@@ -160,6 +177,9 @@ def make_system(
 
     print('Call ForceField for protein and water')
     forcefield = ForceField(*proteinforcefield,*solventforcefield)
+    if solvent_model is None:
+        solvent_model = _infer_solvent_model(solventforcefield)
+    print('Using solvent packing model:        ', solvent_model)
     if implsolv is not None:
         if implsolv == "OBC2":
             forcefield.loadFile('implicit/obc2.xml')
@@ -362,15 +382,15 @@ def make_system(
     if ligandforcefield[0:4] == "gaff":
         from openmmforcefields.generators import GAFFTemplateGenerator
         print('Using GAFFTemplateGenerator function for ligands')
-        template_gen = GAFFTemplateGenerator(molecules=ligandmolecules, cache=ffcachefile )
+        template_gen = GAFFTemplateGenerator(molecules=ligandmolecules, cache=ffcachefile, template_generator_kwargs=template_generator_kwargs )
     elif ligandforcefield[0:6] == "openff":
         from openmmforcefields.generators import SMIRNOFFTemplateGenerator
         print('Call SMIRNOFFTemplateGenerator function for ligands')
-        template_gen = SMIRNOFFTemplateGenerator(molecules=ligandmolecules, forcefield=ligandforcefield, cache=ffcachefile )
+        template_gen = SMIRNOFFTemplateGenerator(molecules=ligandmolecules, forcefield=ligandforcefield, cache=ffcachefile, template_generator_kwargs=template_generator_kwargs )
     elif ligandforcefield[0:8] == "espaloma":
         from openmmforcefields.generators import EspalomaTemplateGenerator
         print('Call EspalomaTemplateGenerator function for ligands')
-        template_gen = EspalomaTemplateGenerator(molecules=ligandmolecules, forcefield=ligandforcefield, cache=ffcachefile )
+        template_gen = EspalomaTemplateGenerator(molecules=ligandmolecules, forcefield=ligandforcefield, cache=ffcachefile, template_generator_kwargs=template_generator_kwargs )
     else:
         print('Unknown ligand force field %s' % ligandforcefield)
         sys.exit(1)
@@ -384,7 +404,9 @@ def make_system(
     if implsolv is None:
         print("Ionic strength = ", ionicstrength*molar)
         print("Adding solvent and processing system ...")
-        modeller.addSolvent(forcefield, boxVectors = (xBoxvec,yBoxvec,zBoxvec ), ionicStrength = ionicstrength*molar)
+        modeller.addExtraParticles(forcefield)
+        modeller.addSolvent(forcefield, model=solvent_model, boxVectors = (xBoxvec,yBoxvec,zBoxvec ), ionicStrength = ionicstrength*molar)
+        modeller.addExtraParticles(forcefield)
         print("Number of atoms in solvated system:", modeller.topology.getNumAtoms())
         system=forcefield.createSystem(modeller.topology, nonbondedMethod = PME, nonbondedCutoff = 0.9*nanometer,
                                     constraints=HBonds, rigidWater = True, removeCMMotion = False, hydrogenMass = hmass*amu)

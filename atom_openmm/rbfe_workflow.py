@@ -49,6 +49,74 @@ def _require_mapping(value, name):
     return value
 
 
+def _as_list(value, name):
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return value
+    raise WorkflowConfigError(f"{name} must be a string or list of strings")
+
+
+def _ligand_forcefield_family(ligand_forcefield):
+    if ligand_forcefield.startswith("gaff"):
+        return "gaff"
+    if ligand_forcefield.startswith("openff"):
+        return "openff"
+    if ligand_forcefield.startswith("espaloma"):
+        return "espaloma"
+    raise WorkflowConfigError(f"unsupported ligand force field: {ligand_forcefield}")
+
+
+def normalize_setup_options(workflow, atom_options):
+    setup = workflow.get("setup", {})
+    if setup is None:
+        setup = {}
+    _require_mapping(setup, "workflow.setup")
+
+    ligand_forcefield = setup.get("ligand_forcefield", atom_options.get("LIGAND_FORCE_FIELD", "openff-2.0.0"))
+    if not isinstance(ligand_forcefield, str):
+        raise WorkflowConfigError("workflow.setup.ligand_forcefield must be a string")
+    ligand_family = _ligand_forcefield_family(ligand_forcefield)
+
+    template_generator_kwargs = deepcopy(setup.get("template_generator_kwargs", {}))
+    if template_generator_kwargs is None:
+        template_generator_kwargs = {}
+    _require_mapping(template_generator_kwargs, "workflow.setup.template_generator_kwargs")
+
+    charge_model = setup.get("ligand_charge_model")
+    if charge_model is not None:
+        if not isinstance(charge_model, str):
+            raise WorkflowConfigError("workflow.setup.ligand_charge_model must be a string")
+        if charge_model == "nn":
+            if ligand_family != "espaloma":
+                raise WorkflowConfigError("workflow.setup.ligand_charge_model='nn' requires an espaloma ligand_forcefield")
+            template_generator_kwargs["charge_method"] = "nn"
+        elif charge_model == "am1-bcc":
+            if ligand_family == "openff":
+                raise WorkflowConfigError(
+                    "workflow.setup.ligand_charge_model='am1-bcc' is not exposed independently for OpenFF"
+                )
+            if ligand_family == "espaloma":
+                template_generator_kwargs["charge_method"] = "am1-bcc"
+        else:
+            raise WorkflowConfigError("workflow.setup.ligand_charge_model must be 'nn' or 'am1-bcc'")
+
+    normalized = {
+        "ligandforcefield": ligand_forcefield,
+        "template_generator_kwargs": template_generator_kwargs or None,
+    }
+    if "protein_forcefield" in setup:
+        normalized["proteinforcefield"] = _as_list(setup["protein_forcefield"], "workflow.setup.protein_forcefield")
+    if "solvent_forcefield" in setup:
+        normalized["solventforcefield"] = _as_list(setup["solvent_forcefield"], "workflow.setup.solvent_forcefield")
+    if "solvent_model" in setup:
+        solvent_model = setup["solvent_model"]
+        if not isinstance(solvent_model, str):
+            raise WorkflowConfigError("workflow.setup.solvent_model must be a string")
+        normalized["solvent_model"] = solvent_model
+    return normalized
+
+
 def load_workflow_config(config_file):
     config_path = Path(config_file).resolve()
     with open(config_path, "r") as f:
@@ -175,9 +243,11 @@ def load_or_generate_alignments(workflow, plan):
     return alignments
 
 
-def setup_small_molecule_system(receptor_file, lig1_file, lig2_file, ff_json_file, options):
+def setup_small_molecule_system(receptor_file, lig1_file, lig2_file, ff_json_file, options, setup_options=None):
     from atom_openmm.make_atm_system_from_rcpt_lig import make_system
 
+    if setup_options is None:
+        setup_options = {}
     basename = options["BASENAME"]
     setup = {
         "receptorfile": str(receptor_file),
@@ -190,8 +260,7 @@ def setup_small_molecule_system(receptor_file, lig1_file, lig2_file, ff_json_fil
     }
     if "HMASS" in options:
         setup["hmass"] = options["HMASS"]
-    if "LIGAND_FORCE_FIELD" in options:
-        setup["ligandforcefield"] = options["LIGAND_FORCE_FIELD"]
+    setup.update(setup_options)
     make_system(**setup)
 
 
@@ -355,13 +424,14 @@ def analyze_pair(options, workflow):
     }
 
 
-def run_pair(pair_plan, workflow, atom_options, receptor_file, alignments):
+def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, alignments):
     jobdir = pair_plan["jobdir"]
     jobdir.mkdir(parents=True, exist_ok=True)
 
     options = deepcopy(atom_options)
     options["BASENAME"] = pair_plan["jobname"]
     options["WORKDIR"] = str(jobdir.resolve())
+    options["LIGAND_FORCE_FIELD"] = setup_options["ligandforcefield"]
 
     for lig_name, key in (
         (pair_plan["lig1_name"], "ALIGN_LIGAND1_REF_ATOMS"),
@@ -387,6 +457,7 @@ def run_pair(pair_plan, workflow, atom_options, receptor_file, alignments):
                 pair_plan["lig2_file"],
                 ff_json_file,
                 options,
+                setup_options,
             )
 
         derive_small_molecule_options(options)
@@ -413,6 +484,7 @@ def run_pair(pair_plan, workflow, atom_options, receptor_file, alignments):
 def run_rbfe_workflow(config_file):
     config = load_workflow_config(config_file)
     plan = build_small_molecule_plan(config)
+    setup_options = normalize_setup_options(config["workflow"], config["atom_options"])
     alignments = load_or_generate_alignments(config["workflow"], plan)
     results = []
     for pair_plan in plan["pairs"]:
@@ -421,6 +493,7 @@ def run_rbfe_workflow(config_file):
                 pair_plan,
                 config["workflow"],
                 config["atom_options"],
+                setup_options,
                 plan["receptor_file"],
                 alignments,
             )

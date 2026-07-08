@@ -71,6 +71,24 @@ atom-rbfe workflow.yaml
 
 Set `prepare_only: true` under `workflow` to create the per-pair directories and final YAML files without starting production.
 
+Setup-time force fields can be selected in `workflow.setup`:
+
+```yaml
+workflow:
+  setup:
+    protein_forcefield:
+      - amber14-all.xml
+    solvent_forcefield:
+      - amber14/tip3p.xml
+    solvent_model: tip3p
+    ligand_forcefield: espaloma-0.3.2
+    ligand_charge_model: nn
+```
+
+`ligand_charge_model: nn` is supported for Espaloma ligand force fields. `ligand_charge_model: am1-bcc` is supported for Espaloma and is the expected GAFF setup behavior. OpenFF charge assignment is controlled by the selected OpenFF/SMIRNOFF force field and generator rather than a separate wrapper charge-model option.
+
+`solvent_model` is the OpenMM solvent packing model passed to `Modeller.addSolvent()`. If omitted, the wrapper infers it from `solvent_forcefield`. For example, `amber19/opc.xml` uses `solvent_model: tip4pew` for four-site water placement while parameterizing with OPC.
+
 For the CDK2 small-molecule workflow:
 
 ```bash

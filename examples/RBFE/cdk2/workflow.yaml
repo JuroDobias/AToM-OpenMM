@@ -16,6 +16,13 @@ workflow:
   forcefield_cache: ff.json
   run: true
   analyze: true
+  setup:
+    protein_forcefield:
+      - amber14-all.xml
+    solvent_forcefield:
+      - amber14/tip3p.xml
+    ligand_forcefield: gaff-2.2.20
+    ligand_charge_model: am1-bcc
 
 atom_options:
   TEMPERATURES: [310.0]
@@ -49,4 +56,3 @@ atom_options:
   HMASS: 1.5
   TIME_STEP: 0.004
   VERBOSE: false
-  LIGAND_FORCE_FIELD: gaff-2.2.20
