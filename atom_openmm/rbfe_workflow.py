@@ -11,6 +11,7 @@ from openmm.app import PDBFile
 from openmm.unit import angstrom, nanometer
 
 from atom_openmm.rbfe_production import rbfe_production
+from atom_openmm.rbfe_result import RBFEResultWriter
 from atom_openmm.rbfe_structprep import rbfe_structprep
 from atom_openmm.equilibration import normalize_equilibration_protocol
 from atom_openmm.utils.AtomUtils import (
@@ -439,7 +440,7 @@ def run_production(options, workflow):
     raise WorkflowConfigError("workflow.production_method must be 'async_re' or 'neqti'")
 
 
-def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, alignments):
+def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, alignments, workflow_yaml=None):
     jobdir = pair_plan["jobdir"]
     jobdir.mkdir(parents=True, exist_ok=True)
 
@@ -448,63 +449,118 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
     options["WORKDIR"] = str(jobdir.resolve())
     options["LIGAND_FORCE_FIELD"] = setup_options["ligandforcefield"]
     production_method = workflow.get("production_method", "async_re")
-    if production_method == "neqti":
-        options["STRUCTPREP_MODE"] = "physical_only"
-        options["NEQTI_INITIAL_STATE_FILE"] = options["BASENAME"] + "_equil.xml"
-    else:
-        options["STRUCTPREP_MODE"] = "async_re"
-    equilibration_protocol = normalize_equilibration_protocol(workflow)
-    if equilibration_protocol is not None:
-        options["EQUILIBRATION_PROTOCOL"] = equilibration_protocol
+    requested_samples = (
+        (workflow.get("neqti") or {}).get("n_snapshots", atom_options.get("MAX_SAMPLES", 1))
+        if production_method == "neqti"
+        else atom_options.get("MAX_SAMPLES")
+    )
+    result_writer = RBFEResultWriter(
+        pair_plan=pair_plan,
+        receptor_file=receptor_file,
+        workflow_yaml=workflow_yaml or (Path.cwd() / "workflow.yaml"),
+        method=production_method,
+        requested_samples=requested_samples,
+    )
+    stage = "setup"
+    result_writer.update("running")
+    try:
+        if production_method == "neqti":
+            options["STRUCTPREP_MODE"] = "physical_only"
+            options["NEQTI_INITIAL_STATE_FILE"] = options["BASENAME"] + "_equil.xml"
+        else:
+            options["STRUCTPREP_MODE"] = "async_re"
+        equilibration_protocol = normalize_equilibration_protocol(workflow)
+        if equilibration_protocol is not None:
+            options["EQUILIBRATION_PROTOCOL"] = equilibration_protocol
 
-    for lig_name, key in (
-        (pair_plan["lig1_name"], "ALIGN_LIGAND1_REF_ATOMS"),
-        (pair_plan["lig2_name"], "ALIGN_LIGAND2_REF_ATOMS"),
-    ):
-        if lig_name not in alignments:
-            raise WorkflowConfigError(f"missing alignment atoms for ligand {lig_name}")
-        options[key] = [int(i) - 1 for i in alignments[lig_name]["align_atom_ids"]]
+        for lig_name, key in (
+            (pair_plan["lig1_name"], "ALIGN_LIGAND1_REF_ATOMS"),
+            (pair_plan["lig2_name"], "ALIGN_LIGAND2_REF_ATOMS"),
+        ):
+            if lig_name not in alignments:
+                raise WorkflowConfigError(f"missing alignment atoms for ligand {lig_name}")
+            options[key] = [int(i) - 1 for i in alignments[lig_name]["align_atom_ids"]]
 
-    if not options.get("DISPLACEMENT"):
-        options["DISPLACEMENT"] = list(calc_displ_vec(str(receptor_file), str(pair_plan["lig2_file"])))
+        if not options.get("DISPLACEMENT"):
+            options["DISPLACEMENT"] = list(calc_displ_vec(str(receptor_file), str(pair_plan["lig2_file"])))
 
-    forcefield_cache = workflow.get("forcefield_cache", "ff.json")
-    ff_json_file = Path(forcefield_cache)
-    if not ff_json_file.is_absolute():
-        ff_json_file = jobdir / ff_json_file
+        forcefield_cache = workflow.get("forcefield_cache", "ff.json")
+        ff_json_file = Path(forcefield_cache)
+        if not ff_json_file.is_absolute():
+            ff_json_file = jobdir / ff_json_file
+    except (Exception, KeyboardInterrupt) as exc:
+        result_writer.update(
+            "failed",
+            error={"type": type(exc).__name__, "message": str(exc), "stage": stage},
+        )
+        raise
 
-    with _pushd(jobdir):
-        if not Path(options["BASENAME"] + ".pdb").exists():
-            setup_small_molecule_system(
-                receptor_file,
-                pair_plan["lig1_file"],
-                pair_plan["lig2_file"],
-                ff_json_file,
-                options,
-                setup_options,
-            )
+    try:
+        with _pushd(jobdir):
+            if not Path(options["BASENAME"] + ".pdb").exists():
+                setup_small_molecule_system(
+                    receptor_file,
+                    pair_plan["lig1_file"],
+                    pair_plan["lig2_file"],
+                    ff_json_file,
+                    options,
+                    setup_options,
+                )
 
-        derive_small_molecule_options(options)
-        write_options_yaml(options)
-        create_vmd_infile(options)
+            derive_small_molecule_options(options)
+            write_options_yaml(options)
+            create_vmd_infile(options)
 
-        if workflow.get("prepare_only", False) or not workflow.get("run", True):
-            return {"jobname": options["BASENAME"], "status": "prepared", "workdir": options["WORKDIR"]}
+            if workflow.get("prepare_only", False) or not workflow.get("run", True):
+                result_writer.update("prepared")
+                return {"jobname": options["BASENAME"], "status": "prepared", "workdir": options["WORKDIR"]}
 
-        prep_state = options["BASENAME"] + ("_equil.xml" if production_method == "neqti" else "_0.xml")
-        if not Path(prep_state).exists():
-            rbfe_structprep(config_file=None, options=options)
+            stage = "preparation"
+            prep_state = options["BASENAME"] + ("_equil.xml" if production_method == "neqti" else "_0.xml")
+            if not Path(prep_state).exists():
+                rbfe_structprep(config_file=None, options=options)
+            result_writer.update("prepared")
 
-        production_result = run_production(options, workflow)
-        if production_result is not None:
-            return {"workdir": options["WORKDIR"], **production_result}
+            stage = "production"
+            result_writer.update("running")
 
-        if workflow.get("production_method", "async_re") == "async_re" and workflow.get("analyze", True):
-            analysis = analyze_pair(options, workflow)
-            if analysis is not None:
-                return {"status": "analyzed", "workdir": options["WORKDIR"], **analysis}
+            production_result = run_production(options, workflow)
+            if production_result is not None:
+                final_status = production_result.get("status", "completed")
+                warning = None if production_result.get("analysis") else "No finite NEQTI estimate is available."
+                result_writer.update(final_status, analysis=production_result, warning=warning)
+                return {"workdir": options["WORKDIR"], **production_result}
 
-        return {"jobname": options["BASENAME"], "status": "completed", "workdir": options["WORKDIR"]}
+            if production_method == "async_re" and workflow.get("analyze", True):
+                stage = "analysis"
+                analysis = analyze_pair(options, workflow)
+                raw_samples = production_sample_count(options)
+                reached_target = (
+                    raw_samples is not None
+                    and (requested_samples is None or raw_samples >= int(requested_samples))
+                )
+                final_status = "completed" if reached_target else "partial"
+                warning = None if analysis is not None else "No finite UWHAM estimate is available."
+                result_writer.update(final_status, analysis=analysis, warning=warning)
+                if analysis is not None:
+                    return {"status": "analyzed", "workdir": options["WORKDIR"], **analysis}
+            else:
+                raw_samples = production_sample_count(options) if production_method == "async_re" else None
+                reached_target = raw_samples is not None and (
+                    requested_samples is None or raw_samples >= int(requested_samples)
+                )
+                result_writer.update(
+                    "completed" if reached_target else "partial",
+                    warning="Analysis is disabled; no free-energy estimate is available.",
+                )
+
+            return {"jobname": options["BASENAME"], "status": "completed", "workdir": options["WORKDIR"]}
+    except (Exception, KeyboardInterrupt) as exc:
+        result_writer.update(
+            "failed",
+            error={"type": type(exc).__name__, "message": str(exc), "stage": stage},
+        )
+        raise
 
 
 def run_rbfe_workflow(config_file):
@@ -522,6 +578,7 @@ def run_rbfe_workflow(config_file):
                 setup_options,
                 plan["receptor_file"],
                 alignments,
+                config["config_path"],
             )
         )
     return results

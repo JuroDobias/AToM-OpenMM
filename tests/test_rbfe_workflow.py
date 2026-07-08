@@ -134,6 +134,12 @@ def _test_prepare_only_writes_final_pair_yaml(tmp_path, monkeypatch):
     assert alignments_yaml.exists()
     assert not (tmp_path / "ligands" / "alignments.yaml").exists()
     assert final_yaml.exists()
+    machine_result = yaml.safe_load((jobdir / "result.yaml").read_text())
+    assert machine_result["schema_version"] == 1
+    assert machine_result["status"] == "prepared"
+    assert machine_result["method"] == "async_re"
+    assert machine_result["inputs"]["workflow_yaml"] == str(config_file.resolve())
+    assert machine_result["artifacts"]["prepared_complex"] == "cdk2-H1Q-H1R.pdb"
 
     options = yaml.safe_load(final_yaml.read_text())
     assert options["BASENAME"] == "cdk2-H1Q-H1R"
