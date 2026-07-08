@@ -4,12 +4,14 @@ import csv
 import logging
 import math
 import os
+import time
 from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
 import yaml
-from openmm.unit import kelvin, kilocalorie_per_mole, kilocalories_per_mole, kilojoules_per_mole
+from openmm.app import PDBFile
+from openmm.unit import kelvin, kilocalorie_per_mole, kilocalories_per_mole, kilojoules_per_mole, picosecond
 from scipy.optimize import brentq, minimize_scalar
 
 from atom_openmm.async_re import JobManager
@@ -187,6 +189,53 @@ def _append_row(path, row):
         writer.writerow(row)
 
 
+def _write_checkpoint(path, checkpoint):
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(checkpoint)
+    os.replace(temporary, path)
+
+
+def _initialize_sampling_stream(
+    worker,
+    *,
+    direction,
+    initial_state_file,
+    start_state,
+    checkpoint_file,
+    completed_count,
+    initial_equilibration_steps,
+    resume,
+    logger,
+):
+    if resume and checkpoint_file.exists():
+        worker.set_chkpt(checkpoint_file.read_bytes())
+        worker.set_state(start_state)
+        logger.info(
+            "Resuming NEQTI %s sampling after %d completed trajectories from %s; skipping initial equilibration",
+            direction,
+            completed_count,
+            checkpoint_file,
+        )
+        return
+
+    worker.simulation.loadState(initial_state_file)
+    worker.set_state(start_state)
+    _write_worker_pdb_pair(worker, f"neqti_{direction}_start.pdb")
+    if resume and completed_count > 0:
+        logger.info(
+            "Resuming NEQTI %s after %d completed trajectories without a sampling checkpoint; "
+            "reloading the endpoint and skipping initial equilibration",
+            direction,
+            completed_count,
+        )
+    elif initial_equilibration_steps > 0:
+        logger.info("NEQTI %s initial equilibration: %d steps", direction, initial_equilibration_steps)
+        worker.run(initial_equilibration_steps)
+        _write_worker_pdb_pair(worker, f"neqti_{direction}_equilibrated.pdb")
+    _write_checkpoint(checkpoint_file, worker.get_chkpt())
+
+
 def _write_integrated_work(path, rows, prefix):
     with open(path, "w") as f:
         for row in rows:
@@ -203,6 +252,32 @@ def _write_worker_swapped_pdb(worker, path):
     write_atm_swapped_pdb(worker.topology, state.getPositions(), worker.keywords, path)
 
 
+def _write_worker_pdb(worker, path):
+    if not getattr(worker, "context", None) or not getattr(worker, "topology", None):
+        return
+    state = worker.context.getState(getPositions=True)
+    box_vectors = state.getPeriodicBoxVectors()
+    if box_vectors is not None:
+        worker.topology.setPeriodicBoxVectors(box_vectors)
+    with open(path, "w") as handle:
+        PDBFile.writeFile(worker.topology, state.getPositions(), handle, keepIds=True)
+
+
+def _write_worker_pdb_pair(worker, path):
+    path = Path(path)
+    _write_worker_pdb(worker, path)
+    _write_worker_swapped_pdb(worker, path.with_name(path.stem + "_swapped.pdb"))
+
+
+def _worker_timestep_ps(worker):
+    integrator = getattr(worker, "integrator", None)
+    if integrator is None and getattr(worker, "simulation", None) is not None:
+        integrator = getattr(worker.simulation, "integrator", None)
+    if integrator is None:
+        return None
+    return float(integrator.getStepSize().value_in_unit(picosecond))
+
+
 def _potential_kcal(worker):
     pot = worker.get_energy()
     return pot["potential_energy"] / kilocalories_per_mole
@@ -212,6 +287,8 @@ def _run_switch(worker, start_par, schedule, steps_per_segment, state_path, logg
     worker.set_state(start_par)
     work = 0.0
     total = len(schedule)
+    timestep_ps = _worker_timestep_ps(worker)
+    segment_started = time.perf_counter()
     previous_log_run_timing = getattr(worker, "log_run_timing", True)
     worker.log_run_timing = False
     try:
@@ -223,17 +300,36 @@ def _run_switch(worker, start_par, schedule, steps_per_segment, state_path, logg
             worker.run(1)
             if logger is not None and label and step % steps_per_segment == 0:
                 segment = step // steps_per_segment
-                logger.info(
-                    "NEQTI %s segment %d/%d complete: state %d -> %d, %d/%d steps, work %.6g kcal/mol",
-                    label,
-                    segment,
-                    len(state_path) - 1,
-                    state_path[segment - 1],
-                    state_path[segment],
-                    step,
-                    total,
-                    work,
-                )
+                elapsed = time.perf_counter() - segment_started
+                ns_per_day = None
+                if timestep_ps is not None and elapsed > 0.0:
+                    ns_per_day = steps_per_segment * timestep_ps * 86.4 / elapsed
+                if ns_per_day is None:
+                    logger.info(
+                        "NEQTI %s segment %d/%d complete: state %d -> %d, %d/%d steps, work %.6g kcal/mol",
+                        label,
+                        segment,
+                        len(state_path) - 1,
+                        state_path[segment - 1],
+                        state_path[segment],
+                        step,
+                        total,
+                        work,
+                    )
+                else:
+                    logger.info(
+                        "NEQTI %s segment %d/%d complete: state %d -> %d, %d/%d steps, work %.6g kcal/mol, %.3f ns/day",
+                        label,
+                        segment,
+                        len(state_path) - 1,
+                        state_path[segment - 1],
+                        state_path[segment],
+                        step,
+                        total,
+                        work,
+                        ns_per_day,
+                    )
+                segment_started = time.perf_counter()
     finally:
         worker.log_run_timing = previous_log_run_timing
     return work
@@ -296,7 +392,7 @@ def analyze_neqti_work(forward_work_kcal, reverse_work_kcal, temperature_kelvin,
     }
 
 
-def run_neqti(options, neqti_options=None):
+def run_neqti(options, neqti_options=None, progress_callback=None):
     if neqti_options is None:
         neqti_options = normalize_neqti_options({"neqti": {}}, options)
 
@@ -370,8 +466,18 @@ def run_neqti(options, neqti_options=None):
 
     forward_file = Path("neqti_forward.csv")
     reverse_file = Path("neqti_reverse.csv")
+    forward_checkpoint = Path("neqti_forward_sampling.chk")
+    reverse_checkpoint = Path("neqti_reverse_sampling.chk")
     if not neqti_options["resume"]:
-        for path in [forward_file, reverse_file, Path("integA.dat"), Path("integB.dat"), Path("neqti_summary.yaml")]:
+        for path in [
+            forward_file,
+            reverse_file,
+            forward_checkpoint,
+            reverse_checkpoint,
+            Path("integA.dat"),
+            Path("integB.dat"),
+            Path("neqti_summary.yaml"),
+        ]:
             if path.exists():
                 path.unlink()
     _ensure_work_csv(forward_file)
@@ -381,19 +487,24 @@ def run_neqti(options, neqti_options=None):
         completed_forward = _read_completed_rows(forward_file)
         completed_reverse = _read_completed_rows(reverse_file)
 
-        worker.simulation.loadState(forward_initial_state_file)
-        worker.set_state(forward_start)
-        _write_worker_swapped_pdb(worker, "neqti_forward_start_swapped.pdb")
-        if neqti_options["initial_equilibration_steps"] > 0:
-            logger.info("NEQTI forward initial equilibration: %d steps", neqti_options["initial_equilibration_steps"])
-            worker.run(neqti_options["initial_equilibration_steps"])
-            _write_worker_swapped_pdb(worker, "neqti_forward_equilibrated_swapped.pdb")
+        if len(completed_forward) < neqti_options["n_snapshots"]:
+            _initialize_sampling_stream(
+                worker,
+                direction="forward",
+                initial_state_file=forward_initial_state_file,
+                start_state=forward_start,
+                checkpoint_file=forward_checkpoint,
+                completed_count=len(completed_forward),
+                initial_equilibration_steps=neqti_options["initial_equilibration_steps"],
+                resume=neqti_options["resume"],
+                logger=logger,
+            )
         for traj in range(len(completed_forward), neqti_options["n_snapshots"]):
             if neqti_options["decorrelation_steps"] > 0:
                 logger.info("NEQTI forward trajectory %d decorrelation: %d steps", traj, neqti_options["decorrelation_steps"])
                 worker.run(neqti_options["decorrelation_steps"])
             snapshot = worker.get_chkpt()
-            _write_worker_swapped_pdb(worker, f"neqti_forward_snapshot_{traj}_swapped.pdb")
+            _write_worker_pdb_pair(worker, f"neqti_forward_snapshot_{traj}.pdb")
             logger.info("NEQTI forward trajectory %d switch: %d steps", traj, len(forward_schedule))
             work_kcal = _run_switch(
                 worker,
@@ -417,23 +528,40 @@ def run_neqti(options, neqti_options=None):
                     "status": "complete",
                 },
             )
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "jobname": basename,
+                        "method": "neqti",
+                        "status": "partial",
+                        "forward_samples": traj + 1,
+                        "reverse_samples": len(completed_reverse),
+                        "analysis": None,
+                    }
+                )
             logger.info("NEQTI forward trajectory %d complete: %.6g kcal/mol", traj, work_kcal)
             worker.set_chkpt(snapshot)
             worker.set_state(forward_start)
+            _write_checkpoint(forward_checkpoint, worker.get_chkpt())
 
-        worker.simulation.loadState(reverse_initial_state_file)
-        worker.set_state(reverse_start)
-        _write_worker_swapped_pdb(worker, "neqti_reverse_start_swapped.pdb")
-        if neqti_options["initial_equilibration_steps"] > 0:
-            logger.info("NEQTI reverse initial equilibration: %d steps", neqti_options["initial_equilibration_steps"])
-            worker.run(neqti_options["initial_equilibration_steps"])
-            _write_worker_swapped_pdb(worker, "neqti_reverse_equilibrated_swapped.pdb")
+        if len(completed_reverse) < neqti_options["n_snapshots"]:
+            _initialize_sampling_stream(
+                worker,
+                direction="reverse",
+                initial_state_file=reverse_initial_state_file,
+                start_state=reverse_start,
+                checkpoint_file=reverse_checkpoint,
+                completed_count=len(completed_reverse),
+                initial_equilibration_steps=neqti_options["initial_equilibration_steps"],
+                resume=neqti_options["resume"],
+                logger=logger,
+            )
         for traj in range(len(completed_reverse), neqti_options["n_snapshots"]):
             if neqti_options["decorrelation_steps"] > 0:
                 logger.info("NEQTI reverse trajectory %d decorrelation: %d steps", traj, neqti_options["decorrelation_steps"])
                 worker.run(neqti_options["decorrelation_steps"])
             snapshot = worker.get_chkpt()
-            _write_worker_swapped_pdb(worker, f"neqti_reverse_snapshot_{traj}_swapped.pdb")
+            _write_worker_pdb_pair(worker, f"neqti_reverse_snapshot_{traj}.pdb")
             logger.info("NEQTI reverse trajectory %d switch: %d steps", traj, len(reverse_schedule))
             work_kcal = _run_switch(
                 worker,
@@ -457,9 +585,29 @@ def run_neqti(options, neqti_options=None):
                     "status": "complete",
                 },
             )
+            if progress_callback is not None:
+                current_forward = _read_completed_rows(forward_file)
+                current_reverse = _read_completed_rows(reverse_file)
+                progress_callback(
+                    {
+                        "jobname": basename,
+                        "method": "neqti",
+                        "status": "partial",
+                        "forward_samples": len(current_forward),
+                        "reverse_samples": len(current_reverse),
+                        "analysis": analyze_neqti_work(
+                            [float(row["work_kcal_per_mol"]) for row in current_forward],
+                            [float(row["work_kcal_per_mol"]) for row in current_reverse],
+                            stateparams[state_path[0]]["temperature"] / kelvin,
+                            bootstrap_samples=0,
+                            random_seed=neqti_options["random_seed"],
+                        ),
+                    }
+                )
             logger.info("NEQTI reverse trajectory %d complete: %.6g kcal/mol", traj, work_kcal)
             worker.set_chkpt(snapshot)
             worker.set_state(reverse_start)
+            _write_checkpoint(reverse_checkpoint, worker.get_chkpt())
     finally:
         worker.finish()
 

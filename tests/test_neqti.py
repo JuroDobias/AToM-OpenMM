@@ -1,7 +1,7 @@
 import csv
 
 import pytest
-from openmm.unit import kelvin, kilocalories_per_mole
+from openmm.unit import kelvin, kilocalories_per_mole, picosecond
 
 
 def _atom_options():
@@ -72,6 +72,39 @@ def _test_switch_schedule_keeps_direction_discrete_at_midpoint():
     assert [state["atmintermediate"] for state in schedule] == [1.0, 1.0, 1.0, 1.0]
 
 
+def _test_switch_progress_reports_effective_ns_per_day():
+    from atom_openmm.neqti import _run_switch
+
+    class FakeIntegrator:
+        def getStepSize(self):
+            return 0.002 * picosecond
+
+    class FakeWorker:
+        integrator = FakeIntegrator()
+
+        def set_state(self, state):
+            self.state = state
+
+        def get_energy(self):
+            return {"potential_energy": 0.0 * kilocalories_per_mole}
+
+        def run(self, steps):
+            pass
+
+    messages = []
+
+    class FakeLogger:
+        def info(self, message, *args):
+            messages.append(message % args)
+
+    state = {"lambda1": 0.0}
+    _run_switch(FakeWorker(), state, [state, state], 2, [0, 1], FakeLogger(), "forward trajectory 0")
+
+    assert len(messages) == 1
+    assert "state 0 -> 1" in messages[0]
+    assert "ns/day" in messages[0]
+
+
 def _test_bar_estimator_sign_convention():
     from atom_openmm.neqti import estimate_bar
 
@@ -105,6 +138,106 @@ def _test_completed_rows_filter_incomplete_rows(tmp_path):
         writer.writerow({"trajectory": 1, "status": "running"})
 
     assert _read_completed_rows(out) == [{"trajectory": "0", "status": "complete"}]
+
+
+def _test_sampling_stream_resume_skips_initial_equilibration(tmp_path):
+    from atom_openmm.neqti import _initialize_sampling_stream
+
+    class FakeSimulation:
+        def __init__(self):
+            self.loaded = []
+
+        def loadState(self, path):
+            self.loaded.append(path)
+
+    class FakeWorker:
+        def __init__(self):
+            self.simulation = FakeSimulation()
+            self.checkpoints = []
+            self.runs = []
+
+        def set_chkpt(self, checkpoint):
+            self.checkpoints.append(checkpoint)
+
+        def set_state(self, state):
+            pass
+
+        def run(self, steps):
+            self.runs.append(steps)
+
+        def get_chkpt(self):
+            return b"current"
+
+    class FakeLogger:
+        def info(self, *args):
+            pass
+
+    checkpoint = tmp_path / "sampling.chk"
+    checkpoint.write_bytes(b"saved")
+    worker = FakeWorker()
+    _initialize_sampling_stream(
+        worker,
+        direction="forward",
+        initial_state_file="endpoint.xml",
+        start_state={},
+        checkpoint_file=checkpoint,
+        completed_count=7,
+        initial_equilibration_steps=25000,
+        resume=True,
+        logger=FakeLogger(),
+    )
+
+    assert worker.checkpoints == [b"saved"]
+    assert worker.simulation.loaded == []
+    assert worker.runs == []
+
+
+def _test_legacy_resume_without_checkpoint_skips_initial_equilibration(tmp_path, monkeypatch):
+    from atom_openmm import neqti
+
+    class FakeSimulation:
+        def __init__(self):
+            self.loaded = []
+
+        def loadState(self, path):
+            self.loaded.append(path)
+
+    class FakeWorker:
+        def __init__(self):
+            self.simulation = FakeSimulation()
+            self.runs = []
+
+        def set_state(self, state):
+            pass
+
+        def run(self, steps):
+            self.runs.append(steps)
+
+        def get_chkpt(self):
+            return b"current"
+
+    class FakeLogger:
+        def info(self, *args):
+            pass
+
+    monkeypatch.setattr(neqti, "_write_worker_pdb_pair", lambda worker, path: None)
+    worker = FakeWorker()
+    checkpoint = tmp_path / "sampling.chk"
+    neqti._initialize_sampling_stream(
+        worker,
+        direction="forward",
+        initial_state_file="endpoint.xml",
+        start_state={},
+        checkpoint_file=checkpoint,
+        completed_count=7,
+        initial_equilibration_steps=25000,
+        resume=True,
+        logger=FakeLogger(),
+    )
+
+    assert worker.simulation.loaded == ["endpoint.xml"]
+    assert worker.runs == []
+    assert checkpoint.read_bytes() == b"current"
 
 
 def _test_neqti_loads_physical_initial_state_for_both_directions(tmp_path, monkeypatch):
@@ -157,6 +290,7 @@ def _test_neqti_loads_physical_initial_state_for_both_directions(tmp_path, monke
     monkeypatch.setattr(neqti, "OMMSystemRBFE", FakeOMMSystem)
     monkeypatch.setattr(neqti, "OMMWorkerATMSync", FakeWorker)
 
+    progress = []
     summary = neqti.run_neqti(
         options,
         {
@@ -170,9 +304,12 @@ def _test_neqti_loads_physical_initial_state_for_both_directions(tmp_path, monke
             "random_seed": 1,
             "platform": None,
         },
+        progress_callback=progress.append,
     )
 
     assert worker_options["INITIAL_STATE_FILE"] == "pair_equil.xml"
     assert load_calls == ["pair_equil.xml", "pair_equil.xml"]
     assert summary["forward_samples"] == 1
     assert summary["reverse_samples"] == 1
+    assert [(item["forward_samples"], item["reverse_samples"]) for item in progress] == [(1, 0), (1, 1)]
+    assert progress[-1]["analysis"]["bar_dg_kcal_per_mol"] == pytest.approx(0.0)

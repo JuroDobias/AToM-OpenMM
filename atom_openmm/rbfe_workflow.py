@@ -426,7 +426,7 @@ def analyze_pair(options, workflow):
     }
 
 
-def run_production(options, workflow):
+def run_production(options, workflow, progress_callback=None):
     production_method = workflow.get("production_method", "async_re")
     if production_method == "async_re":
         if should_run_production(options):
@@ -436,7 +436,9 @@ def run_production(options, workflow):
         from atom_openmm.neqti import normalize_neqti_options, run_neqti
 
         neqti_options = normalize_neqti_options(workflow, options)
-        return run_neqti(options, neqti_options)
+        if progress_callback is None:
+            return run_neqti(options, neqti_options)
+        return run_neqti(options, neqti_options, progress_callback=progress_callback)
     raise WorkflowConfigError("workflow.production_method must be 'async_re' or 'neqti'")
 
 
@@ -524,7 +526,10 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
             stage = "production"
             result_writer.update("running")
 
-            production_result = run_production(options, workflow)
+            def record_neqti_progress(summary):
+                result_writer.update("partial", analysis=summary)
+
+            production_result = run_production(options, workflow, progress_callback=record_neqti_progress)
             if production_result is not None:
                 final_status = production_result.get("status", "completed")
                 warning = None if production_result.get("analysis") else "No finite NEQTI estimate is available."

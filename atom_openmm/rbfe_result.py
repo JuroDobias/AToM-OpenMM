@@ -71,6 +71,8 @@ class RBFEResultWriter:
             "endpoint_b_swapped": self._relative_if_exists("neqti_endpoint_B_swapped.pdb"),
             "forward_work_csv": self._relative_if_exists("neqti_forward.csv"),
             "reverse_work_csv": self._relative_if_exists("neqti_reverse.csv"),
+            "forward_sampling_checkpoint": self._relative_if_exists("neqti_forward_sampling.chk"),
+            "reverse_sampling_checkpoint": self._relative_if_exists("neqti_reverse_sampling.chk"),
             "forward_integrated_work": self._relative_if_exists("integA.dat"),
             "reverse_integrated_work": self._relative_if_exists("integB.dat"),
             "neqti_summary": self._relative_if_exists("neqti_summary.yaml"),

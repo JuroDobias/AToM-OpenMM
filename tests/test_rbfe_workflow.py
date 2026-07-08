@@ -340,7 +340,7 @@ def _test_neqti_workflow_uses_physical_only_structprep(tmp_path, monkeypatch):
         received["equilibration"] = options["EQUILIBRATION_PROTOCOL"]
         Path(options["BASENAME"] + "_equil.xml").write_text("<state/>")
 
-    def fake_run_production(options, workflow):
+    def fake_run_production(options, workflow, progress_callback=None):
         received["production_initial"] = options["NEQTI_INITIAL_STATE_FILE"]
         return {"jobname": options["BASENAME"], "status": "completed"}
 

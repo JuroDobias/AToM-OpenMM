@@ -139,9 +139,9 @@ For the example above, the execution order is:
 | `random_seed` | Seed used for bootstrap resampling. |
 | `platform` | Optional OpenMM platform override for NEQTI. |
 
-`switch_steps_per_segment` applies to every neighboring pair of nodes in `state_path`. With the default 22-node schedule, a value of 1000 produces 21,000 integration steps per forward or reverse switch. A progress message is written after each complete node-to-node segment.
+`switch_steps_per_segment` applies to every neighboring pair of nodes in `state_path`. With the default 22-node schedule, a value of 1000 produces 21,000 integration steps per forward or reverse switch. A progress message is written after each complete node-to-node segment, including accumulated work and effective ns/day. The reported throughput includes parameter updates and protocol-work energy evaluations, not only OpenMM integration.
 
-When `resume: true`, completed work rows and compatible endpoint states are reused. An interrupted switching trajectory is rerun because work is only marked complete after the whole trajectory finishes. Review the YAML and output files before restarting: changing the schedule or protocol while retaining old work CSV files can mix incompatible results.
+When `resume: true`, completed work rows, compatible endpoint states, and the per-direction sampling checkpoints `neqti_forward_sampling.chk` and `neqti_reverse_sampling.chk` are reused. Initial equilibration runs only once for each endpoint sampling stream. An interrupted switching trajectory is rerun because work is only marked complete after the whole trajectory finishes. For older runs that already contain completed work rows but no sampling checkpoint, NEQTI reloads the endpoint and skips repeated initial equilibration; subsequent trajectories create and maintain a checkpoint. Review the YAML and output files before restarting: changing the schedule or protocol while retaining old work CSV or checkpoint files can mix incompatible results.
 
 The wrapper can replace the default equilibration stages with inline mdflow-style steps. Amber masks require `parmed`. For `async_re`, `pre_atm` replaces the physical minimization/thermalization/NPT/NVT stage and `async_re.midpoint` can replace the final lambda-0.5 equilibration. For `neqti`, preparation stops after the physical equilibrated state and `neqti.endpoint` is run separately at endpoint A and endpoint B before switching:
 
@@ -236,7 +236,74 @@ For NEQTI, also inspect:
 | `neqti_summary.yaml` | BAR estimate and optional bootstrap uncertainty. |
 | `*_swapped.pdb` | Diagnostic coordinates after applying the ATM virtual coordinate swap. |
 
-The ordinary PDB contains the physical coordinates held by the OpenMM context. ATM evaluates an additional swapped coordinate state internally. Use the swapped PDBs to verify that the ligand expected in the binding site overlaps the intended reference pose at each endpoint. These files are diagnostics, not independent simulation states.
+The ordinary PDB contains the physical coordinates held by the OpenMM context. ATM evaluates an additional swapped coordinate state internally. NEQTI writes both forms for forward and reverse start, post-equilibration, and snapshot diagnostics, for example `neqti_forward_snapshot_4.pdb` and `neqti_forward_snapshot_4_swapped.pdb`. Use the swapped PDBs to verify that the ligand expected in the binding site overlaps the intended reference pose at each endpoint. These files are diagnostics, not independent simulation states.
+
+## Machine-Readable Results
+
+Each pair directory contains `result.yaml`. The file is written atomically, so an external process may poll it while the workflow is running without observing partially serialized YAML. Input and work-directory paths are absolute; artifact paths are relative to the pair directory and are null until the corresponding file exists.
+
+```yaml
+schema_version: 1
+tool: atom_openmm_rbfe
+jobname: cdk2-H1Q-H1R
+status: completed
+method: neqti
+ligand_a: H1Q
+ligand_b: H1R
+workdir: /abs/path/to/cdk2-H1Q-H1R
+result:
+  ddg_kcal_per_mol: -1.23
+  ddg_error_kcal_per_mol: 0.31
+  ddg_kj_per_mol: -5.14632
+  ddg_error_kj_per_mol: 1.29704
+  estimator: BAR
+  samples_forward: 50
+  samples_reverse: 50
+  samples_per_replica: null
+quality:
+  convergence_status: usable
+  overlap_score: null
+  cycle_closure_error: null
+  warnings: []
+error: null
+inputs:
+  receptor: /abs/path/receptor.pdb
+  ligand_a_file: /abs/path/H1Q.sdf
+  ligand_b_file: /abs/path/H1R.sdf
+  workflow_yaml: /abs/path/workflow.yaml
+  final_pair_yaml: /abs/path/cdk2-H1Q-H1R.yaml
+artifacts:
+  prepared_complex: cdk2-H1Q-H1R.pdb
+  equilibrated_complex: cdk2-H1Q-H1R_equil.pdb
+  endpoint_a: neqti_endpoint_A.pdb
+  endpoint_b: neqti_endpoint_B.pdb
+  endpoint_a_swapped: neqti_endpoint_A_swapped.pdb
+  endpoint_b_swapped: neqti_endpoint_B_swapped.pdb
+  forward_work_csv: neqti_forward.csv
+  reverse_work_csv: neqti_reverse.csv
+  forward_sampling_checkpoint: neqti_forward_sampling.chk
+  reverse_sampling_checkpoint: neqti_reverse_sampling.chk
+  forward_integrated_work: integA.dat
+  reverse_integrated_work: integB.dat
+  neqti_summary: neqti_summary.yaml
+  async_re_log: null
+  async_re_replica_output_pattern: null
+  plot: null
+```
+
+For asynchronous replica exchange, `estimator` is `UWHAM`, `samples_per_replica` is populated, and the forward/reverse sample fields are null. For NEQTI, `estimator` is `BAR`, the forward/reverse fields are populated, and `samples_per_replica` is null.
+
+The top-level status has the following meaning:
+
+| Status | Meaning |
+| --- | --- |
+| `prepared` | System preparation completed but production was not requested. |
+| `running` | Setup, equilibration, production, or analysis is active. |
+| `partial` | A finite estimate may exist, but requested sampling is incomplete. |
+| `completed` | Requested sampling completed. |
+| `failed` | The workflow raised an exception; `error` records its type, message, and stage. |
+
+`quality.convergence_status: usable` means only that the run completed its requested sample count and produced a finite estimate. It is not a scientific convergence guarantee. Quantitative overlap and network cycle-closure analysis are not implemented in schema version 1 and remain null.
 
 ## Current Limitations
 
