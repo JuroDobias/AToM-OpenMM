@@ -12,6 +12,7 @@ from openmm.unit import angstrom, nanometer
 
 from atom_openmm.rbfe_production import rbfe_production
 from atom_openmm.rbfe_structprep import rbfe_structprep
+from atom_openmm.equilibration import normalize_equilibration_protocol
 from atom_openmm.utils.AtomUtils import (
     calc_displ_vec,
     cm_from_indexes,
@@ -446,6 +447,15 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
     options["BASENAME"] = pair_plan["jobname"]
     options["WORKDIR"] = str(jobdir.resolve())
     options["LIGAND_FORCE_FIELD"] = setup_options["ligandforcefield"]
+    production_method = workflow.get("production_method", "async_re")
+    if production_method == "neqti":
+        options["STRUCTPREP_MODE"] = "physical_only"
+        options["NEQTI_INITIAL_STATE_FILE"] = options["BASENAME"] + "_equil.xml"
+    else:
+        options["STRUCTPREP_MODE"] = "async_re"
+    equilibration_protocol = normalize_equilibration_protocol(workflow)
+    if equilibration_protocol is not None:
+        options["EQUILIBRATION_PROTOCOL"] = equilibration_protocol
 
     for lig_name, key in (
         (pair_plan["lig1_name"], "ALIGN_LIGAND1_REF_ATOMS"),
@@ -481,7 +491,8 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
         if workflow.get("prepare_only", False) or not workflow.get("run", True):
             return {"jobname": options["BASENAME"], "status": "prepared", "workdir": options["WORKDIR"]}
 
-        if not Path(options["BASENAME"] + "_0.xml").exists():
+        prep_state = options["BASENAME"] + ("_equil.xml" if production_method == "neqti" else "_0.xml")
+        if not Path(prep_state).exists():
             rbfe_structprep(config_file=None, options=options)
 
         production_result = run_production(options, workflow)

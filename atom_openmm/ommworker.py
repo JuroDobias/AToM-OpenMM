@@ -262,7 +262,8 @@ class OMMWorker(object):
             pote = state.getPotentialEnergy()
 
         #load initial state/coordinates
-        self.simulation.loadState(self.basename + "_0.xml")
+        initial_state_file = self.keywords.get("INITIAL_STATE_FILE", self.basename + "_0.xml")
+        self.simulation.loadState(initial_state_file)
 
         #replace parameters loaded from the initial xml file with the values in the system
         for param_name in self.ommsystem.cparams:
@@ -512,7 +513,10 @@ class OMMWorkerATMSync(OMMWorkerATM):
         self.hightemp = float(hightemp)
 
         #self.context.reinitialize(preserveState=True)
-        with Timer(self.logger.info, "Executing replica"):
+        if getattr(self, "log_run_timing", True):
+            with Timer(self.logger.info, "Executing replica"):
+                self._openmm_worker_run()
+        else:
             self._openmm_worker_run()
 
         if self.logfile_p is not None:

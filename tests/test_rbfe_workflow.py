@@ -250,3 +250,101 @@ def _test_run_production_routes_neqti(monkeypatch):
     monkeypatch.setattr(neqti, "run_neqti", fake_run_neqti)
 
     assert rbfe_workflow.run_production(options, workflow)["analysis"]["bar_dg_kcal_per_mol"] == 1.0
+
+
+def _test_neqti_workflow_uses_physical_only_structprep(tmp_path, monkeypatch):
+    from atom_openmm import rbfe_workflow
+
+    config_file = _write_minimal_workflow(tmp_path)
+    config = yaml.safe_load(config_file.read_text())
+    config["workflow"]["prepare_only"] = False
+    config["workflow"]["production_method"] = "neqti"
+    config["workflow"]["equilibration"] = {
+        "pre_atm": {
+            "steps": [
+                {
+                    "id": "min",
+                    "type": "minimization",
+                    "tolerance_kj_mol_nm": 10.0,
+                    "max_iterations": 1,
+                }
+            ]
+        },
+        "neqti": {
+            "endpoint": {
+                "steps": [
+                    {
+                        "id": "nvt",
+                        "type": "md",
+                        "ensemble": "NVT",
+                        "n_steps": 1,
+                    }
+                ]
+            }
+        },
+    }
+    config_file.write_text(yaml.dump(config))
+
+    monkeypatch.setattr(
+        rbfe_workflow,
+        "get_alignment_atoms",
+        lambda ref_lig_file, ref_atoms, lig_files: {
+            "H1Q": {"align_atom_ids": [1, 2, 3], "N_atoms": 3},
+            "H1R": {"align_atom_ids": [1, 2, 3], "N_atoms": 3},
+        },
+    )
+    monkeypatch.setattr(rbfe_workflow, "calc_displ_vec", lambda receptor, ligand: [22.0, 22.0, 22.0])
+    monkeypatch.setattr(
+        rbfe_workflow,
+        "setup_small_molecule_system",
+        lambda receptor_file, lig1_file, lig2_file, ff_json_file, options, setup_options: Path(
+            options["BASENAME"] + ".pdb"
+        ).write_text("generated\n"),
+    )
+    monkeypatch.setattr(
+        rbfe_workflow,
+        "derive_small_molecule_options",
+        lambda options: options.update(
+            {
+                "LIGAND1_ATOMS": [0, 1, 2],
+                "LIGAND2_ATOMS": [3, 4, 5],
+                "LIGAND1_VAR_ATOMS": [0, 1, 2],
+                "LIGAND2_VAR_ATOMS": [3, 4, 5],
+                "LIGAND1_ATTACH_ATOM": 0,
+                "LIGAND2_ATTACH_ATOM": 3,
+                "LIGAND1_CM_ATOMS": [0],
+                "LIGAND2_CM_ATOMS": [3],
+                "RCPT_CM_ATOMS": [10, 11, 12],
+                "RCPT_FRAME_ATOMS_O": [10, 11, 12],
+                "RCPT_FRAME_ATOMS_Z": [13, 14, 15],
+                "RCPT_FRAME_ATOMS_Y": [16, 17, 18],
+                "LIGOFFSET": [1.0, 2.0, 3.0],
+                "POS_RESTRAINED_ATOMS": [10, 11, 12],
+                "EXCLUSION_POT_MOL1_INDEXES": [20, 21],
+                "EXCLUSION_POT_MOL2_INDEXES": [22, 23],
+            }
+        ),
+    )
+
+    received = {}
+
+    def fake_structprep(config_file=None, options=None):
+        received["structprep_mode"] = options["STRUCTPREP_MODE"]
+        received["initial"] = options["NEQTI_INITIAL_STATE_FILE"]
+        received["equilibration"] = options["EQUILIBRATION_PROTOCOL"]
+        Path(options["BASENAME"] + "_equil.xml").write_text("<state/>")
+
+    def fake_run_production(options, workflow):
+        received["production_initial"] = options["NEQTI_INITIAL_STATE_FILE"]
+        return {"jobname": options["BASENAME"], "status": "completed"}
+
+    monkeypatch.setattr(rbfe_workflow, "rbfe_structprep", fake_structprep)
+    monkeypatch.setattr(rbfe_workflow, "run_production", fake_run_production)
+
+    results = rbfe_workflow.run_rbfe_workflow(config_file)
+
+    assert results[0]["status"] == "completed"
+    assert received["structprep_mode"] == "physical_only"
+    assert received["initial"] == "cdk2-H1Q-H1R_equil.xml"
+    assert received["production_initial"] == "cdk2-H1Q-H1R_equil.xml"
+    assert received["equilibration"]["neqti"]["endpoint"]["steps"][0]["id"] == "nvt"

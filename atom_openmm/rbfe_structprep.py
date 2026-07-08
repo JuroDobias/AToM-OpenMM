@@ -22,8 +22,14 @@ from datetime import datetime
 import logging
 
 from atom_openmm.ommsystem import *
+from atom_openmm.atm_coordinates import write_atm_swapped_pdb
 from atom_openmm.utils.AtomUtils import AtomUtils, residue_is_solvent
 from atom_openmm.abfe_structprep import set_platform
+from atom_openmm.equilibration import (
+    async_midpoint_steps,
+    pre_atm_steps,
+    run_custom_equilibration,
+)
 
 class OMMSystemRBFEnoATM(OMMSystemRBFE):
     def populate_atmforcegroup(self):
@@ -199,6 +205,25 @@ def do_mintherm(keywords, logger):
     with open(jobname + '_equil.pdb', 'w') as output:
         PDBFile.writeFile(simulation.topology, positions, output, keepIds=True)
 
+def do_custom_mintherm(keywords, logger, steps):
+    basename = keywords.get('BASENAME')
+    pdbtopfile = basename + ".pdb"
+    systemfile = basename + "_sys.xml"
+
+    syst = OMMSystemRBFEnoATM(basename, keywords, pdbtopfile, systemfile, logger)
+    syst.create_system()
+
+    (platform, platform_properties) = set_platform(keywords)
+    return run_custom_equilibration(
+        ommsystem=syst,
+        steps=steps,
+        platform=platform,
+        platform_properties=platform_properties,
+        output_dir=Path("equilibration") / "pre_atm",
+        final_state_path=basename + "_equil.xml",
+        final_pdb_path=basename + "_equil.pdb",
+    )
+
 def do_lambda_annealing(keywords, logger):
     basename = keywords.get('BASENAME')
     jobname = basename
@@ -325,6 +350,7 @@ def do_lambda_annealing(keywords, logger):
     simulation.topology.setPeriodicBoxVectors(boxsize)
     with open(jobname + '_mdlambda.pdb', 'w') as output:
         PDBFile.writeFile(simulation.topology, positions, output, keepIds=True)
+    write_atm_swapped_pdb(simulation.topology, positions, keywords, jobname + '_mdlambda_swapped.pdb')
 
 def do_equil(keywords, logger):
     basename = keywords.get('BASENAME')
@@ -411,6 +437,44 @@ def do_equil(keywords, logger):
     simulation.topology.setPeriodicBoxVectors(boxsize)
     with open(jobname + '_0.pdb', 'w') as output:
         PDBFile.writeFile(simulation.topology, positions, output, keepIds=True)
+    write_atm_swapped_pdb(simulation.topology, positions, keywords, jobname + '_0_swapped.pdb')
+
+def _midpoint_atm_state():
+    return {
+        "lambda1": 0.5,
+        "lambda2": 0.5,
+        "lambda3": 0.5,
+        "alpha": 0.0 / kilocalorie_per_mole,
+        "uh": 0.0 * kilocalorie_per_mole,
+        "uh1": 0.0 * kilocalorie_per_mole,
+        "w0": 0.0 * kilocalorie_per_mole,
+        "atmdirection": 1,
+        "Umax": 1000.0 * kilocalorie_per_mole,
+        "Ubcore": 500.0 * kilocalorie_per_mole,
+        "Acore": 0.062500,
+        "uoffset": 0.0 * kilocalorie_per_mole,
+    }
+
+def do_custom_equil(keywords, logger, steps):
+    basename = keywords.get('BASENAME')
+    pdbtopfile = basename + ".pdb"
+    systemfile = basename + "_sys.xml"
+
+    syst = OMMSystemRBFE(basename, keywords, pdbtopfile, systemfile, logger)
+    syst.create_system()
+
+    (platform, platform_properties) = set_platform(keywords)
+    return run_custom_equilibration(
+        ommsystem=syst,
+        steps=steps,
+        platform=platform,
+        platform_properties=platform_properties,
+        output_dir=Path("equilibration") / "async_re_midpoint",
+        final_state_path=basename + "_0.xml",
+        final_pdb_path=basename + "_0.pdb",
+        initial_state_path=basename + "_mdlambda.xml",
+        atm_state=_midpoint_atm_state(),
+    )
 
 def massage_keywords(keywords, restrain_solutes = True):
 
@@ -474,14 +538,31 @@ def rbfe_structprep(config_file=None, options=None):
     old_keywords = keywords.copy()
     massage_keywords(keywords, restrain_solutes)
 
-    do_mintherm(keywords, logger)
+    custom_pre_atm_steps = pre_atm_steps(keywords)
+    if custom_pre_atm_steps is not None:
+        do_custom_mintherm(keywords, logger, custom_pre_atm_steps)
+    else:
+        do_mintherm(keywords, logger)
+
+    prep_mode = keywords.get("STRUCTPREP_MODE", "async_re")
+    if prep_mode == "physical_only":
+        if restrain_solutes:
+            keywords["POS_RESTRAINED_ATOMS"] = old_keywords.get("POS_RESTRAINED_ATOMS")
+        return
+    if prep_mode != "async_re":
+        raise ValueError("STRUCTPREP_MODE must be 'async_re' or 'physical_only'")
+
     do_lambda_annealing(keywords, logger)
 
     # reestablish the restrained atoms
     if restrain_solutes:
         keywords["POS_RESTRAINED_ATOMS"] = old_keywords.get("POS_RESTRAINED_ATOMS")
 
-    do_equil(keywords, logger)
+    custom_midpoint_steps = async_midpoint_steps(keywords)
+    if custom_midpoint_steps is not None:
+        do_custom_equil(keywords, logger, custom_midpoint_steps)
+    else:
+        do_equil(keywords, logger)
 
 if __name__ == "__main__":
     assert len(sys.argv) == 2, "Specify ONE input file"

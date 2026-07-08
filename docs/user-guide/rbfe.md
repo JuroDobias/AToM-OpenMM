@@ -104,6 +104,39 @@ workflow:
 
 NEQTI reuses the existing ATM schedule as switching knots. By default it switches from the first state through every listed schedule state to the final state, and then repeats the reverse path. It writes `neqti_forward.csv`, `neqti_reverse.csv`, `neqti_summary.yaml`, and pmx-compatible integrated work files `integA.dat` and `integB.dat` in each pair directory. The integrated work files use kJ/mol so they can be read by `analyze_dhdl.py -iA integA.dat -iB integB.dat`.
 
+The wrapper can replace the default equilibration stages with inline mdflow-style steps. Amber masks require `parmed`. For `async_re`, `pre_atm` replaces the physical minimization/thermalization/NPT/NVT stage and `async_re.midpoint` can replace the final lambda-0.5 equilibration. For `neqti`, preparation stops after the physical equilibrated state and `neqti.endpoint` is run separately at endpoint A and endpoint B before switching:
+
+```yaml
+workflow:
+  production_method: neqti
+  equilibration:
+    pre_atm:
+      steps:
+        - id: min_heavy_restrained
+          type: minimization
+          tolerance_kj_mol_nm: 10.0
+          max_iterations: 3000
+          positional_restraints:
+            mask: '!@H= & !:HOH,WAT,NA,CL,K,CA'
+            k_kcal_mol_a2: 25.0
+            tolerance_a: 0.01
+    neqti:
+      endpoint:
+        steps:
+          - id: endpoint_nvt
+            type: md
+            ensemble: NVT
+            n_steps: 25000
+            timestep_ps: 0.004
+            thermostat:
+              temperature_k: 310.0
+              friction_per_ps: 1.0
+            positional_restraints:
+              mask: '!@H= & !:HOH,WAT,NA,CL,K,CA'
+              k_kcal_mol_a2: 5.0
+              tolerance_a: 0.25
+```
+
 For the CDK2 small-molecule workflow:
 
 ```bash

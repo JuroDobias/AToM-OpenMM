@@ -94,3 +94,74 @@ def _test_completed_rows_filter_incomplete_rows(tmp_path):
         writer.writerow({"trajectory": 1, "status": "running"})
 
     assert _read_completed_rows(out) == [{"trajectory": "0", "status": "complete"}]
+
+
+def _test_neqti_loads_physical_initial_state_for_both_directions(tmp_path, monkeypatch):
+    from atom_openmm import neqti
+
+    monkeypatch.chdir(tmp_path)
+    options = _atom_options()
+    options.update(
+        {
+            "BASENAME": "pair",
+            "NEQTI_INITIAL_STATE_FILE": "pair_equil.xml",
+        }
+    )
+
+    load_calls = []
+    worker_options = {}
+
+    class FakeSimulation:
+        def loadState(self, path):
+            load_calls.append(path)
+
+    class FakeWorker:
+        def __init__(self, basename, ommsystem, options, node_info=None, compute=True, logger=None):
+            worker_options.update(options)
+            self.simulation = FakeSimulation()
+
+        def set_state(self, par):
+            pass
+
+        def run(self, nsteps):
+            pass
+
+        def get_chkpt(self):
+            return b"checkpoint"
+
+        def set_chkpt(self, chkpt):
+            pass
+
+        def get_energy(self):
+            return {"potential_energy": 0.0 * kilocalories_per_mole}
+
+        def finish(self):
+            pass
+
+    class FakeOMMSystem:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(neqti, "_select_node_info", lambda options, neqti_options: {"node_name": "local"})
+    monkeypatch.setattr(neqti, "OMMSystemRBFE", FakeOMMSystem)
+    monkeypatch.setattr(neqti, "OMMWorkerATMSync", FakeWorker)
+
+    summary = neqti.run_neqti(
+        options,
+        {
+            "initial_equilibration_steps": 0,
+            "n_snapshots": 1,
+            "decorrelation_steps": 0,
+            "switch_steps_per_segment": 1,
+            "state_path": [0, 1],
+            "resume": False,
+            "bootstrap_samples": 0,
+            "random_seed": 1,
+            "platform": None,
+        },
+    )
+
+    assert worker_options["INITIAL_STATE_FILE"] == "pair_equil.xml"
+    assert load_calls == ["pair_equil.xml", "pair_equil.xml"]
+    assert summary["forward_samples"] == 1
+    assert summary["reverse_samples"] == 1

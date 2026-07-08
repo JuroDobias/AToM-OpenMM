@@ -13,6 +13,9 @@ from openmm.unit import kelvin, kilocalorie_per_mole, kilocalories_per_mole, kil
 from scipy.optimize import brentq, minimize_scalar
 
 from atom_openmm.async_re import JobManager
+from atom_openmm.abfe_structprep import set_platform
+from atom_openmm.atm_coordinates import write_atm_swapped_pdb
+from atom_openmm.equilibration import neqti_endpoint_steps, run_custom_equilibration
 from atom_openmm.ommsystem import OMMSystemRBFE
 from atom_openmm.ommworker import OMMWorkerATMSync
 
@@ -165,6 +168,14 @@ def _read_completed_rows(path):
         return [row for row in csv.DictReader(f) if row.get("status") == "complete"]
 
 
+def _ensure_work_csv(path):
+    if path.exists():
+        return
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+
+
 def _append_row(path, row):
     write_header = not path.exists()
     with open(path, "a", newline="") as f:
@@ -180,20 +191,49 @@ def _write_integrated_work(path, rows, prefix):
             f.write(f"{prefix}_{int(row['trajectory'])} {float(row['work_kj_per_mol']):.12g}\n")
 
 
+def _write_worker_swapped_pdb(worker, path):
+    if not getattr(worker, "context", None) or not getattr(worker, "topology", None):
+        return
+    state = worker.context.getState(getPositions=True)
+    box_vectors = state.getPeriodicBoxVectors()
+    if box_vectors is not None:
+        worker.topology.setPeriodicBoxVectors(box_vectors)
+    write_atm_swapped_pdb(worker.topology, state.getPositions(), worker.keywords, path)
+
+
 def _potential_kcal(worker):
     pot = worker.get_energy()
     return pot["potential_energy"] / kilocalories_per_mole
 
 
-def _run_switch(worker, start_par, schedule):
+def _run_switch(worker, start_par, schedule, steps_per_segment, state_path, logger=None, label=None):
     worker.set_state(start_par)
     work = 0.0
-    for par in schedule:
-        old_energy = _potential_kcal(worker)
-        worker.set_state(par)
-        new_energy = _potential_kcal(worker)
-        work += new_energy - old_energy
-        worker.run(1)
+    total = len(schedule)
+    previous_log_run_timing = getattr(worker, "log_run_timing", True)
+    worker.log_run_timing = False
+    try:
+        for step, par in enumerate(schedule, start=1):
+            old_energy = _potential_kcal(worker)
+            worker.set_state(par)
+            new_energy = _potential_kcal(worker)
+            work += new_energy - old_energy
+            worker.run(1)
+            if logger is not None and label and step % steps_per_segment == 0:
+                segment = step // steps_per_segment
+                logger.info(
+                    "NEQTI %s segment %d/%d complete: state %d -> %d, %d/%d steps, work %.6g kcal/mol",
+                    label,
+                    segment,
+                    len(state_path) - 1,
+                    state_path[segment - 1],
+                    state_path[segment],
+                    step,
+                    total,
+                    work,
+                )
+    finally:
+        worker.log_run_timing = previous_log_run_timing
     return work
 
 
@@ -270,10 +310,61 @@ def run_neqti(options, neqti_options=None):
     reverse_schedule = make_switch_schedule(stateparams, reverse_path, neqti_options["switch_steps_per_segment"])
     forward_start = stateparams[state_path[0]]
     reverse_start = stateparams[state_path[-1]]
+    initial_state_file = options.get("NEQTI_INITIAL_STATE_FILE") or options.get("INITIAL_STATE_FILE") or basename + "_0.xml"
+    forward_initial_state_file = initial_state_file
+    reverse_initial_state_file = initial_state_file
+
+    endpoint_steps = neqti_endpoint_steps(options)
+    if endpoint_steps is not None:
+        endpoint_a = Path("neqti_endpoint_A.xml")
+        endpoint_b = Path("neqti_endpoint_B.xml")
+        endpoint_marker = Path("neqti_endpoint_states.ok")
+        if neqti_options["resume"] and endpoint_a.exists() and endpoint_b.exists() and endpoint_marker.exists():
+            logger.info("Reusing completed NEQTI endpoint equilibration states")
+        else:
+            if neqti_options["resume"]:
+                logger.info("NEQTI endpoint states are incomplete or from an older protocol; rebuilding A and B endpoints")
+            else:
+                logger.info("NEQTI resume is disabled; rebuilding A and B endpoints")
+            endpoint_system = OMMSystemRBFE(basename, options, basename + ".pdb", basename + "_sys.xml", logger)
+            endpoint_system.create_system()
+            platform_options = deepcopy(options)
+            if neqti_options.get("platform"):
+                platform_options["OPENMM_PLATFORM"] = neqti_options["platform"]
+            platform, platform_properties = set_platform(platform_options)
+            run_custom_equilibration(
+                ommsystem=endpoint_system,
+                steps=endpoint_steps,
+                platform=platform,
+                platform_properties=platform_properties,
+                output_dir=Path("equilibration") / "neqti_A",
+                final_state_path=endpoint_a,
+                final_pdb_path="neqti_endpoint_A.pdb",
+                initial_state_path=initial_state_file,
+                atm_state=forward_start,
+            )
+            logger.info("Completed NEQTI endpoint A equilibration")
+            run_custom_equilibration(
+                ommsystem=endpoint_system,
+                steps=endpoint_steps,
+                platform=platform,
+                platform_properties=platform_properties,
+                output_dir=Path("equilibration") / "neqti_B",
+                final_state_path=endpoint_b,
+                final_pdb_path="neqti_endpoint_B.pdb",
+                initial_state_path=initial_state_file,
+                atm_state=reverse_start,
+            )
+            logger.info("Completed NEQTI endpoint B equilibration")
+            endpoint_marker.write_text("compatible\n")
+        forward_initial_state_file = "neqti_endpoint_A.xml"
+        reverse_initial_state_file = "neqti_endpoint_B.xml"
 
     node_info = _select_node_info(options, neqti_options)
     ommsystem = OMMSystemRBFE(basename, options, basename + ".pdb", basename + "_sys.xml", logger)
-    worker = OMMWorkerATMSync(basename, ommsystem, options, node_info=node_info, compute=True, logger=logger)
+    worker_options = deepcopy(options)
+    worker_options["INITIAL_STATE_FILE"] = forward_initial_state_file
+    worker = OMMWorkerATMSync(basename, ommsystem, worker_options, node_info=node_info, compute=True, logger=logger)
 
     forward_file = Path("neqti_forward.csv")
     reverse_file = Path("neqti_reverse.csv")
@@ -281,19 +372,36 @@ def run_neqti(options, neqti_options=None):
         for path in [forward_file, reverse_file, Path("integA.dat"), Path("integB.dat"), Path("neqti_summary.yaml")]:
             if path.exists():
                 path.unlink()
+    _ensure_work_csv(forward_file)
+    _ensure_work_csv(reverse_file)
 
     try:
         completed_forward = _read_completed_rows(forward_file)
         completed_reverse = _read_completed_rows(reverse_file)
 
+        worker.simulation.loadState(forward_initial_state_file)
         worker.set_state(forward_start)
+        _write_worker_swapped_pdb(worker, "neqti_forward_start_swapped.pdb")
         if neqti_options["initial_equilibration_steps"] > 0:
+            logger.info("NEQTI forward initial equilibration: %d steps", neqti_options["initial_equilibration_steps"])
             worker.run(neqti_options["initial_equilibration_steps"])
+            _write_worker_swapped_pdb(worker, "neqti_forward_equilibrated_swapped.pdb")
         for traj in range(len(completed_forward), neqti_options["n_snapshots"]):
             if neqti_options["decorrelation_steps"] > 0:
+                logger.info("NEQTI forward trajectory %d decorrelation: %d steps", traj, neqti_options["decorrelation_steps"])
                 worker.run(neqti_options["decorrelation_steps"])
             snapshot = worker.get_chkpt()
-            work_kcal = _run_switch(worker, forward_start, forward_schedule)
+            _write_worker_swapped_pdb(worker, f"neqti_forward_snapshot_{traj}_swapped.pdb")
+            logger.info("NEQTI forward trajectory %d switch: %d steps", traj, len(forward_schedule))
+            work_kcal = _run_switch(
+                worker,
+                forward_start,
+                forward_schedule,
+                neqti_options["switch_steps_per_segment"],
+                state_path,
+                logger,
+                f"forward trajectory {traj}",
+            )
             _append_row(
                 forward_file,
                 {
@@ -307,17 +415,33 @@ def run_neqti(options, neqti_options=None):
                     "status": "complete",
                 },
             )
+            logger.info("NEQTI forward trajectory %d complete: %.6g kcal/mol", traj, work_kcal)
             worker.set_chkpt(snapshot)
             worker.set_state(forward_start)
 
+        worker.simulation.loadState(reverse_initial_state_file)
         worker.set_state(reverse_start)
+        _write_worker_swapped_pdb(worker, "neqti_reverse_start_swapped.pdb")
         if neqti_options["initial_equilibration_steps"] > 0:
+            logger.info("NEQTI reverse initial equilibration: %d steps", neqti_options["initial_equilibration_steps"])
             worker.run(neqti_options["initial_equilibration_steps"])
+            _write_worker_swapped_pdb(worker, "neqti_reverse_equilibrated_swapped.pdb")
         for traj in range(len(completed_reverse), neqti_options["n_snapshots"]):
             if neqti_options["decorrelation_steps"] > 0:
+                logger.info("NEQTI reverse trajectory %d decorrelation: %d steps", traj, neqti_options["decorrelation_steps"])
                 worker.run(neqti_options["decorrelation_steps"])
             snapshot = worker.get_chkpt()
-            work_kcal = _run_switch(worker, reverse_start, reverse_schedule)
+            _write_worker_swapped_pdb(worker, f"neqti_reverse_snapshot_{traj}_swapped.pdb")
+            logger.info("NEQTI reverse trajectory %d switch: %d steps", traj, len(reverse_schedule))
+            work_kcal = _run_switch(
+                worker,
+                reverse_start,
+                reverse_schedule,
+                neqti_options["switch_steps_per_segment"],
+                reverse_path,
+                logger,
+                f"reverse trajectory {traj}",
+            )
             _append_row(
                 reverse_file,
                 {
@@ -331,6 +455,7 @@ def run_neqti(options, neqti_options=None):
                     "status": "complete",
                 },
             )
+            logger.info("NEQTI reverse trajectory %d complete: %.6g kcal/mol", traj, work_kcal)
             worker.set_chkpt(snapshot)
             worker.set_state(reverse_start)
     finally:
