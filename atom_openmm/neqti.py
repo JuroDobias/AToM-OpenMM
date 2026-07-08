@@ -9,6 +9,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
+import openmm as mm
 import yaml
 from openmm.app import PDBFile
 from openmm.unit import kelvin, kilocalorie_per_mole, kilocalories_per_mole, kilojoules_per_mole, picosecond
@@ -20,6 +21,7 @@ from atom_openmm.atm_coordinates import write_atm_swapped_pdb
 from atom_openmm.equilibration import neqti_endpoint_steps, run_custom_equilibration
 from atom_openmm.ommsystem import OMMSystemRBFE
 from atom_openmm.ommworker import OMMWorkerATMSync
+from atom_openmm.neqti_integrator import OMMWorkerATMNEQTI
 
 
 KCAL_TO_KJ = 4.184
@@ -103,6 +105,10 @@ def normalize_neqti_options(workflow, atom_options):
     if any(i < 0 or i >= len(stateparams) for i in state_path):
         raise NEQTIConfigError("workflow.neqti.state_path contains an out-of-range state index")
 
+    switch_integrator = str(raw.get("switch_integrator", "custom")).lower()
+    if switch_integrator not in ("custom", "python"):
+        raise NEQTIConfigError("workflow.neqti.switch_integrator must be 'custom' or 'python'")
+
     return {
         "initial_equilibration_steps": int(raw.get("initial_equilibration_steps", 0)),
         "n_snapshots": int(raw.get("n_snapshots", atom_options.get("MAX_SAMPLES", 1))),
@@ -113,6 +119,8 @@ def normalize_neqti_options(workflow, atom_options):
         "bootstrap_samples": int(raw.get("bootstrap_samples", 200)),
         "random_seed": int(raw.get("random_seed", 2026)),
         "platform": raw.get("platform"),
+        "switch_integrator": switch_integrator,
+        "validate_switch_integrator": bool(raw.get("validate_switch_integrator", False)),
     }
 
 
@@ -209,7 +217,13 @@ def _initialize_sampling_stream(
     logger,
 ):
     if resume and checkpoint_file.exists():
-        worker.set_chkpt(checkpoint_file.read_bytes())
+        try:
+            worker.set_chkpt(checkpoint_file.read_bytes())
+        except Exception as exc:
+            raise NEQTIConfigError(
+                f"Could not load {checkpoint_file}. NEQTI sampling checkpoints created before the custom "
+                "switching integrator are incompatible; start a clean job or remove old work and checkpoint files."
+            ) from exc
         worker.set_state(start_state)
         logger.info(
             "Resuming NEQTI %s sampling after %d completed trajectories from %s; skipping initial equilibration",
@@ -276,6 +290,8 @@ def _write_worker_pdb_pair(worker, path):
 
 def _worker_timestep_ps(worker):
     integrator = getattr(worker, "integrator", None)
+    if isinstance(integrator, mm.CompoundIntegrator):
+        integrator = integrator.getCurrentIntegrator()
     if integrator is None and getattr(worker, "simulation", None) is not None:
         integrator = getattr(worker.simulation, "integrator", None)
     if integrator is None:
@@ -362,6 +378,102 @@ def _run_switch(worker, start_par, schedule, steps_per_segment, state_path, logg
     finally:
         worker.log_run_timing = previous_log_run_timing
     return work
+
+
+def _run_switch_custom(worker, start_par, steps_per_segment, state_path, direction, logger=None, label=None):
+    integrator = worker.begin_switch(direction, start_par)
+    total = (len(state_path) - 1) * steps_per_segment
+    try:
+        for segment, (start_state, end_state) in enumerate(zip(state_path[:-1], state_path[1:]), start=1):
+            segment_started = time.perf_counter()
+            integrator.step(steps_per_segment)
+            elapsed = time.perf_counter() - segment_started
+            work = integrator.get_protocol_work() / kilocalories_per_mole
+            if logger is not None and label:
+                ns_per_day = _effective_ns_per_day(worker, steps_per_segment, elapsed)
+                logger.info(
+                    "NEQTI %s segment %d/%d complete: state %d -> %d, %d/%d steps, "
+                    "work %.6g kcal/mol, %.3f ns/day",
+                    label,
+                    segment,
+                    len(state_path) - 1,
+                    start_state,
+                    end_state,
+                    segment * steps_per_segment,
+                    total,
+                    work,
+                    ns_per_day,
+                )
+        return integrator.get_protocol_work() / kilocalories_per_mole
+    finally:
+        worker.end_switch()
+
+
+def _validate_switch_implementations(
+    worker,
+    *,
+    direction,
+    snapshot,
+    start_state,
+    schedule,
+    steps_per_segment,
+    state_path,
+    logger,
+    output_file=Path("neqti_switch_validation.yaml"),
+):
+    if output_file.exists():
+        with open(output_file) as handle:
+            report = yaml.safe_load(handle) or {}
+    else:
+        report = {"status": "informational", "directions": {}}
+    directions = report.setdefault("directions", {})
+    if direction in directions:
+        return
+
+    worker.set_chkpt(snapshot)
+    worker.set_state(start_state)
+    custom_started = time.perf_counter()
+    custom_work = _run_switch_custom(
+        worker,
+        start_state,
+        steps_per_segment,
+        state_path,
+        direction,
+        logger,
+        f"validation custom {direction}",
+    )
+    custom_seconds = time.perf_counter() - custom_started
+
+    worker.set_chkpt(snapshot)
+    worker.set_state(start_state)
+    python_started = time.perf_counter()
+    python_work = _run_switch(
+        worker,
+        start_state,
+        schedule,
+        steps_per_segment,
+        state_path,
+        logger,
+        f"validation python {direction}",
+    )
+    python_seconds = time.perf_counter() - python_started
+    worker.set_chkpt(snapshot)
+    worker.set_state(start_state)
+
+    total_steps = len(schedule)
+    directions[direction] = {
+        "custom_work_kcal_per_mol": float(custom_work),
+        "python_work_kcal_per_mol": float(python_work),
+        "work_difference_kcal_per_mol": float(custom_work - python_work),
+        "custom_seconds": custom_seconds,
+        "python_seconds": python_seconds,
+        "custom_ns_per_day": _effective_ns_per_day(worker, total_steps, custom_seconds),
+        "python_ns_per_day": _effective_ns_per_day(worker, total_steps, python_seconds),
+        "steps": total_steps,
+    }
+    with open(output_file, "w") as handle:
+        yaml.safe_dump(report, handle, sort_keys=False)
+    logger.info("Wrote informational %s switch-integrator comparison to %s", direction, output_file)
 
 
 def _bootstrap_bar(forward, reverse, temperature, nboots, seed):
@@ -491,7 +603,32 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
     ommsystem = OMMSystemRBFE(basename, options, basename + ".pdb", basename + "_sys.xml", logger)
     worker_options = deepcopy(options)
     worker_options["INITIAL_STATE_FILE"] = forward_initial_state_file
-    worker = OMMWorkerATMSync(basename, ommsystem, worker_options, node_info=node_info, compute=True, logger=logger)
+    use_custom_worker = (
+        neqti_options["switch_integrator"] == "custom"
+        or neqti_options["validate_switch_integrator"]
+    )
+    if use_custom_worker:
+        worker = OMMWorkerATMNEQTI(
+            basename,
+            ommsystem,
+            worker_options,
+            node_info=node_info,
+            compute=True,
+            logger=logger,
+            forward_schedule=[stateparams[index] for index in state_path],
+            reverse_schedule=[stateparams[index] for index in reverse_path],
+            steps_per_segment=neqti_options["switch_steps_per_segment"],
+            random_seed=neqti_options["random_seed"],
+        )
+    else:
+        worker = OMMWorkerATMSync(
+            basename,
+            ommsystem,
+            worker_options,
+            node_info=node_info,
+            compute=True,
+            logger=logger,
+        )
 
     forward_file = Path("neqti_forward.csv")
     reverse_file = Path("neqti_reverse.csv")
@@ -511,6 +648,27 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                 path.unlink()
     _ensure_work_csv(forward_file)
     _ensure_work_csv(reverse_file)
+
+    def execute_switch(direction, start_state, schedule, path, label):
+        if neqti_options["switch_integrator"] == "custom":
+            return _run_switch_custom(
+                worker,
+                start_state,
+                neqti_options["switch_steps_per_segment"],
+                path,
+                direction,
+                logger,
+                label,
+            )
+        return _run_switch(
+            worker,
+            start_state,
+            schedule,
+            neqti_options["switch_steps_per_segment"],
+            path,
+            logger,
+            label,
+        )
 
     try:
         completed_forward = _read_completed_rows(forward_file)
@@ -539,16 +697,21 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                 )
             snapshot = worker.get_chkpt()
             _write_worker_pdb_pair(worker, f"neqti_forward_snapshot_{traj}.pdb")
+            if neqti_options["validate_switch_integrator"]:
+                _validate_switch_implementations(
+                    worker,
+                    direction="forward",
+                    snapshot=snapshot,
+                    start_state=forward_start,
+                    schedule=forward_schedule,
+                    steps_per_segment=neqti_options["switch_steps_per_segment"],
+                    state_path=state_path,
+                    logger=logger,
+                )
             logger.info("NEQTI forward trajectory %d switch: %d steps", traj, len(forward_schedule))
             switch_started = time.perf_counter()
-            work_kcal = _run_switch(
-                worker,
-                forward_start,
-                forward_schedule,
-                neqti_options["switch_steps_per_segment"],
-                state_path,
-                logger,
-                f"forward trajectory {traj}",
+            work_kcal = execute_switch(
+                "forward", forward_start, forward_schedule, state_path, f"forward trajectory {traj}"
             )
             _write_worker_pdb_pair(worker, f"neqti_forward_snapshot_{traj}_post_switch.pdb")
             _append_row(
@@ -619,16 +782,21 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                 )
             snapshot = worker.get_chkpt()
             _write_worker_pdb_pair(worker, f"neqti_reverse_snapshot_{traj}.pdb")
+            if neqti_options["validate_switch_integrator"]:
+                _validate_switch_implementations(
+                    worker,
+                    direction="reverse",
+                    snapshot=snapshot,
+                    start_state=reverse_start,
+                    schedule=reverse_schedule,
+                    steps_per_segment=neqti_options["switch_steps_per_segment"],
+                    state_path=reverse_path,
+                    logger=logger,
+                )
             logger.info("NEQTI reverse trajectory %d switch: %d steps", traj, len(reverse_schedule))
             switch_started = time.perf_counter()
-            work_kcal = _run_switch(
-                worker,
-                reverse_start,
-                reverse_schedule,
-                neqti_options["switch_steps_per_segment"],
-                reverse_path,
-                logger,
-                f"reverse trajectory {traj}",
+            work_kcal = execute_switch(
+                "reverse", reverse_start, reverse_schedule, reverse_path, f"reverse trajectory {traj}"
             )
             _write_worker_pdb_pair(worker, f"neqti_reverse_snapshot_{traj}_post_switch.pdb")
             _append_row(

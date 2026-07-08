@@ -111,6 +111,8 @@ workflow:
 
 NEQTI equilibrates endpoints A and B, collects decorrelated endpoint snapshots, performs forward A-to-B and reverse B-to-A switches through the configured ATM schedule, records protocol work, and estimates the free-energy difference with BAR. This implementation is experimental and should be validated against established calculations before production use.
 
+By default, ATM parameter switching and protocol-work accumulation run inside a dedicated OpenMM `CustomIntegrator`; `openmmtools` is used as a design reference but is not a runtime dependency. Set `workflow.neqti.switch_integrator: python` to use the slower reference path or `validate_switch_integrator: true` for a one-shot comparison.
+
 See the [RBFE user guide](docs/user-guide/rbfe.md) for the complete YAML schema, force-field examples, custom equilibration, restart behavior, outputs, and swapped-coordinate diagnostics.
 
 Every ligand-pair directory also contains an atomically updated `result.yaml` for integration with workflow managers and databases. It uses the same schema for asynchronous replica exchange and NEQTI, reports DDG in kcal/mol and kJ/mol, records input provenance and artifacts, and exposes `prepared`, `running`, `partial`, `completed`, or `failed` status.

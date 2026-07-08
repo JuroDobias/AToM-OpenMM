@@ -113,6 +113,8 @@ workflow:
     n_snapshots: 20
     decorrelation_steps: 10000
     switch_steps_per_segment: 100
+    switch_integrator: custom
+    validate_switch_integrator: false
     resume: true
 ```
 
@@ -133,6 +135,8 @@ For the example above, the execution order is:
 | `n_snapshots` | Number of forward trajectories and number of reverse trajectories. |
 | `decorrelation_steps` | Endpoint MD between consecutive switching snapshots. |
 | `switch_steps_per_segment` | Integration steps used to interpolate between each neighboring pair of ATM schedule nodes. |
+| `switch_integrator` | `custom` (default) performs switching and work accumulation inside OpenMM; `python` retains the reference implementation. |
+| `validate_switch_integrator` | Run one informational custom-versus-Python comparison in each direction from identical snapshots. |
 | `state_path` | Optional ordered list of ATM schedule indices; defaults to all configured states. |
 | `resume` | Reuse completed work rows and completed custom endpoint states when available. |
 | `bootstrap_samples` | Number of BAR bootstrap resamples; zero disables uncertainty estimation. |
@@ -141,7 +145,11 @@ For the example above, the execution order is:
 
 `switch_steps_per_segment` applies to every neighboring pair of nodes in `state_path`. With the default 22-node schedule, a value of 1000 produces 21,000 integration steps per forward or reverse switch. Logs report effective ns/day for initial equilibration, decorrelation, every switching segment, and each complete switching trajectory. Custom equilibration MD steps record the same value in their completion message and `manifest.json`. Switching throughput includes parameter updates and protocol-work energy evaluations, not only OpenMM integration, so it can be substantially lower than ordinary MD throughput.
 
-When `resume: true`, completed work rows, compatible endpoint states, and the per-direction sampling checkpoints `neqti_forward_sampling.chk` and `neqti_reverse_sampling.chk` are reused. Initial equilibration runs only once for each endpoint sampling stream. An interrupted switching trajectory is rerun because work is only marked complete after the whole trajectory finishes. For older runs that already contain completed work rows but no sampling checkpoint, NEQTI reloads the endpoint and skips repeated initial equilibration; subsequent trajectories create and maintain a checkpoint. Review the YAML and output files before restarting: changing the schedule or protocol while retaining old work CSV or checkpoint files can mix incompatible results.
+The custom switching path uses a dedicated BAOAB-style Langevin `CustomIntegrator` with the ATM parameter update centered in each timestep (`V R H O R V`). Endpoint equilibration and snapshot decorrelation continue to use the existing ATM MTS integrator. A `CompoundIntegrator` keeps both modes in one OpenMM context. The custom path executes one Python call per schedule segment rather than one call per integration step.
+
+When `validate_switch_integrator: true`, the first pending forward and reverse snapshots are each switched once with the custom implementation and once with the Python reference after restoring identical starting state. The comparison is written to `neqti_switch_validation.yaml` and is not included in production work CSV files. Individual stochastic work values are not expected to be identical because the two paths use different Langevin splittings; compare throughput and distributions over production trajectories.
+
+When `resume: true`, completed work rows, compatible endpoint states, and the per-direction sampling checkpoints `neqti_forward_sampling.chk` and `neqti_reverse_sampling.chk` are reused. Initial equilibration runs only once for each endpoint sampling stream. An interrupted switching trajectory is rerun because work is only marked complete after the whole trajectory finishes. Checkpoints created before the custom switching integrator are incompatible; start a clean job when changing to this implementation. Review the YAML and output files before restarting: changing the schedule or protocol while retaining old work CSV or checkpoint files can mix incompatible results.
 
 The wrapper can replace the default equilibration stages with inline mdflow-style steps. Amber masks require `parmed`. For `async_re`, `pre_atm` replaces the physical minimization/thermalization/NPT/NVT stage and `async_re.midpoint` can replace the final lambda-0.5 equilibration. For `neqti`, preparation stops after the physical equilibrated state and `neqti.endpoint` is run separately at endpoint A and endpoint B before switching:
 
@@ -286,6 +294,7 @@ artifacts:
   forward_integrated_work: integA.dat
   reverse_integrated_work: integB.dat
   neqti_summary: neqti_summary.yaml
+  neqti_switch_validation: null
   async_re_log: null
   async_re_replica_output_pattern: null
   plot: null

@@ -76,6 +76,7 @@ class RBFEResultWriter:
             "forward_integrated_work": self._relative_if_exists("integA.dat"),
             "reverse_integrated_work": self._relative_if_exists("integB.dat"),
             "neqti_summary": self._relative_if_exists("neqti_summary.yaml"),
+            "neqti_switch_validation": self._relative_if_exists("neqti_switch_validation.yaml"),
             "async_re_log": self._relative_if_exists(f"{job}.log"),
             "async_re_replica_output_pattern": f"r*/{job}.out" if any(self.workdir.glob(f"r*/{job}.out")) else None,
             "plot": self._relative_if_exists(f"{job}.png"),

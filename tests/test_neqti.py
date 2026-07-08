@@ -1,6 +1,7 @@
 import csv
 
 import pytest
+import yaml
 from openmm.unit import kelvin, kilocalories_per_mole, picosecond
 
 
@@ -46,6 +47,7 @@ def _test_normalize_neqti_options_defaults_to_full_state_path():
     assert settings["switch_steps_per_segment"] == 7
     assert settings["n_snapshots"] == 2
     assert settings["resume"] is True
+    assert settings["switch_integrator"] == "custom"
 
 
 def _test_switch_schedule_interpolates_between_knots():
@@ -240,6 +242,76 @@ def _test_legacy_resume_without_checkpoint_skips_initial_equilibration(tmp_path,
     assert checkpoint.read_bytes() == b"current"
 
 
+def _test_incompatible_sampling_checkpoint_has_actionable_error(tmp_path):
+    from atom_openmm.neqti import NEQTIConfigError, _initialize_sampling_stream
+
+    class FakeWorker:
+        def set_chkpt(self, checkpoint):
+            raise RuntimeError("incompatible")
+
+    class FakeLogger:
+        def info(self, *args):
+            pass
+
+    checkpoint = tmp_path / "sampling.chk"
+    checkpoint.write_bytes(b"old")
+    with pytest.raises(NEQTIConfigError, match="start a clean job"):
+        _initialize_sampling_stream(
+            FakeWorker(),
+            direction="forward",
+            initial_state_file="endpoint.xml",
+            start_state={},
+            checkpoint_file=checkpoint,
+            completed_count=1,
+            initial_equilibration_steps=10,
+            resume=True,
+            logger=FakeLogger(),
+        )
+
+
+def _test_switch_validation_restores_snapshot_and_writes_report(tmp_path, monkeypatch):
+    from atom_openmm import neqti
+
+    events = []
+
+    class FakeWorker:
+        def set_chkpt(self, checkpoint):
+            events.append(("checkpoint", checkpoint))
+
+        def set_state(self, state):
+            events.append(("state", state))
+
+    class FakeLogger:
+        def info(self, *args):
+            pass
+
+    monkeypatch.setattr(neqti, "_run_switch_custom", lambda *args, **kwargs: 1.25)
+    monkeypatch.setattr(neqti, "_run_switch", lambda *args, **kwargs: 1.5)
+    monkeypatch.setattr(neqti, "_effective_ns_per_day", lambda *args, **kwargs: 10.0)
+    output = tmp_path / "validation.yaml"
+    neqti._validate_switch_implementations(
+        FakeWorker(),
+        direction="forward",
+        snapshot=b"snapshot",
+        start_state={"lambda1": 0.0},
+        schedule=[{}, {}],
+        steps_per_segment=1,
+        state_path=[0, 1, 2],
+        logger=FakeLogger(),
+        output_file=output,
+    )
+
+    report = yaml.safe_load(output.read_text())
+    assert report["directions"]["forward"]["custom_work_kcal_per_mol"] == 1.25
+    assert report["directions"]["forward"]["python_work_kcal_per_mol"] == 1.5
+    assert report["directions"]["forward"]["work_difference_kcal_per_mol"] == -0.25
+    assert [event for event in events if event[0] == "checkpoint"] == [
+        ("checkpoint", b"snapshot"),
+        ("checkpoint", b"snapshot"),
+        ("checkpoint", b"snapshot"),
+    ]
+
+
 def _test_neqti_loads_physical_initial_state_for_both_directions(tmp_path, monkeypatch):
     from atom_openmm import neqti
 
@@ -309,6 +381,8 @@ def _test_neqti_loads_physical_initial_state_for_both_directions(tmp_path, monke
             "bootstrap_samples": 0,
             "random_seed": 1,
             "platform": None,
+            "switch_integrator": "python",
+            "validate_switch_integrator": False,
         },
         progress_callback=progress.append,
     )
