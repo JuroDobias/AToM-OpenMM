@@ -120,6 +120,8 @@ def interpolate_state(start, end, fraction):
         end_value = end[key]
         if key == "temperature":
             par[key] = start_value
+        elif key in ("atmdirection", "atmintermediate"):
+            par[key] = end_value if fraction >= 1.0 else start_value
         elif hasattr(start_value, "unit"):
             par[key] = start_value + (end_value - start_value) * fraction
         elif isinstance(start_value, (int, float)):

@@ -61,6 +61,17 @@ def _test_switch_schedule_interpolates_between_knots():
     assert schedule[1]["lambda2"] == pytest.approx(0.5)
 
 
+def _test_switch_schedule_keeps_direction_discrete_at_midpoint():
+    from atom_openmm.neqti import build_atm_state_parameters, make_switch_schedule
+
+    states = build_atm_state_parameters(_atom_options())
+    schedule = make_switch_schedule(states, [1, 2], 4)
+
+    assert [state["atmdirection"] for state in schedule] == [1.0, 1.0, 1.0, -1.0]
+    assert all(state["atmdirection"] in (-1.0, 1.0) for state in schedule)
+    assert [state["atmintermediate"] for state in schedule] == [1.0, 1.0, 1.0, 1.0]
+
+
 def _test_bar_estimator_sign_convention():
     from atom_openmm.neqti import estimate_bar
 
