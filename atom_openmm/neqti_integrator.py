@@ -12,20 +12,17 @@ from atom_openmm.ommworker import OMMWorkerATMSync
 # https://github.com/choderalab/openmmtools/blob/main/openmmtools/integrators.py
 
 
-def _piecewise_expression(values, steps_per_segment, discrete=False):
+def _piecewise_expression(values, steps_per_segment):
     values = [float(value) for value in values]
     expression = f"({values[0]:.17g})"
     for segment, (start, end) in enumerate(zip(values[:-1], values[1:])):
         delta = end - start
         if delta == 0.0:
             continue
-        if discrete:
-            progress = f"step(neq_step-{(segment + 1) * steps_per_segment}+0.5)"
-        else:
-            progress = (
-                f"min(1,max(0,(neq_step-{segment * steps_per_segment})/"
-                f"{float(steps_per_segment):.17g}))"
-            )
+        progress = (
+            f"min(1,max(0,(neq_step-{segment * steps_per_segment})/"
+            f"{float(steps_per_segment):.17g}))"
+        )
         expression += f"+({delta:.17g})*({progress})"
     return expression
 
@@ -69,14 +66,7 @@ class ATMNonequilibriumLangevinIntegrator(mm.CustomIntegrator):
         self.addComputeGlobal("Eold", "energy")
         self.addComputeGlobal("neq_step", "neq_step+1")
         for name, values in parameter_values.items():
-            self.addComputeGlobal(
-                name,
-                _piecewise_expression(
-                    values,
-                    steps_per_segment,
-                    discrete=(name == "Direction"),
-                ),
-            )
+            self.addComputeGlobal(name, _piecewise_expression(values, steps_per_segment))
         self.addComputeGlobal("Enew", "energy")
         self.addComputeGlobal("protocol_work", "protocol_work+Enew-Eold")
 
@@ -92,7 +82,7 @@ class ATMNonequilibriumLangevinIntegrator(mm.CustomIntegrator):
         self.addComputePerDof("x1", "x")
         self.addComputePerDof("x", f"x+({step})*v")
         self.addConstrainPositions()
-        self.addComputePerDof("v", f"v+(x-x1)/({step})")
+        self.addComputePerDof("v", f"(x-x1)/({step})")
 
     def setTemperature(self, temperature):
         self._temperature = temperature
@@ -119,7 +109,6 @@ def _context_parameter_values(ommsystem, schedule):
         atmforce.Alpha(): [state["alpha"] * kilojoules_per_mole for state in schedule],
         atmforce.Uh(): [state["uh"] / kilojoules_per_mole for state in schedule],
         atmforce.W0(): [state["w0"] / kilojoules_per_mole for state in schedule],
-        atmforce.Direction(): [state["atmdirection"] for state in schedule],
         atmforce.Umax(): [state[atmforce.Umax()] / kilojoules_per_mole for state in schedule],
         atmforce.Ubcore(): [state[atmforce.Ubcore()] / kilojoules_per_mole for state in schedule],
         atmforce.Acore(): [state[atmforce.Acore()] for state in schedule],
@@ -132,9 +121,8 @@ def _context_parameter_values(ommsystem, schedule):
 
 
 class OMMWorkerATMNEQTI(OMMWorkerATMSync):
-    def __init__(self, *args, forward_schedule, reverse_schedule, steps_per_segment, random_seed, **kwargs):
-        self._forward_schedule = forward_schedule
-        self._reverse_schedule = reverse_schedule
+    def __init__(self, *args, switch_schedules, steps_per_segment, random_seed, **kwargs):
+        self._switch_schedules = switch_schedules
         self._steps_per_segment = steps_per_segment
         self._random_seed = random_seed
         super().__init__(*args, **kwargs)
@@ -155,30 +143,23 @@ class OMMWorkerATMNEQTI(OMMWorkerATMSync):
         temperature = self.equilibrium_integrator.getTemperature()
         collision_rate = self.ommsystem.frictionCoeff
         timestep = self.ommsystem.MDstepsize
-        self.forward_integrator = ATMNonequilibriumLangevinIntegrator(
-            temperature=temperature,
-            collision_rate=collision_rate,
-            timestep=timestep,
-            parameter_values=_context_parameter_values(self.ommsystem, self._forward_schedule),
-            steps_per_segment=self._steps_per_segment,
-            random_seed=self._random_seed,
-        )
-        self.reverse_integrator = ATMNonequilibriumLangevinIntegrator(
-            temperature=temperature,
-            collision_rate=collision_rate,
-            timestep=timestep,
-            parameter_values=_context_parameter_values(self.ommsystem, self._reverse_schedule),
-            steps_per_segment=self._steps_per_segment,
-            random_seed=self._random_seed,
-        )
-        _set_shared_random_seed(
-            [self.equilibrium_integrator, self.forward_integrator, self.reverse_integrator],
-            self._random_seed,
-        )
+        self.switch_integrators = {}
+        for name, schedule in self._switch_schedules.items():
+            self.switch_integrators[name] = ATMNonequilibriumLangevinIntegrator(
+                temperature=temperature,
+                collision_rate=collision_rate,
+                timestep=timestep,
+                parameter_values=_context_parameter_values(self.ommsystem, schedule),
+                steps_per_segment=self._steps_per_segment,
+                random_seed=self._random_seed,
+            )
+        _set_shared_random_seed([self.equilibrium_integrator, *self.switch_integrators.values()], self._random_seed)
         self.compound_integrator = mm.CompoundIntegrator()
         self.compound_integrator.addIntegrator(self.equilibrium_integrator)
-        self.compound_integrator.addIntegrator(self.forward_integrator)
-        self.compound_integrator.addIntegrator(self.reverse_integrator)
+        self._integrator_indices = {}
+        for name, integrator in self.switch_integrators.items():
+            self._integrator_indices[name] = self.compound_integrator.getNumIntegrators()
+            self.compound_integrator.addIntegrator(integrator)
         self.compound_integrator.setCurrentIntegrator(0)
         self.integrator = self.compound_integrator
         self.ommsystem.integrator = self.compound_integrator
@@ -190,18 +171,18 @@ class OMMWorkerATMNEQTI(OMMWorkerATMSync):
             self._worker_setstate(par)
         finally:
             self.integrator = integrator
-        self.forward_integrator.setTemperature(par["temperature"])
-        self.reverse_integrator.setTemperature(par["temperature"])
+        for switch_integrator in self.switch_integrators.values():
+            switch_integrator.setTemperature(par["temperature"])
 
     def select_equilibrium(self):
         self.compound_integrator.setCurrentIntegrator(0)
 
-    def begin_switch(self, direction, start_state):
+    def begin_switch(self, switch_name, start_state):
         self.select_equilibrium()
         self.set_state(start_state)
-        integrator = self.forward_integrator if direction == "forward" else self.reverse_integrator
+        integrator = self.switch_integrators[switch_name]
         integrator.reset_protocol()
-        self.compound_integrator.setCurrentIntegrator(1 if direction == "forward" else 2)
+        self.compound_integrator.setCurrentIntegrator(self._integrator_indices[switch_name])
         return integrator
 
     def end_switch(self):

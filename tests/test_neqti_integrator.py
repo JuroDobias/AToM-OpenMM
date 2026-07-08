@@ -1,6 +1,6 @@
 import pytest
 import openmm as mm
-from openmm.unit import femtosecond, kelvin, kilojoules_per_mole, picosecond
+from openmm.unit import femtosecond, kelvin, kilojoules_per_mole, nanometer, picosecond
 
 
 def _constant_parameter_system(initial_value):
@@ -55,24 +55,26 @@ def _test_custom_integrator_accumulates_reverse_protocol_work():
     assert integrator.get_protocol_work() / kilojoules_per_mole == pytest.approx(-1.0)
 
 
-def _test_direction_expression_changes_only_at_segment_endpoint():
-    from atom_openmm.neqti_integrator import _piecewise_expression
+def _test_custom_integrator_drift_does_not_double_velocity():
+    from atom_openmm.neqti_integrator import ATMNonequilibriumLangevinIntegrator
 
-    expression = _piecewise_expression([1.0, -1.0], 4, discrete=True)
-    system = _constant_parameter_system(1.0)
-    integrator = mm.CustomIntegrator(0.0)
-    integrator.addGlobalVariable("neq_step", 0.0)
-    integrator.addComputeGlobal("neq_step", "neq_step+1")
-    integrator.addComputeGlobal("switch_parameter", expression)
+    system = _constant_parameter_system(0.0)
+    integrator = ATMNonequilibriumLangevinIntegrator(
+        temperature=0.0 * kelvin,
+        collision_rate=0.0 / picosecond,
+        timestep=1.0 * femtosecond,
+        parameter_values={"switch_parameter": [0.0, 0.0]},
+        steps_per_segment=1,
+    )
     context = mm.Context(system, integrator, mm.Platform.getPlatformByName("Reference"))
     context.setPositions([[0.0, 0.0, 0.0]])
+    context.setVelocities([[1.0, 0.0, 0.0]] * nanometer / picosecond)
 
-    observed = []
-    for _ in range(4):
-        integrator.step(1)
-        observed.append(context.getParameter("switch_parameter"))
+    integrator.step(1)
 
-    assert observed == pytest.approx([1.0, 1.0, 1.0, -1.0])
+    state = context.getState(getPositions=True, getVelocities=True)
+    assert state.getPositions(asNumpy=True)[0, 0] / nanometer == pytest.approx(0.001)
+    assert state.getVelocities(asNumpy=True)[0, 0] / (nanometer / picosecond) == pytest.approx(1.0)
 
 
 def _test_custom_integrators_share_seed_in_compound_context():
@@ -103,3 +105,28 @@ def _test_custom_integrators_share_seed_in_compound_context():
     compound.step(1)
     compound.setCurrentIntegrator(2)
     compound.step(1)
+
+
+def _test_context_parameter_values_uses_softplus_parameters():
+    from atom_openmm.neqti_integrator import _context_parameter_values
+
+    class ATMForce:
+        Lambda1 = staticmethod(lambda: "Lambda1")
+        Lambda2 = staticmethod(lambda: "Lambda2")
+        Alpha = staticmethod(lambda: "Alpha")
+        Uh = staticmethod(lambda: "Uh")
+        W0 = staticmethod(lambda: "W0")
+        Umax = staticmethod(lambda: "Umax")
+        Ubcore = staticmethod(lambda: "Ubcore")
+        Acore = staticmethod(lambda: "Acore")
+
+    state = {"lambda1": 0.5, "lambda2": 0.5, "alpha": 0.1 / kilojoules_per_mole,
+        "uh": 100 * kilojoules_per_mole, "w0": 0 * kilojoules_per_mole,
+        "Umax": 200 * kilojoules_per_mole, "Ubcore": 100 * kilojoules_per_mole,
+        "Acore": 0.0625, "uoffset": 0 * kilojoules_per_mole}
+    system = type("System", (), {"atmforce": ATMForce(), "multisoftplus": False})()
+
+    values = _context_parameter_values(system, [state])
+
+    assert values["Lambda1"] == [0.5]
+    assert values["Lambda2"] == [0.5]

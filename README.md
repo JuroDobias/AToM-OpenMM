@@ -109,7 +109,7 @@ workflow:
     bootstrap_samples: 0
 ```
 
-NEQTI equilibrates endpoints A and B, collects decorrelated endpoint snapshots, performs forward A-to-B and reverse B-to-A switches through the configured ATM schedule, records protocol work, and estimates the free-energy difference with BAR. This implementation is experimental and should be validated against established calculations before production use.
+NEQTI reuses the async-RE ATM soft-core schedule as two bidirectional half paths, A↔M+ and B↔M−. It estimates both legs and the M+↔M− free-energy bridge with BAR, then combines the three terms into the RBFE result.
 
 By default, ATM parameter switching and protocol-work accumulation run inside a dedicated OpenMM `CustomIntegrator`; `openmmtools` is used as a design reference but is not a runtime dependency. Set `workflow.neqti.switch_integrator: python` to use the slower reference path or `validate_switch_integrator: true` for a one-shot comparison.
 

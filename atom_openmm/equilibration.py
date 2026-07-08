@@ -88,6 +88,15 @@ def neqti_endpoint_steps(options: dict[str, Any]) -> list[dict[str, Any]] | None
     return _steps_from_section(neqti_cfg.get("endpoint"), "EQUILIBRATION_PROTOCOL.neqti.endpoint")
 
 
+def neqti_midpoint_steps(options: dict[str, Any]) -> list[dict[str, Any]] | None:
+    cfg = get_equilibration_config(options)
+    neqti_cfg = cfg.get("neqti") or {}
+    if not isinstance(neqti_cfg, dict):
+        raise EquilibrationConfigError("EQUILIBRATION_PROTOCOL.neqti must be a mapping")
+    midpoint = _steps_from_section(neqti_cfg.get("midpoint"), "EQUILIBRATION_PROTOCOL.neqti.midpoint")
+    return midpoint if midpoint is not None else neqti_endpoint_steps(options)
+
+
 def _steps_from_section(section: Any, label: str) -> list[dict[str, Any]] | None:
     if section is None:
         return None

@@ -118,40 +118,37 @@ workflow:
     resume: true
 ```
 
-NEQTI reuses the existing ATM schedule as switching knots. By default it switches from the first state through every listed schedule state to the final state, and then repeats the reverse path. It writes `neqti_forward.csv`, `neqti_reverse.csv`, `neqti_summary.yaml`, and pmx-compatible integrated work files `integA.dat` and `integB.dat` in each pair directory. The integrated work files use kJ/mol so they can be read by `analyze_dhdl.py -iA integA.dat -iB integB.dat`.
+NEQTI derives two half paths from the async-RE ATM schedule: A↔M+ on the positive direction and B↔M− on the negative direction. Independent M+ and M− snapshots are cross-evaluated to estimate the midpoint bridge. The final result is `DG(A→M+) + DG(M+→M−) - DG(B→M−)`.
 
 For the example above, the execution order is:
 
-1. Prepare the ATM system. If `equilibration.neqti.endpoint` is configured, run it independently at A and B and save both endpoint states.
-2. Load endpoint A and run `initial_equilibration_steps` once.
-3. Run `decorrelation_steps`, save a snapshot, switch A to B, and record one forward work value. Repeat until `n_snapshots` forward values exist.
-4. Load endpoint B and run `initial_equilibration_steps` once.
-5. Run `decorrelation_steps`, save a snapshot, switch B to A, and record one reverse work value. Repeat until `n_snapshots` reverse values exist.
-6. Estimate the free-energy difference from forward and reverse work with BAR. If `bootstrap_samples` is greater than zero, estimate uncertainty by bootstrap resampling.
+1. Equilibrate M+ and M− independently, then A and B.
+2. Collect decorrelated M+ and M− snapshots, cross-evaluate their midpoint energies, and switch them to A and B.
+3. Collect decorrelated A and B snapshots and switch them to M+ and M−.
+4. Estimate both half paths and the midpoint bridge with BAR, then combine them with joint bootstrap uncertainty.
 
 | Setting | Meaning |
 | --- | --- |
-| `initial_equilibration_steps` | Additional MD run once at A and once at B before collecting snapshots. |
-| `n_snapshots` | Number of forward trajectories and number of reverse trajectories. |
+| `initial_equilibration_steps` | Additional MD run once for each of A, M+, B, and M−. |
+| `n_snapshots` | Number of work samples in each of the four half-path directions. |
 | `decorrelation_steps` | Endpoint MD between consecutive switching snapshots. |
-| `switch_steps_per_segment` | Integration steps used to interpolate between each neighboring pair of ATM schedule nodes. |
+| `switch_steps_per_segment` | Integration steps between neighboring nodes of each derived half path. |
 | `switch_integrator` | `custom` (default) performs switching and work accumulation inside OpenMM; `python` retains the reference implementation. |
 | `validate_switch_integrator` | Run one informational custom-versus-Python comparison in each direction from identical snapshots. |
-| `state_path` | Optional ordered list of ATM schedule indices; defaults to all configured states. |
 | `resume` | Reuse completed work rows and completed custom endpoint states when available. |
 | `bootstrap_samples` | Number of BAR bootstrap resamples; zero disables uncertainty estimation. |
 | `random_seed` | Seed used for bootstrap resampling. |
 | `platform` | Optional OpenMM platform override for NEQTI. |
 
-`switch_steps_per_segment` applies to every neighboring pair of nodes in `state_path`. With the default 22-node schedule, a value of 1000 produces 21,000 integration steps per forward or reverse switch. Logs report effective ns/day for initial equilibration, decorrelation, every switching segment, and each complete switching trajectory. Custom equilibration MD steps record the same value in their completion message and `manifest.json`. Switching throughput includes parameter updates and protocol-work energy evaluations, not only OpenMM integration, so it can be substantially lower than ordinary MD throughput.
+Four half-path switches have approximately the same total integration length as two complete A↔B switches. Logs report effective ns/day for equilibration, decorrelation, and switching segments.
 
 The custom switching path uses a dedicated BAOAB-style Langevin `CustomIntegrator` with the ATM parameter update centered in each timestep (`V R H O R V`). Endpoint equilibration and snapshot decorrelation continue to use the existing ATM MTS integrator. A `CompoundIntegrator` keeps both modes in one OpenMM context. The custom path executes one Python call per schedule segment rather than one call per integration step.
 
-When `validate_switch_integrator: true`, the first pending forward and reverse snapshots are each switched once with the custom implementation and once with the Python reference after restoring identical starting state. The comparison is written to `neqti_switch_validation.yaml` and is not included in production work CSV files. Individual stochastic work values are not expected to be identical because the two paths use different Langevin splittings; compare throughput and distributions over production trajectories.
+When `validate_switch_integrator: true`, the first pending snapshot on each half-path direction is switched with both custom and Python implementations after restoring the same state.
 
-When `resume: true`, completed work rows, compatible endpoint states, and the per-direction sampling checkpoints `neqti_forward_sampling.chk` and `neqti_reverse_sampling.chk` are reused. Initial equilibration runs only once for each endpoint sampling stream. An interrupted switching trajectory is rerun because work is only marked complete after the whole trajectory finishes. Checkpoints created before the custom switching integrator are incompatible; start a clean job when changing to this implementation. Review the YAML and output files before restarting: changing the schedule or protocol while retaining old work CSV or checkpoint files can mix incompatible results.
+When `resume: true`, completed work rows and four sampling checkpoints are reused. `neqti_protocol.yaml` signs the ATM paths and segment length. Older full-path or linear artifacts are rejected.
 
-The wrapper can replace the default equilibration stages with inline mdflow-style steps. Amber masks require `parmed`. For `async_re`, `pre_atm` replaces the physical minimization/thermalization/NPT/NVT stage and `async_re.midpoint` can replace the final lambda-0.5 equilibration. For `neqti`, preparation stops after the physical equilibrated state and `neqti.endpoint` is run separately at endpoint A and endpoint B before switching:
+The wrapper can replace the default equilibration stages with inline mdflow-style steps. Amber masks require `parmed`. For `async_re`, `pre_atm` replaces the physical minimization/thermalization/NPT/NVT stage and `async_re.midpoint` can replace the final lambda-0.5 equilibration. For `neqti`, `neqti.midpoint` is applied independently at M+ and M− and `neqti.endpoint` at A and B. When `neqti.midpoint` is omitted, it reuses the endpoint steps:
 
 ```yaml
 workflow:
@@ -238,10 +235,12 @@ For NEQTI, also inspect:
 
 | Output | Use |
 | --- | --- |
-| `neqti_endpoint_A.xml`, `neqti_endpoint_B.xml` | Restartable endpoint states after custom endpoint equilibration. |
-| `neqti_forward.csv`, `neqti_reverse.csv` | Per-trajectory protocol work and completion status. |
-| `integA.dat`, `integB.dat` | Integrated work in kJ/mol for external analysis tools. |
-| `neqti_summary.yaml` | BAR estimate and optional bootstrap uncertainty. |
+| `neqti_endpoint_A.xml`, `neqti_endpoint_B.xml` | Restartable endpoint states. |
+| `neqti_midpoint_plus.xml`, `neqti_midpoint_minus.xml` | Restartable directional midpoint states. |
+| `neqti_leg_*_*.csv` | Four half-path protocol-work datasets. |
+| `neqti_midpoint_bridge.csv` | Midpoint cross-energy work in both directions. |
+| `neqti_summary.yaml` | Component BAR estimates, overlap, combined DDG, and uncertainty. |
+| `neqti_protocol.yaml` | Two-leg protocol and resume compatibility signature. |
 | `*_swapped.pdb` | Diagnostic coordinates after applying the ATM virtual coordinate swap. |
 
 The ordinary PDB contains the physical coordinates held by the OpenMM context. ATM evaluates an additional swapped coordinate state internally. NEQTI writes both forms for forward and reverse start, post-equilibration, and switching diagnostics. The existing snapshot pair, for example `neqti_forward_snapshot_4.pdb` and `neqti_forward_snapshot_4_swapped.pdb`, contains the coordinates immediately before the switch. The corresponding `neqti_forward_snapshot_4_post_switch.pdb` and `neqti_forward_snapshot_4_post_switch_swapped.pdb` files contain the coordinates immediately after the complete switch and before the sampling checkpoint is restored. Use the swapped PDBs to verify that the ligand expected in the binding site overlaps the intended reference pose at each endpoint. These files are diagnostics, not independent simulation states.
@@ -287,13 +286,15 @@ artifacts:
   endpoint_b: neqti_endpoint_B.pdb
   endpoint_a_swapped: neqti_endpoint_A_swapped.pdb
   endpoint_b_swapped: neqti_endpoint_B_swapped.pdb
-  forward_work_csv: neqti_forward.csv
-  reverse_work_csv: neqti_reverse.csv
-  forward_sampling_checkpoint: neqti_forward_sampling.chk
-  reverse_sampling_checkpoint: neqti_reverse_sampling.chk
-  forward_integrated_work: integA.dat
-  reverse_integrated_work: integB.dat
+  midpoint_plus: neqti_midpoint_plus.pdb
+  midpoint_minus: neqti_midpoint_minus.pdb
+  leg_a_forward_work_csv: neqti_leg_a_forward.csv
+  leg_a_reverse_work_csv: neqti_leg_a_reverse.csv
+  leg_b_forward_work_csv: neqti_leg_b_forward.csv
+  leg_b_reverse_work_csv: neqti_leg_b_reverse.csv
+  midpoint_bridge_csv: neqti_midpoint_bridge.csv
   neqti_summary: neqti_summary.yaml
+  neqti_protocol: neqti_protocol.yaml
   neqti_switch_validation: null
   async_re_log: null
   async_re_replica_output_pattern: null

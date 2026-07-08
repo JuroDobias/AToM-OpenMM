@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import logging
 import math
 import os
@@ -12,13 +14,13 @@ import numpy as np
 import openmm as mm
 import yaml
 from openmm.app import PDBFile
-from openmm.unit import kelvin, kilocalorie_per_mole, kilocalories_per_mole, kilojoules_per_mole, picosecond
+from openmm.unit import kelvin, kilocalories_per_mole, kilojoules_per_mole, picosecond
 from scipy.optimize import brentq, minimize_scalar
 
 from atom_openmm.async_re import JobManager
 from atom_openmm.abfe_structprep import set_platform
 from atom_openmm.atm_coordinates import write_atm_swapped_pdb
-from atom_openmm.equilibration import neqti_endpoint_steps, run_custom_equilibration
+from atom_openmm.equilibration import neqti_endpoint_steps, neqti_midpoint_steps, run_custom_equilibration
 from atom_openmm.ommsystem import OMMSystemRBFE
 from atom_openmm.ommworker import OMMWorkerATMSync
 from atom_openmm.neqti_integrator import OMMWorkerATMNEQTI
@@ -38,57 +40,117 @@ CSV_FIELDS = [
 ]
 
 
+def _protocol_signature(settings):
+    payload = {
+        "schema_version": 3,
+        "hamiltonian": "atm_softplus_two_leg",
+        "paths": settings["paths"],
+        "switch_steps_per_segment": settings["switch_steps_per_segment"],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _initialize_protocol_manifest(settings, resume):
+    path = Path("neqti_protocol.yaml")
+    signature = _protocol_signature(settings)
+    existing_artifacts = [
+        Path("neqti_endpoint_A.xml"),
+        Path("neqti_endpoint_B.xml"),
+        Path("neqti_leg_a_forward.csv"),
+        Path("neqti_leg_a_reverse.csv"),
+        Path("neqti_leg_b_forward.csv"),
+        Path("neqti_leg_b_reverse.csv"),
+        Path("neqti_midpoint_bridge.csv"),
+        Path("neqti_midpoint_plus.xml"),
+        Path("neqti_midpoint_minus.xml"),
+        Path("neqti_a_sampling.chk"),
+        Path("neqti_b_sampling.chk"),
+        Path("neqti_mplus_sampling.chk"),
+        Path("neqti_mminus_sampling.chk"),
+    ]
+    if resume and any(item.exists() for item in existing_artifacts):
+        if not path.exists():
+            raise NEQTIConfigError(
+                "Existing NEQTI artifacts predate the two-leg protocol; "
+                "remove them or set resume: false"
+            )
+        with open(path) as handle:
+            manifest = yaml.safe_load(handle) or {}
+        if manifest.get("signature") != signature:
+            raise NEQTIConfigError(
+                "Existing NEQTI artifacts use a different Hamiltonian or lambda schedule; "
+                "remove them or set resume: false"
+            )
+    manifest = {
+        "schema_version": 3,
+        "hamiltonian": "atm_softplus_two_leg",
+        "paths": settings["paths"],
+        "switch_steps_per_segment": settings["switch_steps_per_segment"],
+        "signature": signature,
+    }
+    with open(path, "w") as handle:
+        yaml.safe_dump(manifest, handle, sort_keys=False)
+    return signature
+
+
 class NEQTIConfigError(ValueError):
     pass
 
 
 def build_atm_state_parameters(options):
-    lambdas = options.get("LAMBDAS")
+    keys = ["LAMBDAS", "DIRECTION", "INTERMEDIATE", "LAMBDA1", "LAMBDA2", "ALPHA", "U0", "W0COEFF"]
+    arrays = {key: options.get(key) for key in keys}
+    if any(values is None for values in arrays.values()):
+        raise NEQTIConfigError("NEQTI requires the complete async-RE ATM schedule")
+    nstates = len(arrays["LAMBDAS"])
+    if any(len(values) != nstates for values in arrays.values()):
+        raise NEQTIConfigError("ATM schedule arrays must have the same length")
     temperatures = options.get("TEMPERATURES")
-    intermediates = options.get("INTERMEDIATE")
-    directions = options.get("DIRECTION")
-    lambda1s = options.get("LAMBDA1")
-    lambda2s = options.get("LAMBDA2")
-    lambda3s = options.get("LAMBDA3") or options.get("LAMBDA2")
-    alphas = options.get("ALPHA")
-    uhs = options.get("U0")
-    uhs1 = options.get("U1") or options.get("U0")
-    w0coeffs = options.get("W0COEFF")
-
-    required = [lambdas, temperatures, intermediates, directions, lambda1s, lambda2s, lambda3s, alphas, uhs, uhs1, w0coeffs]
-    if any(value is None for value in required):
-        raise NEQTIConfigError("LAMBDAS, TEMPERATURES, DIRECTION, INTERMEDIATE, LAMBDA1, LAMBDA2, ALPHA, U0, and W0COEFF are required")
-
-    nstates = len(lambdas)
-    for values in [intermediates, directions, lambda1s, lambda2s, lambda3s, alphas, uhs, uhs1, w0coeffs]:
-        if len(values) != nstates:
-            raise NEQTIConfigError("ATM schedule arrays must have the same length")
-    if len(temperatures) != 1:
-        raise NEQTIConfigError("NEQTI v1 supports exactly one temperature")
-
-    stateparams = []
-    for lambd, direction, intermediate, lambda1, lambda2, lambda3, alpha, uh, uh1, w0 in zip(
-        lambdas, directions, intermediates, lambda1s, lambda2s, lambda3s, alphas, uhs, uhs1, w0coeffs
-    ):
-        par = {
-            "lambda": float(lambd),
-            "atmdirection": float(direction),
-            "atmintermediate": float(intermediate),
-            "lambda1": float(lambda1),
-            "lambda2": float(lambda2),
-            "lambda3": float(lambda3),
-            "alpha": float(alpha) / kilocalories_per_mole,
-            "uh": float(uh) * kilocalories_per_mole,
-            "uh1": float(uh1) * kilocalories_per_mole,
-            "w0": float(w0) * kilocalories_per_mole,
+    if not isinstance(temperatures, list) or len(temperatures) != 1:
+        raise NEQTIConfigError("NEQTI requires exactly one temperature")
+    lambda3s = options.get("LAMBDA3") or arrays["LAMBDA2"]
+    uh1s = options.get("U1") or arrays["U0"]
+    states = []
+    for i in range(nstates):
+        states.append({
+            "lambda": float(arrays["LAMBDAS"][i]),
+            "atmdirection": float(arrays["DIRECTION"][i]),
+            "atmintermediate": float(arrays["INTERMEDIATE"][i]),
+            "lambda1": float(arrays["LAMBDA1"][i]),
+            "lambda2": float(arrays["LAMBDA2"][i]),
+            "lambda3": float(lambda3s[i]),
+            "alpha": float(arrays["ALPHA"][i]) / kilocalories_per_mole,
+            "uh": float(arrays["U0"][i]) * kilocalories_per_mole,
+            "uh1": float(uh1s[i]) * kilocalories_per_mole,
+            "w0": float(arrays["W0COEFF"][i]) * kilocalories_per_mole,
             "temperature": float(temperatures[0]) * kelvin,
-            "Umax": float(options.get("UMAX")) * kilocalorie_per_mole,
-            "Ubcore": float(options.get("UBCORE")) * kilocalorie_per_mole,
-            "Acore": float(options.get("ACORE")),
-            "uoffset": float(options.get("PERTE_OFFSET", 0.0)) * kilocalorie_per_mole,
-        }
-        stateparams.append(par)
-    return stateparams
+            "Umax": float(options["UMAX"]) * kilocalories_per_mole,
+            "Ubcore": float(options["UBCORE"]) * kilocalories_per_mole,
+            "Acore": float(options["ACORE"]),
+            "uoffset": float(options.get("PERTE_OFFSET", 0.0)) * kilocalories_per_mole,
+        })
+    return states
+
+
+def split_two_leg_paths(states):
+    boundaries = [
+        i for i in range(len(states) - 1)
+        if states[i]["atmintermediate"] > 0
+        and states[i + 1]["atmintermediate"] > 0
+        and states[i]["atmdirection"] > 0
+        and states[i + 1]["atmdirection"] < 0
+    ]
+    if len(boundaries) != 1:
+        raise NEQTIConfigError("ATM schedule must contain exactly one adjacent M+/M- midpoint pair")
+    midpoint_plus = boundaries[0]
+    midpoint_minus = midpoint_plus + 1
+    return {
+        "leg_a_forward": list(range(0, midpoint_plus + 1)),
+        "leg_a_reverse": list(range(midpoint_plus, -1, -1)),
+        "leg_b_forward": list(range(len(states) - 1, midpoint_minus - 1, -1)),
+        "leg_b_reverse": list(range(midpoint_minus, len(states))),
+    }
 
 
 def normalize_neqti_options(workflow, atom_options):
@@ -96,14 +158,9 @@ def normalize_neqti_options(workflow, atom_options):
     if not isinstance(raw, dict):
         raise NEQTIConfigError("workflow.neqti must be a mapping")
 
-    stateparams = build_atm_state_parameters(atom_options)
-    default_path = list(range(len(stateparams)))
-    state_path = raw.get("state_path", default_path)
-    if not isinstance(state_path, list) or len(state_path) < 2:
-        raise NEQTIConfigError("workflow.neqti.state_path must contain at least two state indices")
-    state_path = [int(i) for i in state_path]
-    if any(i < 0 or i >= len(stateparams) for i in state_path):
-        raise NEQTIConfigError("workflow.neqti.state_path contains an out-of-range state index")
+    if "lambda_schedule" in raw or "state_path" in raw:
+        raise NEQTIConfigError("NEQTI now derives its two half paths from the async-RE ATM schedule")
+    paths = split_two_leg_paths(build_atm_state_parameters(atom_options))
 
     switch_integrator = str(raw.get("switch_integrator", "custom")).lower()
     if switch_integrator not in ("custom", "python"):
@@ -114,14 +171,15 @@ def normalize_neqti_options(workflow, atom_options):
         "n_snapshots": int(raw.get("n_snapshots", atom_options.get("MAX_SAMPLES", 1))),
         "decorrelation_steps": int(raw.get("decorrelation_steps", atom_options.get("PRODUCTION_STEPS", 1))),
         "switch_steps_per_segment": int(raw.get("switch_steps_per_segment", atom_options.get("PRODUCTION_STEPS", 1))),
-        "state_path": state_path,
+        "hamiltonian": "atm_softplus_two_leg",
+        "paths": paths,
         "resume": bool(raw.get("resume", True)),
         "bootstrap_samples": int(raw.get("bootstrap_samples", 200)),
         "random_seed": int(raw.get("random_seed", 2026)),
         "platform": raw.get("platform"),
         "switch_integrator": switch_integrator,
         "validate_switch_integrator": bool(raw.get("validate_switch_integrator", False)),
-    }
+}
 
 
 def interpolate_state(start, end, fraction):
@@ -291,9 +349,11 @@ def _write_worker_pdb_pair(worker, path):
 def _worker_timestep_ps(worker):
     integrator = getattr(worker, "integrator", None)
     if isinstance(integrator, mm.CompoundIntegrator):
-        integrator = integrator.getCurrentIntegrator()
+        integrator = integrator.getIntegrator(integrator.getCurrentIntegrator())
     if integrator is None and getattr(worker, "simulation", None) is not None:
         integrator = getattr(worker.simulation, "integrator", None)
+        if isinstance(integrator, mm.CompoundIntegrator):
+            integrator = integrator.getIntegrator(integrator.getCurrentIntegrator())
     if integrator is None:
         return None
     return float(integrator.getStepSize().value_in_unit(picosecond))
@@ -533,6 +593,74 @@ def analyze_neqti_work(forward_work_kcal, reverse_work_kcal, temperature_kelvin,
     }
 
 
+def _bar_overlap_score(forward_work, reverse_work, dg, temperature_kelvin):
+    if dg is None or not forward_work or not reverse_work:
+        return None
+    beta = 1.0 / (KB_KCAL_PER_MOL_K * float(temperature_kelvin))
+    forward_acceptance = np.mean(1.0 / (1.0 + np.exp(np.clip(beta * (np.asarray(forward_work) - dg), -700, 700))))
+    reverse_acceptance = np.mean(1.0 / (1.0 + np.exp(np.clip(beta * (np.asarray(reverse_work) + dg), -700, 700))))
+    return float(min(1.0, 2.0 * min(forward_acceptance, reverse_acceptance)))
+
+
+def analyze_two_leg_work(work, temperature_kelvin, bootstrap_samples=200, random_seed=2026):
+    components = {}
+    for name, forward_key, reverse_key in (
+        ("leg_a", "leg_a_forward", "leg_a_reverse"),
+        ("midpoint_bridge", "bridge_forward", "bridge_reverse"),
+        ("leg_b", "leg_b_forward", "leg_b_reverse"),
+    ):
+        dg = estimate_bar(work[forward_key], work[reverse_key], temperature_kelvin)
+        components[name] = {
+            "dg_kcal_per_mol": dg,
+            "overlap_score": _bar_overlap_score(
+                work[forward_key], work[reverse_key], dg, temperature_kelvin
+            ),
+        }
+    if any(component["dg_kcal_per_mol"] is None for component in components.values()):
+        return None
+    ddg = (
+        components["leg_a"]["dg_kcal_per_mol"]
+        + components["midpoint_bridge"]["dg_kcal_per_mol"]
+        - components["leg_b"]["dg_kcal_per_mol"]
+    )
+    error = None
+    if bootstrap_samples > 0 and all(len(values) >= 2 for values in work.values()):
+        rng = np.random.default_rng(random_seed)
+        estimates = []
+        for _ in range(bootstrap_samples):
+            sampled = {
+                key: rng.choice(values, size=len(values), replace=True)
+                for key, values in work.items()
+            }
+            try:
+                estimates.append(
+                    estimate_bar(sampled["leg_a_forward"], sampled["leg_a_reverse"], temperature_kelvin)
+                    + estimate_bar(sampled["bridge_forward"], sampled["bridge_reverse"], temperature_kelvin)
+                    - estimate_bar(sampled["leg_b_forward"], sampled["leg_b_reverse"], temperature_kelvin)
+                )
+            except Exception:
+                pass
+        if estimates:
+            error = float(np.std(estimates, ddof=1)) if len(estimates) > 1 else 0.0
+    return {
+        "bar_dg_kcal_per_mol": float(ddg),
+        "bar_dg_kj_per_mol": float(ddg) * KCAL_TO_KJ,
+        "bar_bootstrap_std_kcal_per_mol": error,
+        "bar_bootstrap_std_kj_per_mol": None if error is None else error * KCAL_TO_KJ,
+        "components": components,
+        "overlap_score": min(component["overlap_score"] for component in components.values()),
+    }
+
+
+def _bridge_work(worker, start_state, target_state):
+    worker.set_state(start_state)
+    old_energy = _potential_kcal(worker)
+    worker.set_state(target_state)
+    new_energy = _potential_kcal(worker)
+    worker.set_state(start_state)
+    return new_energy - old_energy
+
+
 def run_neqti(options, neqti_options=None, progress_callback=None):
     if neqti_options is None:
         neqti_options = normalize_neqti_options({"neqti": {}}, options)
@@ -542,67 +670,76 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
     if not logger.handlers:
         logging.basicConfig(level=logging.INFO)
 
-    stateparams = build_atm_state_parameters(options)
-    state_path = neqti_options["state_path"]
-    reverse_path = list(reversed(state_path))
-    forward_schedule = make_switch_schedule(stateparams, state_path, neqti_options["switch_steps_per_segment"])
-    reverse_schedule = make_switch_schedule(stateparams, reverse_path, neqti_options["switch_steps_per_segment"])
-    forward_start = stateparams[state_path[0]]
-    reverse_start = stateparams[state_path[-1]]
-    initial_state_file = options.get("NEQTI_INITIAL_STATE_FILE") or options.get("INITIAL_STATE_FILE") or basename + "_0.xml"
-    forward_initial_state_file = initial_state_file
-    reverse_initial_state_file = initial_state_file
+    protocol_signature = _initialize_protocol_manifest(neqti_options, neqti_options["resume"])
 
+    stateparams = build_atm_state_parameters(options)
+    paths = neqti_options["paths"]
+    schedules = {
+        name: make_switch_schedule(stateparams, path, neqti_options["switch_steps_per_segment"])
+        for name, path in paths.items()
+    }
+    states = {
+        "a": stateparams[paths["leg_a_forward"][0]],
+        "mplus": stateparams[paths["leg_a_forward"][-1]],
+        "b": stateparams[paths["leg_b_forward"][0]],
+        "mminus": stateparams[paths["leg_b_forward"][-1]],
+    }
+    initial_state_file = options.get("NEQTI_INITIAL_STATE_FILE") or options.get("INITIAL_STATE_FILE") or basename + "_0.xml"
+    state_files = {name: initial_state_file for name in states}
     endpoint_steps = neqti_endpoint_steps(options)
-    if endpoint_steps is not None:
-        endpoint_a = Path("neqti_endpoint_A.xml")
-        endpoint_b = Path("neqti_endpoint_B.xml")
-        endpoint_marker = Path("neqti_endpoint_states.ok")
-        if neqti_options["resume"] and endpoint_a.exists() and endpoint_b.exists() and endpoint_marker.exists():
-            logger.info("Reusing completed NEQTI endpoint equilibration states")
+    midpoint_steps = neqti_midpoint_steps(options)
+    equilibrated_files = {
+        "mplus": Path("neqti_midpoint_plus.xml"),
+        "mminus": Path("neqti_midpoint_minus.xml"),
+        "a": Path("neqti_endpoint_A.xml"),
+        "b": Path("neqti_endpoint_B.xml"),
+    }
+    marker = Path("neqti_equilibrium_states.ok")
+    marker_matches = marker.exists() and marker.read_text().strip() == protocol_signature
+    if endpoint_steps is not None or midpoint_steps is not None:
+        if neqti_options["resume"] and marker_matches and all(path.exists() for path in equilibrated_files.values()):
+            logger.info("Reusing completed NEQTI endpoint and midpoint states")
         else:
-            if neqti_options["resume"]:
-                logger.info("NEQTI endpoint states are incomplete or from an older protocol; rebuilding A and B endpoints")
-            else:
-                logger.info("NEQTI resume is disabled; rebuilding A and B endpoints")
+            logger.info("Building NEQTI M+, M-, A, and B equilibrium states")
             endpoint_system = OMMSystemRBFE(basename, options, basename + ".pdb", basename + "_sys.xml", logger)
             endpoint_system.create_system()
             platform_options = deepcopy(options)
             if neqti_options.get("platform"):
                 platform_options["OPENMM_PLATFORM"] = neqti_options["platform"]
             platform, platform_properties = set_platform(platform_options)
-            run_custom_equilibration(
-                ommsystem=endpoint_system,
-                steps=endpoint_steps,
-                platform=platform,
-                platform_properties=platform_properties,
-                output_dir=Path("equilibration") / "neqti_A",
-                final_state_path=endpoint_a,
-                final_pdb_path="neqti_endpoint_A.pdb",
-                initial_state_path=initial_state_file,
-                atm_state=forward_start,
-            )
-            logger.info("Completed NEQTI endpoint A equilibration")
-            run_custom_equilibration(
-                ommsystem=endpoint_system,
-                steps=endpoint_steps,
-                platform=platform,
-                platform_properties=platform_properties,
-                output_dir=Path("equilibration") / "neqti_B",
-                final_state_path=endpoint_b,
-                final_pdb_path="neqti_endpoint_B.pdb",
-                initial_state_path=initial_state_file,
-                atm_state=reverse_start,
-            )
-            logger.info("Completed NEQTI endpoint B equilibration")
-            endpoint_marker.write_text("compatible\n")
-        forward_initial_state_file = "neqti_endpoint_A.xml"
-        reverse_initial_state_file = "neqti_endpoint_B.xml"
+            for name in ("mplus", "mminus", "a", "b"):
+                steps = midpoint_steps if name.startswith("m") else endpoint_steps
+                if steps is None:
+                    continue
+                source = initial_state_file
+                if name == "a" and equilibrated_files["mplus"].exists():
+                    source = str(equilibrated_files["mplus"])
+                elif name == "b" and equilibrated_files["mminus"].exists():
+                    source = str(equilibrated_files["mminus"])
+                run_custom_equilibration(
+                    ommsystem=endpoint_system,
+                    steps=steps,
+                    platform=platform,
+                    platform_properties=platform_properties,
+                    output_dir=Path("equilibration") / f"neqti_{name}",
+                    final_state_path=equilibrated_files[name],
+                    final_pdb_path={
+                        "mplus": "neqti_midpoint_plus.pdb",
+                        "mminus": "neqti_midpoint_minus.pdb",
+                        "a": "neqti_endpoint_A.pdb",
+                        "b": "neqti_endpoint_B.pdb",
+                    }[name],
+                    initial_state_path=source,
+                    atm_state=states[name],
+                )
+                logger.info("Completed NEQTI %s equilibration", name)
+            marker.write_text(protocol_signature + "\n")
+        state_files.update({name: str(path) for name, path in equilibrated_files.items() if path.exists()})
 
     node_info = _select_node_info(options, neqti_options)
     ommsystem = OMMSystemRBFE(basename, options, basename + ".pdb", basename + "_sys.xml", logger)
     worker_options = deepcopy(options)
-    worker_options["INITIAL_STATE_FILE"] = forward_initial_state_file
+    worker_options["INITIAL_STATE_FILE"] = state_files["mplus"]
     use_custom_worker = (
         neqti_options["switch_integrator"] == "custom"
         or neqti_options["validate_switch_integrator"]
@@ -615,8 +752,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
             node_info=node_info,
             compute=True,
             logger=logger,
-            forward_schedule=[stateparams[index] for index in state_path],
-            reverse_schedule=[stateparams[index] for index in reverse_path],
+            switch_schedules={name: [stateparams[index] for index in path] for name, path in paths.items()},
             steps_per_segment=neqti_options["switch_steps_per_segment"],
             random_seed=neqti_options["random_seed"],
         )
@@ -630,33 +766,24 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
             logger=logger,
         )
 
-    forward_file = Path("neqti_forward.csv")
-    reverse_file = Path("neqti_reverse.csv")
-    forward_checkpoint = Path("neqti_forward_sampling.chk")
-    reverse_checkpoint = Path("neqti_reverse_sampling.chk")
+    work_files = {name: Path(f"neqti_{name}.csv") for name in paths}
+    bridge_file = Path("neqti_midpoint_bridge.csv")
+    checkpoints = {name: Path(f"neqti_{name}_sampling.chk") for name in states}
     if not neqti_options["resume"]:
-        for path in [
-            forward_file,
-            reverse_file,
-            forward_checkpoint,
-            reverse_checkpoint,
-            Path("integA.dat"),
-            Path("integB.dat"),
-            Path("neqti_summary.yaml"),
-        ]:
+        for path in [*work_files.values(), bridge_file, *checkpoints.values(), Path("neqti_summary.yaml")]:
             if path.exists():
                 path.unlink()
-    _ensure_work_csv(forward_file)
-    _ensure_work_csv(reverse_file)
+    for path in [*work_files.values(), bridge_file]:
+        _ensure_work_csv(path)
 
-    def execute_switch(direction, start_state, schedule, path, label):
+    def execute_switch(switch_name, start_state, schedule, path, label):
         if neqti_options["switch_integrator"] == "custom":
             return _run_switch_custom(
                 worker,
                 start_state,
                 neqti_options["switch_steps_per_segment"],
                 path,
-                direction,
+                switch_name,
                 logger,
                 label,
             )
@@ -670,214 +797,106 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
             label,
         )
 
+    stream_specs = (
+        ("mplus", "leg_a_reverse", "mminus"),
+        ("mminus", "leg_b_reverse", "mplus"),
+        ("a", "leg_a_forward", None),
+        ("b", "leg_b_forward", None),
+    )
+    existing_bridge = {
+        (row["direction"], int(row["trajectory"])) for row in _read_completed_rows(bridge_file)
+    }
     try:
-        completed_forward = _read_completed_rows(forward_file)
-        completed_reverse = _read_completed_rows(reverse_file)
-
-        if len(completed_forward) < neqti_options["n_snapshots"]:
+        for ensemble, switch_name, bridge_target in stream_specs:
+            completed = _read_completed_rows(work_files[switch_name])
+            if len(completed) >= neqti_options["n_snapshots"]:
+                continue
             _initialize_sampling_stream(
                 worker,
-                direction="forward",
-                initial_state_file=forward_initial_state_file,
-                start_state=forward_start,
-                checkpoint_file=forward_checkpoint,
-                completed_count=len(completed_forward),
+                direction=ensemble,
+                initial_state_file=state_files[ensemble],
+                start_state=states[ensemble],
+                checkpoint_file=checkpoints[ensemble],
+                completed_count=len(completed),
                 initial_equilibration_steps=neqti_options["initial_equilibration_steps"],
                 resume=neqti_options["resume"],
                 logger=logger,
             )
-        for traj in range(len(completed_forward), neqti_options["n_snapshots"]):
-            if neqti_options["decorrelation_steps"] > 0:
-                logger.info("NEQTI forward trajectory %d decorrelation: %d steps", traj, neqti_options["decorrelation_steps"])
-                _run_worker_steps(
-                    worker,
-                    neqti_options["decorrelation_steps"],
-                    logger,
-                    f"NEQTI forward trajectory {traj} decorrelation",
-                )
-            snapshot = worker.get_chkpt()
-            _write_worker_pdb_pair(worker, f"neqti_forward_snapshot_{traj}.pdb")
-            if neqti_options["validate_switch_integrator"]:
-                _validate_switch_implementations(
-                    worker,
-                    direction="forward",
-                    snapshot=snapshot,
-                    start_state=forward_start,
-                    schedule=forward_schedule,
-                    steps_per_segment=neqti_options["switch_steps_per_segment"],
-                    state_path=state_path,
-                    logger=logger,
-                )
-            logger.info("NEQTI forward trajectory %d switch: %d steps", traj, len(forward_schedule))
-            switch_started = time.perf_counter()
-            work_kcal = execute_switch(
-                "forward", forward_start, forward_schedule, state_path, f"forward trajectory {traj}"
-            )
-            _write_worker_pdb_pair(worker, f"neqti_forward_snapshot_{traj}_post_switch.pdb")
-            _append_row(
-                forward_file,
-                {
-                    "trajectory": traj,
-                    "direction": "forward",
-                    "start_state": state_path[0],
-                    "end_state": state_path[-1],
+            for traj in range(len(completed), neqti_options["n_snapshots"]):
+                if neqti_options["decorrelation_steps"] > 0:
+                    _run_worker_steps(worker, neqti_options["decorrelation_steps"], logger, f"NEQTI {ensemble} trajectory {traj} decorrelation")
+                snapshot = worker.get_chkpt()
+                _write_worker_pdb_pair(worker, f"neqti_{ensemble}_snapshot_{traj}.pdb")
+                if bridge_target is not None:
+                    bridge_direction = f"{ensemble}_to_{bridge_target}"
+                    if (bridge_direction, traj) not in existing_bridge:
+                        bridge_work = _bridge_work(worker, states[ensemble], states[bridge_target])
+                        _append_row(bridge_file, {
+                            "trajectory": traj, "direction": bridge_direction,
+                            "start_state": paths[switch_name][0], "end_state": paths[switch_name][0],
+                            "work_kcal_per_mol": f"{bridge_work:.12g}",
+                            "work_kj_per_mol": f"{bridge_work * KCAL_TO_KJ:.12g}", "switch_steps": 0, "status": "complete",
+                        })
+                        existing_bridge.add((bridge_direction, traj))
+                if neqti_options["validate_switch_integrator"]:
+                    _validate_switch_implementations(worker, direction=switch_name, snapshot=snapshot,
+                        start_state=states[ensemble], schedule=schedules[switch_name],
+                        steps_per_segment=neqti_options["switch_steps_per_segment"], state_path=paths[switch_name], logger=logger)
+                work_kcal = execute_switch(switch_name, states[ensemble], schedules[switch_name], paths[switch_name], f"{switch_name} trajectory {traj}")
+                _append_row(work_files[switch_name], {
+                    "trajectory": traj, "direction": switch_name,
+                    "start_state": paths[switch_name][0], "end_state": paths[switch_name][-1],
                     "work_kcal_per_mol": f"{work_kcal:.12g}",
                     "work_kj_per_mol": f"{work_kcal * KCAL_TO_KJ:.12g}",
-                    "switch_steps": len(forward_schedule),
-                    "status": "complete",
-                },
-            )
-            if progress_callback is not None:
-                progress_callback(
-                    {
+                    "switch_steps": len(schedules[switch_name]), "status": "complete",
+                })
+                if progress_callback is not None:
+                    current_counts = {
+                        name: len(_read_completed_rows(path)) for name, path in work_files.items()
+                    }
+                    progress_callback({
                         "jobname": basename,
                         "method": "neqti",
                         "status": "partial",
-                        "forward_samples": traj + 1,
-                        "reverse_samples": len(completed_reverse),
+                        "forward_samples": current_counts["leg_a_forward"] + current_counts["leg_b_forward"],
+                        "reverse_samples": current_counts["leg_a_reverse"] + current_counts["leg_b_reverse"],
+                        "sample_counts": current_counts,
                         "analysis": None,
-                    }
-                )
-            switch_elapsed = time.perf_counter() - switch_started
-            switch_ns_per_day = _effective_ns_per_day(worker, len(forward_schedule), switch_elapsed)
-            if switch_ns_per_day is None:
-                logger.info(
-                    "NEQTI forward trajectory %d complete: %.6g kcal/mol, %.3f s",
-                    traj,
-                    work_kcal,
-                    switch_elapsed,
-                )
-            else:
-                logger.info(
-                    "NEQTI forward trajectory %d complete: %.6g kcal/mol, %.3f s, %.3f ns/day",
-                    traj,
-                    work_kcal,
-                    switch_elapsed,
-                    switch_ns_per_day,
-                )
-            worker.set_chkpt(snapshot)
-            worker.set_state(forward_start)
-            _write_checkpoint(forward_checkpoint, worker.get_chkpt())
-
-        if len(completed_reverse) < neqti_options["n_snapshots"]:
-            _initialize_sampling_stream(
-                worker,
-                direction="reverse",
-                initial_state_file=reverse_initial_state_file,
-                start_state=reverse_start,
-                checkpoint_file=reverse_checkpoint,
-                completed_count=len(completed_reverse),
-                initial_equilibration_steps=neqti_options["initial_equilibration_steps"],
-                resume=neqti_options["resume"],
-                logger=logger,
-            )
-        for traj in range(len(completed_reverse), neqti_options["n_snapshots"]):
-            if neqti_options["decorrelation_steps"] > 0:
-                logger.info("NEQTI reverse trajectory %d decorrelation: %d steps", traj, neqti_options["decorrelation_steps"])
-                _run_worker_steps(
-                    worker,
-                    neqti_options["decorrelation_steps"],
-                    logger,
-                    f"NEQTI reverse trajectory {traj} decorrelation",
-                )
-            snapshot = worker.get_chkpt()
-            _write_worker_pdb_pair(worker, f"neqti_reverse_snapshot_{traj}.pdb")
-            if neqti_options["validate_switch_integrator"]:
-                _validate_switch_implementations(
-                    worker,
-                    direction="reverse",
-                    snapshot=snapshot,
-                    start_state=reverse_start,
-                    schedule=reverse_schedule,
-                    steps_per_segment=neqti_options["switch_steps_per_segment"],
-                    state_path=reverse_path,
-                    logger=logger,
-                )
-            logger.info("NEQTI reverse trajectory %d switch: %d steps", traj, len(reverse_schedule))
-            switch_started = time.perf_counter()
-            work_kcal = execute_switch(
-                "reverse", reverse_start, reverse_schedule, reverse_path, f"reverse trajectory {traj}"
-            )
-            _write_worker_pdb_pair(worker, f"neqti_reverse_snapshot_{traj}_post_switch.pdb")
-            _append_row(
-                reverse_file,
-                {
-                    "trajectory": traj,
-                    "direction": "reverse",
-                    "start_state": state_path[-1],
-                    "end_state": state_path[0],
-                    "work_kcal_per_mol": f"{work_kcal:.12g}",
-                    "work_kj_per_mol": f"{work_kcal * KCAL_TO_KJ:.12g}",
-                    "switch_steps": len(reverse_schedule),
-                    "status": "complete",
-                },
-            )
-            if progress_callback is not None:
-                current_forward = _read_completed_rows(forward_file)
-                current_reverse = _read_completed_rows(reverse_file)
-                progress_callback(
-                    {
-                        "jobname": basename,
-                        "method": "neqti",
-                        "status": "partial",
-                        "forward_samples": len(current_forward),
-                        "reverse_samples": len(current_reverse),
-                        "analysis": analyze_neqti_work(
-                            [float(row["work_kcal_per_mol"]) for row in current_forward],
-                            [float(row["work_kcal_per_mol"]) for row in current_reverse],
-                            stateparams[state_path[0]]["temperature"] / kelvin,
-                            bootstrap_samples=0,
-                            random_seed=neqti_options["random_seed"],
-                        ),
-                    }
-                )
-            switch_elapsed = time.perf_counter() - switch_started
-            switch_ns_per_day = _effective_ns_per_day(worker, len(reverse_schedule), switch_elapsed)
-            if switch_ns_per_day is None:
-                logger.info(
-                    "NEQTI reverse trajectory %d complete: %.6g kcal/mol, %.3f s",
-                    traj,
-                    work_kcal,
-                    switch_elapsed,
-                )
-            else:
-                logger.info(
-                    "NEQTI reverse trajectory %d complete: %.6g kcal/mol, %.3f s, %.3f ns/day",
-                    traj,
-                    work_kcal,
-                    switch_elapsed,
-                    switch_ns_per_day,
-                )
-            worker.set_chkpt(snapshot)
-            worker.set_state(reverse_start)
-            _write_checkpoint(reverse_checkpoint, worker.get_chkpt())
+                    })
+                worker.set_chkpt(snapshot)
+                worker.set_state(states[ensemble])
+                _write_checkpoint(checkpoints[ensemble], worker.get_chkpt())
     finally:
         worker.finish()
 
-    forward_rows = _read_completed_rows(forward_file)
-    reverse_rows = _read_completed_rows(reverse_file)
-    _write_integrated_work(Path("integA.dat"), forward_rows, "forward")
-    _write_integrated_work(Path("integB.dat"), reverse_rows, "reverse")
-
-    forward_work = [float(row["work_kcal_per_mol"]) for row in forward_rows]
-    reverse_work = [float(row["work_kcal_per_mol"]) for row in reverse_rows]
-    temperature_kelvin = stateparams[state_path[0]]["temperature"] / kelvin
-    analysis = analyze_neqti_work(
-        forward_work,
-        reverse_work,
-        temperature_kelvin,
+    rows = {name: _read_completed_rows(path) for name, path in work_files.items()}
+    for name, values in rows.items():
+        _write_integrated_work(Path(f"integ_{name}.dat"), values, name)
+    bridge_rows = _read_completed_rows(bridge_file)
+    bridge_forward = [row for row in bridge_rows if row["direction"] == "mplus_to_mminus"]
+    bridge_reverse = [row for row in bridge_rows if row["direction"] == "mminus_to_mplus"]
+    work = {name: [float(row["work_kcal_per_mol"]) for row in values] for name, values in rows.items()}
+    work["bridge_forward"] = [float(row["work_kcal_per_mol"]) for row in bridge_forward]
+    work["bridge_reverse"] = [float(row["work_kcal_per_mol"]) for row in bridge_reverse]
+    temperature_kelvin = states["a"]["temperature"] / kelvin
+    analysis = analyze_two_leg_work(
+        work, temperature_kelvin,
         bootstrap_samples=neqti_options["bootstrap_samples"],
         random_seed=neqti_options["random_seed"],
     )
+    complete = all(len(values) >= neqti_options["n_snapshots"] for values in rows.values()) and len(bridge_forward) >= neqti_options["n_snapshots"] and len(bridge_reverse) >= neqti_options["n_snapshots"]
+    usable_overlap = analysis is not None and analysis["overlap_score"] >= 0.01
     summary = {
         "jobname": basename,
         "method": "neqti",
-        "status": "completed" if len(forward_rows) >= neqti_options["n_snapshots"] and len(reverse_rows) >= neqti_options["n_snapshots"] else "partial",
-        "forward_samples": len(forward_rows),
-        "reverse_samples": len(reverse_rows),
+        "status": "completed" if complete and usable_overlap else "partial",
+        "forward_samples": len(rows["leg_a_forward"]) + len(rows["leg_b_forward"]),
+        "reverse_samples": len(rows["leg_a_reverse"]) + len(rows["leg_b_reverse"]),
+        "sample_counts": {name: len(values) for name, values in rows.items()},
+        "bridge_samples": {"forward": len(bridge_forward), "reverse": len(bridge_reverse)},
         "temperature_kelvin": float(temperature_kelvin),
-        "state_path": state_path,
-        "switch_steps": len(forward_schedule),
+        "hamiltonian": "atm_softplus_two_leg",
+        "paths": paths,
         "settings": neqti_options,
         "analysis": analysis,
     }

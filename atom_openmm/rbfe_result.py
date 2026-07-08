@@ -54,6 +54,7 @@ class RBFEResultWriter:
             "samples_forward": None,
             "samples_reverse": None,
             "samples_per_replica": None,
+            "components": None,
         }
 
     def _relative_if_exists(self, name):
@@ -69,13 +70,19 @@ class RBFEResultWriter:
             "endpoint_b": self._relative_if_exists("neqti_endpoint_B.pdb"),
             "endpoint_a_swapped": self._relative_if_exists("neqti_endpoint_A_swapped.pdb"),
             "endpoint_b_swapped": self._relative_if_exists("neqti_endpoint_B_swapped.pdb"),
-            "forward_work_csv": self._relative_if_exists("neqti_forward.csv"),
-            "reverse_work_csv": self._relative_if_exists("neqti_reverse.csv"),
-            "forward_sampling_checkpoint": self._relative_if_exists("neqti_forward_sampling.chk"),
-            "reverse_sampling_checkpoint": self._relative_if_exists("neqti_reverse_sampling.chk"),
-            "forward_integrated_work": self._relative_if_exists("integA.dat"),
-            "reverse_integrated_work": self._relative_if_exists("integB.dat"),
+            "midpoint_plus": self._relative_if_exists("neqti_midpoint_plus.pdb"),
+            "midpoint_minus": self._relative_if_exists("neqti_midpoint_minus.pdb"),
+            "leg_a_forward_work_csv": self._relative_if_exists("neqti_leg_a_forward.csv"),
+            "leg_a_reverse_work_csv": self._relative_if_exists("neqti_leg_a_reverse.csv"),
+            "leg_b_forward_work_csv": self._relative_if_exists("neqti_leg_b_forward.csv"),
+            "leg_b_reverse_work_csv": self._relative_if_exists("neqti_leg_b_reverse.csv"),
+            "midpoint_bridge_csv": self._relative_if_exists("neqti_midpoint_bridge.csv"),
+            "leg_a_forward_integrated_work": self._relative_if_exists("integ_leg_a_forward.dat"),
+            "leg_a_reverse_integrated_work": self._relative_if_exists("integ_leg_a_reverse.dat"),
+            "leg_b_forward_integrated_work": self._relative_if_exists("integ_leg_b_forward.dat"),
+            "leg_b_reverse_integrated_work": self._relative_if_exists("integ_leg_b_reverse.dat"),
             "neqti_summary": self._relative_if_exists("neqti_summary.yaml"),
+            "neqti_protocol": self._relative_if_exists("neqti_protocol.yaml"),
             "neqti_switch_validation": self._relative_if_exists("neqti_switch_validation.yaml"),
             "async_re_log": self._relative_if_exists(f"{job}.log"),
             "async_re_replica_output_pattern": f"r*/{job}.out" if any(self.workdir.glob(f"r*/{job}.out")) else None,
@@ -94,6 +101,8 @@ class RBFEResultWriter:
             result["ddg_error_kcal_per_mol"] = values.get("bar_bootstrap_std_kcal_per_mol")
             result["samples_forward"] = int((analysis or {}).get("forward_samples", 0))
             result["samples_reverse"] = int((analysis or {}).get("reverse_samples", 0))
+            result["components"] = values.get("components")
+            self.data["quality"]["overlap_score"] = values.get("overlap_score")
         else:
             result["ddg_kcal_per_mol"] = (analysis or {}).get("ddg")
             result["ddg_error_kcal_per_mol"] = (analysis or {}).get("ddg_std")
@@ -121,7 +130,7 @@ class RBFEResultWriter:
         if finite_result and result["ddg_error_kcal_per_mol"] is None:
             warnings.append("Free-energy uncertainty is unavailable.")
         if status == "partial":
-            warnings.append("Requested sampling target was not reached.")
+            warnings.append("Sampling or overlap quality requirements were not met.")
         if status == "failed" and error:
             warnings.append(f"{error['stage']} failed: {error['message']}")
 

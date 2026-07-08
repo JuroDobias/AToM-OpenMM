@@ -77,7 +77,7 @@ def _test_neqti_partial_result_and_missing_uncertainty(tmp_path):
     assert result["result"]["samples_per_replica"] is None
     assert result["quality"]["convergence_status"] == "partial"
     assert "Free-energy uncertainty is unavailable." in result["quality"]["warnings"]
-    assert "Requested sampling target was not reached." in result["quality"]["warnings"]
+    assert "Sampling or overlap quality requirements were not met." in result["quality"]["warnings"]
 
 
 def _test_failed_result_has_structured_error(tmp_path):

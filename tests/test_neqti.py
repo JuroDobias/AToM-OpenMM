@@ -2,6 +2,7 @@ import csv
 
 import pytest
 import yaml
+import openmm as mm
 from openmm.unit import kelvin, kilocalories_per_mole, picosecond
 
 
@@ -25,25 +26,16 @@ def _atom_options():
     }
 
 
-def _test_build_atm_state_parameters_uses_existing_schedule():
-    from atom_openmm.neqti import build_atm_state_parameters
-
-    states = build_atm_state_parameters(_atom_options())
-
-    assert len(states) == 4
-    assert states[0]["lambda1"] == 0.0
-    assert states[0]["atmdirection"] == 1.0
-    assert states[-1]["atmdirection"] == -1.0
-    assert states[0]["temperature"] / kelvin == 300.0
-    assert states[1]["uh"] / kilocalories_per_mole == 110.0
-
-
-def _test_normalize_neqti_options_defaults_to_full_state_path():
+def _test_normalize_neqti_options_derives_two_leg_paths():
     from atom_openmm.neqti import normalize_neqti_options
 
     settings = normalize_neqti_options({"neqti": {"switch_steps_per_segment": 7}}, _atom_options())
 
-    assert settings["state_path"] == [0, 1, 2, 3]
+    assert settings["paths"] == {
+        "leg_a_forward": [0, 1], "leg_a_reverse": [1, 0],
+        "leg_b_forward": [3, 2], "leg_b_reverse": [2, 3],
+    }
+    assert settings["hamiltonian"] == "atm_softplus_two_leg"
     assert settings["switch_steps_per_segment"] == 7
     assert settings["n_snapshots"] == 2
     assert settings["resume"] is True
@@ -58,20 +50,37 @@ def _test_switch_schedule_interpolates_between_knots():
 
     assert len(schedule) == 2
     assert schedule[0]["lambda1"] == pytest.approx(0.25)
-    assert schedule[0]["lambda2"] == pytest.approx(0.25)
     assert schedule[1]["lambda1"] == pytest.approx(0.5)
-    assert schedule[1]["lambda2"] == pytest.approx(0.5)
 
 
-def _test_switch_schedule_keeps_direction_discrete_at_midpoint():
-    from atom_openmm.neqti import build_atm_state_parameters, make_switch_schedule
+def _test_legacy_state_path_is_rejected():
+    from atom_openmm.neqti import NEQTIConfigError, normalize_neqti_options
 
-    states = build_atm_state_parameters(_atom_options())
-    schedule = make_switch_schedule(states, [1, 2], 4)
+    with pytest.raises(NEQTIConfigError, match="derives its two half paths"):
+        normalize_neqti_options(
+            {"neqti": {"state_path": [0, 1], "lambda_schedule": [0.0, 1.0]}},
+            _atom_options(),
+        )
 
-    assert [state["atmdirection"] for state in schedule] == [1.0, 1.0, 1.0, -1.0]
-    assert all(state["atmdirection"] in (-1.0, 1.0) for state in schedule)
-    assert [state["atmintermediate"] for state in schedule] == [1.0, 1.0, 1.0, 1.0]
+
+def _test_schedule_without_adjacent_directional_midpoints_is_rejected():
+    from atom_openmm.neqti import NEQTIConfigError, normalize_neqti_options
+
+    with pytest.raises(NEQTIConfigError):
+        options = _atom_options()
+        options["INTERMEDIATE"] = [0, 1, 0, 0]
+        normalize_neqti_options({"neqti": {}}, options)
+
+
+def _test_protocol_manifest_rejects_legacy_artifacts(tmp_path, monkeypatch):
+    from atom_openmm.neqti import NEQTIConfigError, _initialize_protocol_manifest
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "neqti_leg_a_forward.csv").write_text("legacy\n")
+    settings = {"paths": {"leg_a_forward": [0, 1]}, "switch_steps_per_segment": 10}
+
+    with pytest.raises(NEQTIConfigError, match="predate the two-leg protocol"):
+        _initialize_protocol_manifest(settings, resume=True)
 
 
 def _test_switch_progress_reports_effective_ns_per_day():
@@ -107,10 +116,38 @@ def _test_switch_progress_reports_effective_ns_per_day():
     assert "ns/day" in messages[0]
 
 
+def _test_worker_timestep_resolves_active_compound_integrator():
+    from atom_openmm.neqti import _worker_timestep_ps
+
+    compound = mm.CompoundIntegrator()
+    compound.addIntegrator(mm.VerletIntegrator(0.001 * picosecond))
+    compound.addIntegrator(mm.VerletIntegrator(0.004 * picosecond))
+    compound.setCurrentIntegrator(1)
+    worker = type("Worker", (), {"integrator": compound})()
+
+    assert _worker_timestep_ps(worker) == pytest.approx(0.004)
+
+
 def _test_bar_estimator_sign_convention():
     from atom_openmm.neqti import estimate_bar
 
     assert estimate_bar([2.0, 2.0, 2.0], [-2.0, -2.0, -2.0], 300.0) == pytest.approx(2.0)
+
+
+def _test_two_leg_analysis_includes_midpoint_bridge():
+    from atom_openmm.neqti import analyze_two_leg_work
+
+    work = {
+        "leg_a_forward": [2.0, 2.0], "leg_a_reverse": [-2.0, -2.0],
+        "bridge_forward": [0.5, 0.5], "bridge_reverse": [-0.5, -0.5],
+        "leg_b_forward": [1.0, 1.0], "leg_b_reverse": [-1.0, -1.0],
+    }
+
+    result = analyze_two_leg_work(work, 300.0, bootstrap_samples=0)
+
+    assert result["bar_dg_kcal_per_mol"] == pytest.approx(1.5)
+    assert result["components"]["midpoint_bridge"]["dg_kcal_per_mol"] == pytest.approx(0.5)
+    assert result["overlap_score"] > 0.0
 
 
 def _test_integrated_work_file_is_pmx_compatible(tmp_path):
@@ -376,7 +413,11 @@ def _test_neqti_loads_physical_initial_state_for_both_directions(tmp_path, monke
             "n_snapshots": 1,
             "decorrelation_steps": 0,
             "switch_steps_per_segment": 1,
-            "state_path": [0, 1],
+            "hamiltonian": "atm_softplus_two_leg",
+            "paths": {
+                "leg_a_forward": [0, 1], "leg_a_reverse": [1, 0],
+                "leg_b_forward": [3, 2], "leg_b_reverse": [2, 3],
+            },
             "resume": False,
             "bootstrap_samples": 0,
             "random_seed": 1,
@@ -388,15 +429,8 @@ def _test_neqti_loads_physical_initial_state_for_both_directions(tmp_path, monke
     )
 
     assert worker_options["INITIAL_STATE_FILE"] == "pair_equil.xml"
-    assert load_calls == ["pair_equil.xml", "pair_equil.xml"]
-    assert summary["forward_samples"] == 1
-    assert summary["reverse_samples"] == 1
-    assert [(item["forward_samples"], item["reverse_samples"]) for item in progress] == [(1, 0), (1, 1)]
-    assert progress[-1]["analysis"]["bar_dg_kcal_per_mol"] == pytest.approx(0.0)
-    forward_pre = events.index(("pdb", "neqti_forward_snapshot_0.pdb"))
-    forward_post = events.index(("pdb", "neqti_forward_snapshot_0_post_switch.pdb"))
-    reverse_pre = events.index(("pdb", "neqti_reverse_snapshot_0.pdb"))
-    reverse_post = events.index(("pdb", "neqti_reverse_snapshot_0_post_switch.pdb"))
-    restore_events = [index for index, event in enumerate(events) if event[0] == "restore"]
-    assert forward_pre < forward_post < restore_events[0]
-    assert reverse_pre < reverse_post < restore_events[1]
+    assert load_calls == ["pair_equil.xml"] * 4
+    assert summary["forward_samples"] == 2
+    assert summary["reverse_samples"] == 2
+    assert summary["analysis"]["bar_dg_kcal_per_mol"] == pytest.approx(0.0)
+    assert summary["bridge_samples"] == {"forward": 1, "reverse": 1}
