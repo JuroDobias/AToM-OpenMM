@@ -211,3 +211,42 @@ def _test_solvent_model_inference_uses_four_site_packing_for_opc():
 
     assert _infer_solvent_model(["amber19/opc.xml"]) == "tip4pew"
     assert _infer_solvent_model(["amber14/tip3p.xml"]) == "tip3p"
+
+
+def _test_run_production_routes_neqti(monkeypatch):
+    from atom_openmm import neqti, rbfe_workflow
+
+    options = {
+        "BASENAME": "cdk2-H1Q-H1R",
+        "TEMPERATURES": [310.0],
+        "LAMBDAS": [0.0, 0.5, 1.0],
+        "DIRECTION": [1, 1, -1],
+        "INTERMEDIATE": [0, 1, 0],
+        "LAMBDA1": [0.0, 0.5, 0.0],
+        "LAMBDA2": [0.0, 0.5, 0.0],
+        "ALPHA": [0.1, 0.1, 0.1],
+        "U0": [110.0, 110.0, 110.0],
+        "W0COEFF": [0, 0, 0],
+        "UMAX": 200.0,
+        "UBCORE": 100.0,
+        "ACORE": 0.0625,
+        "PRODUCTION_STEPS": 5,
+        "MAX_SAMPLES": 1,
+    }
+    workflow = {
+        "production_method": "neqti",
+        "neqti": {
+            "n_snapshots": 1,
+            "switch_steps_per_segment": 2,
+        },
+    }
+
+    def fake_run_neqti(received_options, received_neqti_options):
+        assert received_options is options
+        assert received_neqti_options["n_snapshots"] == 1
+        assert received_neqti_options["switch_steps_per_segment"] == 2
+        return {"jobname": "cdk2-H1Q-H1R", "status": "completed", "analysis": {"bar_dg_kcal_per_mol": 1.0}}
+
+    monkeypatch.setattr(neqti, "run_neqti", fake_run_neqti)
+
+    assert rbfe_workflow.run_production(options, workflow)["analysis"]["bar_dg_kcal_per_mol"] == 1.0

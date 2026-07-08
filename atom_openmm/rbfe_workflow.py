@@ -424,6 +424,20 @@ def analyze_pair(options, workflow):
     }
 
 
+def run_production(options, workflow):
+    production_method = workflow.get("production_method", "async_re")
+    if production_method == "async_re":
+        if should_run_production(options):
+            rbfe_production(config_file=None, options=options)
+        return None
+    if production_method == "neqti":
+        from atom_openmm.neqti import normalize_neqti_options, run_neqti
+
+        neqti_options = normalize_neqti_options(workflow, options)
+        return run_neqti(options, neqti_options)
+    raise WorkflowConfigError("workflow.production_method must be 'async_re' or 'neqti'")
+
+
 def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, alignments):
     jobdir = pair_plan["jobdir"]
     jobdir.mkdir(parents=True, exist_ok=True)
@@ -470,10 +484,11 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
         if not Path(options["BASENAME"] + "_0.xml").exists():
             rbfe_structprep(config_file=None, options=options)
 
-        if should_run_production(options):
-            rbfe_production(config_file=None, options=options)
+        production_result = run_production(options, workflow)
+        if production_result is not None:
+            return {"workdir": options["WORKDIR"], **production_result}
 
-        if workflow.get("analyze", True):
+        if workflow.get("production_method", "async_re") == "async_re" and workflow.get("analyze", True):
             analysis = analyze_pair(options, workflow)
             if analysis is not None:
                 return {"status": "analyzed", "workdir": options["WORKDIR"], **analysis}

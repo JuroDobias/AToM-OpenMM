@@ -89,6 +89,21 @@ workflow:
 
 `solvent_model` is the OpenMM solvent packing model passed to `Modeller.addSolvent()`. If omitted, the wrapper infers it from `solvent_forcefield`. For example, `amber19/opc.xml` uses `solvent_model: tip4pew` for four-site water placement while parameterizing with OPC.
 
+The wrapper can also run the experimental NEQTI switching protocol instead of asynchronous replica exchange:
+
+```yaml
+workflow:
+  production_method: neqti
+  neqti:
+    initial_equilibration_steps: 10000
+    n_snapshots: 20
+    decorrelation_steps: 10000
+    switch_steps_per_segment: 100
+    resume: true
+```
+
+NEQTI reuses the existing ATM schedule as switching knots. By default it switches from the first state through every listed schedule state to the final state, and then repeats the reverse path. It writes `neqti_forward.csv`, `neqti_reverse.csv`, `neqti_summary.yaml`, and pmx-compatible integrated work files `integA.dat` and `integB.dat` in each pair directory. The integrated work files use kJ/mol so they can be read by `analyze_dhdl.py -iA integA.dat -iB integB.dat`.
+
 For the CDK2 small-molecule workflow:
 
 ```bash
