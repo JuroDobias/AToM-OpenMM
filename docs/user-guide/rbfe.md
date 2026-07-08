@@ -1,6 +1,6 @@
 # Relative Binding Free Energy
 
-Relative binding free energy (RBFE) workflows estimate free energy differences between two related bound states. In AToM-OpenMM, the newer RBFE examples use a YAML-based setup that prepares paired alchemical systems, runs alchemical Hamiltonian replica exchange, and analyzes the two alchemical legs with UWHAM.
+Relative binding free energy (RBFE) workflows estimate free energy differences between two related bound states. The `atom-rbfe` wrapper accepts one YAML file, prepares each requested ligand pair, and runs either alchemical Hamiltonian replica exchange or experimental nonequilibrium switching (NEQTI).
 
 The most useful local examples to study are:
 
@@ -87,6 +87,20 @@ workflow:
 
 `ligand_charge_model: nn` is supported for Espaloma ligand force fields. `ligand_charge_model: am1-bcc` is supported for Espaloma and is the expected GAFF setup behavior. OpenFF charge assignment is controlled by the selected OpenFF/SMIRNOFF force field and generator rather than a separate wrapper charge-model option.
 
+Common combinations include:
+
+```yaml
+# Amber ff19SB protein, OPC water, Espaloma parameters and neural charges
+setup:
+  protein_forcefield: [amber19-all.xml]
+  solvent_forcefield: [amber19/opc.xml]
+  solvent_model: tip4pew
+  ligand_forcefield: espaloma-0.3.2
+  ligand_charge_model: nn
+```
+
+The accepted ligand force-field families are `gaff-*`, `openff-*`, and `espaloma-*`, subject to the versions available in the installed `openmmforcefields`. Protein and solvent values are OpenMM force-field XML files. Do not combine arbitrary protein and water XML files without checking that they are intended to be used together.
+
 `solvent_model` is the OpenMM solvent packing model passed to `Modeller.addSolvent()`. If omitted, the wrapper infers it from `solvent_forcefield`. For example, `amber19/opc.xml` uses `solvent_model: tip4pew` for four-site water placement while parameterizing with OPC.
 
 The wrapper can also run the experimental NEQTI switching protocol instead of asynchronous replica exchange:
@@ -103,6 +117,31 @@ workflow:
 ```
 
 NEQTI reuses the existing ATM schedule as switching knots. By default it switches from the first state through every listed schedule state to the final state, and then repeats the reverse path. It writes `neqti_forward.csv`, `neqti_reverse.csv`, `neqti_summary.yaml`, and pmx-compatible integrated work files `integA.dat` and `integB.dat` in each pair directory. The integrated work files use kJ/mol so they can be read by `analyze_dhdl.py -iA integA.dat -iB integB.dat`.
+
+For the example above, the execution order is:
+
+1. Prepare the ATM system. If `equilibration.neqti.endpoint` is configured, run it independently at A and B and save both endpoint states.
+2. Load endpoint A and run `initial_equilibration_steps` once.
+3. Run `decorrelation_steps`, save a snapshot, switch A to B, and record one forward work value. Repeat until `n_snapshots` forward values exist.
+4. Load endpoint B and run `initial_equilibration_steps` once.
+5. Run `decorrelation_steps`, save a snapshot, switch B to A, and record one reverse work value. Repeat until `n_snapshots` reverse values exist.
+6. Estimate the free-energy difference from forward and reverse work with BAR. If `bootstrap_samples` is greater than zero, estimate uncertainty by bootstrap resampling.
+
+| Setting | Meaning |
+| --- | --- |
+| `initial_equilibration_steps` | Additional MD run once at A and once at B before collecting snapshots. |
+| `n_snapshots` | Number of forward trajectories and number of reverse trajectories. |
+| `decorrelation_steps` | Endpoint MD between consecutive switching snapshots. |
+| `switch_steps_per_segment` | Integration steps used to interpolate between each neighboring pair of ATM schedule nodes. |
+| `state_path` | Optional ordered list of ATM schedule indices; defaults to all configured states. |
+| `resume` | Reuse completed work rows and completed custom endpoint states when available. |
+| `bootstrap_samples` | Number of BAR bootstrap resamples; zero disables uncertainty estimation. |
+| `random_seed` | Seed used for bootstrap resampling. |
+| `platform` | Optional OpenMM platform override for NEQTI. |
+
+`switch_steps_per_segment` applies to every neighboring pair of nodes in `state_path`. With the default 22-node schedule, a value of 1000 produces 21,000 integration steps per forward or reverse switch. A progress message is written after each complete node-to-node segment.
+
+When `resume: true`, completed work rows and compatible endpoint states are reused. An interrupted switching trajectory is rerun because work is only marked complete after the whole trajectory finishes. Review the YAML and output files before restarting: changing the schedule or protocol while retaining old work CSV files can mix incompatible results.
 
 The wrapper can replace the default equilibration stages with inline mdflow-style steps. Amber masks require `parmed`. For `async_re`, `pre_atm` replaces the physical minimization/thermalization/NPT/NVT stage and `async_re.midpoint` can replace the final lambda-0.5 equilibration. For `neqti`, preparation stops after the physical equilibrated state and `neqti.endpoint` is run separately at endpoint A and endpoint B before switching:
 
@@ -136,6 +175,10 @@ workflow:
               k_kcal_mol_a2: 5.0
               tolerance_a: 0.25
 ```
+
+Each custom step is either `minimization` or `md`. MD steps support `NVT` and `NPT`, `langevin_middle` or `verlet` integration, optional velocity reset, and state/XTC reporters. Positional restraints use Amber mask syntax. The two ligands are named `L1` and `L2` in the prepared system; for example, `!:L1,L2` excludes both ligands from a restraint selection. A 4 fs time step generally requires appropriate hydrogen mass repartitioning through `atom_options.HMASS`; choosing `timestep_ps: 0.004` alone does not make a system stable.
+
+Custom equilibration writes one directory per step under `equilibration/`, including `final_state.xml`, `final_state.pdb`, optional reporter files, and `manifest.json`. NEQTI endpoint equilibration is performed independently at A and B rather than alternating between endpoints.
 
 For the CDK2 small-molecule workflow:
 
@@ -182,6 +225,26 @@ Inside each `complexes/<jobname>/` directory, the main outputs are:
 | `vmd.in` | VMD helper file generated from the template when available. |
 
 The final log lines report `DG` in kcal/mol, its estimated uncertainty, the two leg free energies, and the number of samples used after discarding initial samples.
+
+For NEQTI, also inspect:
+
+| Output | Use |
+| --- | --- |
+| `neqti_endpoint_A.xml`, `neqti_endpoint_B.xml` | Restartable endpoint states after custom endpoint equilibration. |
+| `neqti_forward.csv`, `neqti_reverse.csv` | Per-trajectory protocol work and completion status. |
+| `integA.dat`, `integB.dat` | Integrated work in kJ/mol for external analysis tools. |
+| `neqti_summary.yaml` | BAR estimate and optional bootstrap uncertainty. |
+| `*_swapped.pdb` | Diagnostic coordinates after applying the ATM virtual coordinate swap. |
+
+The ordinary PDB contains the physical coordinates held by the OpenMM context. ATM evaluates an additional swapped coordinate state internally. Use the swapped PDBs to verify that the ligand expected in the binding site overlaps the intended reference pose at each endpoint. These files are diagnostics, not independent simulation states.
+
+## Current Limitations
+
+- The single-YAML wrapper currently supports `workflow.mode: small_molecule`.
+- NEQTI is experimental and has not replaced asynchronous replica exchange as the established production method.
+- NEQTI currently uses the configured discrete ATM schedule as interpolation knots; it does not yet implement an arbitrary continuous OpenMMTools-style alchemical function.
+- GPU, CUDA, OpenMM, Espaloma, and `openmmforcefields` compatibility is the responsibility of the environment.
+- A numerically completed run is not sufficient validation. Inspect endpoint structures, swapped structures, work distributions, forward/reverse overlap, and sensitivity to equilibration and switching time.
 
 ## Planning and Adapting
 

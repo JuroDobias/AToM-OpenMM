@@ -10,7 +10,8 @@ This version uses [ATMForce](https://github.com/openmm/openmm/pull/4110), availa
 
 - [Installation](installation.md): install AToM-OpenMM and its runtime dependencies.
 - [Tutorials](tutorials/index.md): start with Colab notebooks or local repository tutorials.
-- [User guide](user-guide/index.md): learn the high-level ABFE and RBFE workflow layout.
+- [RBFE YAML workflow](user-guide/rbfe.md): run ligand-pair calculations from one YAML file, including custom equilibration and experimental NEQTI switching.
+- [User guide](user-guide/index.md): learn the high-level ABFE and legacy RBFE workflow layout.
 - [Theory](theory/index.md): introduces the theory of the Alchemical Transfer approach
 - [API reference](api-reference/index.md): find command-line entry points, workflow modules, and utility modules.
 

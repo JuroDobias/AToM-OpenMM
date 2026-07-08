@@ -3,7 +3,9 @@ AToM-OpenMM v8.5
 
 ![AToM logo](AToM-logo.png)
 
-The Alchemical Transfer Method for OpenMM (AToM-OpenMM) is an extensible Python package for the estimation of absolute and relative binding free energies of molecular complexes. It implements the [Alchemical Transfer Method (ATM)](https://pubs.acs.org/doi/10.1021/acs.jcim.1c01129) with  asynchronous parallel replica exchange molecular dynamics with the [OpenMM](https://github.com/openmm) library. The AToM software can be deployed on workstations or cluster nodes with one or more GPUs.
+The Alchemical Transfer Method for OpenMM (AToM-OpenMM) is an extensible Python package for estimating absolute and relative binding free energies of molecular complexes. It implements the [Alchemical Transfer Method (ATM)](https://pubs.acs.org/doi/10.1021/acs.jcim.1c01129) with [OpenMM](https://github.com/openmm) and can run on GPU workstations or cluster nodes.
+
+This fork adds a single-YAML small-molecule RBFE workflow on top of the original AToM-OpenMM implementation. The wrapper can prepare and run complete ligand-pair calculations, select setup force fields and ligand charges, define custom equilibration protocols with Amber masks, and use either asynchronous replica exchange or an experimental nonequilibrium switching (NEQTI) protocol.
 
 This version of AToM-OpenMM has been tested with OpenMM 8.5 and 8.4; it uses [ATMForce](https://github.com/openmm/openmm/pull/4110) in the 8.4.0 or later versions of [OpenMM](https://github.com/openmm/openmm).
 
@@ -61,11 +63,17 @@ Finally, install AToM-OpenMM:
 pip install atom-openmm
 ```
 
-- From the latest sources:
+- From this fork in editable mode (recommended for development):
 ```
-git clone https://github.com/Gallicchio-Lab/AToM-OpenMM.git
+git clone https://github.com/JuroDobias/AToM-OpenMM.git
 cd AToM-OpenMM
-pip install .
+python -m pip install -e .
+```
+
+Verify that the YAML wrapper was installed into the active environment:
+
+```bash
+atom-rbfe --help
 ```
 
 And this will install the UWHAM R package:
@@ -73,7 +81,37 @@ And this will install the UWHAM R package:
 Rscript -e 'install.packages("UWHAM", repos = "http://cran.us.r-project.org")' 
 ```
 
-While we strive to develop and distribute high-quality and bug-free software, keep in mind that this is research software under heavy development. AToM-OpenMM is provided without any guarantees of correctness. Please report issues [here](https://github.com/Gallicchio-Lab/AToM-OpenMM/issues). We welcome contributions and pull requests.
+While we strive to develop and distribute high-quality and bug-free software, keep in mind that this is research software under heavy development. AToM-OpenMM is provided without any guarantees of correctness. Please report fork-specific issues [here](https://github.com/JuroDobias/AToM-OpenMM/issues). We welcome contributions and pull requests.
+
+Single-YAML RBFE quick start
+----------------------------
+
+Start from [`examples/RBFE/cdk2/workflow.yaml`](examples/RBFE/cdk2/workflow.yaml). It defines the receptor, ligand SDF directory, ligand pairs, reference alignment atoms, force fields, and ATM schedule in one file:
+
+```bash
+cd examples/RBFE/cdk2
+atom-rbfe workflow.yaml
+```
+
+Relative paths are resolved from the workflow file. Results for each pair are written below `workflow.workdir` (the example uses `complexes/`). Use `prepare_only: true` to build the pair directories without running production.
+
+The default production method is the original asynchronous replica exchange implementation. To select experimental NEQTI switching:
+
+```yaml
+workflow:
+  production_method: neqti
+  neqti:
+    initial_equilibration_steps: 25000
+    n_snapshots: 10
+    decorrelation_steps: 5000
+    switch_steps_per_segment: 1000
+    resume: true
+    bootstrap_samples: 0
+```
+
+NEQTI equilibrates endpoints A and B, collects decorrelated endpoint snapshots, performs forward A-to-B and reverse B-to-A switches through the configured ATM schedule, records protocol work, and estimates the free-energy difference with BAR. This implementation is experimental and should be validated against established calculations before production use.
+
+See the [RBFE user guide](docs/user-guide/rbfe.md) for the complete YAML schema, force-field examples, custom equilibration, restart behavior, outputs, and swapped-coordinate diagnostics.
 
 Documentation
 -------------

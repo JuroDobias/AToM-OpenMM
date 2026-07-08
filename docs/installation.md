@@ -18,13 +18,22 @@ Install the latest release:
 pip install atom-openmm
 ```
 
-Or install from source:
+Or install this fork from source. Editable mode is recommended when developing or testing local changes:
 
 ```bash
-git clone https://github.com/Gallicchio-Lab/AToM-OpenMM.git
+git clone https://github.com/JuroDobias/AToM-OpenMM.git
 cd AToM-OpenMM
-pip install .
+python -m pip install -e .
 ```
+
+Confirm that the console entry points belong to the active environment:
+
+```bash
+which atom-rbfe
+atom-rbfe --help
+```
+
+The single-YAML RBFE setup requires `openmmforcefields`. Install `espaloma` when using an Espaloma ligand force field or `ligand_charge_model: nn`. Custom equilibration steps that contain Amber mask selections require `parmed`. These packages must be compatible with the installed OpenMM and GPU stack; AToM-OpenMM does not manage GPU driver or CUDA compatibility.
 
 Install UWHAM for free energy estimation:
 
