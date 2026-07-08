@@ -23,6 +23,7 @@ def _write_minimal_workflow(tmp_path):
             "pairs": [["H1Q", "H1R"]],
             "reference_ligand": "H1Q",
             "reference_alignment_atoms": [1, 2, 3],
+            "alignments_out": "alignments.yaml",
             "prepare_only": True,
         },
         "atom_options": {
@@ -107,6 +108,7 @@ def _test_prepare_only_writes_final_pair_yaml(tmp_path, monkeypatch):
     results = rbfe_workflow.run_rbfe_workflow(config_file)
 
     jobdir = tmp_path / "complexes" / "cdk2-H1Q-H1R"
+    alignments_yaml = tmp_path / "complexes" / "alignments.yaml"
     final_yaml = jobdir / "cdk2-H1Q-H1R.yaml"
     assert results == [
         {
@@ -115,6 +117,8 @@ def _test_prepare_only_writes_final_pair_yaml(tmp_path, monkeypatch):
             "workdir": str(jobdir.resolve()),
         }
     ]
+    assert alignments_yaml.exists()
+    assert not (tmp_path / "ligands" / "alignments.yaml").exists()
     assert final_yaml.exists()
 
     options = yaml.safe_load(final_yaml.read_text())

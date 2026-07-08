@@ -12,7 +12,7 @@ workflow:
     - [H1Q, OIY]
   reference_ligand: H1Q
   reference_alignment_atoms: [14, 21, 18]
-  alignments_out: ligands/alignments.yaml
+  alignments_out: alignments.yaml
   forcefield_cache: ff.json
   run: true
   analyze: true

@@ -167,7 +167,7 @@ def load_or_generate_alignments(workflow, plan):
 
     alignments_out = workflow.get("alignments_out")
     if alignments_out:
-        alignments_out = _resolve_path(alignments_out, plan["ligands_dir"])
+        alignments_out = _resolve_path(alignments_out, plan["workdir"])
         alignments_out.parent.mkdir(parents=True, exist_ok=True)
         with open(alignments_out, "w") as f:
             yaml.dump(alignments, f, default_flow_style=None, width=1000000, sort_keys=False)
