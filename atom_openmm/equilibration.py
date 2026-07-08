@@ -413,7 +413,15 @@ def run_custom_equilibration(
             "final_pdb": str(step_pdb_path),
             "final_swapped_pdb": str(step_dir / "final_state_swapped.pdb") if atm_state is not None else None,
         }
-        print(f"[equilibration {step_id}] completed in {wall_seconds:.2f}s -> {step_state_path}")
+        if step_cfg["type"] == "md" and wall_seconds > 0.0:
+            ns_per_day = completed_steps * timestep_ps * 86.4 / wall_seconds
+            manifest["steps"][step_id]["ns_per_day"] = ns_per_day
+            print(
+                f"[equilibration {step_id}] completed in {wall_seconds:.2f}s "
+                f"({ns_per_day:.3f} ns/day) -> {step_state_path}"
+            )
+        else:
+            print(f"[equilibration {step_id}] completed in {wall_seconds:.2f}s -> {step_state_path}")
         with open(output_dir / "manifest.json", "w") as handle:
             json.dump(manifest, handle, indent=2)
         prev_state_path = step_state_path

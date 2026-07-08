@@ -254,6 +254,7 @@ def _test_neqti_loads_physical_initial_state_for_both_directions(tmp_path, monke
 
     load_calls = []
     worker_options = {}
+    events = []
 
     class FakeSimulation:
         def loadState(self, path):
@@ -274,7 +275,7 @@ def _test_neqti_loads_physical_initial_state_for_both_directions(tmp_path, monke
             return b"checkpoint"
 
         def set_chkpt(self, chkpt):
-            pass
+            events.append(("restore", chkpt))
 
         def get_energy(self):
             return {"potential_energy": 0.0 * kilocalories_per_mole}
@@ -289,6 +290,11 @@ def _test_neqti_loads_physical_initial_state_for_both_directions(tmp_path, monke
     monkeypatch.setattr(neqti, "_select_node_info", lambda options, neqti_options: {"node_name": "local"})
     monkeypatch.setattr(neqti, "OMMSystemRBFE", FakeOMMSystem)
     monkeypatch.setattr(neqti, "OMMWorkerATMSync", FakeWorker)
+    monkeypatch.setattr(
+        neqti,
+        "_write_worker_pdb_pair",
+        lambda worker, path: events.append(("pdb", str(path))),
+    )
 
     progress = []
     summary = neqti.run_neqti(
@@ -313,3 +319,10 @@ def _test_neqti_loads_physical_initial_state_for_both_directions(tmp_path, monke
     assert summary["reverse_samples"] == 1
     assert [(item["forward_samples"], item["reverse_samples"]) for item in progress] == [(1, 0), (1, 1)]
     assert progress[-1]["analysis"]["bar_dg_kcal_per_mol"] == pytest.approx(0.0)
+    forward_pre = events.index(("pdb", "neqti_forward_snapshot_0.pdb"))
+    forward_post = events.index(("pdb", "neqti_forward_snapshot_0_post_switch.pdb"))
+    reverse_pre = events.index(("pdb", "neqti_reverse_snapshot_0.pdb"))
+    reverse_post = events.index(("pdb", "neqti_reverse_snapshot_0_post_switch.pdb"))
+    restore_events = [index for index, event in enumerate(events) if event[0] == "restore"]
+    assert forward_pre < forward_post < restore_events[0]
+    assert reverse_pre < reverse_post < restore_events[1]
