@@ -60,6 +60,17 @@ Use this protein-peptide pattern when the perturbation is better described by a 
 
 ## Running an RBFE Workflow
 
+The single-YAML wrapper can run the small-molecule RBFE workflow from one input file:
+
+```bash
+cd $HOME/AToM-OpenMM/examples/RBFE/cdk2
+atom-rbfe workflow.yaml
+```
+
+`workflow.yaml` contains the receptor, ligand directory, ligand pairs, reference alignment atoms, and the original AToM options under `atom_options`. Relative paths are resolved from the workflow YAML location. Each ligand pair is expanded into `complexes/<jobname>/`, where the wrapper writes the final per-pair `<jobname>.yaml` used by the existing `rbfe_structprep`, `rbfe_production`, and UWHAM analysis code.
+
+Set `prepare_only: true` under `workflow` to create the per-pair directories and final YAML files without starting production.
+
 For the CDK2 small-molecule workflow:
 
 ```bash
