@@ -275,8 +275,9 @@ def make_system(
     print('Read ligand 1 from %s:' % lig1file)
     
     fileext = (os.path.splitext(lig1file)[1]).upper()
-    if fileext == '.SDF':
-        mollig1 = Molecule.from_file(lig1file, file_format='SDF', allow_undefined_stereo=True)
+    if fileext in ('.SDF', '.MOL2'):
+        file_format = 'SDF' if fileext == '.SDF' else 'MOL2'
+        mollig1 = Molecule.from_file(lig1file, file_format=file_format, allow_undefined_stereo=True)
         ligandmolecules.append(mollig1)
         lig1_ommtopology = mollig1.to_topology().to_openmm(ensure_unique_atom_names=True)
         pos = mollig1.conformers[0].to('angstrom').magnitude
@@ -314,8 +315,9 @@ def make_system(
         # read ligand 2 and place it in the solvent
         print('Read ligand 2 from %s:' % lig2file)
         fileext = (os.path.splitext(lig2file)[1]).upper()
-        if fileext == '.SDF':
-            mollig2 = Molecule.from_file(lig2file, file_format='SDF', allow_undefined_stereo=True)
+        if fileext in ('.SDF', '.MOL2'):
+            file_format = 'SDF' if fileext == '.SDF' else 'MOL2'
+            mollig2 = Molecule.from_file(lig2file, file_format=file_format, allow_undefined_stereo=True)
             ligandmolecules.append(mollig2)
             lig2_ommtopology = mollig2.to_topology().to_openmm(ensure_unique_atom_names=True)
             pos = mollig2.conformers[0].to('angstrom').magnitude

@@ -185,6 +185,38 @@ def _test_normalize_setup_options_maps_charge_models():
     assert setup["solvent_model"] == "tip4pew"
 
 
+def _test_normalize_setup_options_maps_ambertools_mode():
+    from atom_openmm.rbfe_workflow import normalize_setup_options
+
+    setup = normalize_setup_options(
+        {
+            "setup": {
+                "mode": "ambertools",
+                "protein_forcefield": "leaprc.protein.ff19SB",
+                "additional_forcefields": ["leaprc.phosaa14SB"],
+                "ligand_forcefield": "leaprc.gaff2",
+                "water_forcefield": "leaprc.water.opc",
+                "solvent_box": "OPCBOX",
+                "solvent_padding_a": 12,
+                "neutralize": False,
+            }
+        },
+        {},
+    )
+
+    assert setup["setup_mode"] == "ambertools"
+    assert setup["ligandforcefield"] == "leaprc.gaff2"
+    assert setup["ambertools"] == {
+        "protein_forcefield": "leaprc.protein.ff19SB",
+        "additional_forcefields": ["leaprc.phosaa14SB"],
+        "ligand_forcefield": "leaprc.gaff2",
+        "water_forcefield": "leaprc.water.opc",
+        "solvent_box": "OPCBOX",
+        "solvent_padding_a": 12.0,
+        "neutralize": False,
+    }
+
+
 def _test_normalize_setup_options_rejects_unsupported_charge_models():
     from atom_openmm.rbfe_workflow import WorkflowConfigError, normalize_setup_options
 
@@ -199,6 +231,59 @@ def _test_normalize_setup_options_rejects_unsupported_charge_models():
             {"setup": {"ligand_forcefield": "openff-2.3.0", "ligand_charge_model": "am1-bcc"}},
             {},
         )
+
+
+def _test_write_ambertools_tleap_input_renames_ligand_residues(tmp_path):
+    from atom_openmm.rbfe_workflow import write_ambertools_tleap_input
+
+    receptor = tmp_path / "receptor.pdb"
+    lig1 = tmp_path / "lig1-p.mol2"
+    lig2 = tmp_path / "lig2-p.mol2"
+    receptor.write_text("RECEPTOR\n")
+    mol2 = "\n".join(
+        [
+            "@<TRIPOS>MOLECULE",
+            "LIG",
+            " 1 0 1 0 0",
+            "SMALL",
+            "bcc",
+            "",
+            "@<TRIPOS>ATOM",
+            "      1 C1 0.0000 1.0000 2.0000 c3 1 UNL -0.100000",
+            "@<TRIPOS>BOND",
+        ]
+    )
+    lig1.write_text(mol2 + "\n")
+    lig2.write_text(mol2 + "\n")
+    lig1.with_suffix(".frcmod").write_text("frcmod1\n")
+    lig2.with_suffix(".frcmod").write_text("frcmod2\n")
+
+    tleap_file = tmp_path / "tleap.cmd"
+    write_ambertools_tleap_input(
+        receptor,
+        lig1,
+        lig2,
+        {"BASENAME": "cdk2-lig1-lig2", "DISPLACEMENT": [1.0, 2.0, 3.0]},
+        {
+            "protein_forcefield": "leaprc.protein.ff14SB",
+            "additional_forcefields": ["leaprc.phosaa14SB"],
+            "ligand_forcefield": "leaprc.gaff2",
+            "water_forcefield": "leaprc.water.tip3p",
+            "solvent_box": "TIP3PBOX",
+            "solvent_padding_a": 10.0,
+            "neutralize": True,
+        },
+        tleap_file,
+    )
+
+    tleap = tleap_file.read_text()
+    assert "source leaprc.protein.ff14SB" in tleap
+    assert "source leaprc.phosaa14SB" in tleap
+    assert "translate LIG2 { 1.000000 2.000000 3.000000 }" in tleap
+    assert "addions2 MOL Na+ 0" in tleap
+    assert "saveamberparm MOL cdk2-lig1-lig2.prmtop cdk2-lig1-lig2.inpcrd" in tleap
+    assert " L1 " in (tmp_path / "ambertools_inputs" / "L1.mol2").read_text()
+    assert " L2 " in (tmp_path / "ambertools_inputs" / "L2.mol2").read_text()
 
 
 def _test_explicit_solvent_adds_extra_particles_before_create_system():

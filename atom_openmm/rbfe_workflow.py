@@ -1,5 +1,6 @@
 import argparse
 import os
+import subprocess
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
@@ -74,6 +75,40 @@ def normalize_setup_options(workflow, atom_options):
     if setup is None:
         setup = {}
     _require_mapping(setup, "workflow.setup")
+
+    setup_mode = setup.get("mode", "openmmforcefields")
+    if not isinstance(setup_mode, str):
+        raise WorkflowConfigError("workflow.setup.mode must be a string")
+    if setup_mode == "ambertools":
+        ambertools = {
+            "protein_forcefield": setup.get("protein_forcefield", "leaprc.protein.ff14SB"),
+            "additional_forcefields": setup.get("additional_forcefields", []),
+            "ligand_forcefield": setup.get("ligand_forcefield", "leaprc.gaff2"),
+            "water_forcefield": setup.get("water_forcefield", "leaprc.water.tip3p"),
+            "solvent_box": setup.get("solvent_box", "TIP3PBOX"),
+            "solvent_padding_a": setup.get("solvent_padding_a", 10.0),
+            "neutralize": setup.get("neutralize", True),
+        }
+        for key in ("protein_forcefield", "ligand_forcefield", "water_forcefield", "solvent_box"):
+            if not isinstance(ambertools[key], str):
+                raise WorkflowConfigError(f"workflow.setup.{key} must be a string for setup.mode='ambertools'")
+        ambertools["additional_forcefields"] = _as_list(
+            ambertools["additional_forcefields"],
+            "workflow.setup.additional_forcefields",
+        )
+        try:
+            ambertools["solvent_padding_a"] = float(ambertools["solvent_padding_a"])
+        except (TypeError, ValueError) as exc:
+            raise WorkflowConfigError("workflow.setup.solvent_padding_a must be a number") from exc
+        if not isinstance(ambertools["neutralize"], bool):
+            raise WorkflowConfigError("workflow.setup.neutralize must be a boolean")
+        return {
+            "setup_mode": "ambertools",
+            "ligandforcefield": ambertools["ligand_forcefield"],
+            "ambertools": ambertools,
+        }
+    if setup_mode != "openmmforcefields":
+        raise WorkflowConfigError("workflow.setup.mode must be 'openmmforcefields' or 'ambertools'")
 
     ligand_forcefield = setup.get("ligand_forcefield", atom_options.get("LIGAND_FORCE_FIELD", "openff-2.0.0"))
     if not isinstance(ligand_forcefield, str):
@@ -250,6 +285,9 @@ def setup_small_molecule_system(receptor_file, lig1_file, lig2_file, ff_json_fil
 
     if setup_options is None:
         setup_options = {}
+    if setup_options.get("setup_mode") == "ambertools":
+        setup_small_molecule_system_ambertools(receptor_file, lig1_file, lig2_file, options, setup_options["ambertools"])
+        return
     basename = options["BASENAME"]
     setup = {
         "receptorfile": str(receptor_file),
@@ -264,6 +302,118 @@ def setup_small_molecule_system(receptor_file, lig1_file, lig2_file, ff_json_fil
         setup["hmass"] = options["HMASS"]
     setup.update(setup_options)
     make_system(**setup)
+
+
+def _inferred_frcmod_path(mol2_file):
+    frcmod = mol2_file.with_suffix(".frcmod")
+    if not frcmod.exists():
+        raise WorkflowConfigError(f"missing Amber frcmod file for {mol2_file.name}: {frcmod}")
+    return frcmod
+
+
+def _write_mol2_with_residue_name(source, destination, residue_name):
+    in_atom_section = False
+    in_substructure_section = False
+    lines = []
+    for line in source.read_text().splitlines():
+        if line.startswith("@<TRIPOS>"):
+            in_atom_section = line.strip().upper() == "@<TRIPOS>ATOM"
+            in_substructure_section = line.strip().upper() == "@<TRIPOS>SUBSTRUCTURE"
+            lines.append(line)
+            continue
+        if in_atom_section and line.strip():
+            parts = line.split()
+            if len(parts) >= 9:
+                parts[7] = residue_name
+                line = (
+                    f"{int(parts[0]):7d} {parts[1]:<8s}"
+                    f" {float(parts[2]):10.4f} {float(parts[3]):10.4f} {float(parts[4]):10.4f}"
+                    f" {parts[5]:<8s} {int(parts[6]):5d} {parts[7]:<8s} {float(parts[8]):12.6f}"
+                )
+        elif in_substructure_section and line.strip():
+            parts = line.split()
+            if len(parts) >= 2:
+                parts[1] = residue_name
+                line = " ".join(parts)
+        lines.append(line)
+    destination.write_text("\n".join(lines) + "\n")
+
+
+def _format_displacement(displacement):
+    if isinstance(displacement, str):
+        values = [float(part) for part in displacement.replace(",", " ").split()]
+    else:
+        values = [float(part) for part in displacement]
+    if len(values) != 3:
+        raise WorkflowConfigError("DISPLACEMENT must contain three values")
+    return values
+
+
+def write_ambertools_tleap_input(
+    receptor_file,
+    lig1_file,
+    lig2_file,
+    options,
+    ambertools_options,
+    tleap_file,
+):
+    basename = options["BASENAME"]
+    displacement = _format_displacement(options["DISPLACEMENT"])
+    inputs_dir = tleap_file.parent / "ambertools_inputs"
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+    lig1_mol2 = inputs_dir / "L1.mol2"
+    lig2_mol2 = inputs_dir / "L2.mol2"
+    _write_mol2_with_residue_name(Path(lig1_file), lig1_mol2, "L1")
+    _write_mol2_with_residue_name(Path(lig2_file), lig2_mol2, "L2")
+    lig1_frcmod = _inferred_frcmod_path(Path(lig1_file))
+    lig2_frcmod = _inferred_frcmod_path(Path(lig2_file))
+
+    commands = [
+        f"source {ambertools_options['protein_forcefield']}",
+    ]
+    commands.extend(f"source {forcefield}" for forcefield in ambertools_options.get("additional_forcefields", []))
+    commands.extend(
+        [
+            f"source {ambertools_options['ligand_forcefield']}",
+            f"source {ambertools_options['water_forcefield']}",
+            f'RCPT = loadpdb "{Path(receptor_file).resolve()}"',
+            f'LIG1 = loadmol2 "{lig1_mol2.resolve()}"',
+            f'loadamberparams "{lig1_frcmod.resolve()}"',
+            f'LIG2 = loadmol2 "{lig2_mol2.resolve()}"',
+            f'loadamberparams "{lig2_frcmod.resolve()}"',
+            f"translate LIG2 {{ {displacement[0]:.6f} {displacement[1]:.6f} {displacement[2]:.6f} }}",
+            "MOL = combine {RCPT LIG1 LIG2}",
+        ]
+    )
+    if ambertools_options.get("neutralize", True):
+        commands.extend(["addions2 MOL Na+ 0", "addions2 MOL Cl- 0"])
+    commands.extend(
+        [
+            f"solvateBox MOL {ambertools_options['solvent_box']} {ambertools_options['solvent_padding_a']:.6f}",
+            f"saveamberparm MOL {basename}.prmtop {basename}.inpcrd",
+            "quit",
+        ]
+    )
+    tleap_file.write_text("\n".join(commands) + "\n")
+    return tleap_file
+
+
+def setup_small_molecule_system_ambertools(receptor_file, lig1_file, lig2_file, options, ambertools_options):
+    from atom_openmm.make_atm_system_from_amber import make_system as make_amber_system
+
+    basename = options["BASENAME"]
+    tleap_file = Path("tleap.cmd")
+    write_ambertools_tleap_input(receptor_file, lig1_file, lig2_file, options, ambertools_options, tleap_file)
+    subprocess.run(["tleap", "-f", str(tleap_file)], check=True)
+    make_amber_system(
+        prmtopfile=basename + ".prmtop",
+        crdfile=basename + ".inpcrd",
+        xmloutfile=basename + "_sys.xml",
+        pdboutfile=basename + ".pdb",
+        hmass=float(options.get("HMASS", 1.0)),
+        nonbondedCutoff=float(options.get("NONBONDED_CUTOFF", 0.9)),
+        switchDistance=float(options.get("SWITCH_DISTANCE", 0.0)),
+    )
 
 
 def derive_small_molecule_options(options):
@@ -313,6 +463,11 @@ def derive_small_molecule_options(options):
     rcpt_chain_query = f"atom.residue.chain.id in {rcpt_chain_names}"
     rcpt_frame_query = rcpt_chain_query + ' and atom.name == "CA"'
     rcpt_frame_indexes = get_indexes_from_query(topology, rcpt_frame_query)
+    if not rcpt_frame_indexes:
+        rcpt_frame_query = 'atom.name == "CA" and atom.residue.name not in ["L1", "L2", "WAT", "HOH"]'
+        rcpt_frame_indexes = get_indexes_from_query(topology, rcpt_frame_query)
+    if not rcpt_frame_indexes:
+        raise WorkflowConfigError("could not identify receptor CA atoms for the ATM reference frame")
     rcpt_frame = get_selected_principal_groups(topology, positions, rcpt_frame_indexes)
 
     options["RCPT_CM_ATOMS"] = rcpt_frame["origin"]["indices"]
