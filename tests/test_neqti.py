@@ -35,8 +35,9 @@ def _test_normalize_neqti_options_derives_two_leg_paths():
         "leg_a_forward": [0, 1], "leg_a_reverse": [1, 0],
         "leg_b_forward": [3, 2], "leg_b_reverse": [2, 3],
     }
-    assert settings["hamiltonian"] == "atm_softplus_two_leg"
+    assert settings["hamiltonian"] == "atm_softplus_single_midpoint"
     assert settings["switch_steps_per_segment"] == 7
+    assert settings["preparation_annealing_steps_per_segment"] == 0
     assert settings["n_snapshots"] == 2
     assert settings["resume"] is True
     assert settings["switch_integrator"] == "custom"
@@ -79,7 +80,7 @@ def _test_protocol_manifest_rejects_legacy_artifacts(tmp_path, monkeypatch):
     (tmp_path / "neqti_leg_a_forward.csv").write_text("legacy\n")
     settings = {"paths": {"leg_a_forward": [0, 1]}, "switch_steps_per_segment": 10}
 
-    with pytest.raises(NEQTIConfigError, match="predate the two-leg protocol"):
+    with pytest.raises(NEQTIConfigError, match="predate the single-midpoint protocol"):
         _initialize_protocol_manifest(settings, resume=True)
 
 
@@ -134,19 +135,18 @@ def _test_bar_estimator_sign_convention():
     assert estimate_bar([2.0, 2.0, 2.0], [-2.0, -2.0, -2.0], 300.0) == pytest.approx(2.0)
 
 
-def _test_two_leg_analysis_includes_midpoint_bridge():
+def _test_single_midpoint_analysis_combines_two_legs_without_bridge():
     from atom_openmm.neqti import analyze_two_leg_work
 
     work = {
         "leg_a_forward": [2.0, 2.0], "leg_a_reverse": [-2.0, -2.0],
-        "bridge_forward": [0.5, 0.5], "bridge_reverse": [-0.5, -0.5],
         "leg_b_forward": [1.0, 1.0], "leg_b_reverse": [-1.0, -1.0],
     }
 
     result = analyze_two_leg_work(work, 300.0, bootstrap_samples=0)
 
-    assert result["bar_dg_kcal_per_mol"] == pytest.approx(1.5)
-    assert result["components"]["midpoint_bridge"]["dg_kcal_per_mol"] == pytest.approx(0.5)
+    assert result["bar_dg_kcal_per_mol"] == pytest.approx(1.0)
+    assert set(result["components"]) == {"leg_a", "leg_b"}
     assert result["overlap_score"] > 0.0
 
 
@@ -413,7 +413,7 @@ def _test_neqti_loads_physical_initial_state_for_both_directions(tmp_path, monke
             "n_snapshots": 1,
             "decorrelation_steps": 0,
             "switch_steps_per_segment": 1,
-            "hamiltonian": "atm_softplus_two_leg",
+            "hamiltonian": "atm_softplus_single_midpoint",
             "paths": {
                 "leg_a_forward": [0, 1], "leg_a_reverse": [1, 0],
                 "leg_b_forward": [3, 2], "leg_b_reverse": [2, 3],
@@ -424,13 +424,21 @@ def _test_neqti_loads_physical_initial_state_for_both_directions(tmp_path, monke
             "platform": None,
             "switch_integrator": "python",
             "validate_switch_integrator": False,
+            "preparation_annealing_steps_per_segment": 0,
+            "tolerate_failed_switches": False,
+            "max_switch_attempts_per_direction": 1,
         },
         progress_callback=progress.append,
     )
 
     assert worker_options["INITIAL_STATE_FILE"] == "pair_equil.xml"
-    assert load_calls == ["pair_equil.xml"] * 4
+    assert load_calls == ["pair_equil.xml"] * 3
     assert summary["forward_samples"] == 2
     assert summary["reverse_samples"] == 2
     assert summary["analysis"]["bar_dg_kcal_per_mol"] == pytest.approx(0.0)
-    assert summary["bridge_samples"] == {"forward": 1, "reverse": 1}
+    assert summary["sample_counts"] == {
+        "leg_a_forward": 1,
+        "leg_a_reverse": 1,
+        "leg_b_forward": 1,
+        "leg_b_reverse": 1,
+    }

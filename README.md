@@ -122,7 +122,7 @@ workflow:
     bootstrap_samples: 0
 ```
 
-NEQTI reuses the async-RE ATM soft-core schedule as two bidirectional half paths, A↔M+ and B↔M−. It estimates both legs and the M+↔M− free-energy bridge with BAR, then combines the three terms into the RBFE result.
+NEQTI reuses the async-RE ATM soft-core schedule as two bidirectional half paths that meet at one shared midpoint ensemble, A<->M and B<->M. It estimates both legs with BAR and combines them as `DG(A->M) - DG(B->M)`.
 
 By default, ATM parameter switching and protocol-work accumulation run inside a dedicated OpenMM `CustomIntegrator`; `openmmtools` is used as a design reference but is not a runtime dependency. Set `workflow.neqti.switch_integrator: python` to use the slower reference path or `validate_switch_integrator: true` for a one-shot comparison.
 

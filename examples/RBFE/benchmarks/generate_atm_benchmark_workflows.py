@@ -90,7 +90,7 @@ BENCHMARK_V1_EQUILIBRATION = {
                 "id": "benchmark_v1_nvt_short_heavy_restrained",
                 "type": "md",
                 "ensemble": "NVT",
-                "n_steps": 25000,
+                "n_steps": 50000,
                 "timestep_ps": 0.002,
                 "thermostat": {"temperature_k": 300.0, "friction_per_ps": 1.0},
                 "positional_restraints": {
@@ -104,7 +104,7 @@ BENCHMARK_V1_EQUILIBRATION = {
                 "id": "benchmark_v1_npt_short_heavy_restrained",
                 "type": "md",
                 "ensemble": "NPT",
-                "n_steps": 50000,
+                "n_steps": 250000,
                 "timestep_ps": 0.002,
                 "thermostat": {"temperature_k": 300.0, "friction_per_ps": 1.0},
                 "positional_restraints": {
@@ -124,33 +124,14 @@ BENCHMARK_V1_EQUILIBRATION = {
                     "type": "minimization",
                     "tolerance_kj_mol_nm": 10.0,
                     "max_iterations": 200,
-                    "positional_restraints": {
-                        "mask": "!@H= & !:L1,L2,HOH,WAT,NA,CL,K,CA",
-                        "k_kcal_mol_a2": 25.0,
-                        "tolerance_a": 0.01,
-                    },
                 },
                 {
                     "id": "benchmark_v1_endpoint_nvt_reheat",
                     "type": "md",
                     "ensemble": "NVT",
-                    "n_steps": 10000,
+                    "n_steps": 50000,
                     "timestep_ps": 0.002,
                     "reset_velocities": True,
-                    "thermostat": {"temperature_k": 300.0, "friction_per_ps": 1.0},
-                    "positional_restraints": {
-                        "mask": "!@H= & !:HOH,WAT,NA,CL,K,CA",
-                        "k_kcal_mol_a2": 2.0,
-                        "tolerance_a": 0.5,
-                    },
-                    "reporters": {"state": {"interval": 5000}},
-                },
-                {
-                    "id": "benchmark_v1_endpoint_npt_short",
-                    "type": "md",
-                    "ensemble": "NPT",
-                    "n_steps": 10000,
-                    "timestep_ps": 0.002,
                     "thermostat": {"temperature_k": 300.0, "friction_per_ps": 1.0},
                     "positional_restraints": {
                         "mask": "!@H= & !:HOH,WAT,NA,CL,K,CA",
@@ -163,14 +144,9 @@ BENCHMARK_V1_EQUILIBRATION = {
                     "id": "benchmark_v1_endpoint_eq",
                     "type": "md",
                     "ensemble": "NPT",
-                    "n_steps": 50000,
+                    "n_steps": 250000,
                     "timestep_ps": 0.004,
                     "thermostat": {"temperature_k": 300.0, "friction_per_ps": 1.0},
-                    "positional_restraints": {
-                        "mask": "!@H= & !:L1,L2,HOH,WAT,NA,CL,K,CA",
-                        "k_kcal_mol_a2": 2.0,
-                        "tolerance_a": 0.5,
-                    },
                     "reporters": {"state": {"interval": 5000}},
                 },
             ]
@@ -180,12 +156,15 @@ BENCHMARK_V1_EQUILIBRATION = {
 
 
 NEQTI_BENCHMARK_V1 = {
-    "initial_equilibration_steps": 100000,
+    "initial_equilibration_steps": 200000,
     "n_snapshots": 40,
-    "decorrelation_steps": 25000,
+    "decorrelation_steps": 100000,
     "switch_steps_per_segment": 5000,
+    "preparation_annealing_steps_per_segment": 10000,
     "switch_integrator": "custom",
     "validate_switch_integrator": False,
+    "tolerate_failed_switches": True,
+    "max_switch_attempts_per_direction": 80,
     "resume": True,
     "bootstrap_samples": 500,
 }
