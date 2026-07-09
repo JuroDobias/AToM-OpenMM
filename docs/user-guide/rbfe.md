@@ -151,6 +151,29 @@ The accepted ligand force-field families are `gaff-*`, `openff-*`, and `espaloma
 
 `solvent_model` is the OpenMM solvent packing model passed to `Modeller.addSolvent()`. If omitted, the wrapper infers it from `solvent_forcefield`. For example, `amber19/opc.xml` uses `solvent_model: tip4pew` for four-site water placement while parameterizing with OPC.
 
+For phosphorylated proteins or other receptor chemistry that needs tleap-specific force fields, use AmberTools setup. Ligands can be supplied as pre-parameterized MOL2/FRCMOD files, or parameterized from SDF on the fly with antechamber:
+
+```yaml
+workflow:
+  setup:
+    mode: ambertools
+    protein_forcefield: leaprc.protein.ff14SB
+    additional_forcefields:
+      - leaprc.phosaa14SB
+    ligand_forcefield: leaprc.gaff2
+    ligand_parameterization: antechamber
+    ligand_charge_model: bcc
+    ligand_net_charge: 0
+    ligand_net_charges:
+      charged_ligand: -1
+    water_forcefield: leaprc.water.tip3p
+    solvent_box: TIP3PBOX
+    solvent_padding_a: 10.0
+    neutralize: true
+```
+
+`ligand_net_charge` is the default integer charge passed to antechamber. `ligand_net_charges` can override it by ligand file stem.
+
 The wrapper can also run the experimental NEQTI switching protocol instead of asynchronous replica exchange:
 
 ```yaml

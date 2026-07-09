@@ -371,6 +371,10 @@ def _test_normalize_setup_options_maps_ambertools_mode():
         "protein_forcefield": "leaprc.protein.ff19SB",
         "additional_forcefields": ["leaprc.phosaa14SB"],
         "ligand_forcefield": "leaprc.gaff2",
+        "ligand_parameterization": "preparameterized",
+        "ligand_charge_model": "bcc",
+        "ligand_net_charge": 0,
+        "ligand_net_charges": {},
         "water_forcefield": "leaprc.water.opc",
         "solvent_box": "OPCBOX",
         "solvent_padding_a": 12.0,
@@ -445,6 +449,79 @@ def _test_write_ambertools_tleap_input_renames_ligand_residues(tmp_path):
     assert "saveamberparm MOL cdk2-lig1-lig2.prmtop cdk2-lig1-lig2.inpcrd" in tleap
     assert " L1 " in (tmp_path / "ambertools_inputs" / "L1.mol2").read_text()
     assert " L2 " in (tmp_path / "ambertools_inputs" / "L2.mol2").read_text()
+    assert (tmp_path / "ambertools_inputs" / "L1.frcmod").read_text() == "frcmod1\n"
+    assert (tmp_path / "ambertools_inputs" / "L2.frcmod").read_text() == "frcmod2\n"
+
+
+def _test_write_ambertools_tleap_input_can_parameterize_sdf_ligands(tmp_path, monkeypatch):
+    from atom_openmm import rbfe_workflow
+
+    receptor = tmp_path / "receptor.pdb"
+    lig1 = tmp_path / "ms_1.sdf"
+    lig2 = tmp_path / "ms_2.sdf"
+    receptor.write_text("RECEPTOR\n")
+    lig1.write_text("lig1\n")
+    lig2.write_text("lig2\n")
+    commands = []
+
+    def fake_run(command, check):
+        commands.append(command)
+        if command[0] == "antechamber":
+            output_file = Path(command[command.index("-o") + 1])
+            residue_name = command[command.index("-rn") + 1]
+            output_file.write_text(
+                "\n".join(
+                    [
+                        "@<TRIPOS>MOLECULE",
+                        "LIG",
+                        " 1 0 1 0 0",
+                        "SMALL",
+                        "bcc",
+                        "",
+                        "@<TRIPOS>ATOM",
+                        f"      1 C1 0.0000 1.0000 2.0000 c3 1 {residue_name} -0.100000",
+                        "@<TRIPOS>BOND",
+                    ]
+                )
+                + "\n"
+            )
+        elif command[0] == "parmchk2":
+            output_file = Path(command[command.index("-o") + 1])
+            output_file.write_text("frcmod\n")
+
+    monkeypatch.setattr(rbfe_workflow.subprocess, "run", fake_run)
+
+    tleap_file = tmp_path / "tleap.cmd"
+    rbfe_workflow.write_ambertools_tleap_input(
+        receptor,
+        lig1,
+        lig2,
+        {"BASENAME": "job", "DISPLACEMENT": [1.0, 2.0, 3.0]},
+        {
+            "protein_forcefield": "leaprc.protein.ff14SB",
+            "additional_forcefields": ["leaprc.phosaa14SB"],
+            "ligand_forcefield": "leaprc.gaff2",
+            "ligand_parameterization": "antechamber",
+            "ligand_charge_model": "bcc",
+            "ligand_net_charge": 0,
+            "ligand_net_charges": {"ms_2": -1},
+            "water_forcefield": "leaprc.water.tip3p",
+            "solvent_box": "TIP3PBOX",
+            "solvent_padding_a": 10.0,
+            "neutralize": True,
+        },
+        tleap_file,
+    )
+
+    antechamber_commands = [command for command in commands if command[0] == "antechamber"]
+    parmchk_commands = [command for command in commands if command[0] == "parmchk2"]
+    assert len(antechamber_commands) == 2
+    assert len(parmchk_commands) == 2
+    assert antechamber_commands[0][antechamber_commands[0].index("-fi") + 1] == "sdf"
+    assert antechamber_commands[0][antechamber_commands[0].index("-c") + 1] == "bcc"
+    assert antechamber_commands[0][antechamber_commands[0].index("-nc") + 1] == "0"
+    assert antechamber_commands[1][antechamber_commands[1].index("-nc") + 1] == "-1"
+    assert "loadamberparams" in tleap_file.read_text()
 
 
 def _test_explicit_solvent_adds_extra_particles_before_create_system():

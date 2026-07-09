@@ -87,18 +87,45 @@ def normalize_setup_options(workflow, atom_options):
             "protein_forcefield": setup.get("protein_forcefield", "leaprc.protein.ff14SB"),
             "additional_forcefields": setup.get("additional_forcefields", []),
             "ligand_forcefield": setup.get("ligand_forcefield", "leaprc.gaff2"),
+            "ligand_parameterization": setup.get("ligand_parameterization", "preparameterized"),
+            "ligand_charge_model": setup.get("ligand_charge_model", "bcc"),
+            "ligand_net_charge": setup.get("ligand_net_charge", 0),
+            "ligand_net_charges": setup.get("ligand_net_charges", {}),
             "water_forcefield": setup.get("water_forcefield", "leaprc.water.tip3p"),
             "solvent_box": setup.get("solvent_box", "TIP3PBOX"),
             "solvent_padding_a": setup.get("solvent_padding_a", 10.0),
             "neutralize": setup.get("neutralize", True),
         }
-        for key in ("protein_forcefield", "ligand_forcefield", "water_forcefield", "solvent_box"):
+        for key in (
+            "protein_forcefield",
+            "ligand_forcefield",
+            "ligand_parameterization",
+            "ligand_charge_model",
+            "water_forcefield",
+            "solvent_box",
+        ):
             if not isinstance(ambertools[key], str):
                 raise WorkflowConfigError(f"workflow.setup.{key} must be a string for setup.mode='ambertools'")
+        if ambertools["ligand_parameterization"] not in ("preparameterized", "antechamber"):
+            raise WorkflowConfigError(
+                "workflow.setup.ligand_parameterization must be 'preparameterized' or 'antechamber'"
+            )
+        if ambertools["ligand_charge_model"] not in ("bcc", "gas"):
+            raise WorkflowConfigError("workflow.setup.ligand_charge_model must be 'bcc' or 'gas' for AmberTools setup")
         ambertools["additional_forcefields"] = _as_list(
             ambertools["additional_forcefields"],
             "workflow.setup.additional_forcefields",
         )
+        if ambertools["ligand_net_charges"] is None:
+            ambertools["ligand_net_charges"] = {}
+        _require_mapping(ambertools["ligand_net_charges"], "workflow.setup.ligand_net_charges")
+        try:
+            ambertools["ligand_net_charge"] = int(ambertools["ligand_net_charge"])
+            ambertools["ligand_net_charges"] = {
+                str(name): int(charge) for name, charge in ambertools["ligand_net_charges"].items()
+            }
+        except (TypeError, ValueError) as exc:
+            raise WorkflowConfigError("workflow.setup ligand net charges must be integers") from exc
         try:
             ambertools["solvent_padding_a"] = float(ambertools["solvent_padding_a"])
         except (TypeError, ValueError) as exc:
@@ -543,6 +570,88 @@ def _write_mol2_with_residue_name(source, destination, residue_name):
     destination.write_text("\n".join(lines) + "\n")
 
 
+def _antechamber_input_format(path):
+    suffix = Path(path).suffix.lower()
+    if suffix == ".sdf":
+        return "sdf"
+    if suffix == ".mol2":
+        return "mol2"
+    if suffix == ".pdb":
+        return "pdb"
+    raise WorkflowConfigError(f"antechamber ligand input must be SDF, MOL2, or PDB: {path}")
+
+
+def _ambertools_atom_type(ligand_forcefield):
+    if "gaff2" in ligand_forcefield.lower():
+        return "gaff2"
+    return "gaff"
+
+
+def _ligand_net_charge(ligand_file, ambertools_options):
+    ligand_name = Path(ligand_file).stem
+    charges = ambertools_options.get("ligand_net_charges", {})
+    if ligand_name in charges:
+        return int(charges[ligand_name])
+    return int(ambertools_options.get("ligand_net_charge", 0))
+
+
+def _prepare_ambertools_ligand(ligand_file, mol2_file, frcmod_file, residue_name, ambertools_options):
+    ligand_file = Path(ligand_file)
+    parameterization = ambertools_options.get("ligand_parameterization", "preparameterized")
+    if parameterization == "preparameterized":
+        _write_mol2_with_residue_name(ligand_file, mol2_file, residue_name)
+        source_frcmod = _inferred_frcmod_path(ligand_file)
+        frcmod_file.write_text(source_frcmod.read_text())
+        return
+
+    if parameterization != "antechamber":
+        raise WorkflowConfigError(f"unsupported AmberTools ligand parameterization: {parameterization}")
+
+    raw_mol2 = mol2_file.with_name(mol2_file.stem + "_antechamber.mol2")
+    atom_type = _ambertools_atom_type(ambertools_options["ligand_forcefield"])
+    input_format = _antechamber_input_format(ligand_file)
+    charge_model = ambertools_options.get("ligand_charge_model", "bcc")
+    net_charge = _ligand_net_charge(ligand_file, ambertools_options)
+
+    subprocess.run(
+        [
+            "antechamber",
+            "-i",
+            str(ligand_file.resolve()),
+            "-fi",
+            input_format,
+            "-o",
+            str(raw_mol2.resolve()),
+            "-fo",
+            "mol2",
+            "-at",
+            atom_type,
+            "-c",
+            charge_model,
+            "-nc",
+            str(net_charge),
+            "-rn",
+            residue_name,
+        ],
+        check=True,
+    )
+    _write_mol2_with_residue_name(raw_mol2, mol2_file, residue_name)
+    subprocess.run(
+        [
+            "parmchk2",
+            "-i",
+            str(mol2_file.resolve()),
+            "-f",
+            "mol2",
+            "-o",
+            str(frcmod_file.resolve()),
+            "-s",
+            atom_type,
+        ],
+        check=True,
+    )
+
+
 def _format_displacement(displacement):
     if isinstance(displacement, str):
         values = [float(part) for part in displacement.replace(",", " ").split()]
@@ -567,10 +676,10 @@ def write_ambertools_tleap_input(
     inputs_dir.mkdir(parents=True, exist_ok=True)
     lig1_mol2 = inputs_dir / "L1.mol2"
     lig2_mol2 = inputs_dir / "L2.mol2"
-    _write_mol2_with_residue_name(Path(lig1_file), lig1_mol2, "L1")
-    _write_mol2_with_residue_name(Path(lig2_file), lig2_mol2, "L2")
-    lig1_frcmod = _inferred_frcmod_path(Path(lig1_file))
-    lig2_frcmod = _inferred_frcmod_path(Path(lig2_file))
+    lig1_frcmod = inputs_dir / "L1.frcmod"
+    lig2_frcmod = inputs_dir / "L2.frcmod"
+    _prepare_ambertools_ligand(Path(lig1_file), lig1_mol2, lig1_frcmod, "L1", ambertools_options)
+    _prepare_ambertools_ligand(Path(lig2_file), lig2_mol2, lig2_frcmod, "L2", ambertools_options)
 
     commands = [
         f"source {ambertools_options['protein_forcefield']}",
