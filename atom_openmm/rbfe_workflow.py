@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import yaml
 from openmm import Vec3
 from openmm.app import PDBFile
 from openmm.unit import angstrom, nanometer
+from rdkit import Chem
 
 from atom_openmm.rbfe_production import rbfe_production
 from atom_openmm.rbfe_result import RBFEResultWriter
@@ -275,6 +277,8 @@ def build_small_molecule_plan(config):
     return {
         "receptor_file": receptor_file,
         "ligands_dir": ligands_dir,
+        "ligand_map": ligand_map,
+        "base_dir": base_dir,
         "workdir": workdir,
         "pairs": pair_plans,
     }
@@ -310,6 +314,16 @@ def load_or_generate_alignments(workflow, plan, write_generated=True):
         with open(alignments_file, "r") as f:
             return yaml.safe_load(f)
 
+    if workflow.get("alignment"):
+        alignments = generate_smarts_alignments(workflow["alignment"], plan)
+        alignments_out = workflow.get("alignments_out")
+        if write_generated and alignments_out:
+            alignments_out = _resolve_path(alignments_out, plan["workdir"])
+            alignments_out.parent.mkdir(parents=True, exist_ok=True)
+            with open(alignments_out, "w") as f:
+                yaml.dump(alignments, f, default_flow_style=None, width=1000000, sort_keys=False)
+        return alignments
+
     ref_ligand = workflow.get("reference_ligand")
     ref_atoms = workflow.get("reference_alignment_atoms")
     if ref_ligand is None or ref_atoms is None:
@@ -320,7 +334,7 @@ def load_or_generate_alignments(workflow, plan, write_generated=True):
     if not isinstance(ref_atoms, list) or len(ref_atoms) != 3:
         raise WorkflowConfigError("workflow.reference_alignment_atoms must contain three atom ids")
 
-    ref_lig_file = _ligand_path(ref_ligand, plan["ligands_dir"])
+    ref_lig_file = _ligand_path(ref_ligand, plan["ligands_dir"], plan.get("ligand_map"), plan.get("base_dir"))
     _validate_file(ref_lig_file, "workflow.reference_ligand")
     lig_files = sorted({p["lig1_file"] for p in plan["pairs"]} | {p["lig2_file"] for p in plan["pairs"]})
     alignments = get_alignment_atoms(str(ref_lig_file), [int(i) for i in ref_atoms], [str(p) for p in lig_files])
@@ -333,6 +347,122 @@ def load_or_generate_alignments(workflow, plan, write_generated=True):
             yaml.dump(alignments, f, default_flow_style=None, width=1000000, sort_keys=False)
 
     return alignments
+
+
+def _load_alignment_mol(path):
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix == ".sdf":
+        supplier = Chem.SDMolSupplier(str(path), removeHs=False)
+        mol = supplier[0] if supplier and len(supplier) else None
+    elif suffix == ".pdb":
+        mol = Chem.MolFromPDBFile(str(path), removeHs=False)
+    elif suffix == ".mol2":
+        mol = Chem.MolFromMol2File(str(path), removeHs=False)
+    else:
+        supplier = Chem.SDMolSupplier(str(path), removeHs=False)
+        mol = supplier[0] if supplier and len(supplier) else None
+    if mol is None:
+        raise WorkflowConfigError(f"could not read ligand for SMARTS alignment: {path}")
+    if mol.GetNumConformers() == 0:
+        raise WorkflowConfigError(f"ligand has no coordinates for SMARTS alignment: {path}")
+    return mol
+
+
+def _smarts_match_atom_ids(mol, query, smarts_atom_ids, ligand_name):
+    matches = mol.GetSubstructMatches(query, uniquify=False)
+    if not matches:
+        raise WorkflowConfigError(f"SMARTS alignment pattern did not match ligand {ligand_name}")
+    max_position = max(smarts_atom_ids)
+    if max_position > query.GetNumAtoms():
+        raise WorkflowConfigError(
+            "workflow.alignment.smarts_atom_ids contains an atom position outside the SMARTS pattern"
+        )
+    selected = []
+    for match in matches:
+        selected.append([int(match[position - 1]) for position in smarts_atom_ids])
+    return selected
+
+
+def _direct_alignment_rmsd(mol_a, atom_ids_a, mol_b, atom_ids_b):
+    conf_a = mol_a.GetConformer()
+    conf_b = mol_b.GetConformer()
+    squared = 0.0
+    for atom_a, atom_b in zip(atom_ids_a, atom_ids_b):
+        pos_a = conf_a.GetAtomPosition(atom_a)
+        pos_b = conf_b.GetAtomPosition(atom_b)
+        squared += (pos_a.x - pos_b.x) ** 2 + (pos_a.y - pos_b.y) ** 2 + (pos_a.z - pos_b.z) ** 2
+    return math.sqrt(squared / len(atom_ids_a))
+
+
+def _best_smarts_pair_alignment(lig_a_file, lig_a_name, lig_b_file, lig_b_name, query, smarts_atom_ids):
+    mol_a = _load_alignment_mol(lig_a_file)
+    mol_b = _load_alignment_mol(lig_b_file)
+    matches_a = _smarts_match_atom_ids(mol_a, query, smarts_atom_ids, lig_a_name)
+    matches_b = _smarts_match_atom_ids(mol_b, query, smarts_atom_ids, lig_b_name)
+
+    best = None
+    for index_a, atom_ids_a in enumerate(matches_a, start=1):
+        for index_b, atom_ids_b in enumerate(matches_b, start=1):
+            rmsd = _direct_alignment_rmsd(mol_a, atom_ids_a, mol_b, atom_ids_b)
+            if best is None or rmsd < best["selected_rmsd_a"]:
+                best = {
+                    "ligand_a": {
+                        "name": lig_a_name,
+                        "align_atom_ids": [atom_id + 1 for atom_id in atom_ids_a],
+                        "match_index": index_a,
+                    },
+                    "ligand_b": {
+                        "name": lig_b_name,
+                        "align_atom_ids": [atom_id + 1 for atom_id in atom_ids_b],
+                        "match_index": index_b,
+                    },
+                    "selected_rmsd_a": float(rmsd),
+                }
+    return best
+
+
+def generate_smarts_alignments(alignment, plan):
+    if not isinstance(alignment, dict):
+        raise WorkflowConfigError("workflow.alignment must be a mapping")
+    method = alignment.get("method")
+    if method != "smarts":
+        raise WorkflowConfigError("workflow.alignment.method must be 'smarts'")
+    smarts = alignment.get("smarts")
+    if not isinstance(smarts, str) or not smarts.strip():
+        raise WorkflowConfigError("workflow.alignment.smarts must be a non-empty string")
+    query = Chem.MolFromSmarts(smarts)
+    if query is None:
+        raise WorkflowConfigError("workflow.alignment.smarts is not a valid SMARTS pattern")
+
+    smarts_atom_ids = alignment.get("smarts_atom_ids")
+    if not isinstance(smarts_atom_ids, list) or len(smarts_atom_ids) != 3:
+        raise WorkflowConfigError("workflow.alignment.smarts_atom_ids must contain three 1-based atom ids")
+    try:
+        smarts_atom_ids = [int(atom_id) for atom_id in smarts_atom_ids]
+    except (TypeError, ValueError) as exc:
+        raise WorkflowConfigError("workflow.alignment.smarts_atom_ids must contain integers") from exc
+    if any(atom_id < 1 for atom_id in smarts_atom_ids):
+        raise WorkflowConfigError("workflow.alignment.smarts_atom_ids must be 1-based positive atom ids")
+
+    pair_alignments = {}
+    for pair in plan["pairs"]:
+        pair_alignments[pair["jobname"]] = _best_smarts_pair_alignment(
+            pair["lig1_file"],
+            pair["lig1_name"],
+            pair["lig2_file"],
+            pair["lig2_name"],
+            query,
+            smarts_atom_ids,
+        )
+
+    return {
+        "schema_version": 2,
+        "method": "smarts",
+        "smarts": smarts,
+        "smarts_atom_ids": smarts_atom_ids,
+        "pairs": pair_alignments,
+    }
 
 
 def setup_small_molecule_system(receptor_file, lig1_file, lig2_file, ff_json_file, options, setup_options=None):
@@ -357,6 +487,25 @@ def setup_small_molecule_system(receptor_file, lig1_file, lig2_file, ff_json_fil
         setup["hmass"] = options["HMASS"]
     setup.update(setup_options)
     make_system(**setup)
+
+
+def _alignment_atoms_for_pair(alignments, pair_plan, ligand_key):
+    pair_alignments = alignments.get("pairs") if isinstance(alignments, dict) else None
+    if isinstance(pair_alignments, dict):
+        pair_alignment = pair_alignments.get(pair_plan["jobname"])
+        if pair_alignment is None:
+            raise WorkflowConfigError(f"missing pair-specific alignment atoms for pair {pair_plan['jobname']}")
+        ligand_alignment = pair_alignment.get(ligand_key)
+        if not ligand_alignment or "align_atom_ids" not in ligand_alignment:
+            raise WorkflowConfigError(
+                f"missing pair-specific alignment atoms for {ligand_key} in pair {pair_plan['jobname']}"
+            )
+        return ligand_alignment["align_atom_ids"]
+
+    lig_name = pair_plan["lig1_name"] if ligand_key == "ligand_a" else pair_plan["lig2_name"]
+    if lig_name not in alignments:
+        raise WorkflowConfigError(f"missing alignment atoms for ligand {lig_name}")
+    return alignments[lig_name]["align_atom_ids"]
 
 
 def _inferred_frcmod_path(mol2_file):
@@ -687,13 +836,11 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
         if equilibration_protocol is not None:
             options["EQUILIBRATION_PROTOCOL"] = equilibration_protocol
 
-        for lig_name, key in (
-            (pair_plan["lig1_name"], "ALIGN_LIGAND1_REF_ATOMS"),
-            (pair_plan["lig2_name"], "ALIGN_LIGAND2_REF_ATOMS"),
+        for ligand_key, option_key in (
+            ("ligand_a", "ALIGN_LIGAND1_REF_ATOMS"),
+            ("ligand_b", "ALIGN_LIGAND2_REF_ATOMS"),
         ):
-            if lig_name not in alignments:
-                raise WorkflowConfigError(f"missing alignment atoms for ligand {lig_name}")
-            options[key] = [int(i) - 1 for i in alignments[lig_name]["align_atom_ids"]]
+            options[option_key] = [int(i) - 1 for i in _alignment_atoms_for_pair(alignments, pair_plan, ligand_key)]
 
         if not options.get("DISPLACEMENT"):
             options["DISPLACEMENT"] = list(calc_displ_vec(str(receptor_file), str(pair_plan["lig2_file"])))

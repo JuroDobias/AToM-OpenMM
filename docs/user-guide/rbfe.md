@@ -67,7 +67,7 @@ cd $HOME/AToM-OpenMM/examples/RBFE/cdk2
 atom-rbfe workflow.yaml
 ```
 
-`workflow.yaml` contains the receptor, ligand directory, ligand pairs, reference alignment atoms, and the original AToM options under `atom_options`. Relative input paths are resolved from the workflow YAML location. Each ligand pair is expanded into `complexes/<jobname>/`, where the wrapper writes the final per-pair `<jobname>.yaml` used by the existing `rbfe_structprep`, `rbfe_production`, and UWHAM analysis code. If `alignments_out` is set, relative output paths are written under the workflow `workdir`.
+`workflow.yaml` contains the receptor, ligand directory, ligand pairs, alignment atom selection, and the original AToM options under `atom_options`. Relative input paths are resolved from the workflow YAML location. Each ligand pair is expanded into `complexes/<jobname>/`, where the wrapper writes the final per-pair `<jobname>.yaml` used by the existing `rbfe_structprep`, `rbfe_production`, and UWHAM analysis code. If `alignments_out` is set, relative output paths are written under the workflow `workdir`.
 
 Set `prepare_only: true` under `workflow` to create the per-pair directories and final YAML files without starting production.
 
@@ -97,6 +97,27 @@ workflow:
 ```
 
 Pair-specific `external_metadata` is merged over workflow-level metadata and copied unchanged to the pair `result.yaml`.
+
+Alignment atoms can be provided in three ways. Explicit `workflow.alignments` has highest priority and reads an existing alignment YAML file. Existing workflows can continue to use:
+
+```yaml
+workflow:
+  reference_ligand: H1Q
+  reference_alignment_atoms: [14, 21, 18]
+```
+
+For template workflows that should apply to a ligand series, use SMARTS alignment:
+
+```yaml
+workflow:
+  alignment:
+    method: smarts
+    smarts: "[#6]-[#6]-[#6]"
+    smarts_atom_ids: [1, 2, 3]
+  alignments_out: alignments.yaml
+```
+
+`smarts_atom_ids` are 1-based positions inside the SMARTS match, not full ligand atom IDs. The SMARTS is matched to both ligands in each pair. If symmetry creates multiple matches, the wrapper evaluates all match combinations and picks the one with the smallest direct coordinate RMSD over the three selected atoms. No structural alignment is performed during this check; input ligand coordinates are expected to already be aligned.
 
 Setup-time force fields can be selected in `workflow.setup`:
 

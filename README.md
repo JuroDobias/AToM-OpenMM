@@ -86,7 +86,7 @@ While we strive to develop and distribute high-quality and bug-free software, ke
 Single-YAML RBFE quick start
 ----------------------------
 
-Start from [`examples/RBFE/cdk2/workflow.yaml`](examples/RBFE/cdk2/workflow.yaml). It defines the receptor, ligand SDF directory, ligand pairs, reference alignment atoms, force fields, and ATM schedule in one file:
+Start from [`examples/RBFE/cdk2/workflow.yaml`](examples/RBFE/cdk2/workflow.yaml). It defines the receptor, ligand SDF directory, ligand pairs, alignment atom selection, force fields, and ATM schedule in one file:
 
 ```bash
 cd examples/RBFE/cdk2
@@ -94,6 +94,19 @@ atom-rbfe workflow.yaml
 ```
 
 Relative paths are resolved from the workflow file. Results for each pair are written below `workflow.workdir` (the example uses `complexes/`). Use `prepare_only: true` to build the pair directories without running production.
+
+Alignment atoms can be supplied explicitly with `workflow.alignments`, generated from the legacy `reference_ligand` plus `reference_alignment_atoms`, or selected from a SMARTS scaffold:
+
+```yaml
+workflow:
+  alignment:
+    method: smarts
+    smarts: "[#6]-[#6]-[#6]"
+    smarts_atom_ids: [1, 2, 3]
+  alignments_out: alignments.yaml
+```
+
+For SMARTS alignment, `smarts_atom_ids` are 1-based positions inside the SMARTS match. If the SMARTS matches symmetrically, all match combinations are evaluated for each ligand pair and the one with the smallest direct coordinate RMSD is used. No fitting, rotation, or translation is performed; input ligands should already be aligned.
 
 The default production method is the original asynchronous replica exchange implementation. To select experimental NEQTI switching:
 

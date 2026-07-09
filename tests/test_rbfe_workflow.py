@@ -3,6 +3,24 @@ import yaml
 from pathlib import Path
 
 
+def _write_carbon_chain_sdf(path, x_positions):
+    from rdkit import Chem
+
+    mol = Chem.RWMol()
+    for _ in x_positions:
+        mol.AddAtom(Chem.Atom("C"))
+    for index in range(len(x_positions) - 1):
+        mol.AddBond(index, index + 1, Chem.BondType.SINGLE)
+    mol = mol.GetMol()
+    conformer = Chem.Conformer(len(x_positions))
+    for index, x in enumerate(x_positions):
+        conformer.SetAtomPosition(index, (float(x), 0.0, 0.0))
+    mol.AddConformer(conformer)
+    writer = Chem.SDWriter(str(path))
+    writer.write(mol)
+    writer.close()
+
+
 def _write_minimal_workflow(tmp_path):
     receptor_dir = tmp_path / "receptor"
     ligands_dir = tmp_path / "ligands"
@@ -50,6 +68,57 @@ def _write_minimal_workflow(tmp_path):
     config_file = tmp_path / "workflow.yaml"
     config_file.write_text(yaml.dump(workflow))
     return config_file
+
+
+def _test_generate_smarts_alignments_selects_lowest_direct_rmsd_pair(tmp_path):
+    from atom_openmm.rbfe_workflow import generate_smarts_alignments
+
+    ligands_dir = tmp_path / "ligands"
+    ligands_dir.mkdir()
+    lig_a = ligands_dir / "A.sdf"
+    lig_b = ligands_dir / "B.sdf"
+    _write_carbon_chain_sdf(lig_a, [0.0, 1.0, 2.0])
+    _write_carbon_chain_sdf(lig_b, [2.0, 1.0, 0.0])
+    plan = {
+        "pairs": [
+            {
+                "jobname": "test-A-B",
+                "lig1_name": "A",
+                "lig2_name": "B",
+                "lig1_file": lig_a,
+                "lig2_file": lig_b,
+            }
+        ]
+    }
+
+    alignments = generate_smarts_alignments(
+        {"method": "smarts", "smarts": "[#6]-[#6]-[#6]", "smarts_atom_ids": [1, 2, 3]},
+        plan,
+    )
+
+    pair = alignments["pairs"]["test-A-B"]
+    assert alignments["schema_version"] == 2
+    assert pair["ligand_a"]["align_atom_ids"] == [1, 2, 3]
+    assert pair["ligand_b"]["align_atom_ids"] == [3, 2, 1]
+    assert pair["selected_rmsd_a"] == pytest.approx(0.0)
+
+
+def _test_pair_specific_alignments_are_converted_to_zero_based_options():
+    from atom_openmm.rbfe_workflow import _alignment_atoms_for_pair
+
+    pair_plan = {"jobname": "test-A-B", "lig1_name": "A", "lig2_name": "B"}
+    alignments = {
+        "schema_version": 2,
+        "pairs": {
+            "test-A-B": {
+                "ligand_a": {"name": "A", "align_atom_ids": [4, 5, 6]},
+                "ligand_b": {"name": "B", "align_atom_ids": [7, 8, 9]},
+            }
+        },
+    }
+
+    assert [int(i) - 1 for i in _alignment_atoms_for_pair(alignments, pair_plan, "ligand_a")] == [3, 4, 5]
+    assert [int(i) - 1 for i in _alignment_atoms_for_pair(alignments, pair_plan, "ligand_b")] == [6, 7, 8]
 
 
 def _test_load_workflow_config_validates_shape(tmp_path):
