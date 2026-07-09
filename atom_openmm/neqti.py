@@ -652,6 +652,68 @@ def analyze_two_leg_work(work, temperature_kelvin, bootstrap_samples=200, random
     }
 
 
+def summarize_existing_neqti_work(options, neqti_options, paths):
+    work_files = {
+        "leg_a_forward": Path("neqti_leg_a_forward.csv"),
+        "leg_a_reverse": Path("neqti_leg_a_reverse.csv"),
+        "leg_b_forward": Path("neqti_leg_b_forward.csv"),
+        "leg_b_reverse": Path("neqti_leg_b_reverse.csv"),
+    }
+    missing = [str(path) for path in work_files.values() if not path.exists()]
+    bridge_file = Path("neqti_midpoint_bridge.csv")
+    if not bridge_file.exists():
+        missing.append(str(bridge_file))
+    if missing:
+        raise NEQTIConfigError("Missing NEQTI work files: " + ", ".join(missing))
+
+    rows = {name: _read_completed_rows(path) for name, path in work_files.items()}
+    for name, values in rows.items():
+        _write_integrated_work(Path(f"integ_{name}.dat"), values, name)
+    bridge_rows = _read_completed_rows(bridge_file)
+    bridge_forward = [row for row in bridge_rows if row["direction"] == "mplus_to_mminus"]
+    bridge_reverse = [row for row in bridge_rows if row["direction"] == "mminus_to_mplus"]
+    work = {name: [float(row["work_kcal_per_mol"]) for row in values] for name, values in rows.items()}
+    work["bridge_forward"] = [float(row["work_kcal_per_mol"]) for row in bridge_forward]
+    work["bridge_reverse"] = [float(row["work_kcal_per_mol"]) for row in bridge_reverse]
+    states = build_atm_state_parameters(options)
+    temperature_kelvin = states[paths["leg_a_forward"][0]]["temperature"] / kelvin
+    analysis = analyze_two_leg_work(
+        work,
+        temperature_kelvin,
+        bootstrap_samples=neqti_options["bootstrap_samples"],
+        random_seed=neqti_options["random_seed"],
+    )
+    complete = (
+        all(len(values) >= neqti_options["n_snapshots"] for values in rows.values())
+        and len(bridge_forward) >= neqti_options["n_snapshots"]
+        and len(bridge_reverse) >= neqti_options["n_snapshots"]
+    )
+    usable_overlap = analysis is not None and analysis["overlap_score"] >= 0.01
+    summary = {
+        "jobname": options["BASENAME"],
+        "method": "neqti",
+        "status": "completed" if complete and usable_overlap else "partial",
+        "forward_samples": len(rows["leg_a_forward"]) + len(rows["leg_b_forward"]),
+        "reverse_samples": len(rows["leg_a_reverse"]) + len(rows["leg_b_reverse"]),
+        "sample_counts": {name: len(values) for name, values in rows.items()},
+        "bridge_samples": {"forward": len(bridge_forward), "reverse": len(bridge_reverse)},
+        "temperature_kelvin": float(temperature_kelvin),
+        "hamiltonian": "atm_softplus_two_leg",
+        "paths": paths,
+        "settings": neqti_options,
+        "analysis": analysis,
+    }
+    with open("neqti_summary.yaml", "w") as f:
+        yaml.dump(summary, f, default_flow_style=False, sort_keys=False)
+    return summary
+
+
+def analyze_existing_neqti(options, neqti_options=None):
+    if neqti_options is None:
+        neqti_options = normalize_neqti_options({"neqti": {}}, options)
+    return summarize_existing_neqti_work(options, neqti_options, neqti_options["paths"])
+
+
 def _bridge_work(worker, start_state, target_state):
     worker.set_state(start_state)
     old_energy = _potential_kcal(worker)
@@ -869,37 +931,4 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
     finally:
         worker.finish()
 
-    rows = {name: _read_completed_rows(path) for name, path in work_files.items()}
-    for name, values in rows.items():
-        _write_integrated_work(Path(f"integ_{name}.dat"), values, name)
-    bridge_rows = _read_completed_rows(bridge_file)
-    bridge_forward = [row for row in bridge_rows if row["direction"] == "mplus_to_mminus"]
-    bridge_reverse = [row for row in bridge_rows if row["direction"] == "mminus_to_mplus"]
-    work = {name: [float(row["work_kcal_per_mol"]) for row in values] for name, values in rows.items()}
-    work["bridge_forward"] = [float(row["work_kcal_per_mol"]) for row in bridge_forward]
-    work["bridge_reverse"] = [float(row["work_kcal_per_mol"]) for row in bridge_reverse]
-    temperature_kelvin = states["a"]["temperature"] / kelvin
-    analysis = analyze_two_leg_work(
-        work, temperature_kelvin,
-        bootstrap_samples=neqti_options["bootstrap_samples"],
-        random_seed=neqti_options["random_seed"],
-    )
-    complete = all(len(values) >= neqti_options["n_snapshots"] for values in rows.values()) and len(bridge_forward) >= neqti_options["n_snapshots"] and len(bridge_reverse) >= neqti_options["n_snapshots"]
-    usable_overlap = analysis is not None and analysis["overlap_score"] >= 0.01
-    summary = {
-        "jobname": basename,
-        "method": "neqti",
-        "status": "completed" if complete and usable_overlap else "partial",
-        "forward_samples": len(rows["leg_a_forward"]) + len(rows["leg_b_forward"]),
-        "reverse_samples": len(rows["leg_a_reverse"]) + len(rows["leg_b_reverse"]),
-        "sample_counts": {name: len(values) for name, values in rows.items()},
-        "bridge_samples": {"forward": len(bridge_forward), "reverse": len(bridge_reverse)},
-        "temperature_kelvin": float(temperature_kelvin),
-        "hamiltonian": "atm_softplus_two_leg",
-        "paths": paths,
-        "settings": neqti_options,
-        "analysis": analysis,
-    }
-    with open("neqti_summary.yaml", "w") as f:
-        yaml.dump(summary, f, default_flow_style=False, sort_keys=False)
-    return summary
+    return summarize_existing_neqti_work(options, neqti_options, paths)

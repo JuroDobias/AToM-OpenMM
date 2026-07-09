@@ -66,6 +66,95 @@ def _test_load_workflow_config_validates_shape(tmp_path):
     assert plan["pairs"][0]["lig2_file"] == (tmp_path / "ligands" / "H1R.sdf").resolve()
 
 
+def _test_object_pairs_external_metadata_and_ligand_mapping(tmp_path):
+    from atom_openmm.rbfe_workflow import build_small_molecule_plan, load_workflow_config
+
+    receptor = tmp_path / "receptor.pdb"
+    mapped_dir = tmp_path / "mapped"
+    mapped_dir.mkdir()
+    ligand_a = mapped_dir / "A.sdf"
+    ligand_b = mapped_dir / "B.sdf"
+    receptor.write_text("RECEPTOR\n")
+    ligand_a.write_text("A\n")
+    ligand_b.write_text("B\n")
+    workflow = {
+        "workflow": {
+            "type": "rbfe",
+            "receptor": "receptor.pdb",
+            "workdir": "run",
+            "external_metadata": {"graph_id": 12, "edge_id": 1},
+            "ligands": {"A": "mapped/A.sdf", "B": str(ligand_b)},
+            "pairs": [
+                {
+                    "ligands": ["A", "B"],
+                    "external_metadata": {"edge_id": 44, "source_microstate_a_id": 101},
+                }
+            ],
+            "alignments": "alignments.yaml",
+        },
+        "atom_options": {"MAX_SAMPLES": 1},
+    }
+    (tmp_path / "alignments.yaml").write_text("A:\n  align_atom_ids: [1, 2, 3]\nB:\n  align_atom_ids: [1, 2, 3]\n")
+    config_file = tmp_path / "workflow.yaml"
+    config_file.write_text(yaml.dump(workflow))
+
+    plan = build_small_molecule_plan(load_workflow_config(config_file))
+    pair = plan["pairs"][0]
+
+    assert pair["lig1_file"] == ligand_a.resolve()
+    assert pair["lig2_file"] == ligand_b.resolve()
+    assert pair["external_metadata"] == {
+        "graph_id": 12,
+        "edge_id": 44,
+        "source_microstate_a_id": 101,
+    }
+
+
+def _test_validate_and_plan_only_do_not_create_workdirs(tmp_path, capsys):
+    from atom_openmm import rbfe_workflow
+
+    config_file = _write_minimal_workflow(tmp_path)
+    monkeypatch_target = {
+        "H1Q": {"align_atom_ids": [1, 2, 3], "N_atoms": 3},
+        "H1R": {"align_atom_ids": [1, 2, 3], "N_atoms": 3},
+    }
+
+    original = rbfe_workflow.get_alignment_atoms
+    rbfe_workflow.get_alignment_atoms = lambda ref_lig_file, ref_atoms, lig_files: monkeypatch_target
+    try:
+        assert rbfe_workflow.main(["--validate", str(config_file)]) == 0
+        capsys.readouterr()
+        assert not (tmp_path / "complexes").exists()
+        assert not (tmp_path / "ligands" / "alignments.yaml").exists()
+
+        assert rbfe_workflow.main(["--plan-only", str(config_file)]) == 0
+        output = capsys.readouterr().out
+        plan = yaml.safe_load(output)
+    finally:
+        rbfe_workflow.get_alignment_atoms = original
+
+    assert plan["schema_version"] == 1
+    assert plan["tool"] == "atom_openmm_rbfe"
+    assert plan["pairs"][0]["jobname"] == "cdk2-H1Q-H1R"
+    assert plan["pairs"][0]["expected_result"].endswith("/complexes/cdk2-H1Q-H1R/result.yaml")
+    assert not (tmp_path / "complexes").exists()
+
+
+def _test_analyze_only_missing_outputs_writes_failed_result(tmp_path):
+    from atom_openmm import rbfe_workflow
+
+    config_file = _write_minimal_workflow(tmp_path)
+
+    assert rbfe_workflow.main(["--analyze-only", str(config_file)]) == 1
+
+    result_path = tmp_path / "complexes" / "cdk2-H1Q-H1R" / "result.yaml"
+    result = yaml.safe_load(result_path.read_text())
+    assert result["status"] == "failed"
+    assert result["error"]["stage"] == "analysis"
+    assert result["error"]["type"] == "WorkflowConfigError"
+    assert "prepared pair YAML does not exist" in result["error"]["message"]
+
+
 def _test_prepare_only_writes_final_pair_yaml(tmp_path, monkeypatch):
     from atom_openmm import rbfe_workflow
 
@@ -138,6 +227,9 @@ def _test_prepare_only_writes_final_pair_yaml(tmp_path, monkeypatch):
     assert machine_result["schema_version"] == 1
     assert machine_result["status"] == "prepared"
     assert machine_result["method"] == "async_re"
+    assert machine_result["convention"]["edge_direction"] == "ligand_a_to_ligand_b"
+    assert machine_result["external_metadata"] == {}
+    assert machine_result["progress"]["stage"] == "prepared"
     assert machine_result["inputs"]["workflow_yaml"] == str(config_file.resolve())
     assert machine_result["artifacts"]["prepared_complex"] == "cdk2-H1Q-H1R.pdb"
 

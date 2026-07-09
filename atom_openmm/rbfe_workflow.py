@@ -1,6 +1,7 @@
 import argparse
 import os
 import subprocess
+import sys
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
@@ -177,8 +178,12 @@ def load_workflow_config(config_file):
     if not isinstance(pairs, list) or not pairs:
         raise WorkflowConfigError("workflow.pairs must be a non-empty list")
     for pair in pairs:
-        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
-            raise WorkflowConfigError("each workflow.pairs entry must contain two ligand names")
+        _normalize_pair_entry(pair)
+
+    if "external_metadata" in workflow and not isinstance(workflow["external_metadata"], dict):
+        raise WorkflowConfigError("workflow.external_metadata must be a mapping")
+    if "ligands" in workflow and not isinstance(workflow["ligands"], dict):
+        raise WorkflowConfigError("workflow.ligands must be a mapping")
 
     return {
         "config_path": config_path,
@@ -188,10 +193,28 @@ def load_workflow_config(config_file):
     }
 
 
-def _ligand_path(ligand, ligands_dir):
-    candidate = Path(ligand)
+def _normalize_pair_entry(pair):
+    if isinstance(pair, dict):
+        ligands = pair.get("ligands")
+        if not isinstance(ligands, (list, tuple)) or len(ligands) != 2:
+            raise WorkflowConfigError("object workflow.pairs entries must contain ligands: [ligand_a, ligand_b]")
+        metadata = pair.get("external_metadata", {})
+        if metadata is None:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            raise WorkflowConfigError("pair external_metadata must be a mapping")
+        return ligands[0], ligands[1], metadata
+    if isinstance(pair, (list, tuple)) and len(pair) == 2:
+        return pair[0], pair[1], {}
+    raise WorkflowConfigError("each workflow.pairs entry must contain two ligand names")
+
+
+def _ligand_path(ligand, ligands_dir, ligand_map=None, base_dir=None):
+    candidate = Path(str(ligand))
     if candidate.suffix:
         return _resolve_path(candidate, ligands_dir)
+    if ligand_map and str(ligand) in ligand_map:
+        return _resolve_path(ligand_map[str(ligand)], base_dir or ligands_dir)
     return (ligands_dir / f"{ligand}.sdf").resolve()
 
 
@@ -219,16 +242,22 @@ def build_small_molecule_plan(config):
 
     workdir = _resolve_path(workflow.get("workdir", "complexes"), base_dir)
     job_prefix = workflow.get("job_prefix", receptor_file.stem)
+    ligand_map = workflow.get("ligands", {}) or {}
+    global_metadata = workflow.get("external_metadata", {}) or {}
 
     pair_plans = []
-    for pair in workflow["pairs"]:
-        lig1_name = _ligand_name(pair[0])
-        lig2_name = _ligand_name(pair[1])
-        lig1_file = _ligand_path(pair[0], ligands_dir)
-        lig2_file = _ligand_path(pair[1], ligands_dir)
+    total_pairs = len(workflow["pairs"])
+    for index, pair in enumerate(workflow["pairs"], start=1):
+        lig1, lig2, pair_metadata = _normalize_pair_entry(pair)
+        lig1_name = _ligand_name(lig1)
+        lig2_name = _ligand_name(lig2)
+        lig1_file = _ligand_path(lig1, ligands_dir, ligand_map, base_dir)
+        lig2_file = _ligand_path(lig2, ligands_dir, ligand_map, base_dir)
         _validate_file(lig1_file, f"ligand {lig1_name}")
         _validate_file(lig2_file, f"ligand {lig2_name}")
         jobname = f"{job_prefix}-{lig1_name}-{lig2_name}"
+        external_metadata = deepcopy(global_metadata)
+        external_metadata.update(pair_metadata)
         pair_plans.append(
             {
                 "jobname": jobname,
@@ -237,6 +266,9 @@ def build_small_molecule_plan(config):
                 "lig1_file": lig1_file,
                 "lig2_file": lig2_file,
                 "jobdir": workdir / jobname,
+                "external_metadata": external_metadata,
+                "pair_index": index,
+                "total_pairs": total_pairs,
             }
         )
 
@@ -248,7 +280,30 @@ def build_small_molecule_plan(config):
     }
 
 
-def load_or_generate_alignments(workflow, plan):
+def build_execution_plan(config):
+    plan = build_small_molecule_plan(config)
+    return {
+        "schema_version": 1,
+        "tool": "atom_openmm_rbfe",
+        "workflow_yaml": str(config["config_path"]),
+        "workdir": str(plan["workdir"]),
+        "pairs": [
+            {
+                "jobname": pair["jobname"],
+                "ligand_a": pair["lig1_name"],
+                "ligand_b": pair["lig2_name"],
+                "ligand_a_file": str(pair["lig1_file"]),
+                "ligand_b_file": str(pair["lig2_file"]),
+                "pair_workdir": str(pair["jobdir"].resolve()),
+                "expected_result": str((pair["jobdir"] / "result.yaml").resolve()),
+                "external_metadata": pair.get("external_metadata") or {},
+            }
+            for pair in plan["pairs"]
+        ],
+    }
+
+
+def load_or_generate_alignments(workflow, plan, write_generated=True):
     if workflow.get("alignments"):
         alignments_file = _resolve_path(workflow["alignments"], plan["ligands_dir"])
         _validate_file(alignments_file, "workflow.alignments")
@@ -271,7 +326,7 @@ def load_or_generate_alignments(workflow, plan):
     alignments = get_alignment_atoms(str(ref_lig_file), [int(i) for i in ref_atoms], [str(p) for p in lig_files])
 
     alignments_out = workflow.get("alignments_out")
-    if alignments_out:
+    if write_generated and alignments_out:
         alignments_out = _resolve_path(alignments_out, plan["workdir"])
         alignments_out.parent.mkdir(parents=True, exist_ok=True)
         with open(alignments_out, "w") as f:
@@ -617,9 +672,11 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
         workflow_yaml=workflow_yaml or (Path.cwd() / "workflow.yaml"),
         method=production_method,
         requested_samples=requested_samples,
+        pair_index=pair_plan.get("pair_index", 1),
+        total_pairs=pair_plan.get("total_pairs", 1),
     )
     stage = "setup"
-    result_writer.update("running")
+    result_writer.update("running", stage=stage)
     try:
         if production_method == "neqti":
             options["STRUCTPREP_MODE"] = "physical_only"
@@ -649,6 +706,7 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
         result_writer.update(
             "failed",
             error={"type": type(exc).__name__, "message": str(exc), "stage": stage},
+            stage=stage,
         )
         raise
 
@@ -669,30 +727,32 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
             create_vmd_infile(options)
 
             if workflow.get("prepare_only", False) or not workflow.get("run", True):
-                result_writer.update("prepared")
+                result_writer.update("prepared", stage="prepared")
                 return {"jobname": options["BASENAME"], "status": "prepared", "workdir": options["WORKDIR"]}
 
             stage = "preparation"
             prep_state = options["BASENAME"] + ("_equil.xml" if production_method == "neqti" else "_0.xml")
             if not Path(prep_state).exists():
+                result_writer.update("running", stage=stage)
                 rbfe_structprep(config_file=None, options=options)
-            result_writer.update("prepared")
+            result_writer.update("prepared", stage=stage)
 
             stage = "production"
-            result_writer.update("running")
+            result_writer.update("running", stage=stage)
 
             def record_neqti_progress(summary):
-                result_writer.update("partial", analysis=summary)
+                result_writer.update("partial", analysis=summary, stage=stage)
 
             production_result = run_production(options, workflow, progress_callback=record_neqti_progress)
             if production_result is not None:
                 final_status = production_result.get("status", "completed")
                 warning = None if production_result.get("analysis") else "No finite NEQTI estimate is available."
-                result_writer.update(final_status, analysis=production_result, warning=warning)
+                result_writer.update(final_status, analysis=production_result, warning=warning, stage=stage)
                 return {"workdir": options["WORKDIR"], **production_result}
 
             if production_method == "async_re" and workflow.get("analyze", True):
                 stage = "analysis"
+                result_writer.update("running", stage=stage)
                 analysis = analyze_pair(options, workflow)
                 raw_samples = production_sample_count(options)
                 reached_target = (
@@ -701,7 +761,7 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
                 )
                 final_status = "completed" if reached_target else "partial"
                 warning = None if analysis is not None else "No finite UWHAM estimate is available."
-                result_writer.update(final_status, analysis=analysis, warning=warning)
+                result_writer.update(final_status, analysis=analysis, warning=warning, stage=stage)
                 if analysis is not None:
                     return {"status": "analyzed", "workdir": options["WORKDIR"], **analysis}
             else:
@@ -712,6 +772,7 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
                 result_writer.update(
                     "completed" if reached_target else "partial",
                     warning="Analysis is disabled; no free-energy estimate is available.",
+                    stage=stage,
                 )
 
             return {"jobname": options["BASENAME"], "status": "completed", "workdir": options["WORKDIR"]}
@@ -719,15 +780,98 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
         result_writer.update(
             "failed",
             error={"type": type(exc).__name__, "message": str(exc), "stage": stage},
+            stage=stage,
+        )
+        raise
+
+
+def _prepare_run_context(config_file):
+    config = load_workflow_config(config_file)
+    plan = build_small_molecule_plan(config)
+    setup_options = normalize_setup_options(config["workflow"], config["atom_options"])
+    alignments = load_or_generate_alignments(config["workflow"], plan)
+    return config, plan, setup_options, alignments
+
+
+def validate_workflow(config_file):
+    config = load_workflow_config(config_file)
+    plan = build_small_molecule_plan(config)
+    normalize_setup_options(config["workflow"], config["atom_options"])
+    load_or_generate_alignments(config["workflow"], plan, write_generated=False)
+    return True
+
+
+def plan_workflow(config_file):
+    config = load_workflow_config(config_file)
+    # Build alignments too so --plan-only catches missing alignment inputs.
+    plan = build_small_molecule_plan(config)
+    load_or_generate_alignments(config["workflow"], plan, write_generated=False)
+    normalize_setup_options(config["workflow"], config["atom_options"])
+    return build_execution_plan(config)
+
+
+def _load_pair_options(pair_plan):
+    pair_yaml = pair_plan["jobdir"] / f"{pair_plan['jobname']}.yaml"
+    if not pair_yaml.exists():
+        raise WorkflowConfigError(f"prepared pair YAML does not exist: {pair_yaml}")
+    with open(pair_yaml) as handle:
+        return yaml.safe_load(handle)
+
+
+def analyze_neqti_existing(options, workflow):
+    from atom_openmm.neqti import analyze_existing_neqti, normalize_neqti_options
+
+    neqti_options = normalize_neqti_options(workflow, options)
+    return analyze_existing_neqti(options, neqti_options)
+
+
+def analyze_pair_existing(pair_plan, workflow, atom_options, receptor_file, workflow_yaml=None):
+    production_method = workflow.get("production_method", "async_re")
+    requested_samples = (
+        (workflow.get("neqti") or {}).get("n_snapshots", atom_options.get("MAX_SAMPLES", 1))
+        if production_method == "neqti"
+        else atom_options.get("MAX_SAMPLES")
+    )
+    result_writer = RBFEResultWriter(
+        pair_plan=pair_plan,
+        receptor_file=receptor_file,
+        workflow_yaml=workflow_yaml or (Path.cwd() / "workflow.yaml"),
+        method=production_method,
+        requested_samples=requested_samples,
+        pair_index=pair_plan.get("pair_index", 1),
+        total_pairs=pair_plan.get("total_pairs", 1),
+    )
+    stage = "analysis"
+    result_writer.update("running", stage=stage)
+    try:
+        with _pushd(pair_plan["jobdir"]):
+            options = _load_pair_options(pair_plan)
+            if production_method == "neqti":
+                analysis = analyze_neqti_existing(options, workflow)
+                status = analysis.get("status", "completed")
+                result_writer.update(status, analysis=analysis, stage=stage)
+                return {"workdir": options["WORKDIR"], **analysis}
+            analysis = analyze_pair(options, workflow)
+            if analysis is None:
+                raise WorkflowConfigError("No async-RE production samples are available for analysis")
+            raw_samples = production_sample_count(options)
+            reached_target = raw_samples is not None and (
+                requested_samples is None or raw_samples >= int(requested_samples)
+            )
+            final_status = "completed" if reached_target else "partial"
+            result_writer.update(final_status, analysis=analysis, stage=stage)
+            return {"status": final_status, "workdir": options["WORKDIR"], **analysis}
+    except (Exception, KeyboardInterrupt) as exc:
+        result_writer.update(
+            "failed",
+            error={"type": type(exc).__name__, "message": str(exc), "stage": stage},
+            stage=stage,
         )
         raise
 
 
 def run_rbfe_workflow(config_file):
-    config = load_workflow_config(config_file)
-    plan = build_small_molecule_plan(config)
-    setup_options = normalize_setup_options(config["workflow"], config["atom_options"])
-    alignments = load_or_generate_alignments(config["workflow"], plan)
+    config, plan, setup_options, alignments = _prepare_run_context(config_file)
     results = []
     for pair_plan in plan["pairs"]:
         results.append(
@@ -744,17 +888,53 @@ def run_rbfe_workflow(config_file):
     return results
 
 
+def analyze_existing_workflow(config_file):
+    config = load_workflow_config(config_file)
+    plan = build_small_molecule_plan(config)
+    results = []
+    for pair_plan in plan["pairs"]:
+        results.append(
+            analyze_pair_existing(
+                pair_plan,
+                config["workflow"],
+                config["atom_options"],
+                plan["receptor_file"],
+                config["config_path"],
+            )
+        )
+    return results
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Run an AToM-OpenMM RBFE workflow from one YAML file.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--validate", action="store_true", help="validate workflow inputs without creating outputs")
+    mode.add_argument("--plan-only", action="store_true", help="print a machine-readable execution plan without creating outputs")
+    mode.add_argument("--analyze-only", action="store_true", help="reanalyze existing pair outputs without running setup or simulation")
     parser.add_argument("workflow_yaml", help="High-level RBFE workflow YAML file")
     args = parser.parse_args(argv)
-    results = run_rbfe_workflow(args.workflow_yaml)
+    try:
+        if args.validate:
+            validate_workflow(args.workflow_yaml)
+            print("valid")
+            return 0
+        if args.plan_only:
+            yaml.safe_dump(plan_workflow(args.workflow_yaml), sys.stdout, sort_keys=False)
+            return 0
+        if args.analyze_only:
+            results = analyze_existing_workflow(args.workflow_yaml)
+        else:
+            results = run_rbfe_workflow(args.workflow_yaml)
+    except Exception as exc:
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
     for result in results:
         line = f"{result['jobname']}: {result['status']} in {result['workdir']}"
         if result.get("ddg") is not None:
             line += f" DG = {result['ddg']:8.3f} +/- {result['ddg_std']:8.3f} kcal/mol"
         print(line)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -20,6 +20,7 @@ def _writer(tmp_path, method="async_re", requested_samples=10):
             "lig2_name": "B",
             "lig1_file": ligand_a,
             "lig2_file": ligand_b,
+            "external_metadata": {"edge_id": 44},
         },
         receptor_file=receptor,
         workflow_yaml=workflow,
@@ -45,6 +46,9 @@ def _test_async_result_schema_and_unit_conversion(tmp_path):
     assert result["tool"] == "atom_openmm_rbfe"
     assert result["status"] == "completed"
     assert result["method"] == "async_re"
+    assert result["convention"]["edge_direction"] == "ligand_a_to_ligand_b"
+    assert result["convention"]["ddg_definition"] == "G(ligand_b) - G(ligand_a)"
+    assert result["external_metadata"] == {"edge_id": 44}
     assert result["result"]["estimator"] == "UWHAM"
     assert result["result"]["ddg_kj_per_mol"] == -1.23 * 4.184
     assert result["result"]["ddg_error_kj_per_mol"] == 0.31 * 4.184
@@ -52,7 +56,12 @@ def _test_async_result_schema_and_unit_conversion(tmp_path):
     assert result["result"]["samples_forward"] is None
     assert result["quality"]["convergence_status"] == "usable"
     assert result["artifacts"]["prepared_complex"] == "pair-A-B.pdb"
+    assert "endpoint_a" in result["artifacts"]
+    assert result["artifacts"]["endpoint_a"] is None
     assert result["artifacts"]["plot"] == "pair-A-B.png"
+    assert result["progress"]["stage"] == "completed"
+    assert result["progress"]["current_pair_index"] == 1
+    assert result["progress"]["total_pairs"] == 1
     assert not writer.path.with_suffix(".yaml.tmp").exists()
 
 
@@ -76,6 +85,10 @@ def _test_neqti_partial_result_and_missing_uncertainty(tmp_path):
     assert result["result"]["samples_reverse"] == 3
     assert result["result"]["samples_per_replica"] is None
     assert result["quality"]["convergence_status"] == "partial"
+    assert result["progress"]["forward_samples"] == 10
+    assert result["progress"]["reverse_samples"] == 3
+    assert result["progress"]["target_forward_samples"] == 10
+    assert result["progress"]["target_reverse_samples"] == 10
     assert "Free-energy uncertainty is unavailable." in result["quality"]["warnings"]
     assert "Sampling or overlap quality requirements were not met." in result["quality"]["warnings"]
 

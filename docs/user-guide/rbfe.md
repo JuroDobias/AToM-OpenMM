@@ -71,6 +71,33 @@ atom-rbfe workflow.yaml
 
 Set `prepare_only: true` under `workflow` to create the per-pair directories and final YAML files without starting production.
 
+Preflight modes are available for workflow managers and batch systems:
+
+```bash
+atom-rbfe --validate workflow.yaml
+atom-rbfe --plan-only workflow.yaml
+atom-rbfe --analyze-only workflow.yaml
+```
+
+`--validate` resolves inputs and alignment settings without creating pair directories. `--plan-only` prints a YAML execution plan with resolved ligand files, expected pair workdirs, expected `result.yaml` paths, and external metadata. `--analyze-only` reuses existing pair outputs to refresh `result.yaml` without running setup or simulation.
+
+Workflows may also use explicit ligand file mappings and opaque external metadata:
+
+```yaml
+workflow:
+  ligands:
+    H1Q: /abs/path/H1Q.sdf
+    H1R: relative/path/H1R.sdf
+  external_metadata:
+    graph_id: 12
+  pairs:
+    - ligands: [H1Q, H1R]
+      external_metadata:
+        edge_id: 44
+```
+
+Pair-specific `external_metadata` is merged over workflow-level metadata and copied unchanged to the pair `result.yaml`.
+
 Setup-time force fields can be selected in `workflow.setup`:
 
 ```yaml
@@ -258,6 +285,11 @@ method: neqti
 ligand_a: H1Q
 ligand_b: H1R
 workdir: /abs/path/to/cdk2-H1Q-H1R
+convention:
+  edge_direction: ligand_a_to_ligand_b
+  ddg_definition: G(ligand_b) - G(ligand_a)
+  positive_value_meaning: ligand_b binds weaker than ligand_a
+external_metadata: {}
 result:
   ddg_kcal_per_mol: -1.23
   ddg_error_kcal_per_mol: 0.31
@@ -299,6 +331,15 @@ artifacts:
   async_re_log: null
   async_re_replica_output_pattern: null
   plot: null
+progress:
+  stage: production
+  current_pair_index: 1
+  total_pairs: 1
+  forward_samples: 50
+  reverse_samples: 50
+  target_forward_samples: 50
+  target_reverse_samples: 50
+  last_update: '2026-07-09T12:00:00Z'
 ```
 
 For asynchronous replica exchange, `estimator` is `UWHAM`, `samples_per_replica` is populated, and the forward/reverse sample fields are null. For NEQTI, `estimator` is `BAR`, the forward/reverse fields are populated, and `samples_per_replica` is null.
