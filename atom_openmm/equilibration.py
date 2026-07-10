@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 import xml.etree.ElementTree as ET
 from copy import deepcopy
@@ -260,6 +261,25 @@ def _set_barostat(system, step_cfg):
         system.addForce(mm.MonteCarloBarostat(pressure, temperature_k * kelvin, frequency))
 
 
+def _step_restraint_label(step_cfg):
+    if "positional_restraints" not in step_cfg:
+        return "none"
+    cfg = step_cfg["positional_restraints"]
+    return (
+        f"mask={cfg['mask']!r}, k={float(cfg['k_kcal_mol_a2']):g} kcal/mol/A^2, "
+        f"tolerance={float(cfg.get('tolerance_a', 0.0)):g} A"
+    )
+
+
+def _step_barostat_label(step_cfg):
+    if str(step_cfg.get("ensemble", "NVT")).upper() != "NPT":
+        return "disabled"
+    cfg = step_cfg.get("barostat") or {}
+    pressure = float(cfg.get("pressure_bar", 1.0))
+    frequency = int(cfg.get("frequency", 25))
+    return f"enabled, pressure={pressure:g} bar, frequency={frequency}"
+
+
 def _step_id(step_cfg, index):
     step_id = step_cfg.get("id", f"step_{index}")
     if not isinstance(step_id, str) or not step_id:
@@ -343,7 +363,9 @@ def run_custom_equilibration(
     final_pdb_path: str | Path,
     initial_state_path: str | Path | None = None,
     atm_state: dict[str, Any] | None = None,
+    logger=None,
 ):
+    logger = logger or logging.getLogger("atom_openmm.equilibration")
     if not steps:
         raise EquilibrationConfigError("Custom equilibration requires at least one step")
     for i, step in enumerate(steps):
@@ -357,7 +379,7 @@ def run_custom_equilibration(
     default_temperature = getattr(ommsystem, "temperature", 300.0 * kelvin)
     manifest = {"steps": {}}
 
-    print(f"Running custom equilibration protocol in {output_dir} ({len(steps)} steps)")
+    logger.info("Running custom equilibration protocol in %s (%d steps)", output_dir, len(steps))
     for i, step_cfg in enumerate(steps):
         step_id = _step_id(step_cfg, i)
         step_dir = output_dir / step_id
@@ -366,7 +388,13 @@ def run_custom_equilibration(
             input_label = "initial positions"
         else:
             input_label = str(prev_state_path)
-        print(f"[equilibration {step_id}] starting step {i + 1}/{len(steps)} from {input_label}")
+        logger.info(
+            "Custom equilibration step %d/%d %s: starting from %s",
+            i + 1,
+            len(steps),
+            step_id,
+            input_label,
+        )
 
         step_system = _clone_system(ommsystem.system)
         reference_positions = _state_positions(prev_state_path) if prev_state_path and prev_state_path.exists() else base_positions
@@ -395,7 +423,15 @@ def run_custom_equilibration(
 
         wall_start = time.perf_counter()
         if step_cfg["type"] == "minimization":
-            print(f"[equilibration {step_id}] minimization")
+            logger.info(
+                "Custom equilibration step %d/%d %s: minimization, tolerance=%g kJ/mol/nm, max_iterations=%d, restraints=%s",
+                i + 1,
+                len(steps),
+                step_id,
+                float(step_cfg.get("tolerance_kj_mol_nm", 10.0)),
+                int(step_cfg.get("max_iterations", 0)),
+                _step_restraint_label(step_cfg),
+            )
             simulation.minimizeEnergy(
                 tolerance=float(step_cfg.get("tolerance_kj_mol_nm", 10.0)) * kilojoule_per_mole / nanometer,
                 maxIterations=int(step_cfg.get("max_iterations", 0)),
@@ -405,17 +441,38 @@ def run_custom_equilibration(
             completed_steps = int(step_cfg["n_steps"])
             timestep_ps = float(step_cfg.get("timestep_ps", 0.002))
             ensemble = str(step_cfg.get("ensemble", "NVT")).upper()
-            print(f"[equilibration {step_id}] {ensemble} MD {completed_steps} steps at {timestep_ps:g} ps/step")
+            logger.info(
+                "Custom equilibration step %d/%d %s: %s MD, steps=%d, timestep=%g ps, restraints=%s, barostat=%s",
+                i + 1,
+                len(steps),
+                step_id,
+                ensemble,
+                completed_steps,
+                timestep_ps,
+                _step_restraint_label(step_cfg),
+                _step_barostat_label(step_cfg),
+            )
             simulation.step(completed_steps)
+            logger.info("Custom equilibration step %d/%d %s: MD integration finished", i + 1, len(steps), step_id)
 
         step_state_path = step_dir / "final_state.xml"
         step_pdb_path = step_dir / "final_state.pdb"
+        logger.info("Custom equilibration step %d/%d %s: saving XML state to %s", i + 1, len(steps), step_id, step_state_path)
         simulation.saveState(str(step_state_path))
         _strip_integrator_parameters(step_state_path)
+        logger.info("Custom equilibration step %d/%d %s: writing PDB to %s", i + 1, len(steps), step_id, step_pdb_path)
         _save_final_pdb(simulation, step_pdb_path)
         if atm_state is not None:
+            swapped_path = step_dir / "final_state_swapped.pdb"
+            logger.info(
+                "Custom equilibration step %d/%d %s: writing swapped PDB to %s",
+                i + 1,
+                len(steps),
+                step_id,
+                swapped_path,
+            )
             positions = simulation.context.getState(getPositions=True).getPositions()
-            write_atm_swapped_pdb(simulation.topology, positions, ommsystem.keywords, step_dir / "final_state_swapped.pdb")
+            write_atm_swapped_pdb(simulation.topology, positions, ommsystem.keywords, swapped_path)
         wall_seconds = time.perf_counter() - wall_start
         manifest["steps"][step_id] = {
             "type": step_cfg["type"],
@@ -428,12 +485,24 @@ def run_custom_equilibration(
         if step_cfg["type"] == "md" and wall_seconds > 0.0:
             ns_per_day = completed_steps * timestep_ps * 86.4 / wall_seconds
             manifest["steps"][step_id]["ns_per_day"] = ns_per_day
-            print(
-                f"[equilibration {step_id}] completed in {wall_seconds:.2f}s "
-                f"({ns_per_day:.3f} ns/day) -> {step_state_path}"
+            logger.info(
+                "Custom equilibration step %d/%d %s: completed in %.2f s, %.3f ns/day -> %s",
+                i + 1,
+                len(steps),
+                step_id,
+                wall_seconds,
+                ns_per_day,
+                step_state_path,
             )
         else:
-            print(f"[equilibration {step_id}] completed in {wall_seconds:.2f}s -> {step_state_path}")
+            logger.info(
+                "Custom equilibration step %d/%d %s: completed in %.2f s -> %s",
+                i + 1,
+                len(steps),
+                step_id,
+                wall_seconds,
+                step_state_path,
+            )
         with open(output_dir / "manifest.json", "w") as handle:
             json.dump(manifest, handle, indent=2)
         prev_state_path = step_state_path
@@ -450,5 +519,5 @@ def run_custom_equilibration(
         final_pdb_path=final_pdb_path,
         atm_state=atm_state,
     )
-    print(f"Custom equilibration protocol complete: {final_state_path}")
+    logger.info("Custom equilibration protocol complete: state=%s, pdb=%s", final_state_path, final_pdb_path)
     return {"final_state": str(final_state_path), "final_pdb": str(final_pdb_path), "steps": manifest["steps"]}

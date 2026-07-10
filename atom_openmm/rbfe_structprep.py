@@ -222,6 +222,7 @@ def do_custom_mintherm(keywords, logger, steps):
         output_dir=Path("equilibration") / "pre_atm",
         final_state_path=basename + "_equil.xml",
         final_pdb_path=basename + "_equil.pdb",
+        logger=logger,
     )
 
 def do_lambda_annealing(keywords, logger):
@@ -474,6 +475,7 @@ def do_custom_equil(keywords, logger, steps):
         final_pdb_path=basename + "_0.pdb",
         initial_state_path=basename + "_mdlambda.xml",
         atm_state=_midpoint_atm_state(),
+        logger=logger,
     )
 
 def massage_keywords(keywords, restrain_solutes = True):

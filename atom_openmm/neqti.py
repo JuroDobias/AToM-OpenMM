@@ -765,7 +765,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
 
     basename = options["BASENAME"]
     logger = logging.getLogger("atom_openmm.neqti")
-    if not logger.handlers:
+    if not logger.hasHandlers():
         logging.basicConfig(level=logging.INFO)
 
     protocol_signature = _initialize_protocol_manifest(neqti_options, neqti_options["resume"])
@@ -848,6 +848,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                     final_pdb_path="neqti_midpoint.pdb",
                     initial_state_path=midpoint_source,
                     atm_state=states["m"],
+                    logger=logger,
                 )
                 logger.info("Completed NEQTI midpoint equilibration")
             else:
@@ -908,6 +909,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                         final_pdb_path={"a": "neqti_endpoint_A.pdb", "b": "neqti_endpoint_B.pdb"}[name],
                         initial_state_path=endpoint_sources[name],
                         atm_state=states[name],
+                        logger=logger,
                     )
                     logger.info("Completed NEQTI %s equilibration", name)
             marker.write_text(protocol_signature + "\n")

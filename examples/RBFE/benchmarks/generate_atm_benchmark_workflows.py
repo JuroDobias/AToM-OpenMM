@@ -161,7 +161,10 @@ BENCHMARK_V1_EQUILIBRATION = {
                     "n_steps": 500000,
                     "timestep_ps": 0.002,
                     "thermostat": {"temperature_k": 300.0, "friction_per_ps": 1.0},
-                    "reporters": {"state": {"interval": 5000}},
+                    "reporters": {
+                        "state": {"interval": 5000},
+                        "traj": {"format": "xtc", "interval": 5000},
+                    },
                 },
             ]
         }
