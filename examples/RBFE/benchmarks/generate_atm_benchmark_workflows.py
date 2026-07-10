@@ -448,7 +448,7 @@ def generate_workflows(
     outdir,
     default_alignment_atoms=None,
     pairs_filter=None,
-    link_mode="symlink",
+    link_mode="copy",
     conda_sh="$HOME/miniconda3/etc/profile.d/conda.sh",
     conda_env="myatom",
     slurm_gres="gpu:nvidia_L40S:1",
@@ -541,7 +541,7 @@ def parse_args(argv=None):
         nargs="*",
         help="optional filters like system:ligA:ligB or ligA:ligB",
     )
-    parser.add_argument("--link-mode", choices=["symlink", "copy"], default="symlink")
+    parser.add_argument("--link-mode", choices=["symlink", "copy"], default="copy")
     parser.add_argument("--conda-sh", default="$HOME/miniconda3/etc/profile.d/conda.sh")
     parser.add_argument("--conda-env", default="myatom")
     parser.add_argument("--slurm-gres", default="gpu:nvidia_L40S:1")

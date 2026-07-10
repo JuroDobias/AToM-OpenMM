@@ -39,6 +39,7 @@ The generated Slurm scripts default to:
 - memory: `100G`
 - wall time: `12:00:00`
 - conda setup: `source $HOME/miniconda3/etc/profile.d/conda.sh && conda activate myatom`
+- input materialization: copy receptor, ligand, and frcmod files into each job directory
 
 You can override the conda setup at submission time:
 
@@ -48,7 +49,8 @@ export ATOM_CONDA_ENV=atomopenmm_legacy
 ```
 
 Or override it while generating scripts with `--conda-sh`, `--conda-env`,
-`--slurm-gres`, `--slurm-cpus-per-task`, `--slurm-mem`, and `--slurm-time`.
+`--link-mode symlink`, `--slurm-gres`, `--slurm-cpus-per-task`, `--slurm-mem`,
+and `--slurm-time`.
 
 Collect results:
 
