@@ -101,6 +101,7 @@ def _test_generate_workflows_writes_one_job_per_pair(tmp_path):
     assert workflow["workflow"]["neqti"]["n_snapshots"] == 40
     assert workflow["workflow"]["neqti"]["switch_steps_per_segment"] == 5000
     assert workflow["workflow"]["neqti"]["switch_integrator"] == "custom"
+    assert workflow["workflow"]["neqti"]["sampling_order"] == "interleaved"
     assert workflow["workflow"]["equilibration"]["pre_atm"]["steps"][0]["id"].startswith("benchmark_v1")
     run_text = run_script.read_text()
     assert "#SBATCH --gres=gpu:nvidia_L40S:1" in run_text

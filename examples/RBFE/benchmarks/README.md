@@ -90,6 +90,7 @@ The first benchmark protocol is intentionally fixed across pairs:
 - decorrelation: 100,000 steps
 - preparation annealing: 10,000 steps per ATM schedule segment
 - switching: 5,000 steps per ATM schedule segment
+- sampling order: interleaved midpoint/A/B cycles
 - custom NEQTI switch integrator enabled
 - failed production switches are recorded and skipped, with up to 80 attempts per direction
 

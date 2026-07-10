@@ -44,11 +44,12 @@ CSV_FIELDS = [
 
 def _protocol_signature(settings):
     payload = {
-        "schema_version": 4,
+        "schema_version": 5,
         "hamiltonian": "atm_softplus_single_midpoint",
         "paths": settings["paths"],
         "switch_steps_per_segment": settings["switch_steps_per_segment"],
         "preparation_annealing_steps_per_segment": settings.get("preparation_annealing_steps_per_segment", 0),
+        "sampling_order": settings.get("sampling_order", "interleaved"),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -84,15 +85,16 @@ def _initialize_protocol_manifest(settings, resume):
             manifest = yaml.safe_load(handle) or {}
         if manifest.get("signature") != signature:
             raise NEQTIConfigError(
-                "Existing NEQTI artifacts use a different Hamiltonian or lambda schedule; "
+                "Existing NEQTI artifacts use a different Hamiltonian, lambda schedule, or sampling order; "
                 "remove them or set resume: false"
             )
     manifest = {
-        "schema_version": 4,
+        "schema_version": 5,
         "hamiltonian": "atm_softplus_single_midpoint",
         "paths": settings["paths"],
         "switch_steps_per_segment": settings["switch_steps_per_segment"],
         "preparation_annealing_steps_per_segment": settings.get("preparation_annealing_steps_per_segment", 0),
+        "sampling_order": settings.get("sampling_order", "interleaved"),
         "signature": signature,
     }
     with open(path, "w") as handle:
@@ -171,6 +173,9 @@ def normalize_neqti_options(workflow, atom_options):
     switch_integrator = str(raw.get("switch_integrator", "custom")).lower()
     if switch_integrator not in ("custom", "python"):
         raise NEQTIConfigError("workflow.neqti.switch_integrator must be 'custom' or 'python'")
+    sampling_order = str(raw.get("sampling_order", "interleaved")).lower()
+    if sampling_order not in ("interleaved", "batched"):
+        raise NEQTIConfigError("workflow.neqti.sampling_order must be 'interleaved' or 'batched'")
 
     return {
         "initial_equilibration_steps": int(raw.get("initial_equilibration_steps", 0)),
@@ -185,6 +190,7 @@ def normalize_neqti_options(workflow, atom_options):
         "random_seed": int(raw.get("random_seed", 2026)),
         "platform": raw.get("platform"),
         "switch_integrator": switch_integrator,
+        "sampling_order": sampling_order,
         "validate_switch_integrator": bool(raw.get("validate_switch_integrator", False)),
         "tolerate_failed_switches": bool(raw.get("tolerate_failed_switches", False)),
         "max_switch_attempts_per_direction": int(
@@ -664,7 +670,7 @@ def analyze_two_leg_work(work, temperature_kelvin, bootstrap_samples=200, random
     }
 
 
-def summarize_existing_neqti_work(options, neqti_options, paths):
+def summarize_existing_neqti_work(options, neqti_options, paths, *, bootstrap_samples=None):
     work_files = {
         "leg_a_forward": Path("neqti_leg_a_forward.csv"),
         "leg_a_reverse": Path("neqti_leg_a_reverse.csv"),
@@ -684,7 +690,7 @@ def summarize_existing_neqti_work(options, neqti_options, paths):
     analysis = analyze_two_leg_work(
         work,
         temperature_kelvin,
-        bootstrap_samples=neqti_options["bootstrap_samples"],
+        bootstrap_samples=neqti_options["bootstrap_samples"] if bootstrap_samples is None else bootstrap_samples,
         random_seed=neqti_options["random_seed"],
     )
     complete = all(len(values) >= neqti_options["n_snapshots"] for values in rows.values())
@@ -762,6 +768,7 @@ def _run_preparation_anneal(worker, switch_name, start_state, state_path, steps_
 def run_neqti(options, neqti_options=None, progress_callback=None):
     if neqti_options is None:
         neqti_options = normalize_neqti_options({"neqti": {}}, options)
+    neqti_options.setdefault("sampling_order", "interleaved")
 
     basename = options["BASENAME"]
     logger = logging.getLogger("atom_openmm.neqti")
@@ -975,20 +982,29 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
             label,
         )
 
-    def emit_progress():
+    def current_counts():
+        return {name: len(_read_completed_rows(path)) for name, path in work_files.items()}
+
+    def emit_progress(with_analysis=False):
         if progress_callback is None:
             return
-        current_counts = {
-            name: len(_read_completed_rows(path)) for name, path in work_files.items()
-        }
+        counts = current_counts()
+        analysis_summary = None
+        if with_analysis and all(counts.values()):
+            analysis_summary = summarize_existing_neqti_work(
+                options,
+                neqti_options,
+                paths,
+                bootstrap_samples=0,
+            )
         progress_callback({
             "jobname": basename,
             "method": "neqti",
             "status": "partial",
-            "forward_samples": current_counts["leg_a_forward"] + current_counts["leg_b_forward"],
-            "reverse_samples": current_counts["leg_a_reverse"] + current_counts["leg_b_reverse"],
-            "sample_counts": current_counts,
-            "analysis": None,
+            "forward_samples": counts["leg_a_forward"] + counts["leg_b_forward"],
+            "reverse_samples": counts["leg_a_reverse"] + counts["leg_b_reverse"],
+            "sample_counts": counts,
+            "analysis": None if analysis_summary is None else analysis_summary.get("analysis"),
         })
 
     def record_switch_failure(switch_name, attempt, exc):
@@ -1008,6 +1024,171 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
         ("a", "leg_a_forward"),
         ("b", "leg_b_forward"),
     )
+
+    def completed_count(name):
+        return len(_read_completed_rows(work_files[name]))
+
+    def attempted_count(name):
+        return completed_count(name) + len(_read_failed_rows(work_files[name]))
+
+    def needs_attempt(name, attempt):
+        return completed_count(name) < neqti_options["n_snapshots"] and attempted_count(name) <= attempt
+
+    def all_targets_reached():
+        return all(completed_count(name) >= neqti_options["n_snapshots"] for name in work_files)
+
+    def run_interleaved_sampling():
+        stream_initialized = {"m": False, "a": False, "b": False}
+
+        def initialize_stream_once(direction, initial_state_file, start_state, checkpoint_file, completed):
+            if stream_initialized[direction]:
+                if checkpoint_file.exists():
+                    worker.set_chkpt(checkpoint_file.read_bytes())
+                    worker.set_state(start_state)
+                return
+            _initialize_sampling_stream(
+                worker,
+                direction=direction,
+                initial_state_file=initial_state_file,
+                start_state=start_state,
+                checkpoint_file=checkpoint_file,
+                completed_count=completed,
+                initial_equilibration_steps=neqti_options["initial_equilibration_steps"],
+                resume=neqti_options["resume"],
+                logger=logger,
+            )
+            stream_initialized[direction] = True
+
+        for attempt in range(
+            min(attempted_count(name) for name in work_files),
+            neqti_options["max_switch_attempts_per_direction"],
+        ):
+            if all_targets_reached():
+                break
+            cycle_changed = False
+
+            midpoint_switches = ("leg_a_reverse", "leg_b_reverse")
+            if any(needs_attempt(name, attempt) for name in midpoint_switches):
+                initialize_stream_once(
+                    "m",
+                    state_files["m"],
+                    states["m"],
+                    checkpoints["m"],
+                    max(completed_count(name) for name in midpoint_switches),
+                )
+                if neqti_options["decorrelation_steps"] > 0:
+                    _run_worker_steps(
+                        worker,
+                        neqti_options["decorrelation_steps"],
+                        logger,
+                        f"NEQTI m trajectory {attempt} decorrelation",
+                    )
+                snapshot = worker.get_chkpt()
+                _write_worker_pdb_pair(worker, f"neqti_m_snapshot_{attempt}.pdb")
+                for switch_name in midpoint_switches:
+                    if not needs_attempt(switch_name, attempt):
+                        continue
+                    worker.set_chkpt(snapshot)
+                    worker.set_state(stateparams[paths[switch_name][0]])
+                    if neqti_options["validate_switch_integrator"]:
+                        _validate_switch_implementations(
+                            worker,
+                            direction=switch_name,
+                            snapshot=snapshot,
+                            start_state=stateparams[paths[switch_name][0]],
+                            schedule=schedules[switch_name],
+                            steps_per_segment=neqti_options["switch_steps_per_segment"],
+                            state_path=paths[switch_name],
+                            logger=logger,
+                        )
+                    try:
+                        work_kcal = execute_switch(
+                            switch_name,
+                            stateparams[paths[switch_name][0]],
+                            schedules[switch_name],
+                            paths[switch_name],
+                            f"{switch_name} trajectory {attempt}",
+                        )
+                        _write_worker_pdb_pair(worker, f"neqti_m_{switch_name}_snapshot_{attempt}_post_switch.pdb")
+                        _append_row(work_files[switch_name], {
+                            "trajectory": attempt, "direction": switch_name,
+                            "start_state": paths[switch_name][0], "end_state": paths[switch_name][-1],
+                            "work_kcal_per_mol": f"{work_kcal:.12g}",
+                            "work_kj_per_mol": f"{work_kcal * KCAL_TO_KJ:.12g}",
+                            "switch_steps": len(schedules[switch_name]), "status": "complete",
+                        })
+                    except Exception as exc:
+                        record_switch_failure(switch_name, attempt, exc)
+                    finally:
+                        worker.set_chkpt(snapshot)
+                        worker.set_state(states["m"])
+                    cycle_changed = True
+                _write_checkpoint(checkpoints["m"], worker.get_chkpt())
+
+            for ensemble, switch_name in endpoint_stream_specs:
+                if not needs_attempt(switch_name, attempt):
+                    continue
+                initialize_stream_once(
+                    ensemble,
+                    state_files[ensemble],
+                    states[ensemble],
+                    checkpoints[ensemble],
+                    completed_count(switch_name),
+                )
+                if neqti_options["decorrelation_steps"] > 0:
+                    _run_worker_steps(
+                        worker,
+                        neqti_options["decorrelation_steps"],
+                        logger,
+                        f"NEQTI {ensemble} trajectory {attempt} decorrelation",
+                    )
+                snapshot = worker.get_chkpt()
+                _write_worker_pdb_pair(worker, f"neqti_{ensemble}_snapshot_{attempt}.pdb")
+                if neqti_options["validate_switch_integrator"]:
+                    _validate_switch_implementations(
+                        worker,
+                        direction=switch_name,
+                        snapshot=snapshot,
+                        start_state=stateparams[paths[switch_name][0]],
+                        schedule=schedules[switch_name],
+                        steps_per_segment=neqti_options["switch_steps_per_segment"],
+                        state_path=paths[switch_name],
+                        logger=logger,
+                    )
+                try:
+                    work_kcal = execute_switch(
+                        switch_name,
+                        stateparams[paths[switch_name][0]],
+                        schedules[switch_name],
+                        paths[switch_name],
+                        f"{switch_name} trajectory {attempt}",
+                    )
+                    _write_worker_pdb_pair(worker, f"neqti_{ensemble}_{switch_name}_snapshot_{attempt}_post_switch.pdb")
+                    _append_row(work_files[switch_name], {
+                        "trajectory": attempt, "direction": switch_name,
+                        "start_state": paths[switch_name][0], "end_state": paths[switch_name][-1],
+                        "work_kcal_per_mol": f"{work_kcal:.12g}",
+                        "work_kj_per_mol": f"{work_kcal * KCAL_TO_KJ:.12g}",
+                        "switch_steps": len(schedules[switch_name]), "status": "complete",
+                    })
+                except Exception as exc:
+                    record_switch_failure(switch_name, attempt, exc)
+                finally:
+                    worker.set_chkpt(snapshot)
+                    worker.set_state(states[ensemble])
+                    _write_checkpoint(checkpoints[ensemble], worker.get_chkpt())
+                cycle_changed = True
+
+            if cycle_changed:
+                emit_progress(with_analysis=True)
+
+    if neqti_options["sampling_order"] == "interleaved":
+        try:
+            run_interleaved_sampling()
+        finally:
+            worker.finish()
+        return summarize_existing_neqti_work(options, neqti_options, paths)
+
     try:
         midpoint_switches = ("leg_a_reverse", "leg_b_reverse")
         if any(len(_read_completed_rows(work_files[name])) < neqti_options["n_snapshots"] for name in midpoint_switches):

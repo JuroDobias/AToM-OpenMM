@@ -179,6 +179,7 @@ NEQTI_BENCHMARK_V1 = {
     "switch_steps_per_segment": 5000,
     "preparation_annealing_steps_per_segment": 10000,
     "switch_integrator": "custom",
+    "sampling_order": "interleaved",
     "validate_switch_integrator": False,
     "tolerate_failed_switches": True,
     "max_switch_attempts_per_direction": 80,

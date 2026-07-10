@@ -41,6 +41,22 @@ def _test_normalize_neqti_options_derives_two_leg_paths():
     assert settings["n_snapshots"] == 2
     assert settings["resume"] is True
     assert settings["switch_integrator"] == "custom"
+    assert settings["sampling_order"] == "interleaved"
+
+
+def _test_normalize_neqti_options_accepts_batched_sampling_order():
+    from atom_openmm.neqti import normalize_neqti_options
+
+    settings = normalize_neqti_options({"neqti": {"sampling_order": "batched"}}, _atom_options())
+
+    assert settings["sampling_order"] == "batched"
+
+
+def _test_normalize_neqti_options_rejects_invalid_sampling_order():
+    from atom_openmm.neqti import NEQTIConfigError, normalize_neqti_options
+
+    with pytest.raises(NEQTIConfigError, match="sampling_order"):
+        normalize_neqti_options({"neqti": {"sampling_order": "random"}}, _atom_options())
 
 
 def _test_switch_schedule_interpolates_between_knots():
@@ -81,6 +97,23 @@ def _test_protocol_manifest_rejects_legacy_artifacts(tmp_path, monkeypatch):
     settings = {"paths": {"leg_a_forward": [0, 1]}, "switch_steps_per_segment": 10}
 
     with pytest.raises(NEQTIConfigError, match="predate the single-midpoint protocol"):
+        _initialize_protocol_manifest(settings, resume=True)
+
+
+def _test_protocol_manifest_rejects_sampling_order_changes(tmp_path, monkeypatch):
+    from atom_openmm.neqti import NEQTIConfigError, _ensure_work_csv, _initialize_protocol_manifest
+
+    monkeypatch.chdir(tmp_path)
+    settings = {
+        "paths": {"leg_a_forward": [0, 1]},
+        "switch_steps_per_segment": 10,
+        "sampling_order": "batched",
+    }
+    _initialize_protocol_manifest(settings, resume=False)
+    _ensure_work_csv(tmp_path / "neqti_leg_a_forward.csv")
+
+    settings["sampling_order"] = "interleaved"
+    with pytest.raises(NEQTIConfigError, match="sampling order"):
         _initialize_protocol_manifest(settings, resume=True)
 
 
@@ -442,3 +475,107 @@ def _test_neqti_loads_physical_initial_state_for_both_directions(tmp_path, monke
         "leg_b_forward": 1,
         "leg_b_reverse": 1,
     }
+
+
+def _run_fake_neqti_for_order(tmp_path, monkeypatch, sampling_order):
+    from atom_openmm import neqti
+
+    monkeypatch.chdir(tmp_path)
+    options = _atom_options()
+    options.update({"BASENAME": "pair", "NEQTI_INITIAL_STATE_FILE": "pair_equil.xml"})
+
+    class FakeSimulation:
+        def loadState(self, path):
+            pass
+
+    class FakeWorker:
+        def __init__(self, basename, ommsystem, options, node_info=None, compute=True, logger=None):
+            self.simulation = FakeSimulation()
+
+        def set_state(self, par):
+            pass
+
+        def run(self, nsteps):
+            pass
+
+        def get_chkpt(self):
+            return b"checkpoint"
+
+        def set_chkpt(self, chkpt):
+            pass
+
+        def get_energy(self):
+            return {"potential_energy": 0.0 * kilocalories_per_mole}
+
+        def finish(self):
+            pass
+
+    class FakeOMMSystem:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    labels = []
+    progress = []
+
+    def fake_run_switch(worker, start_state, schedule, steps_per_segment, path, logger, label):
+        labels.append(label.split()[0])
+        return 0.0
+
+    monkeypatch.setattr(neqti, "_select_node_info", lambda options, neqti_options: {"node_name": "local"})
+    monkeypatch.setattr(neqti, "OMMSystemRBFE", FakeOMMSystem)
+    monkeypatch.setattr(neqti, "OMMWorkerATMSync", FakeWorker)
+    monkeypatch.setattr(neqti, "_write_worker_pdb_pair", lambda worker, path: None)
+    monkeypatch.setattr(neqti, "_run_switch", fake_run_switch)
+
+    summary = neqti.run_neqti(
+        options,
+        {
+            "initial_equilibration_steps": 0,
+            "n_snapshots": 2,
+            "decorrelation_steps": 0,
+            "switch_steps_per_segment": 1,
+            "hamiltonian": "atm_softplus_single_midpoint",
+            "paths": {
+                "leg_a_forward": [0, 1], "leg_a_reverse": [1, 0],
+                "leg_b_forward": [3, 2], "leg_b_reverse": [2, 3],
+            },
+            "resume": False,
+            "bootstrap_samples": 0,
+            "random_seed": 1,
+            "platform": None,
+            "switch_integrator": "python",
+            "sampling_order": sampling_order,
+            "validate_switch_integrator": False,
+            "preparation_annealing_steps_per_segment": 0,
+            "tolerate_failed_switches": False,
+            "max_switch_attempts_per_direction": 2,
+        },
+        progress_callback=progress.append,
+    )
+    return labels, progress, summary
+
+
+def _test_interleaved_sampling_runs_all_legs_per_cycle(tmp_path, monkeypatch):
+    labels, progress, summary = _run_fake_neqti_for_order(tmp_path, monkeypatch, "interleaved")
+
+    assert labels == [
+        "leg_a_reverse", "leg_b_reverse", "leg_a_forward", "leg_b_forward",
+        "leg_a_reverse", "leg_b_reverse", "leg_a_forward", "leg_b_forward",
+    ]
+    assert progress[-1]["analysis"]["bar_dg_kcal_per_mol"] == pytest.approx(0.0)
+    assert summary["sample_counts"] == {
+        "leg_a_forward": 2,
+        "leg_a_reverse": 2,
+        "leg_b_forward": 2,
+        "leg_b_reverse": 2,
+    }
+
+
+def _test_batched_sampling_preserves_old_leg_order(tmp_path, monkeypatch):
+    labels, progress, summary = _run_fake_neqti_for_order(tmp_path, monkeypatch, "batched")
+
+    assert labels == [
+        "leg_a_reverse", "leg_b_reverse", "leg_a_reverse", "leg_b_reverse",
+        "leg_a_forward", "leg_a_forward", "leg_b_forward", "leg_b_forward",
+    ]
+    assert summary["sample_counts"]["leg_b_forward"] == 2
