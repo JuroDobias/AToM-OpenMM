@@ -677,3 +677,29 @@ def _test_neqti_workflow_uses_physical_only_structprep(tmp_path, monkeypatch):
     assert received["initial"] == "cdk2-H1Q-H1R_equil.xml"
     assert received["production_initial"] == "cdk2-H1Q-H1R_equil.xml"
     assert received["equilibration"]["neqti"]["endpoint"]["steps"][0]["id"] == "nvt"
+
+
+def _test_state_xml_sanitizer_removes_transient_context_parameters(tmp_path):
+    from atom_openmm.equilibration import _strip_integrator_parameters
+
+    state = tmp_path / "state.xml"
+    state.write_text(
+        """<?xml version='1.0' encoding='UTF-8'?>
+<State>
+  <Parameters Lambda1=".5" k="836.8" tol=".05" MonteCarloPressure="1"/>
+  <Positions/>
+  <IntegratorParameters version="1">
+    <Parameter name="unused" value="1"/>
+  </IntegratorParameters>
+</State>
+"""
+    )
+
+    _strip_integrator_parameters(state)
+
+    text = state.read_text()
+    assert "IntegratorParameters" not in text
+    assert 'k="' not in text
+    assert 'tol="' not in text
+    assert 'Lambda1="' not in text
+    assert "<Positions" in text

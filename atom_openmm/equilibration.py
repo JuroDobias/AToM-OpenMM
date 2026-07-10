@@ -146,6 +146,8 @@ def _save_final_pdb(simulation: Simulation, path: str | Path):
 def _strip_integrator_parameters(path: str | Path):
     tree = ET.parse(path)
     root = tree.getroot()
+    for node in root.findall("Parameters"):
+        node.attrib.clear()
     for node in list(root.findall("IntegratorParameters")):
         root.remove(node)
     tree.write(path, encoding="unicode", xml_declaration=True)
@@ -409,6 +411,7 @@ def run_custom_equilibration(
         step_state_path = step_dir / "final_state.xml"
         step_pdb_path = step_dir / "final_state.pdb"
         simulation.saveState(str(step_state_path))
+        _strip_integrator_parameters(step_state_path)
         _save_final_pdb(simulation, step_pdb_path)
         if atm_state is not None:
             positions = simulation.context.getState(getPositions=True).getPositions()
