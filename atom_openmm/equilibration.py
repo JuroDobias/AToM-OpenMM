@@ -233,9 +233,8 @@ def _build_integrator(step_cfg: dict[str, Any], default_temperature):
 
 def _resolve_step_restraints(steps, topology, positions):
     resolver = AmberMaskResolver(topology, positions)
-    resolved = {}
+    resolved = []
     for i, step in enumerate(steps):
-        step_id = _step_id(step, i)
         step_resolved = {}
         if "positional_restraints" in step:
             pos_cfg = step["positional_restraints"]
@@ -243,7 +242,7 @@ def _resolve_step_restraints(steps, topology, positions):
                 pos_cfg["mask"],
                 f"steps[{i}].positional_restraints.mask",
             )
-        resolved[step_id] = step_resolved
+        resolved.append(step_resolved)
     return resolved
 
 
@@ -437,7 +436,7 @@ def run_custom_equilibration(
 
         step_system = _clone_system(ommsystem.system)
         reference_positions = _state_positions(prev_state_path) if prev_state_path and prev_state_path.exists() else base_positions
-        _apply_restraints(step_system, step_cfg, reference_positions, resolved_restraints.get(step_id, {}))
+        _apply_restraints(step_system, step_cfg, reference_positions, resolved_restraints[i])
         _set_barostat(step_system, step_cfg)
         integrator = _build_integrator(step_cfg, default_temperature)
         simulation = Simulation(ommsystem.topology, step_system, integrator, platform, platform_properties)
