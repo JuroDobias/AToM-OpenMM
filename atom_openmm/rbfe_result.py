@@ -169,6 +169,7 @@ class RBFEResultWriter:
         self.data["result"] = result
 
     def _progress(self, stage, analysis=None):
+        leg_names = ("leg_a_forward", "leg_a_reverse", "leg_b_forward", "leg_b_reverse")
         progress = {
             "stage": stage,
             "current_pair_index": self.pair_index,
@@ -177,14 +178,31 @@ class RBFEResultWriter:
             "reverse_samples": None,
             "target_forward_samples": None,
             "target_reverse_samples": None,
+            "sample_counts": None,
+            "target_sample_counts": None,
+            "completed_snapshot_cycles": None,
+            "target_snapshot_cycles": None,
             "last_update": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
         if self.method == "neqti":
-            progress["target_forward_samples"] = self.requested_samples
-            progress["target_reverse_samples"] = self.requested_samples
+            target_work_rows = None if self.requested_samples is None else 2 * self.requested_samples
+            progress["target_forward_samples"] = target_work_rows
+            progress["target_reverse_samples"] = target_work_rows
+            progress["target_sample_counts"] = {
+                name: self.requested_samples for name in leg_names
+            }
+            progress["target_snapshot_cycles"] = self.requested_samples
             if analysis:
                 progress["forward_samples"] = int((analysis or {}).get("forward_samples", 0))
                 progress["reverse_samples"] = int((analysis or {}).get("reverse_samples", 0))
+                raw_counts = (analysis or {}).get("sample_counts") or {}
+                sample_counts = {
+                    name: None if raw_counts.get(name) is None else int(raw_counts.get(name, 0))
+                    for name in leg_names
+                }
+                progress["sample_counts"] = sample_counts
+                if all(value is not None for value in sample_counts.values()):
+                    progress["completed_snapshot_cycles"] = min(sample_counts.values())
         elif analysis:
             samples = (analysis or {}).get("samples")
             progress["forward_samples"] = None if samples is None else int(samples)

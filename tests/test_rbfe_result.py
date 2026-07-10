@@ -72,6 +72,12 @@ def _test_neqti_partial_result_and_missing_uncertainty(tmp_path):
         analysis={
             "forward_samples": 10,
             "reverse_samples": 3,
+            "sample_counts": {
+                "leg_a_forward": 4,
+                "leg_a_reverse": 2,
+                "leg_b_forward": 6,
+                "leg_b_reverse": 1,
+            },
             "analysis": {
                 "bar_dg_kcal_per_mol": 2.0,
                 "bar_bootstrap_std_kcal_per_mol": None,
@@ -87,10 +93,54 @@ def _test_neqti_partial_result_and_missing_uncertainty(tmp_path):
     assert result["quality"]["convergence_status"] == "partial"
     assert result["progress"]["forward_samples"] == 10
     assert result["progress"]["reverse_samples"] == 3
-    assert result["progress"]["target_forward_samples"] == 10
-    assert result["progress"]["target_reverse_samples"] == 10
+    assert result["progress"]["target_forward_samples"] == 20
+    assert result["progress"]["target_reverse_samples"] == 20
+    assert result["progress"]["sample_counts"] == {
+        "leg_a_forward": 4,
+        "leg_a_reverse": 2,
+        "leg_b_forward": 6,
+        "leg_b_reverse": 1,
+    }
+    assert result["progress"]["target_sample_counts"] == {
+        "leg_a_forward": 10,
+        "leg_a_reverse": 10,
+        "leg_b_forward": 10,
+        "leg_b_reverse": 10,
+    }
+    assert result["progress"]["completed_snapshot_cycles"] == 1
+    assert result["progress"]["target_snapshot_cycles"] == 10
     assert "Free-energy uncertainty is unavailable." in result["quality"]["warnings"]
     assert "Sampling or overlap quality requirements were not met." in result["quality"]["warnings"]
+
+
+def _test_neqti_progress_handles_staged_two_leg_counts(tmp_path):
+    writer = _writer(tmp_path, method="neqti", requested_samples=40)
+    writer.update(
+        "partial",
+        analysis={
+            "forward_samples": 17,
+            "reverse_samples": 80,
+            "sample_counts": {
+                "leg_a_forward": 17,
+                "leg_a_reverse": 40,
+                "leg_b_forward": 0,
+                "leg_b_reverse": 40,
+            },
+            "analysis": None,
+        },
+        stage="production",
+    )
+    result = _read(writer)
+
+    assert result["progress"]["stage"] == "production"
+    assert result["progress"]["forward_samples"] == 17
+    assert result["progress"]["target_forward_samples"] == 80
+    assert result["progress"]["reverse_samples"] == 80
+    assert result["progress"]["target_reverse_samples"] == 80
+    assert result["progress"]["sample_counts"]["leg_a_forward"] == 17
+    assert result["progress"]["sample_counts"]["leg_b_forward"] == 0
+    assert result["progress"]["completed_snapshot_cycles"] == 0
+    assert result["progress"]["target_snapshot_cycles"] == 40
 
 
 def _test_failed_result_has_structured_error(tmp_path):
