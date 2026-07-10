@@ -588,6 +588,7 @@ def _test_neqti_workflow_uses_physical_only_structprep(tmp_path, monkeypatch):
     config = yaml.safe_load(config_file.read_text())
     config["workflow"]["prepare_only"] = False
     config["workflow"]["production_method"] = "neqti"
+    config["atom_options"]["TIME_STEP"] = 0.002
     config["workflow"]["equilibration"] = {
         "pre_atm": {
             "steps": [
@@ -661,10 +662,12 @@ def _test_neqti_workflow_uses_physical_only_structprep(tmp_path, monkeypatch):
         received["structprep_mode"] = options["STRUCTPREP_MODE"]
         received["initial"] = options["NEQTI_INITIAL_STATE_FILE"]
         received["equilibration"] = options["EQUILIBRATION_PROTOCOL"]
+        options["TIME_STEP"] = 0.001
         Path(options["BASENAME"] + "_equil.xml").write_text("<state/>")
 
     def fake_run_production(options, workflow, progress_callback=None):
         received["production_initial"] = options["NEQTI_INITIAL_STATE_FILE"]
+        received["production_time_step"] = options["TIME_STEP"]
         return {"jobname": options["BASENAME"], "status": "completed"}
 
     monkeypatch.setattr(rbfe_workflow, "rbfe_structprep", fake_structprep)
@@ -676,6 +679,7 @@ def _test_neqti_workflow_uses_physical_only_structprep(tmp_path, monkeypatch):
     assert received["structprep_mode"] == "physical_only"
     assert received["initial"] == "cdk2-H1Q-H1R_equil.xml"
     assert received["production_initial"] == "cdk2-H1Q-H1R_equil.xml"
+    assert received["production_time_step"] == 0.002
     assert received["equilibration"]["neqti"]["endpoint"]["steps"][0]["id"] == "nvt"
 
 

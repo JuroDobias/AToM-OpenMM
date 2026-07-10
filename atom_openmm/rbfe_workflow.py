@@ -990,7 +990,7 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
             prep_state = options["BASENAME"] + ("_equil.xml" if production_method == "neqti" else "_0.xml")
             if not Path(prep_state).exists():
                 result_writer.update("running", stage=stage)
-                rbfe_structprep(config_file=None, options=options)
+                rbfe_structprep(config_file=None, options=deepcopy(options))
             result_writer.update("prepared", stage=stage)
 
             stage = "production"
