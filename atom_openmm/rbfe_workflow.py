@@ -1053,6 +1053,7 @@ def validate_workflow(config_file):
     config = load_workflow_config(config_file)
     plan = build_small_molecule_plan(config)
     normalize_setup_options(config["workflow"], config["atom_options"])
+    normalize_equilibration_protocol(config["workflow"])
     load_or_generate_alignments(config["workflow"], plan, write_generated=False)
     return True
 
@@ -1063,6 +1064,7 @@ def plan_workflow(config_file):
     plan = build_small_molecule_plan(config)
     load_or_generate_alignments(config["workflow"], plan, write_generated=False)
     normalize_setup_options(config["workflow"], config["atom_options"])
+    normalize_equilibration_protocol(config["workflow"])
     return build_execution_plan(config)
 
 

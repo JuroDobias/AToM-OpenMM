@@ -145,6 +145,7 @@ def _steps_from_section(section: Any, label: str) -> list[dict[str, Any]] | None
         raise EquilibrationConfigError(f"{label}.steps must be a list of mappings")
     if not steps:
         raise EquilibrationConfigError(f"{label}.steps must not be empty")
+    _validate_unique_step_ids(steps, label)
     return steps
 
 
@@ -154,7 +155,22 @@ def normalize_equilibration_protocol(workflow: dict[str, Any]) -> dict[str, Any]
         return None
     if not isinstance(raw, dict):
         raise EquilibrationConfigError("workflow.equilibration must be a mapping")
-    return deepcopy(raw)
+    normalized = deepcopy(raw)
+    _validate_equilibration_protocol(normalized, "workflow.equilibration")
+    return normalized
+
+
+def _validate_equilibration_protocol(protocol: dict[str, Any], label: str):
+    _steps_from_section(protocol.get("pre_atm"), f"{label}.pre_atm")
+    async_cfg = protocol.get("async_re") or {}
+    if not isinstance(async_cfg, dict):
+        raise EquilibrationConfigError(f"{label}.async_re must be a mapping")
+    _steps_from_section(async_cfg.get("midpoint"), f"{label}.async_re.midpoint")
+    neqti_cfg = protocol.get("neqti") or {}
+    if not isinstance(neqti_cfg, dict):
+        raise EquilibrationConfigError(f"{label}.neqti must be a mapping")
+    _steps_from_section(neqti_cfg.get("endpoint"), f"{label}.neqti.endpoint")
+    _steps_from_section(neqti_cfg.get("midpoint"), f"{label}.neqti.midpoint")
 
 
 def _clone_system(system):
@@ -319,6 +335,19 @@ def _step_id(step_cfg, index):
     if not isinstance(step_id, str) or not step_id:
         raise EquilibrationConfigError(f"steps[{index}].id must be a non-empty string")
     return step_id
+
+
+def _validate_unique_step_ids(steps, label):
+    seen = {}
+    for index, step_cfg in enumerate(steps):
+        step_id = _step_id(step_cfg, index)
+        previous = seen.get(step_id)
+        if previous is not None:
+            raise EquilibrationConfigError(
+                f"{label}.steps has duplicate step id {step_id!r} at steps {previous + 1} and {index + 1}; "
+                "step ids must be unique within each custom equilibration section"
+            )
+        seen[step_id] = index
 
 
 def _validate_step(step_cfg, index):
