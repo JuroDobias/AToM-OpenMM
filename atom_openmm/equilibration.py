@@ -21,6 +21,7 @@ from openmm.unit import (
 )
 
 from atom_openmm.atm_coordinates import write_atm_swapped_pdb
+from atom_openmm.atm_coordinates import atm_swapped_positions
 
 
 KCAL_MOL_A2_TO_KJ_MOL_NM2 = 418.4
@@ -29,6 +30,40 @@ A_TO_NM = 0.1
 
 class EquilibrationConfigError(ValueError):
     pass
+
+
+class ATMSwappedPDBReporter:
+    def __init__(self, file, report_interval, keywords, enforce_periodic_box=False):
+        self._report_interval = int(report_interval)
+        self._keywords = keywords
+        self._enforce_periodic_box = enforce_periodic_box
+        self._out = open(file, "w")
+        self._topology = None
+        self._next_model = 1
+
+    def describeNextReport(self, simulation):
+        steps = self._report_interval - simulation.currentStep % self._report_interval
+        return {"steps": steps, "periodic": self._enforce_periodic_box, "include": ["positions"]}
+
+    def report(self, simulation, state):
+        positions = atm_swapped_positions(state.getPositions(asNumpy=True), self._keywords)
+        if positions is None:
+            return
+        topology = simulation.topology
+        if self._next_model == 1:
+            PDBFile.writeHeader(topology, self._out)
+            self._topology = topology
+        PDBFile.writeModel(topology, positions, self._out, self._next_model)
+        self._next_model += 1
+        self._out.flush()
+
+    def __del__(self):
+        try:
+            if self._topology is not None:
+                PDBFile.writeFooter(self._topology, self._out)
+            self._out.close()
+        except Exception:
+            pass
 
 
 class AmberMaskResolver:
@@ -305,7 +340,7 @@ def _validate_step(step_cfg, index):
                 raise EquilibrationConfigError(f"steps[{index}].positional_restraints.{key} is required")
 
 
-def _build_reporters(step_cfg, step_dir):
+def _build_reporters(step_cfg, step_dir, *, keywords=None):
     reporters = []
     reporter_cfg = step_cfg.get("reporters") or {}
     state_cfg = reporter_cfg.get("state")
@@ -329,6 +364,10 @@ def _build_reporters(step_cfg, step_dir):
         if fmt != "xtc":
             raise EquilibrationConfigError("Only XTC trajectory reporters are supported for custom equilibration")
         reporters.append(XTCReporter(str(step_dir / "trajectory.xtc"), interval, enforcePeriodicBox=False))
+        if bool(traj_cfg.get("swapped_pdb", False)):
+            if keywords is None:
+                raise EquilibrationConfigError("reporters.traj.swapped_pdb requires ATM keyword context")
+            reporters.append(ATMSwappedPDBReporter(str(step_dir / "trajectory_swapped.pdb"), interval, keywords))
     return reporters
 
 
@@ -409,7 +448,7 @@ def run_custom_equilibration(
             simulation.loadState(str(prev_state_path))
         _apply_atm_state(simulation.context, ommsystem, atm_state)
         simulation.context.applyConstraints(0.00001)
-        for reporter in _build_reporters(step_cfg, step_dir):
+        for reporter in _build_reporters(step_cfg, step_dir, keywords=ommsystem.keywords if atm_state is not None else None):
             simulation.reporters.append(reporter)
         if not simulation.reporters:
             interval = max(1, int(step_cfg.get("reporter_interval", step_cfg.get("n_steps", 1))))

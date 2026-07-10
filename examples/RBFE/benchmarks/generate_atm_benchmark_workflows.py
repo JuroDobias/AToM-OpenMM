@@ -163,7 +163,7 @@ BENCHMARK_V1_EQUILIBRATION = {
                     "thermostat": {"temperature_k": 300.0, "friction_per_ps": 1.0},
                     "reporters": {
                         "state": {"interval": 5000},
-                        "traj": {"format": "xtc", "interval": 5000},
+                        "traj": {"format": "xtc", "interval": 5000, "swapped_pdb": True},
                     },
                 },
             ]
