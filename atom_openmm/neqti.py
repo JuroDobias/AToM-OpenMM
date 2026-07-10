@@ -735,7 +735,18 @@ def _strip_state_if_possible(path):
 
 
 def _run_preparation_anneal(worker, switch_name, start_state, state_path, steps_per_segment, output_state, output_pdb, logger):
-    logger.info("NEQTI preparation anneal %s: %s", switch_name, " -> ".join(str(i) for i in state_path))
+    labels = {
+        "leg_a_forward": "physical_to_M",
+        "leg_a_reverse": "M_to_A",
+        "leg_b_reverse": "M_to_B",
+    }
+    label = labels.get(switch_name, switch_name)
+    logger.info(
+        "NEQTI preparation anneal %s (%s): %s",
+        label,
+        switch_name,
+        " -> ".join(str(i) for i in state_path),
+    )
     _run_switch_custom(
         worker,
         start_state,
@@ -743,7 +754,7 @@ def _run_preparation_anneal(worker, switch_name, start_state, state_path, steps_
         state_path,
         switch_name,
         logger,
-        f"preparation {switch_name}",
+        f"preparation anneal {label} ({switch_name})",
     )
     _save_worker_state(worker, output_state, output_pdb)
 

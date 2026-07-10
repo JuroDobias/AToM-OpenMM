@@ -70,7 +70,7 @@ The first benchmark protocol is intentionally fixed across pairs:
 - ligand inputs: prepared `*-p.mol2` files plus matching `*-p.frcmod`
 - NEQTI snapshots: 40
 - shared midpoint and endpoint sampling equilibration: 200,000 steps
-- endpoint NVT reheat: weak non-hydrogen solute restraints, endpoint NPT unrestrained
+- endpoint equilibration: weakly restrained NVT reheat, short weakly restrained NPT, then unrestrained NPT
 - decorrelation: 100,000 steps
 - preparation annealing: 10,000 steps per ATM schedule segment
 - switching: 5,000 steps per ATM schedule segment
