@@ -50,7 +50,23 @@ export ATOM_CONDA_ENV=atomopenmm_legacy
 
 Or override it while generating scripts with `--conda-sh`, `--conda-env`,
 `--link-mode symlink`, `--slurm-gres`, `--slurm-cpus-per-task`, `--slurm-mem`,
-and `--slurm-time`.
+`--slurm-time`, `--neqti-n-snapshots`, `--neqti-switch-steps-per-segment`,
+`--neqti-max-switch-attempts-per-direction`, and
+`--production-restart-attempts`.
+
+Example 4-edge CDK2 smoother-switch test set:
+
+```bash
+python examples/RBFE/benchmarks/generate_atm_benchmark_workflows.py \
+  --benchmark-csv /path/to/ATM_benchmark/ATM_Validation/DDG_ATM_GAFF2_enriched_CDK2.csv \
+  --systems-root /path/to/ATM_benchmark \
+  --outdir /path/to/neqti_cdk2_4_300ps \
+  --pairs-filter CDK2:17:22 CDK2:1oiu:26 CDK2:30:31 CDK2:1oiy:32 \
+  --neqti-n-snapshots 40 \
+  --neqti-switch-steps-per-segment 15000 \
+  --neqti-max-switch-attempts-per-direction 80 \
+  --production-restart-attempts 6
+```
 
 Collect results:
 

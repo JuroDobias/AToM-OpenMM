@@ -32,6 +32,13 @@ class WorkflowConfigError(ValueError):
     pass
 
 
+class ProductionRestartExhaustedError(RuntimeError):
+    def __init__(self, original, attempts):
+        self.original = original
+        self.attempts = attempts
+        super().__init__(str(original))
+
+
 @contextmanager
 def _pushd(path):
     previous = Path.cwd()
@@ -53,6 +60,17 @@ def _require_mapping(value, name):
     if not isinstance(value, dict):
         raise WorkflowConfigError(f"{name} must be a mapping")
     return value
+
+
+def normalize_production_restarts(workflow):
+    cfg = workflow.get("production_restarts") or {}
+    if not isinstance(cfg, dict):
+        raise WorkflowConfigError("workflow.production_restarts must be a mapping")
+    enabled = bool(cfg.get("enabled", False))
+    max_attempts = int(cfg.get("max_attempts", 1 if not enabled else 2))
+    if max_attempts < 1:
+        raise WorkflowConfigError("workflow.production_restarts.max_attempts must be positive")
+    return {"enabled": enabled, "max_attempts": max_attempts}
 
 
 def _as_list(value, name):
@@ -910,6 +928,40 @@ def run_production(options, workflow, progress_callback=None):
     raise WorkflowConfigError("workflow.production_method must be 'async_re' or 'neqti'")
 
 
+def run_production_with_restarts(options, workflow, result_writer, stage, progress_callback=None):
+    restart_cfg = normalize_production_restarts(workflow)
+    max_attempts = restart_cfg["max_attempts"] if restart_cfg["enabled"] else 1
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return run_production(options, workflow, progress_callback=progress_callback)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= max_attempts:
+                if restart_cfg["enabled"]:
+                    raise ProductionRestartExhaustedError(exc, max_attempts) from exc
+                raise
+            warning = (
+                f"Production attempt {attempt}/{max_attempts} failed with "
+                f"{type(exc).__name__}: {exc}; retrying with resume state."
+            )
+            result_writer.update(
+                "partial",
+                error={
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "stage": stage,
+                    "restart_attempt": attempt,
+                    "restart_attempts_allowed": max_attempts,
+                },
+                warning=warning,
+                stage=stage,
+            )
+    raise ProductionRestartExhaustedError(last_exc, max_attempts)
+
+
 def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, alignments, workflow_yaml=None):
     jobdir = pair_plan["jobdir"]
     jobdir.mkdir(parents=True, exist_ok=True)
@@ -959,9 +1011,18 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
         if not ff_json_file.is_absolute():
             ff_json_file = jobdir / ff_json_file
     except (Exception, KeyboardInterrupt) as exc:
+        error = {"type": type(exc).__name__, "message": str(exc), "stage": stage}
+        if isinstance(exc, ProductionRestartExhaustedError):
+            error.update(
+                {
+                    "type": type(exc.original).__name__,
+                    "message": str(exc.original),
+                    "restart_attempts_used": exc.attempts,
+                }
+            )
         result_writer.update(
             "failed",
-            error={"type": type(exc).__name__, "message": str(exc), "stage": stage},
+            error=error,
             stage=stage,
         )
         raise
@@ -999,7 +1060,13 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
             def record_neqti_progress(summary):
                 result_writer.update("partial", analysis=summary, stage=stage)
 
-            production_result = run_production(options, workflow, progress_callback=record_neqti_progress)
+            production_result = run_production_with_restarts(
+                options,
+                workflow,
+                result_writer,
+                stage,
+                progress_callback=record_neqti_progress,
+            )
             if production_result is not None:
                 final_status = production_result.get("status", "completed")
                 warning = None if production_result.get("analysis") else "No finite NEQTI estimate is available."
@@ -1033,9 +1100,18 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
 
             return {"jobname": options["BASENAME"], "status": "completed", "workdir": options["WORKDIR"]}
     except (Exception, KeyboardInterrupt) as exc:
+        error = {"type": type(exc).__name__, "message": str(exc), "stage": stage}
+        if isinstance(exc, ProductionRestartExhaustedError):
+            error.update(
+                {
+                    "type": type(exc.original).__name__,
+                    "message": str(exc.original),
+                    "restart_attempts_used": exc.attempts,
+                }
+            )
         result_writer.update(
             "failed",
-            error={"type": type(exc).__name__, "message": str(exc), "stage": stage},
+            error=error,
             stage=stage,
         )
         raise
@@ -1054,6 +1130,7 @@ def validate_workflow(config_file):
     plan = build_small_molecule_plan(config)
     normalize_setup_options(config["workflow"], config["atom_options"])
     normalize_equilibration_protocol(config["workflow"])
+    normalize_production_restarts(config["workflow"])
     load_or_generate_alignments(config["workflow"], plan, write_generated=False)
     return True
 
@@ -1065,6 +1142,7 @@ def plan_workflow(config_file):
     load_or_generate_alignments(config["workflow"], plan, write_generated=False)
     normalize_setup_options(config["workflow"], config["atom_options"])
     normalize_equilibration_protocol(config["workflow"])
+    normalize_production_restarts(config["workflow"])
     return build_execution_plan(config)
 
 

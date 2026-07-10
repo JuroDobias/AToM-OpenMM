@@ -683,6 +683,87 @@ def _test_neqti_workflow_uses_physical_only_structprep(tmp_path, monkeypatch):
     assert received["equilibration"]["neqti"]["endpoint"]["steps"][0]["id"] == "nvt"
 
 
+def _test_production_restarts_retry_failed_production(monkeypatch):
+    from atom_openmm import rbfe_workflow
+
+    calls = []
+    updates = []
+
+    class FakeResultWriter:
+        def update(self, *args, **kwargs):
+            updates.append((args, kwargs))
+
+    def fake_run_production(options, workflow, progress_callback=None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ValueError("transient NaN")
+        return {"status": "completed", "analysis": {"bar_dg_kcal_per_mol": 0.0}}
+
+    monkeypatch.setattr(rbfe_workflow, "run_production", fake_run_production)
+
+    result = rbfe_workflow.run_production_with_restarts(
+        {},
+        {"production_restarts": {"enabled": True, "max_attempts": 3}},
+        FakeResultWriter(),
+        "production",
+    )
+
+    assert len(calls) == 2
+    assert result["status"] == "completed"
+    assert updates[0][0] == ("partial",)
+    assert updates[0][1]["error"]["restart_attempt"] == 1
+    assert "retrying with resume state" in updates[0][1]["warning"]
+
+
+def _test_production_restarts_stop_at_cap(monkeypatch):
+    from atom_openmm import rbfe_workflow
+
+    calls = []
+
+    class FakeResultWriter:
+        def update(self, *args, **kwargs):
+            pass
+
+    def fake_run_production(options, workflow, progress_callback=None):
+        calls.append(1)
+        raise ValueError("persistent NaN")
+
+    monkeypatch.setattr(rbfe_workflow, "run_production", fake_run_production)
+
+    with pytest.raises(rbfe_workflow.ProductionRestartExhaustedError, match="persistent NaN") as excinfo:
+        rbfe_workflow.run_production_with_restarts(
+            {},
+            {"production_restarts": {"enabled": True, "max_attempts": 2}},
+            FakeResultWriter(),
+            "production",
+        )
+
+    assert len(calls) == 2
+    assert isinstance(excinfo.value.original, ValueError)
+    assert excinfo.value.attempts == 2
+
+
+def _test_production_restarts_default_disabled(monkeypatch):
+    from atom_openmm import rbfe_workflow
+
+    calls = []
+
+    class FakeResultWriter:
+        def update(self, *args, **kwargs):
+            pass
+
+    def fake_run_production(options, workflow, progress_callback=None):
+        calls.append(1)
+        raise ValueError("no retry")
+
+    monkeypatch.setattr(rbfe_workflow, "run_production", fake_run_production)
+
+    with pytest.raises(ValueError, match="no retry"):
+        rbfe_workflow.run_production_with_restarts({}, {}, FakeResultWriter(), "production")
+
+    assert len(calls) == 1
+
+
 def _test_state_xml_sanitizer_removes_transient_context_parameters(tmp_path):
     from atom_openmm.equilibration import _strip_integrator_parameters
 

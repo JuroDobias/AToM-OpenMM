@@ -396,36 +396,51 @@ def _alignment_dict(pair, ligand_a_name, ligand_b_name):
     }
 
 
-def workflow_for_pair(pair, ligand_a_file, ligand_b_file):
+def workflow_for_pair(
+    pair,
+    ligand_a_file,
+    ligand_b_file,
+    neqti_overrides=None,
+    production_restart_attempts=0,
+):
     atom_schedule = deepcopy(ATOM_SCHEDULE)
     if pair.displacement is not None:
         atom_schedule["DISPLACEMENT"] = pair.displacement
-    return {
-        "workflow": {
-            "type": "rbfe",
-            "mode": "small_molecule",
-            "workdir": "run",
-            "receptor": "receptor/receptor.pdb",
-            "ligands_dir": "ligands",
-            "pairs": [[ligand_a_file.name, ligand_b_file.name]],
-            "alignments": "alignments.yaml",
-            "forcefield_cache": "ff.json",
-            "run": True,
-            "analyze": True,
-            "production_method": "neqti",
-            "equilibration": BENCHMARK_V1_EQUILIBRATION,
-            "neqti": NEQTI_BENCHMARK_V1,
-            "setup": {
-                "mode": "ambertools",
-                "protein_forcefield": "leaprc.protein.ff14SB",
-                "additional_forcefields": ["leaprc.phosaa14SB"],
-                "ligand_forcefield": "leaprc.gaff2",
-                "water_forcefield": "leaprc.water.tip3p",
-                "solvent_box": "TIP3PBOX",
-                "solvent_padding_a": 10.0,
-                "neutralize": True,
-            },
+    neqti = deepcopy(NEQTI_BENCHMARK_V1)
+    if neqti_overrides:
+        neqti.update(neqti_overrides)
+    workflow = {
+        "type": "rbfe",
+        "mode": "small_molecule",
+        "workdir": "run",
+        "receptor": "receptor/receptor.pdb",
+        "ligands_dir": "ligands",
+        "pairs": [[ligand_a_file.name, ligand_b_file.name]],
+        "alignments": "alignments.yaml",
+        "forcefield_cache": "ff.json",
+        "run": True,
+        "analyze": True,
+        "production_method": "neqti",
+        "equilibration": BENCHMARK_V1_EQUILIBRATION,
+        "neqti": neqti,
+        "setup": {
+            "mode": "ambertools",
+            "protein_forcefield": "leaprc.protein.ff14SB",
+            "additional_forcefields": ["leaprc.phosaa14SB"],
+            "ligand_forcefield": "leaprc.gaff2",
+            "water_forcefield": "leaprc.water.tip3p",
+            "solvent_box": "TIP3PBOX",
+            "solvent_padding_a": 10.0,
+            "neutralize": True,
         },
+    }
+    if production_restart_attempts:
+        workflow["production_restarts"] = {
+            "enabled": True,
+            "max_attempts": int(production_restart_attempts),
+        }
+    return {
+        "workflow": workflow,
         "atom_options": atom_schedule,
     }
 
@@ -472,6 +487,10 @@ def generate_workflows(
     slurm_cpus_per_task=16,
     slurm_mem="100G",
     slurm_time="12:00:00",
+    neqti_n_snapshots=None,
+    neqti_switch_steps_per_segment=None,
+    neqti_max_switch_attempts_per_direction=None,
+    production_restart_attempts=0,
 ):
     pairs = read_benchmark_csv(benchmark_csv, default_alignment_atoms, pairs_filter)
     if not pairs:
@@ -505,7 +524,22 @@ def generate_workflows(
                 width=1000000,
             )
 
-        workflow = workflow_for_pair(pair, ligand_a_dest, ligand_b_dest)
+        neqti_overrides = {}
+        if neqti_n_snapshots is not None:
+            neqti_overrides["n_snapshots"] = int(neqti_n_snapshots)
+        if neqti_switch_steps_per_segment is not None:
+            neqti_overrides["switch_steps_per_segment"] = int(neqti_switch_steps_per_segment)
+        if neqti_max_switch_attempts_per_direction is not None:
+            neqti_overrides["max_switch_attempts_per_direction"] = int(
+                neqti_max_switch_attempts_per_direction
+            )
+        workflow = workflow_for_pair(
+            pair,
+            ligand_a_dest,
+            ligand_b_dest,
+            neqti_overrides=neqti_overrides,
+            production_restart_attempts=production_restart_attempts,
+        )
         workflow_path = jobdir / "workflow.yaml"
         with open(workflow_path, "w") as handle:
             yaml.dump(workflow, handle, default_flow_style=None, sort_keys=False, width=1000000)
@@ -565,6 +599,10 @@ def parse_args(argv=None):
     parser.add_argument("--slurm-cpus-per-task", type=int, default=16)
     parser.add_argument("--slurm-mem", default="100G")
     parser.add_argument("--slurm-time", default="12:00:00")
+    parser.add_argument("--neqti-n-snapshots", type=int)
+    parser.add_argument("--neqti-switch-steps-per-segment", type=int)
+    parser.add_argument("--neqti-max-switch-attempts-per-direction", type=int)
+    parser.add_argument("--production-restart-attempts", type=int, default=0)
     return parser.parse_args(argv)
 
 
@@ -583,6 +621,10 @@ def main(argv=None):
         slurm_cpus_per_task=args.slurm_cpus_per_task,
         slurm_mem=args.slurm_mem,
         slurm_time=args.slurm_time,
+        neqti_n_snapshots=args.neqti_n_snapshots,
+        neqti_switch_steps_per_segment=args.neqti_switch_steps_per_segment,
+        neqti_max_switch_attempts_per_direction=args.neqti_max_switch_attempts_per_direction,
+        production_restart_attempts=args.production_restart_attempts,
     )
     print(f"Generated {len(rows)} benchmark workflows in {args.outdir.resolve()}")
 

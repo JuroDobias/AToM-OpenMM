@@ -141,6 +141,30 @@ def _test_generate_workflows_can_filter_pairs(tmp_path):
     assert rows[0]["ligand_b"] == "H1S"
 
 
+def _test_generate_workflows_can_override_neqti_and_restart_settings(tmp_path):
+    generator = _load_module(GENERATOR, "generate_atm_benchmark_workflows")
+    systems_root, csv_path = _write_synthetic_benchmark(tmp_path)
+
+    generator.generate_workflows(
+        csv_path,
+        systems_root,
+        tmp_path / "jobs",
+        pairs_filter=["H1Q:H1R"],
+        link_mode="copy",
+        neqti_n_snapshots=40,
+        neqti_switch_steps_per_segment=15000,
+        neqti_max_switch_attempts_per_direction=80,
+        production_restart_attempts=6,
+    )
+
+    workflow = yaml.safe_load((tmp_path / "jobs" / "cdk2" / "H1Q--H1R" / "workflow.yaml").read_text())
+
+    assert workflow["workflow"]["neqti"]["n_snapshots"] == 40
+    assert workflow["workflow"]["neqti"]["switch_steps_per_segment"] == 15000
+    assert workflow["workflow"]["neqti"]["max_switch_attempts_per_direction"] == 80
+    assert workflow["workflow"]["production_restarts"] == {"enabled": True, "max_attempts": 6}
+
+
 def _test_collect_results_handles_completed_and_missing_pairs(tmp_path):
     collector = _load_module(COLLECTOR, "collect_atm_benchmark_results")
     outdir = tmp_path / "jobs"
