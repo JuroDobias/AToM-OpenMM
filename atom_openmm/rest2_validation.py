@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 from datetime import datetime, timezone
+import gc
 import json
 import logging
 import math
@@ -423,10 +424,59 @@ def _rest2_checkpoint(output, contexts, assignments, cycle, attempts, accepts, r
     os.replace(temporary, checkpoint_dir / "state.json")
 
 
-def run_rest2(config, resume=False):
-    topology, _, physical_system = _load_amber(config, barostat=False)
-    initial = _load_equilibrated_state(config)
+def run_rest2(
+    config, resume=False, _output=None, _initial_state=None,
+    _seed_offset=0, _ensemble_metadata=None,
+):
     rest_config = config.get("rest2", {})
+    ensembles = rest_config.get("ensembles", [])
+    if _output is None and ensembles:
+        if not isinstance(ensembles, list) or not ensembles:
+            raise REST2ValidationError("rest2.ensembles must be a non-empty list")
+        root = config["_workdir"] / "rest2"
+        if not resume and root.exists():
+            shutil.rmtree(root)
+        root.mkdir(parents=True, exist_ok=True)
+        topology, _, physical_system = _load_amber(config, barostat=False)
+        equilibrated = _load_equilibrated_state(config)
+        initialization_steps = int(rest_config.get("initialization_steps", 50000))
+        seen = set()
+        manifest = []
+        for index, ensemble in enumerate(ensembles):
+            if not isinstance(ensemble, dict) or "id" not in ensemble or "initial_torsion_deg" not in ensemble:
+                raise REST2ValidationError(
+                    "each REST2 ensemble requires id and initial_torsion_deg"
+                )
+            ensemble_id = str(ensemble["id"])
+            if not ensemble_id.replace("-", "").replace("_", "").isalnum() or ensemble_id in seen:
+                raise REST2ValidationError(f"invalid or duplicate REST2 ensemble id: {ensemble_id}")
+            seen.add(ensemble_id)
+            target = float(ensemble["initial_torsion_deg"])
+            output = root / ensemble_id
+            checkpoint = output / "checkpoints" / "state.json"
+            if resume and checkpoint.exists():
+                initial = equilibrated
+            else:
+                initial = _initialize_rotamer(
+                    config, topology, physical_system, equilibrated, target,
+                    _simulation_settings(config)["seed"] + 8000 + index,
+                    initialization_steps,
+                )
+                output.mkdir(parents=True, exist_ok=True)
+                with (output / "initial.pdb").open("w") as handle:
+                    app.PDBFile.writeFile(topology, initial.getPositions(), handle, keepIds=True)
+            metadata = {"id": ensemble_id, "initial_torsion_deg": target}
+            run_rest2(
+                config, resume=resume, _output=output, _initial_state=initial,
+                _seed_offset=(index + 1) * 100000, _ensemble_metadata=metadata,
+            )
+            gc.collect()
+            manifest.append({**metadata, "directory": ensemble_id})
+        _atomic_yaml(root / "ensembles.yaml", {"ensembles": manifest})
+        return
+
+    topology, _, physical_system = _load_amber(config, barostat=False)
+    initial = _initial_state or _load_equilibrated_state(config)
     temperatures = [float(value) for value in rest_config.get(
         "effective_temperatures_k", [300, 345, 396, 455, 522, 600]
     )]
@@ -438,12 +488,12 @@ def run_rest2(config, resume=False):
     exchange_interval = int(rest_config.get("exchange_interval_steps", 500))
     steps_per_replica = int(rest_config.get("steps_per_replica", 1000000))
     cycles = int(math.ceil(steps_per_replica / exchange_interval))
-    output = config["_workdir"] / "rest2"
+    output = Path(_output) if _output is not None else config["_workdir"] / "rest2"
     if not resume and output.exists():
         shutil.rmtree(output)
     output.mkdir(parents=True, exist_ok=True)
     platform, properties = _platform(config)
-    seed0 = _simulation_settings(config)["seed"]
+    seed0 = _simulation_settings(config)["seed"] + int(_seed_offset)
     contexts = []
     integrators = []
     for index, scale in enumerate(scales):
@@ -558,14 +608,24 @@ def run_rest2(config, resume=False):
                 _rest2_checkpoint(output, contexts, assignments, cycle + 1, attempts, accepts, rng)
                 rates = np.divide(accepts, attempts, out=np.zeros_like(accepts, dtype=float), where=attempts > 0)
                 LOGGER.info("REST2 cycle %d/%d, neighbor acceptance %s", cycle + 1, cycles, np.round(rates, 3).tolist())
-    _atomic_yaml(output / "summary.yaml", {
+    summary = {
         "effective_temperatures_k": temperatures,
         "scales": scales,
         "attempts": attempts.tolist(),
         "accepts": accepts.tolist(),
         "acceptance_rates": np.divide(accepts, attempts, out=np.zeros_like(accepts, dtype=float), where=attempts > 0).tolist(),
         "completed_cycles": cycles,
-    })
+    }
+    if _ensemble_metadata:
+        summary["ensemble"] = dict(_ensemble_metadata)
+    _atomic_yaml(output / "summary.yaml", summary)
+    context = None
+    context_i = None
+    context_j = None
+    integrator = None
+    del contexts
+    del integrators
+    gc.collect()
 
 
 def _window_centers(config):
@@ -736,6 +796,78 @@ def _round_trips(state_trace, replicas):
     return trips
 
 
+def _analyze_rest2_output(config, directory, limits, bootstrap_samples, rng):
+    torsion_file = directory / "physical_torsion.csv"
+    if not torsion_file.exists():
+        return None
+    burn_in_steps = int(config.get("analysis", {}).get("rest2_burn_in_steps", 0))
+    with torsion_file.open(newline="") as handle:
+        torsion_rows = list(csv.DictReader(handle))
+    angles = np.asarray([
+        float(row["torsion_deg"]) for row in torsion_rows
+        if int(row["step"]) > burn_in_steps
+    ])
+    if not len(angles):
+        raise REST2ValidationError(
+            f"REST2 burn-in removes every physical sample in {directory}"
+        )
+    with (directory / "state_trace.csv").open(newline="") as handle:
+        trace_rows = list(csv.DictReader(handle))
+    walker_columns = [name for name in trace_rows[0] if name.startswith("walker_")] if trace_rows else []
+    exchange_interval = int(config.get("rest2", {}).get("exchange_interval_steps", 500))
+    burn_cycle = int(math.ceil(burn_in_steps / exchange_interval))
+    trace_rows = [row for row in trace_rows if int(row["cycle"]) > burn_cycle]
+    trace = np.asarray([
+        [int(row[name]) for name in walker_columns] for row in trace_rows
+    ], dtype=int)
+    summary = yaml.safe_load((directory / "summary.yaml").read_text())
+    analysis = {
+        "samples": len(angles),
+        "burn_in_steps": burn_in_steps,
+        "basin_a_fraction": _basin_a_fraction(angles, limits),
+        "basin_a_fraction_95ci": _block_bootstrap_fraction(
+            angles, limits, bootstrap_samples, rng
+        ),
+        "acceptance_rates": summary["acceptance_rates"],
+        "round_trips": _round_trips(trace, len(walker_columns)) if len(trace) else 0,
+        "basin_transitions": _basin_transition_count(angles, limits),
+    }
+    if summary.get("ensemble"):
+        analysis["initial_torsion_deg"] = summary["ensemble"]["initial_torsion_deg"]
+    state_torsions = directory / "state_torsions.csv"
+    if state_torsions.exists():
+        with state_torsions.open(newline="") as handle:
+            propagation_rows = [
+                row for row in csv.DictReader(handle)
+                if int(row["step"]) > burn_in_steps
+            ]
+        timestep_ps = float(config.get("simulation", {}).get("timestep_ps", 0.002))
+        block_ns = timestep_ps * exchange_interval / 1000.0
+        by_state = {}
+        for row in propagation_rows:
+            state_index = int(row["state_index"])
+            state = by_state.setdefault(state_index, {
+                "state_index": state_index,
+                "scale": float(row["scale"]),
+                "effective_temperature_k": float(row["effective_temperature_k"]),
+                "propagation_blocks": 0,
+                "basin_changes": 0,
+            })
+            state["propagation_blocks"] += 1
+            state["basin_changes"] += int(row["basin_changed"])
+        for state in by_state.values():
+            sampled_ns = state["propagation_blocks"] * block_ns
+            state["sampled_ns"] = sampled_ns
+            state["basin_changes_per_ns"] = (
+                state["basin_changes"] / sampled_ns if sampled_ns else None
+            )
+        analysis["propagation_by_state"] = [
+            by_state[index] for index in sorted(by_state)
+        ]
+    analysis["_angles"] = angles
+    return analysis
+
+
 def analyze(config):
     workdir = config["_workdir"]
     limits = config.get("torsion", {}).get("basin_a_deg", [-90.0, 90.0])
@@ -761,49 +893,45 @@ def analyze(config):
             "per_run_basin_a_fraction": [_basin_a_fraction(values, limits) for values in md_series],
             "basin_transitions": int(sum(_basin_transition_count(values, limits) for values in md_series)),
         }
-    rest_torsion = workdir / "rest2" / "physical_torsion.csv"
-    if rest_torsion.exists():
-        angles = _read_column(rest_torsion, "torsion_deg")
-        with (workdir / "rest2" / "state_trace.csv").open(newline="") as handle:
-            rows = list(csv.DictReader(handle))
-        walker_columns = [name for name in rows[0] if name.startswith("walker_")] if rows else []
-        trace = np.asarray([[int(row[name]) for name in walker_columns] for row in rows], dtype=int)
-        summary = yaml.safe_load((workdir / "rest2" / "summary.yaml").read_text())
-        result["rest2"] = {
-            "samples": len(angles), "basin_a_fraction": _basin_a_fraction(angles, limits),
-            "basin_a_fraction_95ci": _block_bootstrap_fraction(angles, limits, bootstrap_samples, rng),
-            "acceptance_rates": summary["acceptance_rates"],
-            "round_trips": _round_trips(trace, len(walker_columns)) if len(trace) else 0,
-            "basin_transitions": _basin_transition_count(angles, limits),
-        }
-        state_torsions = workdir / "rest2" / "state_torsions.csv"
-        if state_torsions.exists():
-            with state_torsions.open(newline="") as handle:
-                propagation_rows = list(csv.DictReader(handle))
-            timestep_ps = float(config.get("simulation", {}).get("timestep_ps", 0.002))
-            exchange_steps = int(config.get("rest2", {}).get("exchange_interval_steps", 500))
-            block_ns = timestep_ps * exchange_steps / 1000.0
-            by_state = {}
-            for row in propagation_rows:
-                state_index = int(row["state_index"])
-                state = by_state.setdefault(state_index, {
-                    "state_index": state_index,
-                    "scale": float(row["scale"]),
-                    "effective_temperature_k": float(row["effective_temperature_k"]),
-                    "propagation_blocks": 0,
-                    "basin_changes": 0,
-                })
-                state["propagation_blocks"] += 1
-                state["basin_changes"] += int(row["basin_changed"])
-            for state in by_state.values():
-                sampled_ns = state["propagation_blocks"] * block_ns
-                state["sampled_ns"] = sampled_ns
-                state["basin_changes_per_ns"] = (
-                    state["basin_changes"] / sampled_ns if sampled_ns else None
-                )
-            result["rest2"]["propagation_by_state"] = [
-                by_state[index] for index in sorted(by_state)
-            ]
+    rest_root = workdir / "rest2"
+    if (rest_root / "physical_torsion.csv").exists():
+        rest_analysis = _analyze_rest2_output(
+            config, rest_root, limits, bootstrap_samples, rng
+        )
+        rest_analysis.pop("_angles", None)
+        result["rest2"] = rest_analysis
+    elif (rest_root / "ensembles.yaml").exists():
+        manifest = yaml.safe_load((rest_root / "ensembles.yaml").read_text())
+        ensemble_results = {}
+        all_angles = []
+        for entry in manifest["ensembles"]:
+            ensemble = _analyze_rest2_output(
+                config, rest_root / entry["directory"], limits, bootstrap_samples, rng
+            )
+            if ensemble is not None:
+                all_angles.append(ensemble.pop("_angles"))
+                ensemble_results[entry["id"]] = ensemble
+        if ensemble_results:
+            combined = np.concatenate(all_angles)
+            values = list(ensemble_results.values())
+            result["rest2"] = {
+                "samples": len(combined),
+                "burn_in_steps": int(config.get("analysis", {}).get("rest2_burn_in_steps", 0)),
+                "basin_a_fraction": _basin_a_fraction(combined, limits),
+                "basin_a_fraction_95ci": _block_bootstrap_fraction(
+                    combined, limits, bootstrap_samples, rng
+                ),
+                "acceptance_rates": np.mean(
+                    [value["acceptance_rates"] for value in values], axis=0
+                ).tolist(),
+                "round_trips": min(value["round_trips"] for value in values),
+                "basin_transitions": sum(value["basin_transitions"] for value in values),
+                "ensembles": ensemble_results,
+                "ensemble_basin_a_range": [
+                    min(value["basin_a_fraction"] for value in values),
+                    max(value["basin_a_fraction"] for value in values),
+                ],
+            }
     window_files = sorted((workdir / "umbrella").glob("window_*.csv"))
     if window_files:
         series = [_read_column(path, "torsion_deg") for path in window_files]
@@ -850,6 +978,11 @@ def analyze(config):
             warnings.append("Fewer than three complete REST2 ladder round trips were observed.")
         if result["rest2"]["basin_transitions"] < 10:
             warnings.append("Fewer than ten physical-replica torsional basin transitions were observed.")
+        ensemble_range = result["rest2"].get("ensemble_basin_a_range")
+        if ensemble_range and ensemble_range[1] - ensemble_range[0] > 0.10:
+            warnings.append(
+                "Independent REST2 ensembles differ in basin-A population by more than 0.10."
+            )
     if result["umbrella"] and result["umbrella"]["minimum_adjacent_histogram_overlap"] < 0.03:
         warnings.append("One or more adjacent umbrella windows have histogram overlap below 0.03.")
     if result["rest2"] and result["umbrella"]:

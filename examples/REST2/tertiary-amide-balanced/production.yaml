@@ -1,0 +1,66 @@
+workdir: run_production
+
+system:
+  ligand_file: inputs/rest2_test2.sdf
+  residue_name: UNL
+  ligand_forcefield: leaprc.gaff2
+  water_forcefield: leaprc.water.tip3p
+  solvent_box: TIP3PBOX
+  padding_a: 10.0
+  neutralize: true
+  net_charge: 0
+  parameterization:
+    charge_model: bcc
+
+simulation:
+  temperature_k: 300.0
+  pressure_atm: 1.0
+  timestep_ps: 0.002
+  friction_per_ps: 1.0
+  nonbonded_cutoff_nm: 0.9
+  random_seed: 2026
+  platform: OpenCL
+
+preparation:
+  minimization_tolerance_kj_mol_nm: 10.0
+  minimization_max_iterations: 500
+  npt_steps: 250000
+  report_interval_steps: 5000
+
+torsion:
+  # 1-based SDF atom IDs for the O=C-N-C tertiary-amide torsion.
+  atom_ids: [26, 25, 27, 28]
+  basin_a_deg: [-90.0, 90.0]
+  initialization_k_kcal_mol_rad2: 50.0
+
+ordinary_md:
+  runs: 4
+  steps: 10000000
+  sample_interval_steps: 500
+  rotamer_initialization_steps: 50000
+  initial_torsions_deg: [0.0, 180.0]
+
+rest2:
+  solute_residues: [UNL]
+  effective_temperatures_k: [300.0, 351.0, 411.0, 481.0, 563.0, 658.0, 770.0, 900.0]
+  steps_per_replica: 10000000
+  exchange_interval_steps: 500
+  checkpoint_interval_cycles: 10
+  initialization_steps: 50000
+  ensembles:
+  - id: a_started
+    initial_torsion_deg: 0.0
+  - id: b_started
+    initial_torsion_deg: 180.0
+
+umbrella:
+  spacing_deg: 15.0
+  k_kcal_mol_rad2: 50.0
+  equilibration_steps: 250000
+  production_steps: 1000000
+  sample_interval_steps: 500
+
+analysis:
+  rest2_burn_in_steps: 1000000
+  pmf_bin_width_deg: 5.0
+  bootstrap_samples: 200

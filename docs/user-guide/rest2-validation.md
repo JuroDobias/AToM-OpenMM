@@ -27,3 +27,9 @@ temperature, and whether the configured basin changed. Measuring changes within
 a propagation block is important: comparing coordinates before and after a
 replica exchange would incorrectly attribute an exchanged configuration to a
 torsional transition at that temperature.
+
+For bidirectional convergence tests, `rest2.ensembles` defines independent HREX
+ladders. Each entry requires a unique `id` and `initial_torsion_deg`. The
+ensembles share preparation but use separate random seeds, checkpoints,
+trajectories, and result sections. `analysis.rest2_burn_in_steps` excludes the
+same initial propagation interval from each ensemble before comparison.
