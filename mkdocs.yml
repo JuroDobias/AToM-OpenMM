@@ -24,6 +24,7 @@ nav:
       - Configuration Files: user-guide/configuration.md
       - Absolute Binding Free Energy: user-guide/abfe.md
       - Relative Binding Free Energy: user-guide/rbfe.md
+      - REST2 Validation: user-guide/rest2-validation.md
   - Theory: theory/index.md
   - API Reference: api-reference/index.md
   - Troubleshooting: troubleshooting.md

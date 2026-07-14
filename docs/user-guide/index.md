@@ -40,5 +40,6 @@ For routine use, prefer changing `setup-settings.sh`, `defaults.yaml`, and `run_
 - [Configuration files](configuration.md): YAML defaults, generated per-system files, and the main runtime keywords.
 - [Absolute binding free energy](abfe.md): ABFE-specific setup notes and output interpretation.
 - [Relative binding free energy](rbfe.md): RBFE-specific planning, alignment, and perturbation-network notes.
+- [REST2 validation](rest2-validation.md): validate solute tempering against ordinary MD and an umbrella PMF before coupling it to ATM.
 
 Tutorial examples are configured for short demonstration runs. For quantitative calculations, increase sampling settings such as `MAX_SAMPLES`, increase `WALL_TIME`, and keep the scheduler time limit in `run_template.sh` consistent with those choices.

@@ -1,0 +1,57 @@
+workdir: run_pilot
+
+system:
+  ligand_mol2: inputs/1oiy-p.mol2
+  ligand_frcmod: inputs/1oiy-p.frcmod
+  ligand_forcefield: leaprc.gaff2
+  water_forcefield: leaprc.water.tip3p
+  solvent_box: TIP3PBOX
+  padding_a: 10.0
+  neutralize: true
+  net_charge: 0
+
+simulation:
+  temperature_k: 300.0
+  pressure_atm: 1.0
+  timestep_ps: 0.002
+  friction_per_ps: 1.0
+  nonbonded_cutoff_nm: 0.9
+  random_seed: 2026
+  platform: OpenCL
+
+preparation:
+  minimization_tolerance_kj_mol_nm: 10.0
+  minimization_max_iterations: 500
+  npt_steps: 50000
+  report_interval_steps: 5000
+
+torsion:
+  # 1-based MOL2 atom IDs defining the C-N-C-C Ar-NH-Ar torsion.
+  atom_ids: [1, 22, 23, 13]
+  basin_a_deg: [-90.0, 90.0]
+  initialization_k_kcal_mol_rad2: 50.0
+
+ordinary_md:
+  runs: 2
+  steps: 1000000
+  sample_interval_steps: 500
+  rotamer_initialization_steps: 25000
+  initial_torsions_deg: [-40.0, 140.0]
+
+rest2:
+  solute_residues: [UNL]
+  effective_temperatures_k: [300.0, 345.0, 396.0, 455.0, 522.0, 600.0]
+  steps_per_replica: 1000000
+  exchange_interval_steps: 500
+  checkpoint_interval_cycles: 10
+
+umbrella:
+  spacing_deg: 15.0
+  k_kcal_mol_rad2: 50.0
+  equilibration_steps: 50000
+  production_steps: 250000
+  sample_interval_steps: 500
+
+analysis:
+  pmf_bin_width_deg: 5.0
+  bootstrap_samples: 200
