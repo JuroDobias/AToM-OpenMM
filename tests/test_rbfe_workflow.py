@@ -103,6 +103,43 @@ def _test_generate_smarts_alignments_selects_lowest_direct_rmsd_pair(tmp_path):
     assert pair["selected_rmsd_a"] == pytest.approx(0.0)
 
 
+def _test_generate_smarts_alignments_supports_separate_structure_files(tmp_path):
+    from atom_openmm.rbfe_workflow import generate_smarts_alignments
+
+    lig_a = tmp_path / "A-parameters.mol2"
+    lig_b = tmp_path / "B-parameters.mol2"
+    lig_a.write_text("parameterized input is intentionally not parsed")
+    lig_b.write_text("parameterized input is intentionally not parsed")
+    align_a = tmp_path / "A-alignment.sdf"
+    align_b = tmp_path / "B-alignment.sdf"
+    _write_carbon_chain_sdf(align_a, [0.0, 1.0, 2.0])
+    _write_carbon_chain_sdf(align_b, [0.0, 1.0, 2.0])
+    plan = {
+        "base_dir": tmp_path,
+        "pairs": [{
+            "jobname": "test-A-B",
+            "lig1_name": "A",
+            "lig2_name": "B",
+            "lig1_file": lig_a,
+            "lig2_file": lig_b,
+        }],
+    }
+
+    alignments = generate_smarts_alignments(
+        {
+            "method": "smarts",
+            "smarts": "[#6]-[#6]-[#6]",
+            "smarts_atom_ids": [1, 2, 3],
+            "structures": {"A": "A-alignment.sdf", "B": "B-alignment.sdf"},
+        },
+        plan,
+    )
+
+    pair = alignments["pairs"]["test-A-B"]
+    assert pair["ligand_a"]["align_atom_ids"] == [1, 2, 3]
+    assert pair["ligand_b"]["align_atom_ids"] == [1, 2, 3]
+
+
 def _test_pair_specific_alignments_are_converted_to_zero_based_options():
     from atom_openmm.rbfe_workflow import _alignment_atoms_for_pair
 

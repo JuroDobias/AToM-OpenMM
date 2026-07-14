@@ -490,12 +490,27 @@ def generate_smarts_alignments(alignment, plan):
     if any(atom_id < 1 for atom_id in smarts_atom_ids):
         raise WorkflowConfigError("workflow.alignment.smarts_atom_ids must be 1-based positive atom ids")
 
+    structures = alignment.get("structures", {}) or {}
+    if not isinstance(structures, dict):
+        raise WorkflowConfigError("workflow.alignment.structures must be a mapping")
+
+    def alignment_structure(pair, ligand_key):
+        name_key = "lig1_name" if ligand_key == "ligand_a" else "lig2_name"
+        file_key = "lig1_file" if ligand_key == "ligand_a" else "lig2_file"
+        ligand_name = pair[name_key]
+        configured = structures.get(ligand_name)
+        if configured is None:
+            return pair[file_key]
+        path = _resolve_path(configured, plan.get("base_dir", Path.cwd()))
+        _validate_file(path, f"workflow.alignment.structures.{ligand_name}")
+        return path
+
     pair_alignments = {}
     for pair in plan["pairs"]:
         pair_alignments[pair["jobname"]] = _best_smarts_pair_alignment(
-            pair["lig1_file"],
+            alignment_structure(pair, "ligand_a"),
             pair["lig1_name"],
-            pair["lig2_file"],
+            alignment_structure(pair, "ligand_b"),
             pair["lig2_name"],
             query,
             smarts_atom_ids,

@@ -114,10 +114,15 @@ workflow:
     method: smarts
     smarts: "[#6]-[#6]-[#6]"
     smarts_atom_ids: [1, 2, 3]
+    structures:
+      ligand_a: alignment/ligand_a.sdf
+      ligand_b: alignment/ligand_b.sdf
   alignments_out: alignments.yaml
 ```
 
 `smarts_atom_ids` are 1-based positions inside the SMARTS match, not full ligand atom IDs. The SMARTS is matched to both ligands in each pair. If symmetry creates multiple matches, the wrapper evaluates all match combinations and picks the one with the smallest direct coordinate RMSD over the three selected atoms. No structural alignment is performed during this check; input ligand coordinates are expected to already be aligned.
+
+The optional `structures` mapping selects coordinate files used only for SMARTS matching. This is useful when simulation inputs are parameterized MOL2 files that a chemistry toolkit cannot parse directly; force-field setup still uses the ligand files listed under `pairs`. Mapping keys are ligand names without their filename suffixes.
 
 Setup-time force fields can be selected in `workflow.setup`:
 
