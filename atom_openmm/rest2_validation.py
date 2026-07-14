@@ -103,10 +103,46 @@ def _prepared_paths(config):
     }
 
 
-def _write_tleap(config, output):
+def _prepare_ligand_parameters(config):
     system = config.get("system", {})
-    ligand_mol2 = _resolve(config, system["ligand_mol2"])
-    ligand_frcmod = _resolve(config, system["ligand_frcmod"])
+    if "ligand_mol2" in system:
+        ligand_mol2 = _resolve(config, system["ligand_mol2"])
+        ligand_frcmod = _resolve(config, system["ligand_frcmod"])
+        return ligand_mol2, ligand_frcmod
+    if "ligand_file" not in system:
+        raise REST2ValidationError(
+            "system must define ligand_mol2/ligand_frcmod or ligand_file"
+        )
+    ligand_file = _resolve(config, system["ligand_file"])
+    if ligand_file.suffix.lower() != ".sdf" or not ligand_file.exists():
+        raise REST2ValidationError("system.ligand_file must be an existing SDF file")
+    output = config["_workdir"] / "prepared" / "parameters"
+    output.mkdir(parents=True, exist_ok=True)
+    ligand_mol2 = output / "ligand.mol2"
+    ligand_frcmod = output / "ligand.frcmod"
+    parameterization = system.get("parameterization", {})
+    charge_model = str(parameterization.get("charge_model", "bcc"))
+    net_charge = int(system.get("net_charge", parameterization.get("net_charge", 0)))
+    residue_name = str(system.get("residue_name", "UNL"))
+    LOGGER.info(
+        "Parameterizing %s with GAFF2/%s and net charge %d",
+        ligand_file.name, charge_model, net_charge,
+    )
+    subprocess.run([
+        "antechamber", "-i", str(ligand_file), "-fi", "sdf",
+        "-o", str(ligand_mol2), "-fo", "mol2", "-at", "gaff2",
+        "-c", charge_model, "-nc", str(net_charge), "-rn", residue_name,
+        "-s", "2",
+    ], cwd=output, check=True)
+    subprocess.run([
+        "parmchk2", "-i", str(ligand_mol2), "-f", "mol2",
+        "-o", str(ligand_frcmod), "-s", "gaff2",
+    ], cwd=output, check=True)
+    return ligand_mol2, ligand_frcmod
+
+
+def _write_tleap(config, output, ligand_mol2, ligand_frcmod):
+    system = config.get("system", {})
     if not ligand_mol2.exists() or not ligand_frcmod.exists():
         raise REST2ValidationError("ligand MOL2 and frcmod inputs must exist")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -216,7 +252,8 @@ def prepare(config):
     paths = _prepared_paths(config)
     paths["prmtop"].parent.mkdir(parents=True, exist_ok=True)
     tleap_file = paths["prmtop"].parent / "tleap.in"
-    _write_tleap(config, tleap_file)
+    ligand_mol2, ligand_frcmod = _prepare_ligand_parameters(config)
+    _write_tleap(config, tleap_file, ligand_mol2, ligand_frcmod)
     LOGGER.info("Preparing solvated ligand with tleap")
     subprocess.run(["tleap", "-f", str(tleap_file)], cwd=paths["prmtop"].parent, check=True)
     topology, coordinates, system = _load_amber(config, barostat=True)
@@ -441,7 +478,9 @@ def run_rest2(config, resume=False):
     exchange_csv = output / "exchanges.csv"
     state_csv = output / "state_trace.csv"
     torsion_csv = output / "physical_torsion.csv"
+    heated_torsion_csv = output / "state_torsions.csv"
     checkpoint_interval = int(rest_config.get("checkpoint_interval_cycles", 10))
+    basin_limits = config.get("torsion", {}).get("basin_a_deg", [-90.0, 90.0])
     trajectory = output / "physical.dcd"
     append_trajectory = bool(resume and trajectory.exists())
     with trajectory.open("r+b" if append_trajectory else "wb") as trajectory_handle:
@@ -452,8 +491,40 @@ def run_rest2(config, resume=False):
         )
         for cycle in range(start_cycle, cycles):
             block = min(exchange_interval, steps_per_replica - cycle * exchange_interval)
+            start_angles = []
+            for context in contexts:
+                state = context.getState(getPositions=True, enforcePeriodicBox=True)
+                start_angles.append(torsion_angle_degrees(_positions_nm(state), torsion_indices))
             for integrator in integrators:
                 integrator.step(block)
+            end_states = [
+                context.getState(getPositions=True, enforcePeriodicBox=True)
+                for context in contexts
+            ]
+            end_angles = [
+                torsion_angle_degrees(_positions_nm(state), torsion_indices)
+                for state in end_states
+            ]
+            for walker, state_index in enumerate(assignments):
+                _append_csv(
+                    heated_torsion_csv,
+                    [
+                        "cycle", "step", "walker", "state_index", "scale",
+                        "effective_temperature_k", "start_torsion_deg", "end_torsion_deg",
+                        "basin_a_before", "basin_a_after", "basin_changed",
+                    ],
+                    [
+                        cycle + 1, min((cycle + 1) * exchange_interval, steps_per_replica),
+                        walker, state_index, scales[state_index], temperatures[state_index],
+                        start_angles[walker], end_angles[walker],
+                        int(_in_basin_a(start_angles[walker], basin_limits)),
+                        int(_in_basin_a(end_angles[walker], basin_limits)),
+                        int(
+                            _in_basin_a(start_angles[walker], basin_limits)
+                            != _in_basin_a(end_angles[walker], basin_limits)
+                        ),
+                    ],
+                )
             parity = cycle % 2
             for lower_state in range(parity, len(scales) - 1, 2):
                 upper_state = lower_state + 1
@@ -594,6 +665,10 @@ def _basin_a_fraction(angles, limits):
     return float(np.mean((angles >= low) & (angles <= high)))
 
 
+def _in_basin_a(angle, limits):
+    return float(limits[0]) <= float(angle) <= float(limits[1])
+
+
 def _block_bootstrap_fraction(angles, limits, samples, rng):
     angles = np.asarray(angles)
     if len(angles) < 2 or samples <= 0:
@@ -701,6 +776,34 @@ def analyze(config):
             "round_trips": _round_trips(trace, len(walker_columns)) if len(trace) else 0,
             "basin_transitions": _basin_transition_count(angles, limits),
         }
+        state_torsions = workdir / "rest2" / "state_torsions.csv"
+        if state_torsions.exists():
+            with state_torsions.open(newline="") as handle:
+                propagation_rows = list(csv.DictReader(handle))
+            timestep_ps = float(config.get("simulation", {}).get("timestep_ps", 0.002))
+            exchange_steps = int(config.get("rest2", {}).get("exchange_interval_steps", 500))
+            block_ns = timestep_ps * exchange_steps / 1000.0
+            by_state = {}
+            for row in propagation_rows:
+                state_index = int(row["state_index"])
+                state = by_state.setdefault(state_index, {
+                    "state_index": state_index,
+                    "scale": float(row["scale"]),
+                    "effective_temperature_k": float(row["effective_temperature_k"]),
+                    "propagation_blocks": 0,
+                    "basin_changes": 0,
+                })
+                state["propagation_blocks"] += 1
+                state["basin_changes"] += int(row["basin_changed"])
+            for state in by_state.values():
+                sampled_ns = state["propagation_blocks"] * block_ns
+                state["sampled_ns"] = sampled_ns
+                state["basin_changes_per_ns"] = (
+                    state["basin_changes"] / sampled_ns if sampled_ns else None
+                )
+            result["rest2"]["propagation_by_state"] = [
+                by_state[index] for index in sorted(by_state)
+            ]
     window_files = sorted((workdir / "umbrella").glob("window_*.csv"))
     if window_files:
         series = [_read_column(path, "torsion_deg") for path in window_files]
@@ -774,7 +877,12 @@ def run(config_file, stage="all", resume=False):
     for current in stages:
         LOGGER.info("Starting REST2 validation stage: %s", current)
         if current == "prepare":
-            prepare(config)
+            prepared = _prepared_paths(config)
+            required = ("prmtop", "inpcrd", "equilibrated_state")
+            if resume and all(prepared[name].exists() for name in required):
+                LOGGER.info("Preparation artifacts exist; preserving them for resumed production")
+            else:
+                prepare(config)
         elif current == "md":
             run_md(config, resume=resume)
         elif current == "rest2":
