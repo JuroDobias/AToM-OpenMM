@@ -33,3 +33,9 @@ ladders. Each entry requires a unique `id` and `initial_torsion_deg`. The
 ensembles share preparation but use separate random seeds, checkpoints,
 trajectories, and result sections. `analysis.rest2_burn_in_steps` excludes the
 same initial propagation interval from each ensemble before comparison.
+
+When REST2 and umbrella outputs are both available, analysis also writes
+`analysis/rest2_umbrella_distribution.csv` and `.png`. These compare the
+post-burn-in physical REST2 histogram with the probability distribution and PMF
+reconstructed by WHAM. `result.yaml` reports probability overlap, total-variation
+distance, and Jensen-Shannon divergence for every ensemble and the pooled data.

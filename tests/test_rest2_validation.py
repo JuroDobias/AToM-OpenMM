@@ -92,3 +92,17 @@ def _test_resume_preserves_existing_preparation(monkeypatch, tmp_path):
 
     monkeypatch.setattr(rest2_validation, "prepare", fail_prepare)
     rest2_validation.run(config, stage="prepare", resume=True)
+
+
+def _test_distribution_metrics_identify_equal_and_disjoint_distributions():
+    from atom_openmm.rest2_validation import distribution_metrics
+
+    equal = distribution_metrics([0.25, 0.75], [0.25, 0.75])
+    assert equal["total_variation_distance"] == pytest.approx(0.0)
+    assert equal["probability_overlap"] == pytest.approx(1.0)
+    assert equal["jensen_shannon_divergence_nats"] == pytest.approx(0.0)
+
+    disjoint = distribution_metrics([1.0, 0.0], [0.0, 1.0])
+    assert disjoint["total_variation_distance"] == pytest.approx(1.0)
+    assert disjoint["probability_overlap"] == pytest.approx(0.0)
+    assert disjoint["jensen_shannon_divergence_nats"] == pytest.approx(np.log(2.0))

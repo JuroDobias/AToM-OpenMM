@@ -796,6 +796,129 @@ def _round_trips(state_trace, replicas):
     return trips
 
 
+def distribution_metrics(reference_probability, observed_probability):
+    reference = np.asarray(reference_probability, dtype=float)
+    observed = np.asarray(observed_probability, dtype=float)
+    if reference.shape != observed.shape or reference.ndim != 1:
+        raise REST2ValidationError("distribution comparison requires equal one-dimensional arrays")
+    if np.any(reference < 0.0) or np.any(observed < 0.0):
+        raise REST2ValidationError("distribution probabilities must be nonnegative")
+    if reference.sum() <= 0.0 or observed.sum() <= 0.0:
+        raise REST2ValidationError("distribution probabilities must have positive sums")
+    reference = reference / reference.sum()
+    observed = observed / observed.sum()
+    mixture = 0.5 * (reference + observed)
+
+    def relative_entropy(probability, target):
+        mask = probability > 0.0
+        return float(np.sum(probability[mask] * np.log(probability[mask] / target[mask])))
+
+    return {
+        "total_variation_distance": float(0.5 * np.abs(reference - observed).sum()),
+        "probability_overlap": float(np.minimum(reference, observed).sum()),
+        "jensen_shannon_divergence_nats": float(
+            0.5 * relative_entropy(reference, mixture)
+            + 0.5 * relative_entropy(observed, mixture)
+        ),
+    }
+
+
+def _probability_to_pmf(probability, temperature_k):
+    probability = np.asarray(probability, dtype=float)
+    pmf = np.full_like(probability, np.nan)
+    mask = probability > 0.0
+    pmf[mask] = -R_KJ_MOL_K * float(temperature_k) * np.log(probability[mask])
+    pmf[mask] -= np.min(pmf[mask])
+    return pmf
+
+
+def _write_rest2_umbrella_comparison(
+    workdir, bin_centers, umbrella_probability, umbrella_pmf,
+    rest_angle_series, temperature_k, bin_width_deg,
+):
+    edges = np.arange(-180.0, 180.0 + float(bin_width_deg), float(bin_width_deg))
+    probabilities = {}
+    counts = {}
+    for name, angles in rest_angle_series.items():
+        histogram, _ = np.histogram(np.asarray(angles), bins=edges)
+        counts[name] = histogram
+        probabilities[name] = histogram / histogram.sum()
+    pooled_angles = np.concatenate(list(rest_angle_series.values()))
+    pooled_counts, _ = np.histogram(pooled_angles, bins=edges)
+    counts["pooled"] = pooled_counts
+    probabilities["pooled"] = pooled_counts / pooled_counts.sum()
+    metrics = {
+        name: distribution_metrics(umbrella_probability, probability)
+        for name, probability in probabilities.items()
+    }
+    rest_pmfs = {
+        name: _probability_to_pmf(probability, temperature_k)
+        for name, probability in probabilities.items()
+    }
+
+    analysis_dir = Path(workdir) / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = analysis_dir / "rest2_umbrella_distribution.csv"
+    names = (
+        [name for name in probabilities if name != "pooled"]
+        if len(rest_angle_series) > 1 else []
+    )
+    header = [
+        "torsion_deg", "umbrella_probability", "umbrella_pmf_kj_mol",
+        "rest2_pooled_count", "rest2_pooled_probability", "rest2_pooled_pmf_kj_mol",
+    ]
+    for name in names:
+        header.extend([
+            f"rest2_{name}_count", f"rest2_{name}_probability",
+            f"rest2_{name}_pmf_kj_mol",
+        ])
+    with csv_path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(header)
+        for index, center in enumerate(bin_centers):
+            row = [
+                center, umbrella_probability[index], umbrella_pmf[index],
+                counts["pooled"][index], probabilities["pooled"][index],
+                rest_pmfs["pooled"][index],
+            ]
+            for name in names:
+                row.extend([
+                    counts[name][index], probabilities[name][index], rest_pmfs[name][index]
+                ])
+            writer.writerow(row)
+
+    os.environ.setdefault("MPLCONFIGDIR", str(analysis_dir / ".matplotlib"))
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    figure, axes = plt.subplots(2, 1, figsize=(9, 7), sharex=True)
+    axes[0].plot(bin_centers, umbrella_probability, color="black", linewidth=2, label="Umbrella/WHAM")
+    axes[0].step(bin_centers, probabilities["pooled"], where="mid", linewidth=1.8, label="REST2 pooled")
+    for name in names:
+        axes[0].step(bin_centers, probabilities[name], where="mid", alpha=0.65, label=f"REST2 {name}")
+    axes[0].set_ylabel("Probability per bin")
+    axes[0].legend(frameon=False)
+    axes[1].plot(bin_centers, umbrella_pmf, color="black", linewidth=2, label="Umbrella/WHAM")
+    axes[1].step(bin_centers, rest_pmfs["pooled"], where="mid", linewidth=1.8, label="REST2 pooled")
+    for name in names:
+        axes[1].step(bin_centers, rest_pmfs[name], where="mid", alpha=0.65, label=f"REST2 {name}")
+    axes[1].set_xlabel("Torsion (degrees)")
+    axes[1].set_ylabel("Relative PMF (kJ/mol)")
+    axes[1].set_xlim(-180.0, 180.0)
+    axes[1].legend(frameon=False)
+    figure.tight_layout()
+    plot_path = analysis_dir / "rest2_umbrella_distribution.png"
+    figure.savefig(plot_path, dpi=180)
+    plt.close(figure)
+    return {
+        "bin_width_deg": float(bin_width_deg),
+        "metrics": metrics,
+        "csv": str(csv_path.relative_to(workdir)),
+        "plot": str(plot_path.relative_to(workdir)),
+    }
+
+
 def _analyze_rest2_output(config, directory, limits, bootstrap_samples, rng):
     torsion_file = directory / "physical_torsion.csv"
     if not torsion_file.exists():
@@ -873,6 +996,7 @@ def analyze(config):
     limits = config.get("torsion", {}).get("basin_a_deg", [-90.0, 90.0])
     bootstrap_samples = int(config.get("analysis", {}).get("bootstrap_samples", 200))
     rng = np.random.default_rng(_simulation_settings(config)["seed"] + 7000)
+    rest_angle_series = {}
     result = {
         "schema_version": 1,
         "tool": "atom_openmm_rest2_validation",
@@ -898,7 +1022,7 @@ def analyze(config):
         rest_analysis = _analyze_rest2_output(
             config, rest_root, limits, bootstrap_samples, rng
         )
-        rest_analysis.pop("_angles", None)
+        rest_angle_series["physical"] = rest_analysis.pop("_angles")
         result["rest2"] = rest_analysis
     elif (rest_root / "ensembles.yaml").exists():
         manifest = yaml.safe_load((rest_root / "ensembles.yaml").read_text())
@@ -909,7 +1033,9 @@ def analyze(config):
                 config, rest_root / entry["directory"], limits, bootstrap_samples, rng
             )
             if ensemble is not None:
-                all_angles.append(ensemble.pop("_angles"))
+                angles = ensemble.pop("_angles")
+                all_angles.append(angles)
+                rest_angle_series[entry["id"]] = angles
                 ensemble_results[entry["id"]] = ensemble
         if ensemble_results:
             combined = np.concatenate(all_angles)
@@ -969,6 +1095,12 @@ def analyze(config):
             "minimum_adjacent_histogram_overlap": min(overlap) if overlap else None,
             "pmf_csv": str(pmf_csv.relative_to(workdir)),
         }
+        if rest_angle_series:
+            result["distribution_comparison"] = _write_rest2_umbrella_comparison(
+                workdir, bin_centers, probability, pmf, rest_angle_series,
+                float(config.get("simulation", {}).get("temperature_k", 300.0)),
+                float(config.get("analysis", {}).get("pmf_bin_width_deg", 5.0)),
+            )
     warnings = result["quality"]["warnings"]
     if result["rest2"]:
         rates = result["rest2"]["acceptance_rates"]
