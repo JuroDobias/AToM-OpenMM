@@ -1046,3 +1046,70 @@ class OMMSystemRBFE(OMMSystem):
         self.system.addForce(sforce)
 
         self.set_integrator(temperature, self.frictionCoeff, self.MDstepsize)
+
+
+class OMMSystemRBFENativeEndpoint(OMMSystemRBFE):
+    """Physical dual-ligand endpoint without an ATMForce wrapper."""
+
+    def set_native_integrator(self, temperature, frictionCoeff, MDstepsize, defaultMDstepsize=0.001*picosecond):
+        integrator = self.keywords.get("INTEGRATOR", "atmmts").lower()
+        if integrator == "atmmts":
+            nonbonded = [
+                force for force in self.system.getForces()
+                if isinstance(force, NonbondedForce)
+            ]
+            if len(nonbonded) != 1:
+                self._exit(
+                    "Native RBFE endpoint requires exactly one NonbondedForce; "
+                    f"found {len(nonbonded)}"
+                )
+            self.nonbondedforcegroup = self.free_force_group()
+            nonbonded[0].setForceGroup(self.nonbondedforcegroup)
+            bonded_frequency = max(1, int(round(MDstepsize/defaultMDstepsize)))
+            self.logger.info(
+                "Running native endpoint with a %f fs time-step and bonded forces "
+                "integrated %d times per time-step",
+                MDstepsize/femtosecond,
+                bonded_frequency,
+            )
+            self.integrator = ATMMTSLangevinIntegrator(
+                temperature,
+                frictionCoeff,
+                MDstepsize,
+                [(0, bonded_frequency), (self.nonbondedforcegroup, 1)],
+            )
+            self.integrator.setConstraintTolerance(0.00001)
+        elif integrator == "langevinmiddle":
+            self.integrator = LangevinMiddleIntegrator(
+                temperature, frictionCoeff, MDstepsize
+            )
+            self.integrator.setConstraintTolerance(0.00001)
+        else:
+            self._exit(
+                "Native RBFE endpoints support INTEGRATOR=atmmts or langevinmiddle"
+            )
+
+    def create_system(self):
+        self.load_system()
+        self.set_ligand_atoms()
+        # Transform only the standard force field. Endpoint restraints added below
+        # remain at the physical temperature for every REST2 replica.
+        self.set_rest2()
+        self.atm_utils = AtomUtils(self.system)
+        self.set_displacement()
+        self.set_ligand_receptor_exclusion_potentials()
+        self.set_vsite_restraints()
+        self.set_orientation_restraints()
+        self.set_alignmentForce()
+        self.set_positional_restraints()
+
+        temperature = 300 * kelvin
+        pressure = 1 * bar
+        self.set_barostat(temperature, pressure, 0)
+        state_parameters = mm.CustomBondForce("1")
+        for name in self.parameter:
+            state_parameters.addGlobalParameter(self.parameter[name], 0)
+        self.system.addForce(state_parameters)
+        self.set_native_integrator(
+            temperature, self.frictionCoeff, self.MDstepsize
+        )

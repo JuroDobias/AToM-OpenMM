@@ -67,9 +67,10 @@ class REST2ExchangeSampler:
         system,
         topology,
         base_integrator,
-        ommsystem,
+        ommsystem=None,
+        rest2_system=None,
         state_files,
-        atm_states,
+        atm_states=None,
         config,
         platform,
         platform_properties,
@@ -81,6 +82,9 @@ class REST2ExchangeSampler:
         self.system = system
         self.topology = topology
         self.ommsystem = ommsystem
+        self.rest2_system = rest2_system or (
+            None if ommsystem is None else ommsystem.rest2_system
+        )
         self.state_files = {key: str(value) for key, value in state_files.items()}
         self.atm_states = atm_states
         self.config = config
@@ -111,7 +115,7 @@ class REST2ExchangeSampler:
             if hasattr(integrator, "setRandomNumberSeed"):
                 integrator.setRandomNumberSeed(int(random_seed) + 72000 + index)
             context = mm.Context(system, integrator, platform, platform_properties)
-            set_rest2_scale(context, scale, ommsystem.rest2_system)
+            set_rest2_scale(context, scale, self.rest2_system)
             self.integrators.append(integrator)
             self.contexts.append(context)
 
@@ -126,11 +130,26 @@ class REST2ExchangeSampler:
 
     def _initialize_bank(self, ensemble):
         source = mm.XmlSerializer.deserialize(Path(self.state_files[ensemble]).read_text())
-        temperature = self.atm_states[ensemble]["temperature"]
+        temperature = (
+            self.atm_states[ensemble]["temperature"]
+            if self.atm_states is not None else self.physical_temperature * unit.kelvin
+        )
         for index, context in enumerate(self.contexts):
-            context.setState(source)
-            set_atm_state(context, self.ommsystem, self.atm_states[ensemble])
-            set_rest2_scale(context, self.scales[index], self.ommsystem.rest2_system)
+            if self.atm_states is not None:
+                context.setState(source)
+                set_atm_state(context, self.ommsystem, self.atm_states[ensemble])
+            else:
+                box_vectors = source.getPeriodicBoxVectors()
+                if box_vectors is not None:
+                    context.setPeriodicBoxVectors(*box_vectors)
+                context.setPositions(source.getPositions())
+                try:
+                    velocities = source.getVelocities()
+                    if velocities is not None:
+                        context.setVelocities(velocities)
+                except Exception:
+                    pass
+            set_rest2_scale(context, self.scales[index], self.rest2_system)
             ensemble_offset = {"a": 1000, "m": 2000, "b": 3000}.get(ensemble, 4000)
             context.setVelocitiesToTemperature(temperature, 73000 + ensemble_offset + index)
         self.assignments = list(range(len(self.scales)))
@@ -153,9 +172,10 @@ class REST2ExchangeSampler:
         self.cycle = int(metadata["cycle"])
         self.rng.bit_generator.state = metadata["rng_state"]
         for walker, context in enumerate(self.contexts):
-            set_atm_state(context, self.ommsystem, self.atm_states[ensemble])
+            if self.atm_states is not None:
+                set_atm_state(context, self.ommsystem, self.atm_states[ensemble])
             set_rest2_scale(
-                context, self.scales[self.assignments[walker]], self.ommsystem.rest2_system
+                context, self.scales[self.assignments[walker]], self.rest2_system
             )
 
     def activate(self, ensemble):
@@ -207,8 +227,8 @@ class REST2ExchangeSampler:
         context_j = self.contexts[walker_j]
         u_ii = _energy_kj(context_i)
         u_jj = _energy_kj(context_j)
-        set_rest2_scale(context_i, self.scales[upper_state], self.ommsystem.rest2_system)
-        set_rest2_scale(context_j, self.scales[lower_state], self.ommsystem.rest2_system)
+        set_rest2_scale(context_i, self.scales[upper_state], self.rest2_system)
+        set_rest2_scale(context_j, self.scales[lower_state], self.rest2_system)
         u_ij = _energy_kj(context_i)
         u_ji = _energy_kj(context_j)
         log_acceptance = exchange_log_acceptance(self.beta, u_ii, u_ij, u_jj, u_ji)
@@ -218,8 +238,8 @@ class REST2ExchangeSampler:
             self.accepts[lower_state] += 1
             self.assignments[walker_i], self.assignments[walker_j] = upper_state, lower_state
         else:
-            set_rest2_scale(context_i, self.scales[lower_state], self.ommsystem.rest2_system)
-            set_rest2_scale(context_j, self.scales[upper_state], self.ommsystem.rest2_system)
+            set_rest2_scale(context_i, self.scales[lower_state], self.rest2_system)
+            set_rest2_scale(context_j, self.scales[upper_state], self.rest2_system)
         _append_csv(
             self._directory(self.active_ensemble) / "exchanges.csv",
             ["cycle", "lower_state", "upper_state", "walker_i", "walker_j", "accepted", "log_acceptance"],

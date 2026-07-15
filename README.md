@@ -137,6 +137,8 @@ By default, ATM parameter switching and protocol-work accumulation run inside a 
 
 Optional NEQTI REST2 sampling replaces ordinary A, M, and B decorrelation with synchronous solute-tempering exchange. Both ligand copies are tempered, physical snapshots are taken only from the `s=1` replica, and all nonequilibrium switches remain at `s=1`. The existing equilibration and decorrelation counts are interpreted as steps per REST2 replica.
 
+Experimental native endpoint sampling removes `ATMForce` from A/B equilibration and REST2 while retaining ATM for M and all switches. Select `endpoint_system: native`, `sampling_order: batched`, and `rest2.ensembles: [a, b]`. Endpoint ligand roles and restraints are exchanged consistently in B, and only one endpoint ladder is resident at a time. Existing workflows continue to use ATM endpoints by default.
+
 See the [RBFE user guide](docs/user-guide/rbfe.md) for the complete YAML schema, force-field examples, custom equilibration, restart behavior, outputs, and swapped-coordinate diagnostics.
 
 Every ligand-pair directory also contains an atomically updated `result.yaml` for integration with workflow managers and databases. It uses the same schema for asynchronous replica exchange and NEQTI, reports DDG in kcal/mol and kJ/mol, records input provenance and artifacts, and exposes `prepared`, `running`, `partial`, `completed`, or `failed` status.

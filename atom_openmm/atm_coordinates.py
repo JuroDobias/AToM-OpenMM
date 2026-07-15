@@ -27,6 +27,13 @@ def atm_swapped_positions(positions, keywords):
 
     lig1_var_atoms = _as_index_list(keywords.get("LIGAND1_VAR_ATOMS") or keywords.get("LIGAND1_ATOMS"))
     lig2_var_atoms = _as_index_list(keywords.get("LIGAND2_VAR_ATOMS") or keywords.get("LIGAND2_ATOMS"))
+    lig1_common_atoms = _as_index_list(keywords.get("LIGAND1_COMMON_ATOMS"))
+    lig2_common_atoms = _as_index_list(keywords.get("LIGAND2_COMMON_ATOMS"))
+    if len(lig1_common_atoms) != len(lig2_common_atoms):
+        raise ValueError("ATM common-region atom lists must have equal lengths")
+    for atom1, atom2 in zip(lig1_common_atoms, lig2_common_atoms):
+        swapped[atom1] = positions_nm[atom2]
+        swapped[atom2] = positions_nm[atom1]
     for atom in lig1_var_atoms:
         swapped[atom] = positions_nm[atom] + displacement
     for atom in lig2_var_atoms:

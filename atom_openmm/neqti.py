@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -24,6 +25,12 @@ from atom_openmm.equilibration import neqti_endpoint_steps, neqti_midpoint_steps
 from atom_openmm.ommsystem import OMMSystemRBFE
 from atom_openmm.ommworker import OMMWorkerATMSync
 from atom_openmm.neqti_integrator import OMMWorkerATMNEQTI
+from atom_openmm.neqti_endpoints import (
+    create_native_endpoint_system,
+    map_native_to_atm_positions,
+    transfer_state_to_context,
+    write_converted_state,
+)
 from atom_openmm.rest2 import set_rest2_scale
 from atom_openmm.rest2_exchange import REST2ExchangeSampler
 
@@ -52,6 +59,7 @@ def _protocol_signature(settings):
         "switch_steps_per_segment": settings["switch_steps_per_segment"],
         "preparation_annealing_steps_per_segment": settings.get("preparation_annealing_steps_per_segment", 0),
         "sampling_order": settings.get("sampling_order", "interleaved"),
+        "endpoint_system": settings.get("endpoint_system", "atm"),
     }
     if settings.get("rest2", {}).get("enabled", False):
         payload["rest2"] = settings["rest2"]
@@ -101,6 +109,7 @@ def _initialize_protocol_manifest(settings, resume):
         "switch_steps_per_segment": settings["switch_steps_per_segment"],
         "preparation_annealing_steps_per_segment": settings.get("preparation_annealing_steps_per_segment", 0),
         "sampling_order": settings.get("sampling_order", "interleaved"),
+        "endpoint_system": settings.get("endpoint_system", "atm"),
         "rest2": settings.get("rest2", {"enabled": False}),
         "failed_switch_policy": settings.get("failed_switch_policy", "abort"),
         "signature": signature,
@@ -216,6 +225,9 @@ def normalize_neqti_options(workflow, atom_options):
     sampling_order = str(raw.get("sampling_order", "interleaved")).lower()
     if sampling_order not in ("interleaved", "batched"):
         raise NEQTIConfigError("workflow.neqti.sampling_order must be 'interleaved' or 'batched'")
+    endpoint_system = str(raw.get("endpoint_system", "atm")).lower()
+    if endpoint_system not in ("atm", "native"):
+        raise NEQTIConfigError("workflow.neqti.endpoint_system must be 'atm' or 'native'")
     legacy_tolerate_failures = bool(raw.get("tolerate_failed_switches", False))
     failed_switch_policy = str(
         raw.get("failed_switch_policy", "retry" if legacy_tolerate_failures else "abort")
@@ -229,6 +241,13 @@ def normalize_neqti_options(workflow, atom_options):
     if not isinstance(rest2_raw, dict):
         raise NEQTIConfigError("workflow.neqti.rest2 must be a mapping")
     rest2_enabled = bool(rest2_raw.get("enabled", False))
+    rest2_ensembles = [str(value).lower() for value in rest2_raw.get("ensembles", ["a", "m", "b"])]
+    if len(set(rest2_ensembles)) != len(rest2_ensembles) or any(
+        value not in ("a", "m", "b") for value in rest2_ensembles
+    ):
+        raise NEQTIConfigError(
+            "workflow.neqti.rest2.ensembles must contain unique values from [a, m, b]"
+        )
     physical_temperature = float(atom_options["TEMPERATURES"][0])
     temperatures = [
         float(value) for value in rest2_raw.get(
@@ -241,7 +260,7 @@ def normalize_neqti_options(workflow, atom_options):
     initial_steps = int(raw.get("initial_equilibration_steps", 0))
     decorrelation_steps = int(raw.get("decorrelation_steps", atom_options.get("PRODUCTION_STEPS", 1)))
     if rest2_enabled:
-        if sampling_order != "interleaved":
+        if endpoint_system == "atm" and sampling_order != "interleaved":
             raise NEQTIConfigError("NEQTI REST2 currently requires sampling_order: interleaved")
         if solute != "both_ligands":
             raise NEQTIConfigError("workflow.neqti.rest2.solute currently supports only 'both_ligands'")
@@ -259,8 +278,26 @@ def normalize_neqti_options(workflow, atom_options):
                 raise NEQTIConfigError(
                     f"workflow.neqti.{name} must be divisible by rest2.exchange_interval_steps"
                 )
+    if endpoint_system == "native":
+        if not rest2_enabled:
+            raise NEQTIConfigError(
+                "workflow.neqti.endpoint_system: native currently requires REST2"
+            )
+        if set(rest2_ensembles) != {"a", "b"}:
+            raise NEQTIConfigError(
+                "native endpoint REST2 currently requires rest2.ensembles: [a, b]"
+            )
+        if sampling_order != "batched":
+            raise NEQTIConfigError(
+                "native endpoint REST2 currently requires sampling_order: batched"
+            )
+        if int(raw.get("preparation_annealing_steps_per_segment", 0)) < 1:
+            raise NEQTIConfigError(
+                "native endpoint REST2 requires positive preparation_annealing_steps_per_segment"
+            )
     rest2 = {
         "enabled": rest2_enabled,
+        "ensembles": rest2_ensembles,
         "solute": solute,
         "effective_temperatures_k": temperatures,
         "exchange_interval_steps": exchange_interval,
@@ -281,6 +318,7 @@ def normalize_neqti_options(workflow, atom_options):
         "platform": raw.get("platform"),
         "switch_integrator": switch_integrator,
         "sampling_order": sampling_order,
+        "endpoint_system": endpoint_system,
         "rest2": rest2,
         "validate_switch_integrator": bool(raw.get("validate_switch_integrator", False)),
         "tolerate_failed_switches": failed_switch_policy == "retry",
@@ -834,7 +872,10 @@ def summarize_existing_neqti_work(options, neqti_options, paths, *, bootstrap_sa
         warnings.append("BAR has no finite connecting sample in at least one required direction.")
     rest2_summary = None
     if neqti_options.get("rest2", {}).get("enabled", False):
-        rest2_summary = {"states": {}}
+        rest2_summary = {
+            "states": {},
+            "sampled_ensembles": list(neqti_options["rest2"].get("ensembles", ["a", "m", "b"])),
+        }
         for ensemble in ("a", "m", "b"):
             metadata_path = Path("neqti_rest2") / ensemble / "state.json"
             if not metadata_path.exists():
@@ -876,6 +917,7 @@ def summarize_existing_neqti_work(options, neqti_options, paths, *, bootstrap_sa
         "failed_switch_counts": failed_counts,
         "temperature_kelvin": float(temperature_kelvin),
         "hamiltonian": "atm_softplus_single_midpoint",
+        "endpoint_system": neqti_options.get("endpoint_system", "atm"),
         "paths": paths,
         "settings": neqti_options,
         "analysis": analysis,
@@ -970,7 +1012,12 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
     }
     marker = Path("neqti_equilibrium_states.ok")
     marker_matches = marker.exists() and marker.read_text().strip() == protocol_signature
-    if endpoint_steps is not None or midpoint_steps is not None or neqti_options["preparation_annealing_steps_per_segment"] > 0:
+    if (
+        endpoint_steps is not None
+        or midpoint_steps is not None
+        or neqti_options["preparation_annealing_steps_per_segment"] > 0
+        or neqti_options.get("endpoint_system") == "native"
+    ):
         if neqti_options["resume"] and marker_matches and all(path.exists() for path in equilibrated_files.values()):
             logger.info("Reusing completed NEQTI endpoint and midpoint states")
         else:
@@ -1074,7 +1121,40 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                 finally:
                     prep_worker.finish()
 
-            if endpoint_steps is not None:
+            if neqti_options.get("endpoint_system", "atm") == "native":
+                for name in ("a", "b"):
+                    native_system = create_native_endpoint_system(
+                        endpoint_system, name, rest2=True, logger=logger
+                    )
+                    native_input = Path(f"neqti_endpoint_{name.upper()}_native_input.xml")
+                    write_converted_state(
+                        endpoint_sources[name],
+                        native_system,
+                        native_input,
+                        endpoint=name,
+                        keywords=options,
+                        to_native=True,
+                        platform=platform,
+                        platform_properties=platform_properties,
+                    )
+                    if endpoint_steps is None:
+                        equilibrated_files[name].write_text(native_input.read_text())
+                        continue
+                    run_custom_equilibration(
+                        ommsystem=native_system,
+                        steps=endpoint_steps,
+                        platform=platform,
+                        platform_properties=platform_properties,
+                        output_dir=Path("equilibration") / f"neqti_{name}",
+                        final_state_path=equilibrated_files[name],
+                        final_pdb_path={"a": "neqti_endpoint_A.pdb", "b": "neqti_endpoint_B.pdb"}[name],
+                        initial_state_path=native_input,
+                        atm_state=None,
+                        swapped_diagnostics_keywords=options,
+                        logger=logger,
+                    )
+                    logger.info("Completed native NEQTI %s endpoint equilibration", name)
+            elif endpoint_steps is not None:
                 for name in ("a", "b"):
                     run_custom_equilibration(
                         ommsystem=endpoint_system,
@@ -1095,12 +1175,13 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
     node_info = _select_node_info(options, neqti_options)
     rest2_enabled = neqti_options.get("rest2", {}).get("enabled", False)
     system_options = deepcopy(options)
-    system_options["REST2_ENABLED"] = rest2_enabled
+    atm_rest2_enabled = rest2_enabled and neqti_options.get("endpoint_system", "atm") == "atm"
+    system_options["REST2_ENABLED"] = atm_rest2_enabled
     ommsystem = OMMSystemRBFE(
         basename, system_options, basename + ".pdb", basename + "_sys.xml", logger
     )
     worker_options = deepcopy(options)
-    worker_options["REST2_ENABLED"] = rest2_enabled
+    worker_options["REST2_ENABLED"] = atm_rest2_enabled
     worker_options["INITIAL_STATE_FILE"] = state_files["m"]
     use_custom_worker = (
         neqti_options["switch_integrator"] == "custom"
@@ -1129,7 +1210,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
         )
 
     rest2_sampler = None
-    if rest2_enabled:
+    if atm_rest2_enabled:
         set_rest2_scale(worker.context, 1.0, ommsystem.rest2_system)
         rest2_sampler = REST2ExchangeSampler(
             system=worker.system,
@@ -1158,11 +1239,13 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
         for path in [*work_files.values(), *checkpoints.values(), Path("neqti_summary.yaml")]:
             if path.exists():
                 path.unlink()
+        if neqti_options.get("endpoint_system") == "native":
+            shutil.rmtree("neqti_rest2", ignore_errors=True)
     for path in work_files.values():
         _ensure_work_csv(path)
 
     def execute_switch(switch_name, start_state, schedule, path, label):
-        if rest2_enabled:
+        if atm_rest2_enabled:
             set_rest2_scale(worker.context, 1.0, ommsystem.rest2_system)
         if neqti_options["switch_integrator"] == "custom":
             work_kcal = _run_switch_custom(
@@ -1266,6 +1349,128 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
 
     def all_targets_reached():
         return all(completed_count(name) >= neqti_options["n_snapshots"] for name in work_files)
+
+    def run_native_endpoint_stream(ensemble, switch_name):
+        completed = _read_analyzed_rows(work_files[switch_name])
+        if len(completed) >= neqti_options["n_snapshots"]:
+            return
+        native_system = create_native_endpoint_system(
+            ommsystem, ensemble, rest2=True, logger=logger
+        )
+        sampler = REST2ExchangeSampler(
+            system=native_system.system,
+            topology=native_system.topology,
+            base_integrator=native_system.integrator,
+            rest2_system=native_system.rest2_system,
+            state_files={ensemble: state_files[ensemble]},
+            config=neqti_options["rest2"],
+            platform=worker.platform,
+            platform_properties=worker.platform_properties,
+            output_dir="neqti_rest2",
+            resume=True,
+            random_seed=neqti_options["random_seed"] + (10000 if ensemble == "b" else 0),
+            logger=logger,
+        )
+        try:
+            existing_bank = sampler.has_bank(ensemble)
+            sampler.activate(ensemble)
+            if not existing_bank and not completed and neqti_options["initial_equilibration_steps"] > 0:
+                sampler.run_steps(
+                    ensemble,
+                    neqti_options["initial_equilibration_steps"],
+                    f"NEQTI native {ensemble} initial REST2 equilibration",
+                )
+            elif existing_bank:
+                logger.info(
+                    "Resuming native NEQTI %s REST2 sampling after %d analyzed trajectories",
+                    ensemble,
+                    len(completed),
+                )
+            elif completed:
+                logger.info(
+                    "Initializing missing native NEQTI %s REST2 bank after %d analyzed "
+                    "trajectories; skipping initial equilibration",
+                    ensemble,
+                    len(completed),
+                )
+
+            all_existing = len(completed) + len(_read_failed_rows(work_files[switch_name]))
+            for attempt in range(
+                all_existing, neqti_options["max_switch_attempts_per_direction"]
+            ):
+                if len(_read_analyzed_rows(work_files[switch_name])) >= neqti_options["n_snapshots"]:
+                    break
+                if neqti_options["decorrelation_steps"] > 0:
+                    sampler.run_steps(
+                        ensemble,
+                        neqti_options["decorrelation_steps"],
+                        f"NEQTI native {ensemble} trajectory {attempt} decorrelation",
+                    )
+                native_state = sampler.physical_state(ensemble)
+                native_pdb = Path(f"neqti_{ensemble}_native_snapshot_{attempt}.pdb")
+                with native_pdb.open("w") as handle:
+                    PDBFile.writeFile(
+                        native_system.topology,
+                        native_state.getPositions(),
+                        handle,
+                        keepIds=True,
+                    )
+                transfer_state_to_context(
+                    native_state,
+                    worker.context,
+                    endpoint=ensemble,
+                    keywords=options,
+                    to_native=False,
+                )
+                box_vectors = native_state.getPeriodicBoxVectors()
+                if box_vectors is not None:
+                    worker.topology.setPeriodicBoxVectors(box_vectors)
+                worker.set_state(stateparams[paths[switch_name][0]])
+                snapshot = worker.get_chkpt()
+                _write_worker_pdb_pair(
+                    worker, f"neqti_{ensemble}_snapshot_{attempt}.pdb"
+                )
+                if neqti_options["validate_switch_integrator"]:
+                    _validate_switch_implementations(
+                        worker,
+                        direction=switch_name,
+                        snapshot=snapshot,
+                        start_state=stateparams[paths[switch_name][0]],
+                        schedule=schedules[switch_name],
+                        steps_per_segment=neqti_options["switch_steps_per_segment"],
+                        state_path=paths[switch_name],
+                        logger=logger,
+                    )
+                try:
+                    work_kcal = execute_switch(
+                        switch_name,
+                        stateparams[paths[switch_name][0]],
+                        schedules[switch_name],
+                        paths[switch_name],
+                        f"{switch_name} trajectory {attempt}",
+                    )
+                    _write_worker_pdb_pair(
+                        worker,
+                        f"neqti_{ensemble}_{switch_name}_snapshot_{attempt}_post_switch.pdb",
+                    )
+                    _append_row(work_files[switch_name], {
+                        "trajectory": attempt,
+                        "direction": switch_name,
+                        "start_state": paths[switch_name][0],
+                        "end_state": paths[switch_name][-1],
+                        "work_kcal_per_mol": f"{work_kcal:.12g}",
+                        "work_kj_per_mol": f"{work_kcal * KCAL_TO_KJ:.12g}",
+                        "switch_steps": len(schedules[switch_name]),
+                        "status": "complete",
+                    })
+                except Exception as exc:
+                    record_switch_failure(switch_name, attempt, exc)
+                finally:
+                    worker.set_chkpt(snapshot)
+                    worker.set_state(states[ensemble])
+                emit_progress(with_analysis=True)
+        finally:
+            sampler.close()
 
     def run_interleaved_sampling():
         stream_initialized = {"m": False, "a": False, "b": False}
@@ -1531,6 +1736,9 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                 emit_progress()
 
         for ensemble, switch_name in endpoint_stream_specs:
+            if neqti_options.get("endpoint_system") == "native":
+                run_native_endpoint_stream(ensemble, switch_name)
+                continue
             completed = _read_analyzed_rows(work_files[switch_name])
             if len(completed) >= neqti_options["n_snapshots"]:
                 continue

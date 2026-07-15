@@ -87,3 +87,51 @@ def _test_rest2_exchange_sampler_preserves_independent_atm_banks(tmp_path):
     assert sampler.cycle == 2
     assert sampler.physical_state("a").getPositions() is not None
     sampler.close()
+
+
+def _test_rest2_exchange_sampler_supports_fixed_native_hamiltonian(tmp_path):
+    from atom_openmm.rest2 import create_rest2_system
+    from atom_openmm.rest2_exchange import REST2ExchangeSampler
+
+    physical = mm.System()
+    physical.addParticle(12.0)
+    physical.addParticle(12.0)
+    bonds = mm.HarmonicBondForce()
+    bonds.addBond(0, 1, 0.1, 100.0)
+    physical.addForce(bonds)
+    nonbonded = mm.NonbondedForce()
+    nonbonded.addParticle(0.0, 0.3, 0.0)
+    nonbonded.addParticle(0.0, 0.3, 0.0)
+    physical.addForce(nonbonded)
+    rest2 = create_rest2_system(physical, [0, 1])
+
+    state_context = mm.Context(rest2.system, mm.VerletIntegrator(0.001))
+    state_context.setPositions([[0, 0, 0], [0.2, 0, 0]])
+    state_context.setVelocitiesToTemperature(300 * unit.kelvin, 1)
+    state_file = tmp_path / "a.xml"
+    state_file.write_text(mm.XmlSerializer.serialize(
+        state_context.getState(getPositions=True, getVelocities=True)
+    ))
+
+    sampler = REST2ExchangeSampler(
+        system=rest2.system,
+        topology=None,
+        base_integrator=mm.LangevinMiddleIntegrator(300, 1, 0.001),
+        rest2_system=rest2,
+        state_files={"a": state_file},
+        config={
+            "effective_temperatures_k": [300, 600],
+            "exchange_interval_steps": 1,
+            "checkpoint_interval_cycles": 1,
+        },
+        platform=mm.Platform.getPlatformByName("Reference"),
+        platform_properties={},
+        output_dir=tmp_path / "native_rest2",
+        resume=False,
+    )
+    sampler.run_steps("a", 2)
+
+    assert sampler.cycle == 2
+    assert sampler.contexts[0].getParameter("REST2_SCALE") in (0.5, 1.0)
+    assert sampler.physical_state("a").getPositions() is not None
+    sampler.close()

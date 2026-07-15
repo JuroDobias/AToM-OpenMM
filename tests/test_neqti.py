@@ -71,6 +71,54 @@ def _test_normalize_neqti_options_accepts_rest2_sampling():
     assert settings["rest2"]["enabled"] is True
     assert settings["rest2"]["solute"] == "both_ligands"
     assert settings["rest2"]["effective_temperatures_k"] == [300.0, 450.0, 700.0]
+    assert settings["rest2"]["ensembles"] == ["a", "m", "b"]
+    assert settings["endpoint_system"] == "atm"
+
+
+def _test_normalize_neqti_options_accepts_native_endpoint_rest2():
+    from atom_openmm.neqti import normalize_neqti_options
+
+    settings = normalize_neqti_options(
+        {"neqti": {
+            "endpoint_system": "native",
+            "sampling_order": "batched",
+            "preparation_annealing_steps_per_segment": 10,
+            "initial_equilibration_steps": 1000,
+            "decorrelation_steps": 2000,
+            "rest2": {
+                "enabled": True,
+                "ensembles": ["a", "b"],
+                "effective_temperatures_k": [300, 450, 600],
+                "exchange_interval_steps": 500,
+            },
+        }},
+        _atom_options(),
+    )
+
+    assert settings["endpoint_system"] == "native"
+    assert settings["sampling_order"] == "batched"
+    assert settings["rest2"]["ensembles"] == ["a", "b"]
+
+
+@pytest.mark.parametrize(
+    "neqti, message",
+    [
+        ({"endpoint_system": "native", "sampling_order": "batched"}, "requires REST2"),
+        ({
+            "endpoint_system": "native", "sampling_order": "batched", "decorrelation_steps": 500,
+            "rest2": {"enabled": True},
+        }, "ensembles: \\[a, b\\]"),
+        ({
+            "endpoint_system": "native", "decorrelation_steps": 500,
+            "rest2": {"enabled": True, "ensembles": ["a", "b"]},
+        }, "sampling_order: batched"),
+    ],
+)
+def _test_normalize_neqti_options_rejects_incomplete_native_endpoint_mode(neqti, message):
+    from atom_openmm.neqti import NEQTIConfigError, normalize_neqti_options
+
+    with pytest.raises(NEQTIConfigError, match=message):
+        normalize_neqti_options({"neqti": neqti}, _atom_options())
 
 
 def _test_normalize_neqti_options_rejects_incompatible_rest2_steps():

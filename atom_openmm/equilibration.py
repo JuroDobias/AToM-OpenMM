@@ -430,6 +430,7 @@ def run_custom_equilibration(
     final_pdb_path: str | Path,
     initial_state_path: str | Path | None = None,
     atm_state: dict[str, Any] | None = None,
+    swapped_diagnostics_keywords: dict[str, Any] | None = None,
     logger=None,
 ):
     logger = logger or logging.getLogger("atom_openmm.equilibration")
@@ -476,7 +477,12 @@ def run_custom_equilibration(
             simulation.loadState(str(prev_state_path))
         _apply_atm_state(simulation.context, ommsystem, atm_state)
         simulation.context.applyConstraints(0.00001)
-        for reporter in _build_reporters(step_cfg, step_dir, keywords=ommsystem.keywords if atm_state is not None else None):
+        diagnostic_keywords = (
+            ommsystem.keywords if atm_state is not None else swapped_diagnostics_keywords
+        )
+        for reporter in _build_reporters(
+            step_cfg, step_dir, keywords=diagnostic_keywords
+        ):
             simulation.reporters.append(reporter)
         if not simulation.reporters:
             interval = max(1, int(step_cfg.get("reporter_interval", step_cfg.get("n_steps", 1))))
@@ -529,7 +535,7 @@ def run_custom_equilibration(
         _strip_integrator_parameters(step_state_path)
         logger.info("Custom equilibration step %d/%d %s: writing PDB to %s", i + 1, len(steps), step_id, step_pdb_path)
         _save_final_pdb(simulation, step_pdb_path)
-        if atm_state is not None:
+        if diagnostic_keywords is not None:
             swapped_path = step_dir / "final_state_swapped.pdb"
             logger.info(
                 "Custom equilibration step %d/%d %s: writing swapped PDB to %s",
@@ -539,7 +545,9 @@ def run_custom_equilibration(
                 swapped_path,
             )
             positions = simulation.context.getState(getPositions=True).getPositions()
-            write_atm_swapped_pdb(simulation.topology, positions, ommsystem.keywords, swapped_path)
+            write_atm_swapped_pdb(
+                simulation.topology, positions, diagnostic_keywords, swapped_path
+            )
         wall_seconds = time.perf_counter() - wall_start
         manifest["steps"][step_id] = {
             "type": step_cfg["type"],
@@ -547,7 +555,7 @@ def run_custom_equilibration(
             "wall_seconds": wall_seconds,
             "final_state": str(step_state_path),
             "final_pdb": str(step_pdb_path),
-            "final_swapped_pdb": str(step_dir / "final_state_swapped.pdb") if atm_state is not None else None,
+            "final_swapped_pdb": str(step_dir / "final_state_swapped.pdb") if diagnostic_keywords is not None else None,
         }
         if step_cfg["type"] == "md" and wall_seconds > 0.0:
             ns_per_day = completed_steps * timestep_ps * 86.4 / wall_seconds

@@ -218,6 +218,8 @@ For the example above, the execution order is:
 | `decorrelation_steps` | Endpoint MD between consecutive switching snapshots. |
 | `switch_steps_per_segment` | Integration steps between neighboring nodes of each derived half path. |
 | `preparation_annealing_steps_per_segment` | Optional switching steps per schedule segment for pre-ATM->M, M->A, and M->B preparation annealing. |
+| `sampling_order` | `interleaved` runs four directions by snapshot cycle; `batched` completes midpoint directions before endpoint directions. |
+| `endpoint_system` | `atm` (default) samples endpoints with ATM; experimental `native` samples physical dual-ligand A and B systems without `ATMForce`. |
 | `switch_integrator` | `custom` (default) performs switching and work accumulation inside OpenMM; `python` retains the reference implementation. |
 | `validate_switch_integrator` | Run one informational custom-versus-Python comparison in each direction from identical snapshots. |
 | `failed_switch_policy` | `abort` stops on a failed switch, `retry` excludes it and draws a replacement snapshot, and `count_as_infinite` includes a recognized numerical failure as `+inf` work without replacement. |
@@ -230,7 +232,27 @@ For the example above, the execution order is:
 
 When `rest2.enabled: true`, the additional NEQTI sampling at A, M, and B uses a synchronous REST2 ladder instead of ordinary MD. `initial_equilibration_steps` and `decorrelation_steps` are steps per replica and must be divisible by `rest2.exchange_interval_steps`. All replicas use the physical thermostat temperature; the effective temperatures define REST2 Hamiltonian scales. Version 1 supports `solute: both_ligands`, which scales both complete ligand copies while leaving protein, solvent, ions, and ATM restraint forces physical.
 
-The physical `s=1` replica supplies positions, velocities, and box vectors for each NEQTI switch. Switching itself always uses `s=1`, so work values and BAR analysis retain the standard ATM Hamiltonian. REST2 currently requires interleaved NEQTI sampling and the common/variable-region ATM coordinate-swap setup.
+Native endpoint REST2 is enabled explicitly:
+
+```yaml
+workflow:
+  neqti:
+    endpoint_system: native
+    sampling_order: batched
+    preparation_annealing_steps_per_segment: 10000
+    rest2:
+      enabled: true
+      ensembles: [a, b]
+      solute: both_ligands
+      effective_temperatures_k: [300, 331, 366, 404, 446, 492, 543, 600]
+      exchange_interval_steps: 500
+```
+
+This mode retains the current convention: A has L1 bound and L2 unbound; B has L2 bound and L1 unbound. M uses ordinary ATM MD. After ATM M-to-A/B preparation annealing, endpoint coordinates are converted to role-aware physical systems. Site, orientation, alignment, and optional receptor-exclusion restraints follow the bound/unbound roles. Endpoint equilibration and REST2 run without `ATMForce`. Native positions are converted back to the canonical ATM representation only for A/B-to-M switching; box vectors and per-atom velocities are preserved.
+
+Native endpoint mode currently requires REST2, `rest2.ensembles: [a, b]`, `sampling_order: batched`, and positive preparation annealing. It runs midpoint work first and then one resident A or B ladder at a time, avoiding two simultaneous endpoint ladders in GPU memory. Existing workflows retain ATM endpoints.
+
+The physical `s=1` replica supplies positions, velocities, and box vectors for each NEQTI switch. Switching itself always uses `s=1`, so work values and BAR analysis retain the standard ATM Hamiltonian. Legacy ATM endpoint REST2 requires interleaved sampling; native endpoint REST2 uses batched sampling. Both require the common/variable-region ATM coordinate-swap setup.
 
 Four half-path switches have approximately the same total integration length as two complete A↔B switches. Logs report effective ns/day for equilibration, decorrelation, and switching segments.
 
