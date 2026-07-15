@@ -52,11 +52,88 @@ def _test_normalize_neqti_options_accepts_batched_sampling_order():
     assert settings["sampling_order"] == "batched"
 
 
+def _test_normalize_neqti_options_accepts_rest2_sampling():
+    from atom_openmm.neqti import normalize_neqti_options
+
+    settings = normalize_neqti_options(
+        {"neqti": {
+            "initial_equilibration_steps": 1000,
+            "decorrelation_steps": 2000,
+            "rest2": {
+                "enabled": True,
+                "effective_temperatures_k": [300, 450, 700],
+                "exchange_interval_steps": 500,
+            },
+        }},
+        _atom_options(),
+    )
+
+    assert settings["rest2"]["enabled"] is True
+    assert settings["rest2"]["solute"] == "both_ligands"
+    assert settings["rest2"]["effective_temperatures_k"] == [300.0, 450.0, 700.0]
+
+
+def _test_normalize_neqti_options_rejects_incompatible_rest2_steps():
+    from atom_openmm.neqti import NEQTIConfigError, normalize_neqti_options
+
+    with pytest.raises(NEQTIConfigError, match="decorrelation_steps must be divisible"):
+        normalize_neqti_options(
+            {"neqti": {
+                "decorrelation_steps": 750,
+                "rest2": {"enabled": True, "exchange_interval_steps": 500},
+            }},
+            _atom_options(),
+        )
+
+
+def _test_normalize_neqti_options_rejects_batched_rest2():
+    from atom_openmm.neqti import NEQTIConfigError, normalize_neqti_options
+
+    with pytest.raises(NEQTIConfigError, match="sampling_order: interleaved"):
+        normalize_neqti_options(
+            {"neqti": {"sampling_order": "batched", "rest2": {"enabled": True}}},
+            _atom_options(),
+        )
+
+
 def _test_normalize_neqti_options_rejects_invalid_sampling_order():
     from atom_openmm.neqti import NEQTIConfigError, normalize_neqti_options
 
     with pytest.raises(NEQTIConfigError, match="sampling_order"):
         normalize_neqti_options({"neqti": {"sampling_order": "random"}}, _atom_options())
+
+
+def _test_failed_switch_policy_preserves_legacy_defaults():
+    from atom_openmm.neqti import normalize_neqti_options
+
+    abort = normalize_neqti_options({"neqti": {}}, _atom_options())
+    retry = normalize_neqti_options(
+        {"neqti": {"tolerate_failed_switches": True}}, _atom_options()
+    )
+    counted = normalize_neqti_options(
+        {"neqti": {"failed_switch_policy": "count_as_infinite"}}, _atom_options()
+    )
+
+    assert abort["failed_switch_policy"] == "abort"
+    assert retry["failed_switch_policy"] == "retry"
+    assert counted["failed_switch_policy"] == "count_as_infinite"
+    assert counted["tolerate_failed_switches"] is False
+
+
+def _test_numerical_switch_failure_classification_is_conservative():
+    from atom_openmm.neqti import _is_numerical_switch_failure
+
+    assert _is_numerical_switch_failure(mm.OpenMMException("Particle coordinate is NaN"))
+    assert _is_numerical_switch_failure(
+        mm.OpenMMException("The constraints could not be satisfied")
+    )
+    assert not _is_numerical_switch_failure(
+        mm.OpenMMException("Error loading CUDA module: CUDA_ERROR_UNSUPPORTED_PTX_VERSION")
+    )
+    assert not _is_numerical_switch_failure(
+        mm.OpenMMException("Requested two different values for random number seed")
+    )
+    assert not _is_numerical_switch_failure(KeyError("programming error"))
 
 
 def _test_switch_schedule_interpolates_between_knots():
@@ -117,6 +194,36 @@ def _test_protocol_manifest_rejects_sampling_order_changes(tmp_path, monkeypatch
         _initialize_protocol_manifest(settings, resume=True)
 
 
+def _test_count_as_infinite_changes_protocol_signature_only_for_that_policy():
+    from atom_openmm.neqti import _protocol_signature
+
+    settings = {"paths": {"leg_a_forward": [0, 1]}, "switch_steps_per_segment": 10}
+
+    assert _protocol_signature(settings) == _protocol_signature(
+        {**settings, "failed_switch_policy": "retry"}
+    )
+    assert _protocol_signature(settings) == _protocol_signature(
+        {**settings, "failed_switch_policy": "abort"}
+    )
+    assert _protocol_signature(settings) != _protocol_signature(
+        {**settings, "failed_switch_policy": "count_as_infinite"}
+    )
+
+
+def _test_disabled_rest2_preserves_existing_protocol_signature():
+    from atom_openmm.neqti import _protocol_signature
+
+    settings = {
+        "paths": {"leg_a_forward": [0, 1]},
+        "switch_steps_per_segment": 10,
+    }
+    disabled = {**settings, "rest2": {"enabled": False, "effective_temperatures_k": [300, 900]}}
+    enabled = {**settings, "rest2": {"enabled": True, "effective_temperatures_k": [300, 900]}}
+
+    assert _protocol_signature(settings) == _protocol_signature(disabled)
+    assert _protocol_signature(settings) != _protocol_signature(enabled)
+
+
 def _test_switch_progress_reports_effective_ns_per_day():
     from atom_openmm.neqti import _run_switch
 
@@ -166,6 +273,18 @@ def _test_bar_estimator_sign_convention():
     from atom_openmm.neqti import estimate_bar
 
     assert estimate_bar([2.0, 2.0, 2.0], [-2.0, -2.0, -2.0], 300.0) == pytest.approx(2.0)
+
+
+def _test_bar_estimator_includes_infinite_work_observations():
+    from atom_openmm.neqti import estimate_bar
+
+    assert estimate_bar([2.0] * 4, [-2.0] * 3 + [float("inf")], 300.0) == pytest.approx(
+        1.8284951018381972
+    )
+    assert estimate_bar([2.0] * 3 + [float("inf")], [-2.0] * 4, 300.0) == pytest.approx(
+        2.17150489816196
+    )
+    assert estimate_bar([float("inf")], [-2.0], 300.0) is None
 
 
 def _test_single_midpoint_analysis_combines_two_legs_without_bridge():
@@ -477,7 +596,9 @@ def _test_neqti_loads_physical_initial_state_for_both_directions(tmp_path, monke
     }
 
 
-def _run_fake_neqti_for_order(tmp_path, monkeypatch, sampling_order):
+def _run_fake_neqti_for_order(
+    tmp_path, monkeypatch, sampling_order, *, switch_implementation=None, settings_overrides=None
+):
     from atom_openmm import neqti
 
     monkeypatch.chdir(tmp_path)
@@ -519,6 +640,8 @@ def _run_fake_neqti_for_order(tmp_path, monkeypatch, sampling_order):
 
     def fake_run_switch(worker, start_state, schedule, steps_per_segment, path, logger, label):
         labels.append(label.split()[0])
+        if switch_implementation is not None:
+            return switch_implementation(label)
         return 0.0
 
     monkeypatch.setattr(neqti, "_select_node_info", lambda options, neqti_options: {"node_name": "local"})
@@ -527,9 +650,7 @@ def _run_fake_neqti_for_order(tmp_path, monkeypatch, sampling_order):
     monkeypatch.setattr(neqti, "_write_worker_pdb_pair", lambda worker, path: None)
     monkeypatch.setattr(neqti, "_run_switch", fake_run_switch)
 
-    summary = neqti.run_neqti(
-        options,
-        {
+    settings = {
             "initial_equilibration_steps": 0,
             "n_snapshots": 2,
             "decorrelation_steps": 0,
@@ -548,8 +669,13 @@ def _run_fake_neqti_for_order(tmp_path, monkeypatch, sampling_order):
             "validate_switch_integrator": False,
             "preparation_annealing_steps_per_segment": 0,
             "tolerate_failed_switches": False,
+            "failed_switch_policy": "abort",
             "max_switch_attempts_per_direction": 2,
-        },
+        }
+    settings.update(settings_overrides or {})
+    summary = neqti.run_neqti(
+        options,
+        settings,
         progress_callback=progress.append,
     )
     return labels, progress, summary
@@ -579,3 +705,108 @@ def _test_batched_sampling_preserves_old_leg_order(tmp_path, monkeypatch):
         "leg_a_forward", "leg_a_forward", "leg_b_forward", "leg_b_forward",
     ]
     assert summary["sample_counts"]["leg_b_forward"] == 2
+
+
+def _test_counted_numerical_failure_consumes_sample_without_replacement(tmp_path, monkeypatch):
+    failed = False
+
+    def switch(label):
+        nonlocal failed
+        if label.startswith("leg_a_reverse") and not failed:
+            failed = True
+            raise mm.OpenMMException("Particle coordinate is NaN")
+        return 0.0
+
+    labels, progress, summary = _run_fake_neqti_for_order(
+        tmp_path,
+        monkeypatch,
+        "interleaved",
+        switch_implementation=switch,
+        settings_overrides={
+            "n_snapshots": 1,
+            "failed_switch_policy": "count_as_infinite",
+            "max_switch_attempts_per_direction": 2,
+        },
+    )
+
+    assert labels.count("leg_a_reverse") == 1
+    assert summary["sample_counts"]["leg_a_reverse"] == 1
+    assert summary["finite_sample_counts"]["leg_a_reverse"] == 0
+    assert summary["counted_infinite_work_counts"]["leg_a_reverse"] == 1
+    assert summary["failed_switch_counts"]["leg_a_reverse"] == 0
+    assert summary["analysis"] is None
+    with (tmp_path / "neqti_leg_a_reverse.csv").open() as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["status"] == "counted_infinite"
+    assert rows[0]["work_kcal_per_mol"] == "inf"
+    assert progress[-1]["counted_infinite_work_counts"]["leg_a_reverse"] == 1
+
+    resumed_labels, _, resumed = _run_fake_neqti_for_order(
+        tmp_path,
+        monkeypatch,
+        "interleaved",
+        switch_implementation=lambda label: pytest.fail(f"unexpected resumed switch: {label}"),
+        settings_overrides={
+            "n_snapshots": 1,
+            "resume": True,
+            "failed_switch_policy": "count_as_infinite",
+            "max_switch_attempts_per_direction": 2,
+        },
+    )
+    assert resumed_labels == []
+    assert resumed["sample_counts"]["leg_a_reverse"] == 1
+
+
+def _test_retry_policy_replaces_failed_switch(tmp_path, monkeypatch):
+    calls = 0
+
+    def switch(label):
+        nonlocal calls
+        if label.startswith("leg_a_reverse"):
+            calls += 1
+            if calls == 1:
+                raise mm.OpenMMException("Particle coordinate is NaN")
+        return 0.0
+
+    labels, _, summary = _run_fake_neqti_for_order(
+        tmp_path,
+        monkeypatch,
+        "interleaved",
+        switch_implementation=switch,
+        settings_overrides={
+            "n_snapshots": 1,
+            "failed_switch_policy": "retry",
+            "tolerate_failed_switches": True,
+            "max_switch_attempts_per_direction": 2,
+        },
+    )
+
+    assert labels.count("leg_a_reverse") == 2
+    assert summary["sample_counts"]["leg_a_reverse"] == 1
+    assert summary["failed_switch_counts"]["leg_a_reverse"] == 1
+    assert summary["counted_infinite_work_counts"]["leg_a_reverse"] == 0
+
+
+def _test_count_as_infinite_does_not_hide_infrastructure_failure(tmp_path, monkeypatch):
+    def switch(label):
+        raise mm.OpenMMException(
+            "Error loading CUDA module: CUDA_ERROR_UNSUPPORTED_PTX_VERSION"
+        )
+
+    with pytest.raises(mm.OpenMMException, match="UNSUPPORTED_PTX_VERSION"):
+        _run_fake_neqti_for_order(
+            tmp_path,
+            monkeypatch,
+            "interleaved",
+            switch_implementation=switch,
+            settings_overrides={
+                "n_snapshots": 1,
+                "failed_switch_policy": "count_as_infinite",
+                "max_switch_attempts_per_direction": 2,
+            },
+        )
+
+    with (tmp_path / "neqti_leg_a_reverse.csv").open() as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["work_kcal_per_mol"] == ""

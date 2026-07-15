@@ -1,4 +1,5 @@
 import math
+import copy
 
 import numpy as np
 import openmm as mm
@@ -120,3 +121,42 @@ def _test_rest2_rejects_unsupported_force():
     system.addForce(nonbonded)
     with pytest.raises(REST2Error, match="CustomBondForce"):
         create_rest2_system(system, [0])
+
+
+def _test_rest2_parameters_remain_active_inside_atmforce():
+    from atom_openmm.rest2 import create_rest2_system, set_rest2_scale
+
+    system = mm.System()
+    system.addParticle(12.0)
+    system.addParticle(12.0)
+    bonds = mm.HarmonicBondForce()
+    bonds.addBond(0, 1, 0.1, 100.0)
+    system.addForce(bonds)
+    nonbonded = mm.NonbondedForce()
+    nonbonded.addParticle(0.0, 0.3, 0.0)
+    nonbonded.addParticle(0.0, 0.3, 0.0)
+    system.addForce(nonbonded)
+    rest2 = create_rest2_system(system, [0, 1])
+
+    atmforce = mm.ATMForce("u0")
+    for force in rest2.system.getForces():
+        atmforce.addForce(copy.copy(force))
+    atmforce.addParticle(mm.Vec3(0, 0, 0))
+    atmforce.addParticle(mm.Vec3(0, 0, 0))
+    nested = mm.System()
+    nested.addParticle(12.0)
+    nested.addParticle(12.0)
+    nested.addForce(atmforce)
+    context = mm.Context(
+        nested, mm.VerletIntegrator(0.001), mm.Platform.getPlatformByName("Reference")
+    )
+    context.setPositions([[0, 0, 0], [0.2, 0, 0]])
+    physical = context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(
+        unit.kilojoule_per_mole
+    )
+    set_rest2_scale(context, 0.5, rest2)
+    scaled = context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(
+        unit.kilojoule_per_mole
+    )
+
+    assert scaled == pytest.approx(0.5 * physical)

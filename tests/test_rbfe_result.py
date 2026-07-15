@@ -78,6 +78,19 @@ def _test_neqti_partial_result_and_missing_uncertainty(tmp_path):
                 "leg_b_forward": 6,
                 "leg_b_reverse": 1,
             },
+            "finite_sample_counts": {
+                "leg_a_forward": 3,
+                "leg_a_reverse": 2,
+                "leg_b_forward": 5,
+                "leg_b_reverse": 1,
+            },
+            "counted_infinite_work_counts": {
+                "leg_a_forward": 1,
+                "leg_a_reverse": 0,
+                "leg_b_forward": 1,
+                "leg_b_reverse": 0,
+            },
+            "warnings": ["2 numerical switch failures were included as +infinite protocol work."],
             "analysis": {
                 "bar_dg_kcal_per_mol": 2.0,
                 "bar_bootstrap_std_kcal_per_mol": None,
@@ -107,6 +120,9 @@ def _test_neqti_partial_result_and_missing_uncertainty(tmp_path):
         "leg_b_forward": 10,
         "leg_b_reverse": 10,
     }
+    assert result["quality"]["counted_infinite_work_counts"]["leg_a_forward"] == 1
+    assert result["progress"]["finite_sample_counts"]["leg_b_forward"] == 5
+    assert "2 numerical switch failures" in " ".join(result["quality"]["warnings"])
     assert result["progress"]["completed_snapshot_cycles"] == 1
     assert result["progress"]["target_snapshot_cycles"] == 10
     assert "Free-energy uncertainty is unavailable." in result["quality"]["warnings"]

@@ -1,0 +1,89 @@
+import json
+
+import openmm as mm
+from openmm import unit
+
+
+class _ATMNames:
+    def Lambda1(self): return "Lambda1"
+    def Lambda2(self): return "Lambda2"
+    def Alpha(self): return "Alpha"
+    def Uh(self): return "Uh"
+    def W0(self): return "W0"
+    def Direction(self): return "Direction"
+    def Umax(self): return "Umax"
+    def Ubcore(self): return "Ubcore"
+    def Acore(self): return "Acore"
+
+
+def _test_rest2_exchange_sampler_preserves_independent_atm_banks(tmp_path):
+    from atom_openmm.rest2 import create_rest2_system
+    from atom_openmm.rest2_exchange import REST2ExchangeSampler
+
+    physical = mm.System()
+    physical.addParticle(12.0)
+    physical.addParticle(12.0)
+    bonds = mm.HarmonicBondForce()
+    bonds.addBond(0, 1, 0.1, 100.0)
+    physical.addForce(bonds)
+    nonbonded = mm.NonbondedForce()
+    nonbonded.addParticle(0.0, 0.3, 0.0)
+    nonbonded.addParticle(0.0, 0.3, 0.0)
+    physical.addForce(nonbonded)
+    rest2 = create_rest2_system(physical, [0, 1])
+    parameters = mm.CustomExternalForce("0")
+    for name, value in (
+        ("Lambda1", 0), ("Lambda2", 0), ("Alpha", 0.1), ("Uh", 0),
+        ("W0", 0), ("Direction", 1), ("Umax", 200), ("Ubcore", 100),
+        ("Acore", 0.0625), ("UOffset", 0),
+    ):
+        parameters.addGlobalParameter(name, value)
+    parameters.addParticle(0, [])
+    rest2.system.addForce(parameters)
+
+    state_context = mm.Context(rest2.system, mm.VerletIntegrator(0.001))
+    state_context.setPositions([[0, 0, 0], [0.2, 0, 0]])
+    state_context.setVelocitiesToTemperature(300 * unit.kelvin, 1)
+    state_xml = mm.XmlSerializer.serialize(
+        state_context.getState(getPositions=True, getVelocities=True)
+    )
+    state_files = {}
+    for ensemble in ("a", "m", "b"):
+        path = tmp_path / f"{ensemble}.xml"
+        path.write_text(state_xml)
+        state_files[ensemble] = path
+
+    atm_state = {
+        "lambda1": 0.0, "lambda2": 0.0, "alpha": 0.1 / unit.kilocalorie_per_mole,
+        "uh": 0 * unit.kilocalorie_per_mole, "w0": 0 * unit.kilocalorie_per_mole,
+        "atmdirection": 1.0, "Umax": 200 * unit.kilocalorie_per_mole,
+        "Ubcore": 100 * unit.kilocalorie_per_mole, "Acore": 0.0625,
+        "uoffset": 0 * unit.kilocalorie_per_mole, "temperature": 300 * unit.kelvin,
+    }
+    ommsystem = type("FakeSystem", (), {
+        "atmforce": _ATMNames(), "multisoftplus": False, "rest2_system": rest2,
+    })()
+    sampler = REST2ExchangeSampler(
+        system=rest2.system,
+        topology=None,
+        base_integrator=mm.LangevinMiddleIntegrator(300, 1, 0.001),
+        ommsystem=ommsystem,
+        state_files=state_files,
+        atm_states={name: dict(atm_state) for name in state_files},
+        config={
+            "effective_temperatures_k": [300, 600],
+            "exchange_interval_steps": 1,
+            "checkpoint_interval_cycles": 1,
+        },
+        platform=mm.Platform.getPlatformByName("Reference"),
+        platform_properties={},
+        output_dir=tmp_path / "rest2",
+        resume=False,
+    )
+    sampler.run_steps("a", 2)
+    sampler.run_steps("b", 1)
+    sampler.activate("a")
+    assert json.loads((tmp_path / "rest2/a/state.json").read_text())["cycle"] == 2
+    assert sampler.cycle == 2
+    assert sampler.physical_state("a").getPositions() is not None
+    sampler.close()

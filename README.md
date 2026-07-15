@@ -118,13 +118,24 @@ workflow:
     n_snapshots: 10
     decorrelation_steps: 5000
     switch_steps_per_segment: 1000
+    failed_switch_policy: count_as_infinite
+    rest2:
+      enabled: true
+      solute: both_ligands
+      effective_temperatures_k: [300, 351, 411, 481, 563, 658, 770, 900]
+      exchange_interval_steps: 500
+      checkpoint_interval_cycles: 10
     resume: true
     bootstrap_samples: 0
 ```
 
 NEQTI reuses the async-RE ATM soft-core schedule as two bidirectional half paths that meet at one shared midpoint ensemble, A<->M and B<->M. It estimates both legs with BAR and combines them as `DG(A->M) - DG(B->M)`.
 
+For production sampling, `failed_switch_policy: count_as_infinite` preserves recognized numerical switching failures as `+inf` protocol-work observations instead of selectively replacing them. CUDA/environment and programming failures still stop the run. Use `retry` for the previous replacement behavior or `abort` to stop at the first failed switch.
+
 By default, ATM parameter switching and protocol-work accumulation run inside a dedicated OpenMM `CustomIntegrator`; `openmmtools` is used as a design reference but is not a runtime dependency. Set `workflow.neqti.switch_integrator: python` to use the slower reference path or `validate_switch_integrator: true` for a one-shot comparison.
+
+Optional NEQTI REST2 sampling replaces ordinary A, M, and B decorrelation with synchronous solute-tempering exchange. Both ligand copies are tempered, physical snapshots are taken only from the `s=1` replica, and all nonequilibrium switches remain at `s=1`. The existing equilibration and decorrelation counts are interpreted as steps per REST2 replica.
 
 See the [RBFE user guide](docs/user-guide/rbfe.md) for the complete YAML schema, force-field examples, custom equilibration, restart behavior, outputs, and swapped-coordinate diagnostics.
 

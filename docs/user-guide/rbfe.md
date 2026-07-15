@@ -191,6 +191,13 @@ workflow:
     switch_steps_per_segment: 100
     switch_integrator: custom
     validate_switch_integrator: false
+    failed_switch_policy: count_as_infinite
+    rest2:
+      enabled: true
+      solute: both_ligands
+      effective_temperatures_k: [300, 351, 411, 481, 563, 658, 770, 900]
+      exchange_interval_steps: 500
+      checkpoint_interval_cycles: 10
     resume: true
 ```
 
@@ -213,12 +220,17 @@ For the example above, the execution order is:
 | `preparation_annealing_steps_per_segment` | Optional switching steps per schedule segment for pre-ATM->M, M->A, and M->B preparation annealing. |
 | `switch_integrator` | `custom` (default) performs switching and work accumulation inside OpenMM; `python` retains the reference implementation. |
 | `validate_switch_integrator` | Run one informational custom-versus-Python comparison in each direction from identical snapshots. |
-| `tolerate_failed_switches` | Record failed production switches and continue from the pre-switch sampling checkpoint. |
+| `failed_switch_policy` | `abort` stops on a failed switch, `retry` excludes it and draws a replacement snapshot, and `count_as_infinite` includes a recognized numerical failure as `+inf` work without replacement. |
+| `tolerate_failed_switches` | Legacy compatibility option: `false` maps to `abort` and `true` maps to `retry` when `failed_switch_policy` is absent. |
 | `max_switch_attempts_per_direction` | Maximum attempts used to obtain `n_snapshots` complete work samples per direction. |
 | `resume` | Reuse completed work rows and completed custom endpoint states when available. |
 | `bootstrap_samples` | Number of BAR bootstrap resamples; zero disables uncertainty estimation. |
 | `random_seed` | Seed used for bootstrap resampling. |
 | `platform` | Optional OpenMM platform override for NEQTI. |
+
+When `rest2.enabled: true`, the additional NEQTI sampling at A, M, and B uses a synchronous REST2 ladder instead of ordinary MD. `initial_equilibration_steps` and `decorrelation_steps` are steps per replica and must be divisible by `rest2.exchange_interval_steps`. All replicas use the physical thermostat temperature; the effective temperatures define REST2 Hamiltonian scales. Version 1 supports `solute: both_ligands`, which scales both complete ligand copies while leaving protein, solvent, ions, and ATM restraint forces physical.
+
+The physical `s=1` replica supplies positions, velocities, and box vectors for each NEQTI switch. Switching itself always uses `s=1`, so work values and BAR analysis retain the standard ATM Hamiltonian. REST2 currently requires interleaved NEQTI sampling and the common/variable-region ATM coordinate-swap setup.
 
 Four half-path switches have approximately the same total integration length as two complete A↔B switches. Logs report effective ns/day for equilibration, decorrelation, and switching segments.
 
@@ -226,7 +238,9 @@ The custom switching path uses a dedicated BAOAB-style Langevin `CustomIntegrato
 
 When `validate_switch_integrator: true`, the first pending snapshot on each half-path direction is switched with both custom and Python implementations after restoring the same state.
 
-When `resume: true`, completed work rows and three sampling checkpoints are reused. `neqti_protocol.yaml` signs the ATM paths, segment length, and preparation annealing length. Older full-path, midpoint-bridge, or linear artifacts are rejected.
+When `resume: true`, completed work rows and three sampling checkpoints are reused. REST2 runs instead maintain complete replica checkpoint banks under `neqti_rest2/{a,m,b}`. `neqti_protocol.yaml` signs the ATM paths, segment lengths, sampling order, and REST2 ladder settings. Incompatible resume settings are rejected.
+
+`count_as_infinite` is intended for production protocols where a physical numerical instability is itself a zero-overlap outcome that must not be replaced selectively. It recognizes non-finite work, OpenMM NaN/non-finite state errors, and constraint convergence failures. Environment, CUDA/PTX, parameter-name, random-seed, I/O, and programming failures remain fatal. Counted rows use `status: counted_infinite` and `work_kcal_per_mol: inf`; ordinary failed rows from older runs remain excluded on resume. Summaries and `result.yaml` report total analyzed, finite, counted-infinite, and retryable failed counts separately. BAR returns no finite estimate when a required direction has no finite connecting sample.
 
 The wrapper can replace the default equilibration stages with inline mdflow-style steps. Amber masks require `parmed`. For `async_re`, `pre_atm` replaces the physical minimization/thermalization/NPT/NVT stage and `async_re.midpoint` can replace the final lambda-0.5 equilibration. For `neqti`, `neqti.midpoint` is applied at the shared M ensemble and `neqti.endpoint` at A and B. When `neqti.midpoint` is omitted, it reuses the endpoint steps:
 
@@ -320,6 +334,7 @@ For NEQTI, also inspect:
 | `neqti_leg_*_*.csv` | Four half-path protocol-work datasets. |
 | `neqti_summary.yaml` | Component BAR estimates, overlap, combined DDG, and uncertainty. |
 | `neqti_protocol.yaml` | Single-midpoint protocol and resume compatibility signature. |
+| `neqti_rest2/{a,m,b}/` | REST2 walker checkpoints, assignments, exchange history, acceptance, and round-trip state. |
 | `*_swapped.pdb` | Diagnostic coordinates after applying the ATM virtual coordinate swap. |
 
 The ordinary PDB contains the physical coordinates held by the OpenMM context. ATM evaluates an additional swapped coordinate state internally. NEQTI writes both forms for start, post-equilibration, and switching diagnostics. The existing snapshot pair, for example `neqti_m_snapshot_4.pdb` and `neqti_m_snapshot_4_swapped.pdb`, contains the coordinates immediately before both midpoint switches from that sampled M geometry. The corresponding post-switch files include the leg name, for example `neqti_m_leg_a_reverse_snapshot_4_post_switch.pdb` and `neqti_m_leg_b_reverse_snapshot_4_post_switch.pdb`. Endpoint sampling uses the same pattern with `neqti_a_leg_a_forward_snapshot_*_post_switch.pdb` and `neqti_b_leg_b_forward_snapshot_*_post_switch.pdb`. Use the swapped PDBs to verify that the ligand expected in the binding site overlaps the intended reference pose at each endpoint. These files are diagnostics, not independent simulation states.
@@ -412,6 +427,7 @@ The top-level status has the following meaning:
 - The single-YAML wrapper currently supports `workflow.mode: small_molecule`.
 - NEQTI is experimental and has not replaced asynchronous replica exchange as the established production method.
 - NEQTI currently uses the configured discrete ATM schedule as interpolation knots; it does not yet implement an arbitrary continuous OpenMMTools-style alchemical function.
+- NEQTI REST2 currently supports interleaved sampling, both complete ligand copies as the tempered region, and common/variable-region ATM systems. Automatic ladder tuning is not implemented.
 - GPU, CUDA, OpenMM, Espaloma, and `openmmforcefields` compatibility is the responsibility of the environment.
 - A numerically completed run is not sufficient validation. Inspect endpoint structures, swapped structures, work distributions, forward/reverse overlap, and sensitivity to equilibration and switching time.
 

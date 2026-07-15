@@ -54,6 +54,9 @@ class RBFEResultWriter:
                 "overlap_score": None,
                 "cycle_closure_error": None,
                 "warnings": [],
+                "rest2": None,
+                "finite_sample_counts": None,
+                "counted_infinite_work_counts": None,
             },
             "error": None,
             "inputs": {
@@ -105,6 +108,7 @@ class RBFEResultWriter:
             "neqti_summary": None,
             "neqti_protocol": None,
             "neqti_switch_validation": None,
+            "neqti_rest2": None,
             "async_re_log": None,
             "async_re_replica_output_pattern": None,
             "plot": None,
@@ -134,6 +138,7 @@ class RBFEResultWriter:
                 "neqti_summary": self._relative_if_exists("neqti_summary.yaml"),
                 "neqti_protocol": self._relative_if_exists("neqti_protocol.yaml"),
                 "neqti_switch_validation": self._relative_if_exists("neqti_switch_validation.yaml"),
+                "neqti_rest2": "neqti_rest2" if (self.workdir / "neqti_rest2").is_dir() else None,
                 "async_re_log": self._relative_if_exists(f"{job}.log"),
                 "async_re_replica_output_pattern": f"r*/{job}.out" if any(self.workdir.glob(f"r*/{job}.out")) else None,
                 "plot": self._relative_if_exists(f"{job}.png"),
@@ -155,6 +160,11 @@ class RBFEResultWriter:
             result["samples_reverse"] = int((analysis or {}).get("reverse_samples", 0))
             result["components"] = values.get("components")
             self.data["quality"]["overlap_score"] = values.get("overlap_score")
+            self.data["quality"]["rest2"] = (analysis or {}).get("rest2")
+            self.data["quality"]["finite_sample_counts"] = (analysis or {}).get("finite_sample_counts")
+            self.data["quality"]["counted_infinite_work_counts"] = (
+                (analysis or {}).get("counted_infinite_work_counts")
+            )
         else:
             result["ddg_kcal_per_mol"] = (analysis or {}).get("ddg")
             result["ddg_error_kcal_per_mol"] = (analysis or {}).get("ddg_std")
@@ -179,6 +189,8 @@ class RBFEResultWriter:
             "target_forward_samples": None,
             "target_reverse_samples": None,
             "sample_counts": None,
+            "finite_sample_counts": None,
+            "counted_infinite_work_counts": None,
             "target_sample_counts": None,
             "completed_snapshot_cycles": None,
             "target_snapshot_cycles": None,
@@ -201,6 +213,10 @@ class RBFEResultWriter:
                     for name in leg_names
                 }
                 progress["sample_counts"] = sample_counts
+                progress["finite_sample_counts"] = (analysis or {}).get("finite_sample_counts")
+                progress["counted_infinite_work_counts"] = (
+                    (analysis or {}).get("counted_infinite_work_counts")
+                )
                 if all(value is not None for value in sample_counts.values()):
                     progress["completed_snapshot_cycles"] = min(sample_counts.values())
         elif analysis:
@@ -227,6 +243,9 @@ class RBFEResultWriter:
             warnings.append("Sampling or overlap quality requirements were not met.")
         if status == "failed" and error:
             warnings.append(f"{error['stage']} failed: {error['message']}")
+        rest2_quality = self.data["quality"].get("rest2") or {}
+        warnings.extend(str(value) for value in rest2_quality.get("warnings", []))
+        warnings.extend(str(value) for value in (analysis or {}).get("warnings", []))
 
         if status == "failed":
             convergence = "failed"

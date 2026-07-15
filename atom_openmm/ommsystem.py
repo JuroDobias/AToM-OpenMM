@@ -16,6 +16,7 @@ from openmm.unit import *
 from datetime import datetime
 
 from atom_openmm.utils.AtomUtils import AtomUtils, separate14
+from atom_openmm.rest2 import create_rest2_system
 
 # OpenMM's MTSLangevinIntegrator does not have a setTemperature method
 class ATMMTSLangevinIntegrator(MTSLangevinIntegrator):
@@ -609,6 +610,7 @@ class OMMSystemRBFE(OMMSystem):
         self.lig1_atoms = None
         self.lig2_atoms = None
         self.displ = None
+        self.rest2_system = None
 
     def set_ligand_atoms(self):
         lig1_atoms_in = self.keywords.get('LIGAND1_ATOMS')   #indexes of ligand1 atoms
@@ -623,6 +625,22 @@ class OMMSystemRBFE(OMMSystem):
         else:
             msg = "Error: LIGAND2_ATOMS is required"
             self._exit(msg)
+
+    def set_rest2(self):
+        if not self.keywords.get('REST2_ENABLED', False):
+            return
+        if self.keywords.get('LIGAND1_VAR_ATOMS') is None:
+            raise ValueError(
+                "ATM REST2 currently requires LIGAND1_VAR_ATOMS/LIGAND2_VAR_ATOMS; "
+                "the legacy ATM 1-4 separation path is not REST2-safe"
+            )
+        solute_atoms = sorted(set(self.lig1_atoms) | set(self.lig2_atoms))
+        self.rest2_system = create_rest2_system(self.system, solute_atoms)
+        self.system = self.rest2_system.system
+        self.logger.info(
+            "Enabled REST2 scaling for both ligand copies (%d atoms)",
+            len(solute_atoms),
+        )
 
     def set_displacement(self):
         #set displacements and offsets for ligand 1 and ligand 2
@@ -995,8 +1013,9 @@ class OMMSystemRBFE(OMMSystem):
     def create_system(self):
 
         self.load_system()
-        self.atm_utils = AtomUtils(self.system)
         self.set_ligand_atoms()
+        self.set_rest2()
+        self.atm_utils = AtomUtils(self.system)
         self.set_displacement()
         #a repulsion potential between receptor and unbound ligand
         #must be called before set_vsite_restraints() to turn Vsite restraints for
