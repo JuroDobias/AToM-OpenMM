@@ -66,6 +66,8 @@ def _work_csv_fields(intervals=()):
 
 def _protocol_signature(settings):
     payload = {
+        # Keep the base signature version stable so runs without the new
+        # optional features remain resumable from schema-5 manifests.
         "schema_version": 5,
         "hamiltonian": "atm_softplus_single_midpoint",
         "paths": settings["paths"],
@@ -88,6 +90,10 @@ def _protocol_signature(settings):
         payload["rest2"] = rest2
     if settings.get("failed_switch_policy") == "count_as_infinite":
         payload["failed_switch_policy"] = "count_as_infinite"
+    if settings.get("schedule_optimization", {}).get("enabled", False):
+        payload["schedule_optimization"] = settings["schedule_optimization"]
+    if settings.get("convergence", {}).get("enabled", False):
+        payload["convergence"] = settings["convergence"]
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
@@ -127,7 +133,7 @@ def _initialize_protocol_manifest(settings, resume):
                 "remove them or set resume: false"
             )
     manifest = {
-        "schema_version": 5,
+        "schema_version": 6,
         "hamiltonian": "atm_softplus_single_midpoint",
         "paths": settings["paths"],
         "switch_steps_per_segment": settings["switch_steps_per_segment"],
@@ -138,6 +144,8 @@ def _initialize_protocol_manifest(settings, resume):
         "receptor_exclusion_signature": settings.get("receptor_exclusion_signature"),
         "rest2": settings.get("rest2", {"enabled": False}),
         "failed_switch_policy": settings.get("failed_switch_policy", "abort"),
+        "schedule_optimization": settings.get("schedule_optimization", {"enabled": False}),
+        "convergence": settings.get("convergence", {"enabled": False}),
         "signature": signature,
     }
     with open(path, "w") as handle:
@@ -333,10 +341,6 @@ def normalize_neqti_options(workflow, atom_options):
             raise NEQTIConfigError(
                 "native endpoint REST2 currently requires rest2.ensembles: [a, b]"
             )
-        if sampling_order != "batched":
-            raise NEQTIConfigError(
-                "native endpoint REST2 currently requires sampling_order: batched"
-            )
         if int(raw.get("preparation_annealing_steps_per_segment", 0)) < 1:
             raise NEQTIConfigError(
                 "native endpoint REST2 requires positive preparation_annealing_steps_per_segment"
@@ -379,6 +383,71 @@ def normalize_neqti_options(workflow, atom_options):
             f"invalid intervals: {invalid_intervals}"
         )
 
+    optimization_raw = raw.get("schedule_optimization", {}) or {}
+    if not isinstance(optimization_raw, dict):
+        raise NEQTIConfigError("workflow.neqti.schedule_optimization must be a mapping")
+    optimization_enabled = bool(optimization_raw.get("enabled", False))
+    optimize_legs = [str(value).lower() for value in optimization_raw.get("optimize_legs", ["a", "b"])]
+    if len(set(optimize_legs)) != len(optimize_legs) or any(value not in ("a", "b") for value in optimize_legs):
+        raise NEQTIConfigError("schedule_optimization.optimize_legs must contain unique values from [a, b]")
+    schedule_optimization = {
+        "enabled": optimization_enabled,
+        "pilot_samples": int(optimization_raw.get("pilot_samples", 10)),
+        "optimize_legs": optimize_legs,
+        "score_hysteresis_weight": float(optimization_raw.get("score_hysteresis_weight", 0.7)),
+        "score_absolute_weight": float(optimization_raw.get("score_absolute_weight", 0.3)),
+        "score_power": float(optimization_raw.get("score_power", 1.5)),
+        "score_ewma_alpha": float(optimization_raw.get("score_ewma_alpha", 0.3)),
+        "min_segment_steps": int(optimization_raw.get("min_segment_steps", 1000)),
+        "max_segment_steps": int(optimization_raw.get("max_segment_steps", 15000)),
+        "min_update_factor": float(optimization_raw.get("min_update_factor", 0.5)),
+        "max_update_factor": float(optimization_raw.get("max_update_factor", 2.0)),
+    }
+    if optimization_enabled:
+        if endpoint_system != "native" or sampling_order != "interleaved":
+            raise NEQTIConfigError(
+                "schedule optimization requires endpoint_system: native and sampling_order: interleaved"
+            )
+        if switch_integrator != "custom":
+            raise NEQTIConfigError("schedule optimization requires switch_integrator: custom")
+        if schedule_optimization["pilot_samples"] < 1:
+            raise NEQTIConfigError("schedule_optimization.pilot_samples must be positive")
+        nsegments = len(paths["leg_a_forward"]) - 1
+        if schedule_optimization["min_segment_steps"] * nsegments > total_switch_steps:
+            raise NEQTIConfigError("schedule_optimization.min_segment_steps is too large")
+        if schedule_optimization["max_segment_steps"] * nsegments < total_switch_steps:
+            raise NEQTIConfigError("schedule_optimization.max_segment_steps is too small")
+        for name in ("score_hysteresis_weight", "score_absolute_weight", "score_power"):
+            if schedule_optimization[name] <= 0:
+                raise NEQTIConfigError(f"schedule_optimization.{name} must be positive")
+        if not 0 < schedule_optimization["score_ewma_alpha"] <= 1:
+            raise NEQTIConfigError("schedule_optimization.score_ewma_alpha must be in (0, 1]")
+        if not 0 < schedule_optimization["min_update_factor"] <= 1:
+            raise NEQTIConfigError("schedule_optimization.min_update_factor must be in (0, 1]")
+        if schedule_optimization["max_update_factor"] < 1:
+            raise NEQTIConfigError("schedule_optimization.max_update_factor must be >= 1")
+
+    convergence_raw = raw.get("convergence", {}) or {}
+    if not isinstance(convergence_raw, dict):
+        raise NEQTIConfigError("workflow.neqti.convergence must be a mapping")
+    convergence = {
+        "enabled": bool(convergence_raw.get("enabled", False)),
+        "min_samples_per_direction": int(convergence_raw.get("min_samples_per_direction", 30)),
+        "min_overlap_score_per_leg": float(convergence_raw.get("min_overlap_score_per_leg", 0.05)),
+        "max_ddg_error_kcal_per_mol": float(convergence_raw.get("max_ddg_error_kcal_per_mol", 0.5)),
+        "consecutive_checks": int(convergence_raw.get("consecutive_checks", 3)),
+        "max_ddg_range_kcal_per_mol": float(convergence_raw.get("max_ddg_range_kcal_per_mol", 0.25)),
+    }
+    if convergence["enabled"]:
+        if convergence["min_samples_per_direction"] < 2:
+            raise NEQTIConfigError("convergence.min_samples_per_direction must be at least 2")
+        if convergence["min_samples_per_direction"] > int(raw.get("n_snapshots", atom_options.get("MAX_SAMPLES", 1))):
+            raise NEQTIConfigError("convergence.min_samples_per_direction cannot exceed n_snapshots")
+        if convergence["min_overlap_score_per_leg"] <= 0 or convergence["max_ddg_error_kcal_per_mol"] <= 0:
+            raise NEQTIConfigError("convergence overlap and uncertainty thresholds must be positive")
+        if convergence["consecutive_checks"] < 1 or convergence["max_ddg_range_kcal_per_mol"] < 0:
+            raise NEQTIConfigError("convergence check count must be positive and DDG range non-negative")
+
     receptor_exclusion_atoms = [
         int(value) for value in atom_options.get("EXCLUSION_POT_MOL1_INDEXES", [])
     ]
@@ -408,6 +477,8 @@ def normalize_neqti_options(workflow, atom_options):
         "sampling_order": sampling_order,
         "endpoint_system": endpoint_system,
         "rest2": rest2,
+        "schedule_optimization": schedule_optimization,
+        "convergence": convergence,
         "validate_switch_integrator": bool(raw.get("validate_switch_integrator", False)),
         "tolerate_failed_switches": failed_switch_policy == "retry",
         "failed_switch_policy": failed_switch_policy,
@@ -715,15 +786,30 @@ def _run_switch(worker, start_par, schedule, steps_per_segment, state_path, logg
 
 def _run_switch_custom(worker, start_par, steps_per_segment, state_path, direction, logger=None, label=None):
     integrator = worker.begin_switch(direction, start_par)
-    total = (len(state_path) - 1) * steps_per_segment
+    segment_steps = (
+        [int(steps_per_segment)] * (len(state_path) - 1)
+        if isinstance(steps_per_segment, int)
+        else [int(value) for value in steps_per_segment]
+    )
+    if len(segment_steps) != len(state_path) - 1:
+        raise ValueError(f"{direction} segment step count does not match its path")
+    total = sum(segment_steps)
+    completed_steps = 0
+    segment_work = []
+    previous_work = 0.0
     try:
-        for segment, (start_state, end_state) in enumerate(zip(state_path[:-1], state_path[1:]), start=1):
+        for segment, (start_state, end_state, steps) in enumerate(
+            zip(state_path[:-1], state_path[1:], segment_steps), start=1
+        ):
             segment_started = time.perf_counter()
-            integrator.step(steps_per_segment)
+            integrator.step(steps)
             elapsed = time.perf_counter() - segment_started
             work = integrator.get_protocol_work() / kilocalories_per_mole
+            segment_work.append(float(work - previous_work))
+            previous_work = float(work)
+            completed_steps += steps
             if logger is not None and label:
-                ns_per_day = _effective_ns_per_day(worker, steps_per_segment, elapsed)
+                ns_per_day = _effective_ns_per_day(worker, steps, elapsed)
                 logger.info(
                     "NEQTI %s segment %d/%d complete: state %d -> %d, %d/%d steps, "
                     "work %.6g kcal/mol, %.3f ns/day",
@@ -732,13 +818,14 @@ def _run_switch_custom(worker, start_par, steps_per_segment, state_path, directi
                     len(state_path) - 1,
                     start_state,
                     end_state,
-                    segment * steps_per_segment,
+                    completed_steps,
                     total,
                     work,
                     ns_per_day,
                 )
         return {
             "exact": integrator.get_protocol_work() / kilocalories_per_mole,
+            "segment_work": segment_work,
             "sampled": {
                 interval: value / kilocalories_per_mole
                 for interval, value in integrator.get_sampled_protocol_work().items()
@@ -998,6 +1085,104 @@ def analyze_work_estimators(rows, intervals, temperature_kelvin, bootstrap_sampl
     return analyses
 
 
+def _allocate_segment_steps(scores, total_steps, current_steps, settings):
+    scores = np.asarray(scores, dtype=float)
+    current = np.asarray(current_steps, dtype=int)
+    powered = np.power(np.maximum(scores, 1.0e-12), settings["score_power"])
+    raw = powered / powered.sum() * int(total_steps)
+    lower = np.maximum(
+        settings["min_segment_steps"],
+        np.floor(current * settings["min_update_factor"]).astype(int),
+    )
+    upper = np.minimum(
+        settings["max_segment_steps"],
+        np.ceil(current * settings["max_update_factor"]).astype(int),
+    )
+    values = np.clip(raw, lower, upper)
+    for _ in range(100):
+        difference = float(total_steps) - float(values.sum())
+        if abs(difference) < 1.0e-8:
+            break
+        adjustable = values < upper if difference > 0 else values > lower
+        if not np.any(adjustable):
+            raise NEQTIConfigError("schedule optimizer bounds cannot preserve total switch steps")
+        weights = powered[adjustable]
+        values[adjustable] += difference * weights / weights.sum()
+        values = np.clip(values, lower, upper)
+    steps = np.floor(values).astype(int)
+    remainder = int(total_steps) - int(steps.sum())
+    order = np.argsort(-(values - steps))
+    while remainder > 0:
+        changed = False
+        for index in order:
+            if steps[index] < upper[index]:
+                steps[index] += 1
+                remainder -= 1
+                changed = True
+                if remainder == 0:
+                    break
+        if not changed:
+            raise NEQTIConfigError("schedule optimizer could not allocate remaining steps")
+    while remainder < 0:
+        changed = False
+        for index in reversed(order):
+            if steps[index] > lower[index]:
+                steps[index] -= 1
+                remainder += 1
+                changed = True
+                if remainder == 0:
+                    break
+        if not changed:
+            raise NEQTIConfigError("schedule optimizer could not remove excess steps")
+    return [int(value) for value in steps]
+
+
+def _optimizer_cycle_scores(forward_segment_work, reverse_segment_work, settings):
+    reverse_physical = list(reversed(reverse_segment_work))
+    return np.asarray([
+        settings["score_hysteresis_weight"] * abs(float(forward) + float(reverse))
+        + settings["score_absolute_weight"] * max(abs(float(forward)), abs(float(reverse)))
+        + 1.0e-6
+        for forward, reverse in zip(forward_segment_work, reverse_physical)
+    ])
+
+
+def _schedule_change_fraction(previous, current):
+    return float(np.sum(np.abs(np.asarray(current) - np.asarray(previous))) / (2.0 * sum(previous)))
+
+
+def _convergence_record(analysis, counts, settings):
+    components = {} if analysis is None else analysis.get("components", {})
+    overlaps = [components.get(name, {}).get("overlap_score") for name in ("leg_a", "leg_b")]
+    error = None if analysis is None else analysis.get("bar_bootstrap_std_kcal_per_mol")
+    enough = all(value >= settings["min_samples_per_direction"] for value in counts.values())
+    thresholds_pass = (
+        enough
+        and all(value is not None and value >= settings["min_overlap_score_per_leg"] for value in overlaps)
+        and error is not None
+        and error <= settings["max_ddg_error_kcal_per_mol"]
+    )
+    return {
+        "sample_count_per_direction": min(counts.values()),
+        "ddg_kcal_per_mol": None if analysis is None else analysis.get("bar_dg_kcal_per_mol"),
+        "ddg_error_kcal_per_mol": error,
+        "leg_a_overlap_score": overlaps[0],
+        "leg_b_overlap_score": overlaps[1],
+        "thresholds_pass": bool(thresholds_pass),
+    }
+
+
+def _convergence_reached(history, settings):
+    required = settings["consecutive_checks"]
+    if len(history) < required:
+        return False
+    recent = history[-required:]
+    if not all(record["thresholds_pass"] for record in recent):
+        return False
+    estimates = [record["ddg_kcal_per_mol"] for record in recent]
+    return max(estimates) - min(estimates) <= settings["max_ddg_range_kcal_per_mol"]
+
+
 def summarize_existing_neqti_work(options, neqti_options, paths, *, bootstrap_samples=None):
     work_files = {
         "leg_a_forward": Path("neqti_leg_a_forward.csv"),
@@ -1079,10 +1264,29 @@ def summarize_existing_neqti_work(options, neqti_options, paths, *, bootstrap_sa
             ["REST2 neighbor acceptance below 0.05 for " + ", ".join(low_acceptance)]
             if low_acceptance else []
         )
+    convergence_state = {}
+    convergence_path = Path("neqti_convergence.yaml")
+    if convergence_path.exists():
+        with convergence_path.open() as handle:
+            convergence_state = yaml.safe_load(handle) or {}
+    termination_reason = convergence_state.get("termination_reason")
+    convergence_enabled = neqti_options.get("convergence", {}).get("enabled", False)
+    optimizer_state = None
+    optimizer_path = Path("neqti_schedule_optimization.yaml")
+    if optimizer_path.exists():
+        with optimizer_path.open() as handle:
+            optimizer_state = yaml.safe_load(handle) or None
+    if termination_reason == "converged":
+        summary_status = "completed"
+    elif convergence_enabled and termination_reason == "max_samples":
+        summary_status = "partial"
+    else:
+        summary_status = "completed" if complete and usable_overlap else "partial"
     summary = {
         "jobname": options["BASENAME"],
         "method": "neqti",
-        "status": "completed" if complete and usable_overlap else "partial",
+        "status": summary_status,
+        "termination_reason": termination_reason,
         "forward_samples": len(rows["leg_a_forward"]) + len(rows["leg_b_forward"]),
         "reverse_samples": len(rows["leg_a_reverse"]) + len(rows["leg_b_reverse"]),
         "sample_counts": {name: len(values) for name, values in rows.items()},
@@ -1097,6 +1301,8 @@ def summarize_existing_neqti_work(options, neqti_options, paths, *, bootstrap_sa
         "analysis": analysis,
         "work_estimator_analyses": work_estimator_analyses,
         "rest2": rest2_summary,
+        "convergence": convergence_state or None,
+        "schedule_optimization": optimizer_state,
         "warnings": warnings,
     }
     with open("neqti_summary.yaml", "w") as f:
@@ -1364,10 +1570,18 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
     worker_options = deepcopy(options)
     worker_options["REST2_ENABLED"] = atm_rest2_enabled
     worker_options["INITIAL_STATE_FILE"] = state_files["m"]
+    if not neqti_options["resume"] and rest2_enabled:
+        # Sampler constructors create their checkpoint banks. Remove stale banks
+        # before constructing any resident contexts, not after they are live.
+        shutil.rmtree("neqti_rest2", ignore_errors=True)
     use_custom_worker = (
         neqti_options["switch_integrator"] == "custom"
         or neqti_options["validate_switch_integrator"]
     )
+    nsegments = len(paths["leg_a_forward"]) - 1
+    segment_steps = {
+        name: [neqti_options["switch_steps_per_segment"]] * nsegments for name in paths
+    }
     if use_custom_worker:
         worker = OMMWorkerATMNEQTI(
             basename,
@@ -1377,7 +1591,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
             compute=True,
             logger=logger,
             switch_schedules={name: [stateparams[index] for index in path] for name, path in paths.items()},
-            steps_per_segment=neqti_options["switch_steps_per_segment"],
+            steps_per_segment=segment_steps,
             random_seed=neqti_options["random_seed"],
             work_sample_intervals=neqti_options["work_sample_intervals"],
         )
@@ -1392,6 +1606,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
         )
 
     rest2_sampler = None
+    native_endpoint_resources = {}
     if atm_rest2_enabled:
         set_rest2_scale(worker.context, 1.0, ommsystem.rest2_system)
         rest2_sampler = REST2ExchangeSampler(
@@ -1415,14 +1630,52 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
             neqti_options["rest2"]["effective_temperatures_k"][-1],
         )
 
+    if neqti_options.get("endpoint_system") == "native" and neqti_options["sampling_order"] == "interleaved":
+        try:
+            for ensemble in ("a", "b"):
+                native_system = create_native_endpoint_system(
+                    ommsystem, ensemble, rest2=True, logger=logger
+                )
+                sampler = REST2ExchangeSampler(
+                    system=native_system.system,
+                    topology=native_system.topology,
+                    base_integrator=native_system.integrator,
+                    rest2_system=native_system.rest2_system,
+                    state_files={ensemble: state_files[ensemble]},
+                    config=neqti_options["rest2"],
+                    platform=worker.platform,
+                    platform_properties=worker.platform_properties,
+                    output_dir="neqti_rest2",
+                    resume=neqti_options["resume"],
+                    random_seed=neqti_options["random_seed"] + (10000 if ensemble == "b" else 0),
+                    logger=logger,
+                )
+                native_endpoint_resources[ensemble] = (native_system, sampler)
+            logger.info(
+                "Native interleaved NEQTI initialized two resident REST2 ladders (%d contexts each) and one ATM worker context",
+                len(neqti_options["rest2"]["effective_temperatures_k"]),
+            )
+        except Exception as exc:
+            for _system, sampler in native_endpoint_resources.values():
+                sampler.close()
+            worker.finish()
+            raise NEQTIConfigError(
+                "Could not allocate resident native endpoint REST2 ladders; use sampling_order: batched on a memory-limited GPU"
+            ) from exc
+
     work_files = {name: Path(f"neqti_{name}.csv") for name in paths}
     checkpoints = {"m": Path("neqti_m_sampling.chk"), "a": Path("neqti_a_sampling.chk"), "b": Path("neqti_b_sampling.chk")}
     if not neqti_options["resume"]:
-        for path in [*work_files.values(), *checkpoints.values(), Path("neqti_summary.yaml")]:
+        for path in [
+            *work_files.values(),
+            *checkpoints.values(),
+            Path("neqti_summary.yaml"),
+            Path("neqti_schedule_optimization.yaml"),
+            Path("neqti_convergence.yaml"),
+        ]:
             if path.exists():
                 path.unlink()
-        if neqti_options.get("endpoint_system") == "native":
-            shutil.rmtree("neqti_rest2", ignore_errors=True)
+        shutil.rmtree("neqti_schedule_optimization", ignore_errors=True)
     for path in work_files.values():
         _ensure_work_csv(path, neqti_options["work_sample_intervals"])
 
@@ -1433,7 +1686,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
             work_result = _run_switch_custom(
                 worker,
                 start_state,
-                neqti_options["switch_steps_per_segment"],
+                segment_steps[switch_name],
                 path,
                 switch_name,
                 logger,
@@ -1473,7 +1726,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
             "end_state": paths[switch_name][-1],
             "work_kcal_per_mol": f"{exact:.12g}",
             "work_kj_per_mol": f"{exact * KCAL_TO_KJ:.12g}",
-            "switch_steps": len(schedules[switch_name]),
+            "switch_steps": sum(segment_steps[switch_name]),
             "status": "complete",
         }
         for interval, value in work_result["sampled"].items():
@@ -1528,7 +1781,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
             "start_state": paths[switch_name][0], "end_state": paths[switch_name][-1],
             "work_kcal_per_mol": "inf" if counted else "",
             "work_kj_per_mol": "inf" if counted else "",
-            "switch_steps": len(schedules[switch_name]),
+            "switch_steps": sum(segment_steps[switch_name]),
             "status": "counted_infinite" if counted else "failed",
             "error_type": type(exc).__name__, "error_message": str(exc),
         }
@@ -1688,6 +1941,40 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
     def run_interleaved_sampling():
         stream_initialized = {"m": False, "a": False, "b": False}
 
+        def native_rest2_snapshot(ensemble, attempt, label_prefix="trajectory"):
+            native_system, sampler = native_endpoint_resources[ensemble]
+            if not stream_initialized[ensemble]:
+                existing_bank = sampler.has_bank(ensemble)
+                sampler.activate(ensemble)
+                if not existing_bank and neqti_options["initial_equilibration_steps"] > 0:
+                    sampler.run_steps(
+                        ensemble,
+                        neqti_options["initial_equilibration_steps"],
+                        f"NEQTI native {ensemble} initial REST2 equilibration",
+                    )
+                elif existing_bank:
+                    logger.info("Resuming resident native NEQTI %s REST2 bank", ensemble)
+                stream_initialized[ensemble] = True
+            if neqti_options["decorrelation_steps"] > 0:
+                sampler.run_steps(
+                    ensemble,
+                    neqti_options["decorrelation_steps"],
+                    f"NEQTI native {ensemble} {label_prefix} {attempt} decorrelation",
+                )
+            native_state = sampler.physical_state(ensemble)
+            transfer_state_to_context(
+                native_state,
+                worker.context,
+                endpoint=ensemble,
+                keywords=options,
+                to_native=False,
+            )
+            box_vectors = native_state.getPeriodicBoxVectors()
+            if box_vectors is not None:
+                worker.topology.setPeriodicBoxVectors(box_vectors)
+            worker.set_state(states[ensemble])
+            return native_state, native_system
+
         def transfer_rest2_physical(ensemble):
             state = rest2_sampler.physical_state(ensemble)
             worker.context.setPositions(state.getPositions())
@@ -1754,6 +2041,227 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                 logger=logger,
             )
             stream_initialized[direction] = True
+
+        def apply_segment_steps(updated):
+            for direction, values in updated.items():
+                segment_steps[direction] = [int(value) for value in values]
+                worker.set_switch_segment_steps(direction, segment_steps[direction])
+
+        def run_schedule_optimization():
+            settings = neqti_options.get("schedule_optimization", {})
+            if not settings.get("enabled", False):
+                return
+            state_path = Path("neqti_schedule_optimization.yaml")
+            output_dir = Path("neqti_schedule_optimization")
+            output_dir.mkdir(exist_ok=True)
+            pilot_files = {
+                name: output_dir / f"pilot_{name}.csv" for name in work_files
+            }
+            for path in pilot_files.values():
+                _ensure_work_csv(path, neqti_options["work_sample_intervals"])
+            if state_path.exists() and neqti_options["resume"]:
+                with state_path.open() as handle:
+                    optimizer_state = yaml.safe_load(handle) or {}
+            else:
+                optimizer_state = {
+                    "schema_version": 1,
+                    "status": "running",
+                    "completed_pilot_cycles": 0,
+                    "pilot_samples": settings["pilot_samples"],
+                    "scores": {},
+                    "history": [],
+                    "segment_steps": deepcopy(segment_steps),
+                }
+            apply_segment_steps(optimizer_state.get("segment_steps", segment_steps))
+            completed_cycles = int(optimizer_state.get("completed_pilot_cycles", 0))
+            for path in pilot_files.values():
+                with path.open() as handle:
+                    existing_rows = list(csv.DictReader(handle))
+                committed_rows = [
+                    row for row in existing_rows
+                    if int(row.get("trajectory", -1)) < completed_cycles
+                ]
+                if len(committed_rows) != len(existing_rows):
+                    with path.open("w", newline="") as handle:
+                        writer = csv.DictWriter(
+                            handle,
+                            fieldnames=_work_csv_fields(neqti_options["work_sample_intervals"]),
+                        )
+                        writer.writeheader()
+                        writer.writerows(committed_rows)
+            if optimizer_state.get("status") == "frozen":
+                logger.info(
+                    "Restored frozen NEQTI schedules after %d pilot cycles", completed_cycles
+                )
+                return
+
+            for cycle in range(completed_cycles, settings["pilot_samples"]):
+                logger.info(
+                    "NEQTI schedule optimization cycle %d/%d starting with A steps %s and B steps %s",
+                    cycle + 1,
+                    settings["pilot_samples"],
+                    segment_steps["leg_a_forward"],
+                    segment_steps["leg_b_forward"],
+                )
+                initialize_stream_once(
+                    "m", state_files["m"], states["m"], checkpoints["m"], cycle
+                )
+                if neqti_options["decorrelation_steps"] > 0:
+                    _run_worker_steps(
+                        worker,
+                        neqti_options["decorrelation_steps"],
+                        logger,
+                        f"NEQTI optimizer m cycle {cycle} decorrelation",
+                    )
+                midpoint_snapshot = worker.get_chkpt()
+                pilot_results = {}
+                for switch_name in ("leg_a_reverse", "leg_b_reverse"):
+                    worker.set_chkpt(midpoint_snapshot)
+                    result = execute_switch(
+                        switch_name,
+                        stateparams[paths[switch_name][0]],
+                        schedules[switch_name],
+                        paths[switch_name],
+                        f"optimizer {switch_name} cycle {cycle}",
+                    )
+                    pilot_results[switch_name] = result
+                    _append_row(
+                        pilot_files[switch_name],
+                        completed_work_row(switch_name, cycle, result),
+                        neqti_options["work_sample_intervals"],
+                    )
+                worker.set_chkpt(midpoint_snapshot)
+                worker.set_state(states["m"])
+                _write_checkpoint(checkpoints["m"], worker.get_chkpt())
+
+                for ensemble, switch_name in endpoint_stream_specs:
+                    native_state, _native_system = native_rest2_snapshot(
+                        ensemble, cycle, label_prefix="optimizer cycle"
+                    )
+                    snapshot = worker.get_chkpt()
+                    result = execute_switch(
+                        switch_name,
+                        stateparams[paths[switch_name][0]],
+                        schedules[switch_name],
+                        paths[switch_name],
+                        f"optimizer {switch_name} cycle {cycle}",
+                    )
+                    pilot_results[switch_name] = result
+                    _append_row(
+                        pilot_files[switch_name],
+                        completed_work_row(switch_name, cycle, result),
+                        neqti_options["work_sample_intervals"],
+                    )
+                    worker.set_chkpt(snapshot)
+                    worker.set_state(states[ensemble])
+
+                history_record = {"cycle": cycle + 1, "legs": {}}
+                updated_steps = deepcopy(segment_steps)
+                for leg in settings["optimize_legs"]:
+                    forward_name = f"leg_{leg}_forward"
+                    reverse_name = f"leg_{leg}_reverse"
+                    cycle_scores = _optimizer_cycle_scores(
+                        pilot_results[forward_name]["segment_work"],
+                        pilot_results[reverse_name]["segment_work"],
+                        settings,
+                    )
+                    previous_scores = optimizer_state["scores"].get(leg)
+                    aggregate_scores = (
+                        cycle_scores
+                        if previous_scores is None
+                        else settings["score_ewma_alpha"] * cycle_scores
+                        + (1.0 - settings["score_ewma_alpha"]) * np.asarray(previous_scores)
+                    )
+                    optimizer_state["scores"][leg] = aggregate_scores.tolist()
+                    previous_steps = segment_steps[forward_name]
+                    next_steps = _allocate_segment_steps(
+                        aggregate_scores,
+                        sum(previous_steps),
+                        previous_steps,
+                        settings,
+                    )
+                    updated_steps[forward_name] = next_steps
+                    updated_steps[reverse_name] = list(reversed(next_steps))
+                    history_record["legs"][leg] = {
+                        "cycle_scores": cycle_scores.tolist(),
+                        "aggregate_scores": aggregate_scores.tolist(),
+                        "previous_steps": list(previous_steps),
+                        "next_steps": list(next_steps),
+                        "allocation_change_fraction": _schedule_change_fraction(
+                            previous_steps, next_steps
+                        ),
+                    }
+                apply_segment_steps(updated_steps)
+                optimizer_state["completed_pilot_cycles"] = cycle + 1
+                optimizer_state["segment_steps"] = deepcopy(segment_steps)
+                optimizer_state["history"].append(history_record)
+                optimizer_state["status"] = (
+                    "frozen" if cycle + 1 >= settings["pilot_samples"] else "running"
+                )
+                temporary = state_path.with_suffix(".yaml.tmp")
+                with temporary.open("w") as handle:
+                    yaml.safe_dump(optimizer_state, handle, sort_keys=False)
+                os.replace(temporary, state_path)
+                logger.info(
+                    "NEQTI schedule optimization cycle %d complete; A steps %s, B steps %s",
+                    cycle + 1,
+                    segment_steps["leg_a_forward"],
+                    segment_steps["leg_b_forward"],
+                )
+
+            logger.info("NEQTI schedule optimization frozen after %d pilot cycles", settings["pilot_samples"])
+
+        run_schedule_optimization()
+
+        convergence_settings = neqti_options.get("convergence", {})
+        convergence_path = Path("neqti_convergence.yaml")
+        if convergence_path.exists() and neqti_options["resume"]:
+            with convergence_path.open() as handle:
+                convergence_state = yaml.safe_load(handle) or {}
+        else:
+            convergence_state = {"schema_version": 1, "history": [], "termination_reason": None}
+        if convergence_state.get("termination_reason") in ("converged", "max_samples"):
+            logger.info(
+                "NEQTI production already terminated with reason %s",
+                convergence_state["termination_reason"],
+            )
+            return
+
+        def update_convergence():
+            if not convergence_settings.get("enabled", False):
+                return False
+            counts = current_counts()
+            if not all(
+                value >= convergence_settings["min_samples_per_direction"]
+                for value in counts.values()
+            ):
+                return False
+            analysis_summary = summarize_existing_neqti_work(
+                options, neqti_options, paths
+            )
+            record = _convergence_record(
+                analysis_summary.get("analysis"), counts, convergence_settings
+            )
+            convergence_state["history"].append(record)
+            reached = _convergence_reached(
+                convergence_state["history"], convergence_settings
+            )
+            if reached:
+                convergence_state["termination_reason"] = "converged"
+            temporary = convergence_path.with_suffix(".yaml.tmp")
+            with temporary.open("w") as handle:
+                yaml.safe_dump(convergence_state, handle, sort_keys=False)
+            os.replace(temporary, convergence_path)
+            logger.info(
+                "NEQTI convergence check at %d samples/direction: DDG=%s, error=%s, overlaps=[%s, %s], reached=%s",
+                record["sample_count_per_direction"],
+                record["ddg_kcal_per_mol"],
+                record["ddg_error_kcal_per_mol"],
+                record["leg_a_overlap_score"],
+                record["leg_b_overlap_score"],
+                reached,
+            )
+            return reached
 
         for attempt in range(
             min(attempted_count(name) for name in work_files),
@@ -1826,6 +2334,42 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
             for ensemble, switch_name in endpoint_stream_specs:
                 if not needs_attempt(switch_name, attempt):
                     continue
+                if native_endpoint_resources:
+                    native_state, native_system = native_rest2_snapshot(ensemble, attempt)
+                    native_pdb = Path(f"neqti_{ensemble}_native_snapshot_{attempt}.pdb")
+                    with native_pdb.open("w") as handle:
+                        PDBFile.writeFile(
+                            native_system.topology,
+                            native_state.getPositions(),
+                            handle,
+                            keepIds=True,
+                        )
+                    snapshot = worker.get_chkpt()
+                    _write_worker_pdb_pair(worker, f"neqti_{ensemble}_snapshot_{attempt}.pdb")
+                    try:
+                        work_result = execute_switch(
+                            switch_name,
+                            stateparams[paths[switch_name][0]],
+                            schedules[switch_name],
+                            paths[switch_name],
+                            f"{switch_name} trajectory {attempt}",
+                        )
+                        _write_worker_pdb_pair(
+                            worker,
+                            f"neqti_{ensemble}_{switch_name}_snapshot_{attempt}_post_switch.pdb",
+                        )
+                        _append_row(
+                            work_files[switch_name],
+                            completed_work_row(switch_name, attempt, work_result),
+                            neqti_options["work_sample_intervals"],
+                        )
+                    except Exception as exc:
+                        record_switch_failure(switch_name, attempt, exc)
+                    finally:
+                        worker.set_chkpt(snapshot)
+                        worker.set_state(states[ensemble])
+                    cycle_changed = True
+                    continue
                 initialize_stream_once(
                     ensemble,
                     state_files[ensemble],
@@ -1881,6 +2425,16 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
 
             if cycle_changed:
                 emit_progress(with_analysis=True)
+                if update_convergence():
+                    break
+
+        if convergence_settings.get("enabled", False) and not convergence_state.get("termination_reason"):
+            if all_targets_reached():
+                convergence_state["termination_reason"] = "max_samples"
+                temporary = convergence_path.with_suffix(".yaml.tmp")
+                with temporary.open("w") as handle:
+                    yaml.safe_dump(convergence_state, handle, sort_keys=False)
+                os.replace(temporary, convergence_path)
 
     if neqti_options["sampling_order"] == "interleaved":
         try:
@@ -1888,6 +2442,8 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
         finally:
             if rest2_sampler is not None:
                 rest2_sampler.close()
+            for _native_system, sampler in native_endpoint_resources.values():
+                sampler.close()
             worker.finish()
         return summarize_existing_neqti_work(options, neqti_options, paths)
 

@@ -83,6 +83,29 @@ def _test_sampled_work_interval_one_matches_exact_and_other_intervals_share_traj
     assert sampled == pytest.approx({1: 1.0, 5: 1.0, 10: 1.0, 25: 1.0, 50: 1.0})
 
 
+def _test_custom_integrator_updates_segment_boundaries_without_rebuild():
+    from atom_openmm.neqti_integrator import ATMNonequilibriumLangevinIntegrator
+
+    system = _constant_parameter_system(0.0)
+    integrator = ATMNonequilibriumLangevinIntegrator(
+        temperature=300.0 * kelvin,
+        collision_rate=1.0 / picosecond,
+        timestep=1.0 * femtosecond,
+        parameter_values={"switch_parameter": [0.0, 0.25, 1.0]},
+        steps_per_segment=[2, 2],
+        random_seed=4,
+    )
+    context = mm.Context(system, integrator, mm.Platform.getPlatformByName("Reference"))
+    context.setPositions([[0.0, 0.0, 0.0]])
+
+    integrator.set_segment_steps([1, 3])
+    integrator.step(1)
+    assert context.getParameter("switch_parameter") == pytest.approx(0.25)
+    integrator.step(3)
+    assert context.getParameter("switch_parameter") == pytest.approx(1.0)
+    assert integrator.get_segment_steps() == [1, 3]
+
+
 def _test_custom_integrator_drift_does_not_double_velocity():
     from atom_openmm.neqti_integrator import ATMNonequilibriumLangevinIntegrator
 

@@ -129,10 +129,6 @@ def _test_normalize_neqti_options_accepts_native_endpoint_rest2():
             "endpoint_system": "native", "sampling_order": "batched", "decorrelation_steps": 500,
             "rest2": {"enabled": True},
         }, "ensembles: \\[a, b\\]"),
-        ({
-            "endpoint_system": "native", "decorrelation_steps": 500,
-            "rest2": {"enabled": True, "ensembles": ["a", "b"]},
-        }, "sampling_order: batched"),
     ],
 )
 def _test_normalize_neqti_options_rejects_incomplete_native_endpoint_mode(neqti, message):
@@ -140,6 +136,104 @@ def _test_normalize_neqti_options_rejects_incomplete_native_endpoint_mode(neqti,
 
     with pytest.raises(NEQTIConfigError, match=message):
         normalize_neqti_options({"neqti": neqti}, _atom_options())
+
+
+def _test_normalize_native_interleaved_optimizer_and_convergence():
+    from atom_openmm.neqti import normalize_neqti_options
+
+    settings = normalize_neqti_options({"neqti": {
+        "endpoint_system": "native",
+        "sampling_order": "interleaved",
+        "n_snapshots": 100,
+        "decorrelation_steps": 500,
+        "switch_steps_per_segment": 5000,
+        "preparation_annealing_steps_per_segment": 1,
+        "rest2": {"enabled": True, "ensembles": ["a", "b"]},
+        "schedule_optimization": {"enabled": True, "pilot_samples": 10},
+        "convergence": {"enabled": True, "min_samples_per_direction": 30},
+    }}, _atom_options())
+
+    assert settings["sampling_order"] == "interleaved"
+    assert settings["schedule_optimization"]["pilot_samples"] == 10
+    assert settings["convergence"]["min_samples_per_direction"] == 30
+
+
+def _test_schedule_allocation_is_bounded_and_preserves_total():
+    from atom_openmm.neqti import _allocate_segment_steps
+
+    settings = {
+        "score_power": 1.5,
+        "min_segment_steps": 1000,
+        "max_segment_steps": 15000,
+        "min_update_factor": 0.5,
+        "max_update_factor": 2.0,
+    }
+    steps = _allocate_segment_steps(
+        [100, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        50000,
+        [5000] * 10,
+        settings,
+    )
+
+    assert sum(steps) == 50000
+    assert min(steps) >= 2500
+    assert max(steps) <= 10000
+
+
+def _test_convergence_requires_consecutive_stable_checks():
+    from atom_openmm.neqti import _convergence_reached
+
+    settings = {"consecutive_checks": 3, "max_ddg_range_kcal_per_mol": 0.25}
+    history = [
+        {"thresholds_pass": True, "ddg_kcal_per_mol": value}
+        for value in (1.00, 1.12, 1.18)
+    ]
+    assert _convergence_reached(history, settings)
+    history[-1]["ddg_kcal_per_mol"] = 1.4
+    assert not _convergence_reached(history, settings)
+
+
+@pytest.mark.parametrize(
+    "override, message",
+    [
+        ({"endpoint_system": "native", "sampling_order": "batched"}, "sampling_order: interleaved"),
+        ({"switch_integrator": "python"}, "switch_integrator: custom"),
+        ({"pilot_samples": 0}, "pilot_samples must be positive"),
+        ({"min_segment_steps": 6000}, "min_segment_steps is too large"),
+    ],
+)
+def _test_schedule_optimization_rejects_incompatible_settings(override, message):
+    from atom_openmm.neqti import NEQTIConfigError, normalize_neqti_options
+
+    neqti = {
+        "endpoint_system": "native",
+        "sampling_order": "interleaved",
+        "n_snapshots": 100,
+        "decorrelation_steps": 500,
+        "switch_steps_per_segment": 5000,
+        "preparation_annealing_steps_per_segment": 1,
+        "rest2": {"enabled": True, "ensembles": ["a", "b"]},
+        "schedule_optimization": {"enabled": True},
+    }
+    if "endpoint_system" in override or "sampling_order" in override or "switch_integrator" in override:
+        neqti.update(override)
+    else:
+        neqti["schedule_optimization"].update(override)
+    with pytest.raises(NEQTIConfigError, match=message):
+        normalize_neqti_options({"neqti": neqti}, _atom_options())
+
+
+def _test_optimizer_scores_pair_reverse_segments_in_physical_order():
+    from atom_openmm.neqti import _optimizer_cycle_scores
+
+    scores = _optimizer_cycle_scores(
+        [1.0, 10.0],
+        [-8.0, -1.0],
+        {"score_hysteresis_weight": 0.7, "score_absolute_weight": 0.3},
+    )
+
+    assert scores[0] == pytest.approx(0.3 + 1.0e-6)
+    assert scores[1] == pytest.approx(2.0 * 0.7 + 10.0 * 0.3 + 1.0e-6)
 
 
 def _test_normalize_neqti_options_rejects_incompatible_rest2_steps():

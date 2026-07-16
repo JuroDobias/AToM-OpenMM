@@ -140,7 +140,7 @@ Optional NEQTI REST2 sampling replaces ordinary endpoint decorrelation with sync
 
 Role-aware SMARTS leaves can also be embedded in Amber masks used by custom equilibration, for example `'!:HOH,WAT & #bound:"c1ncnc2ncnc12"'`. The RBFE guide defines the canonical ligand and endpoint role semantics. Diagnostic work intervals produce additional BAR estimates from the same switching trajectories; exact per-step work remains the primary result and the diagnostics do not reduce energy-evaluation cost.
 
-Experimental native endpoint sampling removes `ATMForce` from A/B equilibration and REST2 while retaining ATM for M and all switches. Select `endpoint_system: native`, `sampling_order: batched`, and `rest2.ensembles: [a, b]`. Endpoint ligand roles and restraints are exchanged consistently in B, and only one endpoint ladder is resident at a time. Existing workflows continue to use ATM endpoints by default.
+Experimental native endpoint sampling removes `ATMForce` from A/B equilibration and REST2 while retaining ATM for M and all switches. Select `endpoint_system: native` and `rest2.ensembles: [a, b]`. With `sampling_order: interleaved`, both endpoint REST2 ladders remain resident and adaptive pilot scheduling plus automatic convergence stopping are available. Use `sampling_order: batched` when GPU memory permits only one resident ladder. Endpoint ligand roles and restraints are exchanged consistently in B. Existing workflows continue to use ATM endpoints by default.
 
 See the [RBFE user guide](docs/user-guide/rbfe.md) for the complete YAML schema, force-field examples, custom equilibration, restart behavior, outputs, and swapped-coordinate diagnostics.
 

@@ -162,6 +162,37 @@ def _test_neqti_result_surfaces_work_estimator_variants(tmp_path):
     assert result["estimator_variants"]["interval_50"]["paired_bootstrap_difference_std_kcal_per_mol"] == pytest.approx(0.03)
 
 
+def _test_neqti_result_surfaces_adaptive_termination_state(tmp_path):
+    writer = _writer(tmp_path, method="neqti", requested_samples=100)
+    writer.workdir.mkdir(parents=True)
+    (writer.workdir / "neqti_schedule_optimization.yaml").write_text("status: frozen\n")
+    (writer.workdir / "neqti_convergence.yaml").write_text("termination_reason: converged\n")
+    convergence = {"termination_reason": "converged", "history": [{"thresholds_pass": True}]}
+    optimizer = {"status": "frozen", "completed_pilot_cycles": 10}
+
+    writer.update(
+        "completed",
+        analysis={
+            "termination_reason": "converged",
+            "forward_samples": 60,
+            "reverse_samples": 60,
+            "analysis": {
+                "bar_dg_kcal_per_mol": 1.2,
+                "bar_bootstrap_std_kcal_per_mol": 0.3,
+            },
+            "convergence": convergence,
+            "schedule_optimization": optimizer,
+        },
+    )
+    result = _read(writer)
+
+    assert result["termination_reason"] == "converged"
+    assert result["quality"]["convergence"] == convergence
+    assert result["quality"]["schedule_optimization"] == optimizer
+    assert result["artifacts"]["neqti_schedule_optimization"] == "neqti_schedule_optimization.yaml"
+    assert result["artifacts"]["neqti_convergence"] == "neqti_convergence.yaml"
+
+
 def _test_neqti_progress_handles_staged_two_leg_counts(tmp_path):
     writer = _writer(tmp_path, method="neqti", requested_samples=40)
     writer.update(

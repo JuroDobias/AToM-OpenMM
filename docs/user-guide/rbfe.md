@@ -231,6 +231,8 @@ For the example above, the execution order is:
 | `bootstrap_samples` | Number of BAR bootstrap resamples; zero disables uncertainty estimation. |
 | `random_seed` | Seed used for bootstrap resampling. |
 | `platform` | Optional OpenMM platform override for NEQTI. |
+| `schedule_optimization` | Optional excluded pilot that redistributes a fixed total switch time among ATM schedule segments independently for the A and B legs. |
+| `convergence` | Optional per-cycle BAR overlap, bootstrap uncertainty, and estimate-stability stopping criteria. |
 
 When `rest2.enabled: true`, the additional NEQTI sampling at A, M, and B uses a synchronous REST2 ladder instead of ordinary MD. `initial_equilibration_steps` and `decorrelation_steps` are steps per replica and must be divisible by `rest2.exchange_interval_steps`. All replicas use the physical thermostat temperature; the effective temperatures define REST2 Hamiltonian scales. `solute` accepts the selection syntax described below. Legacy `both_ligands` remains accepted and is equivalent to `'#ligand:"*"'`.
 
@@ -240,21 +242,37 @@ Native endpoint REST2 is enabled explicitly:
 workflow:
   neqti:
     endpoint_system: native
-    sampling_order: batched
+    sampling_order: interleaved
     preparation_annealing_steps_per_segment: 10000
     rest2:
       enabled: true
       ensembles: [a, b]
       solute: '#unbound:"*"'
-      effective_temperatures_k: [300, 378, 476, 600]
+      effective_temperatures_k: [300, 357, 424, 505, 600]
       exchange_interval_steps: 500
+    schedule_optimization:
+      enabled: true
+      pilot_samples: 10
+      min_segment_steps: 1000
+      max_segment_steps: 15000
+    convergence:
+      enabled: true
+      min_samples_per_direction: 30
+      min_overlap_score_per_leg: 0.05
+      max_ddg_error_kcal_per_mol: 0.5
+      consecutive_checks: 3
+      max_ddg_range_kcal_per_mol: 0.25
 ```
 
 This mode retains the current convention: A has L1 bound and L2 unbound; B has L2 bound and L1 unbound. M uses ordinary ATM MD. After ATM M-to-A/B preparation annealing, endpoint coordinates are converted to role-aware physical systems. Site, orientation, alignment, and optional receptor-exclusion restraints follow the bound/unbound roles. Endpoint equilibration and REST2 run without `ATMForce`. Native positions are converted back to the canonical ATM representation only for A/B-to-M switching; box vectors and per-atom velocities are preserved.
 
-Native endpoint mode currently requires REST2, `rest2.ensembles: [a, b]`, `sampling_order: batched`, and positive preparation annealing. It runs midpoint work first and then one resident A or B ladder at a time, avoiding two simultaneous endpoint ladders in GPU memory. Existing workflows retain ATM endpoints.
+Native endpoint mode requires REST2, `rest2.ensembles: [a, b]`, and positive preparation annealing. Interleaved mode keeps both endpoint ladders resident for the full run. With five REST2 replicas this uses ten endpoint contexts plus one ATM context, so it is intended for high-memory GPUs such as the L40S. Batched mode keeps only one endpoint ladder resident and remains the lower-memory alternative.
 
-The physical `s=1` replica supplies positions, velocities, and box vectors for each NEQTI switch. Switching itself always uses `s=1`, so work values and BAR analysis retain the standard ATM Hamiltonian. Legacy ATM endpoint REST2 requires interleaved sampling; native endpoint REST2 uses batched sampling. Both require the common/variable-region ATM coordinate-swap setup.
+The physical `s=1` replica supplies positions, velocities, and box vectors for each NEQTI switch. Switching itself always uses `s=1`, so work values and BAR analysis retain the standard ATM Hamiltonian. Legacy ATM endpoint REST2 requires interleaved sampling. Native endpoint REST2 supports interleaved and batched sampling. Both require the common/variable-region ATM coordinate-swap setup.
+
+Adaptive scheduling runs the configured number of complete four-direction pilot cycles before production. Pilot work is written under `neqti_schedule_optimization/` and is never included in production BAR estimates. A and B segment scores combine forward/reverse hysteresis and absolute segment work, are smoothed across pilot cycles, and redistribute the fixed total switch steps within configured bounds. The final schedules are frozen in `neqti_schedule_optimization.yaml` and restored exactly on resume.
+
+With convergence stopping enabled, BAR is recomputed after each complete production cycle once every direction reaches `min_samples_per_direction`. A run stops as `completed` with `termination_reason: converged` only after all overlap and bootstrap-error thresholds pass for the requested number of consecutive checks and the DDG range is stable. Reaching `n_snapshots` first records `termination_reason: max_samples` and leaves the run `partial`. State is stored atomically in `neqti_convergence.yaml`.
 
 Four half-path switches have approximately the same total integration length as two complete A↔B switches. Logs report effective ns/day for equilibration, decorrelation, and switching segments.
 
@@ -264,7 +282,7 @@ The custom switching path uses a dedicated BAOAB-style Langevin `CustomIntegrato
 
 When `validate_switch_integrator: true`, the first pending snapshot on each half-path direction is switched with both custom and Python implementations after restoring the same state.
 
-When `resume: true`, completed work rows and three sampling checkpoints are reused. REST2 runs instead maintain complete replica checkpoint banks under `neqti_rest2/{a,m,b}`. `neqti_protocol.yaml` signs the ATM paths, segment lengths, sampling order, and REST2 ladder settings. Incompatible resume settings are rejected.
+When `resume: true`, completed work rows and three sampling checkpoints are reused. REST2 runs instead maintain complete replica checkpoint banks under `neqti_rest2/{a,m,b}`. Adaptive pilot cycles and convergence checks are also resumed atomically. `neqti_protocol.yaml` signs the ATM paths, segment lengths, sampling order, REST2 ladder settings, optimizer, and convergence configuration. Incompatible resume settings are rejected.
 
 `count_as_infinite` is intended for production protocols where a physical numerical instability is itself a zero-overlap outcome that must not be replaced selectively. It recognizes non-finite work, OpenMM NaN/non-finite state errors, and constraint convergence failures. Environment, CUDA/PTX, parameter-name, random-seed, I/O, and programming failures remain fatal. Counted rows use `status: counted_infinite` and `work_kcal_per_mol: inf`; ordinary failed rows from older runs remain excluded on resume. Summaries and `result.yaml` report total analyzed, finite, counted-infinite, and retryable failed counts separately. BAR returns no finite estimate when a required direction has no finite connecting sample.
 
@@ -459,14 +477,14 @@ The top-level status has the following meaning:
 | `completed` | Requested sampling completed. |
 | `failed` | The workflow raised an exception; `error` records its type, message, and stage. |
 
-`quality.convergence_status: usable` means only that the run completed its requested sample count and produced a finite estimate. It is not a scientific convergence guarantee. Quantitative overlap and network cycle-closure analysis are not implemented in schema version 1 and remain null.
+Without `workflow.neqti.convergence`, `quality.convergence_status: usable` means only that the run completed its requested sample count and produced a finite estimate. It is not a scientific convergence guarantee. With automatic convergence enabled, inspect `termination_reason`, `quality.convergence`, and the per-leg overlap values. Network cycle-closure analysis is not implemented in schema version 1 and remains null.
 
 ## Current Limitations
 
 - The single-YAML wrapper currently supports `workflow.mode: small_molecule`.
 - NEQTI is experimental and has not replaced asynchronous replica exchange as the established production method.
 - NEQTI currently uses the configured discrete ATM schedule as interpolation knots; it does not yet implement an arbitrary continuous OpenMMTools-style alchemical function.
-- NEQTI REST2 supports shared-ATM interleaved sampling and native A/B batched sampling. SMARTS-defined partial hot regions are experimental, and automatic ladder tuning is not implemented.
+- NEQTI REST2 supports shared-ATM interleaved sampling and native A/B interleaved or batched sampling. SMARTS-defined partial hot regions and adaptive switching schedules are experimental; automatic REST2 ladder tuning is not implemented.
 - GPU, CUDA, OpenMM, Espaloma, and `openmmforcefields` compatibility is the responsibility of the environment.
 - A numerically completed run is not sufficient validation. Inspect endpoint structures, swapped structures, work distributions, forward/reverse overlap, and sensitivity to equilibration and switching time.
 

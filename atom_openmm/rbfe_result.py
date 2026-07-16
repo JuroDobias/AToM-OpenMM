@@ -48,6 +48,7 @@ class RBFEResultWriter:
             "workdir": str(self.workdir),
             "convention": CONVENTION.copy(),
             "external_metadata": pair_plan.get("external_metadata") or {},
+            "termination_reason": None,
             "result": self._empty_result(),
             "quality": {
                 "convergence_status": "unknown",
@@ -57,6 +58,8 @@ class RBFEResultWriter:
                 "rest2": None,
                 "finite_sample_counts": None,
                 "counted_infinite_work_counts": None,
+                "convergence": None,
+                "schedule_optimization": None,
             },
             "error": None,
             "inputs": {
@@ -114,6 +117,8 @@ class RBFEResultWriter:
             "neqti_protocol": None,
             "neqti_switch_validation": None,
             "neqti_rest2": None,
+            "neqti_schedule_optimization": None,
+            "neqti_convergence": None,
             "async_re_log": None,
             "async_re_replica_output_pattern": None,
             "plot": None,
@@ -148,6 +153,8 @@ class RBFEResultWriter:
                 "neqti_protocol": self._relative_if_exists("neqti_protocol.yaml"),
                 "neqti_switch_validation": self._relative_if_exists("neqti_switch_validation.yaml"),
                 "neqti_rest2": "neqti_rest2" if (self.workdir / "neqti_rest2").is_dir() else None,
+                "neqti_schedule_optimization": self._relative_if_exists("neqti_schedule_optimization.yaml"),
+                "neqti_convergence": self._relative_if_exists("neqti_convergence.yaml"),
                 "async_re_log": self._relative_if_exists(f"{job}.log"),
                 "async_re_replica_output_pattern": f"r*/{job}.out" if any(self.workdir.glob(f"r*/{job}.out")) else None,
                 "plot": self._relative_if_exists(f"{job}.png"),
@@ -192,6 +199,11 @@ class RBFEResultWriter:
             self.data["quality"]["counted_infinite_work_counts"] = (
                 (analysis or {}).get("counted_infinite_work_counts")
             )
+            self.data["quality"]["convergence"] = (analysis or {}).get("convergence")
+            self.data["quality"]["schedule_optimization"] = (
+                (analysis or {}).get("schedule_optimization")
+            )
+            self.data["termination_reason"] = (analysis or {}).get("termination_reason")
         else:
             result["ddg_kcal_per_mol"] = (analysis or {}).get("ddg")
             result["ddg_error_kcal_per_mol"] = (analysis or {}).get("ddg_std")
