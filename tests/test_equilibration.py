@@ -44,7 +44,7 @@ def _test_restraint_resolution_is_indexed_not_step_id(monkeypatch):
     from atom_openmm import equilibration
 
     class FakeResolver:
-        def __init__(self, topology, positions):
+        def __init__(self, topology, positions, **kwargs):
             pass
 
         def resolve(self, mask, label):

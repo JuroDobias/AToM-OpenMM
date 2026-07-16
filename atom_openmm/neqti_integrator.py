@@ -45,14 +45,21 @@ class ATMNonequilibriumLangevinIntegrator(mm.CustomIntegrator):
         parameter_values,
         steps_per_segment,
         random_seed=None,
+        work_sample_intervals=None,
     ):
         super().__init__(timestep)
+        intervals = tuple(sorted({int(value) for value in (work_sample_intervals or ())}))
+        if any(value <= 0 for value in intervals):
+            raise ValueError("work_sample_intervals must contain positive integers")
+        self._work_sample_intervals = intervals
         self._temperature = temperature
         self.addGlobalVariable("kT", MOLAR_GAS_CONSTANT_R * temperature)
         self.addGlobalVariable("protocol_work", 0.0)
         self.addGlobalVariable("Eold", 0.0)
         self.addGlobalVariable("Enew", 0.0)
         self.addGlobalVariable("neq_step", 0.0)
+        for interval in intervals:
+            self.addGlobalVariable(f"protocol_work_interval_{interval}", 0.0)
         self.addPerDofVariable("x1", 0.0)
 
         gamma_dt = collision_rate * timestep
@@ -69,6 +76,12 @@ class ATMNonequilibriumLangevinIntegrator(mm.CustomIntegrator):
             self.addComputeGlobal(name, _piecewise_expression(values, steps_per_segment))
         self.addComputeGlobal("Enew", "energy")
         self.addComputeGlobal("protocol_work", "protocol_work+Enew-Eold")
+        for interval in intervals:
+            sample = f"delta(neq_step-{interval}*floor(neq_step/{interval}))"
+            self.addComputeGlobal(
+                f"protocol_work_interval_{interval}",
+                f"protocol_work_interval_{interval}+{interval}*({sample})*(Enew-Eold)",
+            )
 
         self.addComputePerDof("v", f"{a:.17g}*v+{b:.17g}*sqrt(kT/m)*gaussian")
         self._add_constrained_drift("0.5*dt")
@@ -96,9 +109,18 @@ class ATMNonequilibriumLangevinIntegrator(mm.CustomIntegrator):
         self.setGlobalVariableByName("Eold", 0.0)
         self.setGlobalVariableByName("Enew", 0.0)
         self.setGlobalVariableByName("neq_step", 0.0)
+        for interval in self._work_sample_intervals:
+            self.setGlobalVariableByName(f"protocol_work_interval_{interval}", 0.0)
 
     def get_protocol_work(self):
         return self.getGlobalVariableByName("protocol_work") * kilojoules_per_mole
+
+    def get_sampled_protocol_work(self):
+        return {
+            interval: self.getGlobalVariableByName(f"protocol_work_interval_{interval}")
+            * kilojoules_per_mole
+            for interval in self._work_sample_intervals
+        }
 
 
 def _context_parameter_values(ommsystem, schedule):
@@ -121,10 +143,11 @@ def _context_parameter_values(ommsystem, schedule):
 
 
 class OMMWorkerATMNEQTI(OMMWorkerATMSync):
-    def __init__(self, *args, switch_schedules, steps_per_segment, random_seed, **kwargs):
+    def __init__(self, *args, switch_schedules, steps_per_segment, random_seed, work_sample_intervals=None, **kwargs):
         self._switch_schedules = switch_schedules
         self._steps_per_segment = steps_per_segment
         self._random_seed = random_seed
+        self._work_sample_intervals = work_sample_intervals
         super().__init__(*args, **kwargs)
 
     def _openmm_worker_body(self):
@@ -152,6 +175,7 @@ class OMMWorkerATMNEQTI(OMMWorkerATMSync):
                 parameter_values=_context_parameter_values(self.ommsystem, schedule),
                 steps_per_segment=self._steps_per_segment,
                 random_seed=self._random_seed,
+                work_sample_intervals=self._work_sample_intervals,
             )
         _set_shared_random_seed([self.equilibrium_integrator, *self.switch_integrators.values()], self._random_seed)
         self.compound_integrator = mm.CompoundIntegrator()

@@ -129,6 +129,39 @@ def _test_neqti_partial_result_and_missing_uncertainty(tmp_path):
     assert "Sampling or overlap quality requirements were not met." in result["quality"]["warnings"]
 
 
+def _test_neqti_result_surfaces_work_estimator_variants(tmp_path):
+    writer = _writer(tmp_path, method="neqti", requested_samples=2)
+    exact = {
+        "bar_dg_kcal_per_mol": 1.0,
+        "bar_dg_kj_per_mol": 4.184,
+        "bar_bootstrap_std_kcal_per_mol": 0.2,
+        "bar_bootstrap_std_kj_per_mol": 0.8368,
+        "overlap_score": 0.3,
+    }
+    interval = {
+        **exact,
+        "bar_dg_kcal_per_mol": 1.1,
+        "bar_dg_kj_per_mol": 4.6024,
+        "difference_from_exact_kcal_per_mol": 0.1,
+        "paired_bootstrap_difference_std_kcal_per_mol": 0.03,
+    }
+    writer.update(
+        "completed",
+        analysis={
+            "forward_samples": 4,
+            "reverse_samples": 4,
+            "analysis": exact,
+            "work_estimator_analyses": {"exact": exact, "interval_50": interval},
+        },
+    )
+
+    result = _read(writer)["result"]
+    assert result["ddg_kcal_per_mol"] == pytest.approx(1.0)
+    assert result["estimator_variants"]["exact"]["difference_from_exact_kcal_per_mol"] == 0.0
+    assert result["estimator_variants"]["interval_50"]["ddg_kcal_per_mol"] == pytest.approx(1.1)
+    assert result["estimator_variants"]["interval_50"]["paired_bootstrap_difference_std_kcal_per_mol"] == pytest.approx(0.03)
+
+
 def _test_neqti_progress_handles_staged_two_leg_counts(tmp_path):
     writer = _writer(tmp_path, method="neqti", requested_samples=40)
     writer.update(

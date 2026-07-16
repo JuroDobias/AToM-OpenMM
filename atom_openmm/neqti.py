@@ -37,7 +37,7 @@ from atom_openmm.rest2_exchange import REST2ExchangeSampler
 
 KCAL_TO_KJ = 4.184
 KB_KCAL_PER_MOL_K = 0.0019872041
-CSV_FIELDS = [
+BASE_CSV_FIELDS = [
     "trajectory",
     "direction",
     "start_state",
@@ -51,6 +51,19 @@ CSV_FIELDS = [
 ]
 
 
+def _work_column(interval):
+    return f"work_interval_{int(interval)}_kcal_per_mol"
+
+
+def _work_csv_fields(intervals=()):
+    fields = list(BASE_CSV_FIELDS)
+    insertion = fields.index("switch_steps")
+    diagnostic = []
+    for interval in intervals:
+        diagnostic.extend([_work_column(interval), f"work_interval_{int(interval)}_kj_per_mol"])
+    return fields[:insertion] + diagnostic + fields[insertion:]
+
+
 def _protocol_signature(settings):
     payload = {
         "schema_version": 5,
@@ -61,8 +74,18 @@ def _protocol_signature(settings):
         "sampling_order": settings.get("sampling_order", "interleaved"),
         "endpoint_system": settings.get("endpoint_system", "atm"),
     }
+    if settings.get("work_sample_intervals"):
+        payload["work_sample_intervals"] = settings["work_sample_intervals"]
+    if settings.get("receptor_exclusion_signature"):
+        payload["receptor_exclusion_signature"] = settings["receptor_exclusion_signature"]
     if settings.get("rest2", {}).get("enabled", False):
-        payload["rest2"] = settings["rest2"]
+        rest2 = deepcopy(settings["rest2"])
+        if (
+            rest2.get("solute") == '#ligand:"*"'
+            and not rest2.get("selection_metadata")
+        ):
+            rest2["solute"] = "both_ligands"
+        payload["rest2"] = rest2
     if settings.get("failed_switch_policy") == "count_as_infinite":
         payload["failed_switch_policy"] = "count_as_infinite"
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -99,7 +122,8 @@ def _initialize_protocol_manifest(settings, resume):
             manifest = yaml.safe_load(handle) or {}
         if manifest.get("signature") != signature:
             raise NEQTIConfigError(
-                "Existing NEQTI artifacts use a different Hamiltonian, lambda schedule, or sampling order; "
+                "Existing NEQTI artifacts use a different Hamiltonian, lambda schedule, sampling order, "
+                "REST2 selection, receptor exclusion region, or work-estimator schema; "
                 "remove them or set resume: false"
             )
     manifest = {
@@ -110,6 +134,8 @@ def _initialize_protocol_manifest(settings, resume):
         "preparation_annealing_steps_per_segment": settings.get("preparation_annealing_steps_per_segment", 0),
         "sampling_order": settings.get("sampling_order", "interleaved"),
         "endpoint_system": settings.get("endpoint_system", "atm"),
+        "work_sample_intervals": settings.get("work_sample_intervals", []),
+        "receptor_exclusion_signature": settings.get("receptor_exclusion_signature"),
         "rest2": settings.get("rest2", {"enabled": False}),
         "failed_switch_policy": settings.get("failed_switch_policy", "abort"),
         "signature": signature,
@@ -218,6 +244,17 @@ def normalize_neqti_options(workflow, atom_options):
     if "lambda_schedule" in raw or "state_path" in raw:
         raise NEQTIConfigError("NEQTI now derives its two half paths from the async-RE ATM schedule")
     paths = split_two_leg_paths(build_atm_state_parameters(atom_options))
+    work_sample_intervals = raw.get("work_sample_intervals", []) or []
+    if not isinstance(work_sample_intervals, list) or any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in work_sample_intervals
+    ):
+        raise NEQTIConfigError("workflow.neqti.work_sample_intervals must be a list of integers")
+    if any(value <= 0 for value in work_sample_intervals) or len(set(work_sample_intervals)) != len(work_sample_intervals):
+        raise NEQTIConfigError(
+            "workflow.neqti.work_sample_intervals must contain unique positive integers"
+        )
+    work_sample_intervals = sorted(work_sample_intervals)
 
     switch_integrator = str(raw.get("switch_integrator", "custom")).lower()
     if switch_integrator not in ("custom", "python"):
@@ -256,14 +293,23 @@ def normalize_neqti_options(workflow, atom_options):
     ]
     exchange_interval = int(rest2_raw.get("exchange_interval_steps", 500))
     checkpoint_interval = int(rest2_raw.get("checkpoint_interval_cycles", 10))
-    solute = str(rest2_raw.get("solute", "both_ligands"))
+    solute = str(rest2_raw.get("solute", "both_ligands")).strip()
+    if solute == "both_ligands":
+        solute = '#ligand:"*"'
     initial_steps = int(raw.get("initial_equilibration_steps", 0))
     decorrelation_steps = int(raw.get("decorrelation_steps", atom_options.get("PRODUCTION_STEPS", 1)))
     if rest2_enabled:
         if endpoint_system == "atm" and sampling_order != "interleaved":
             raise NEQTIConfigError("NEQTI REST2 currently requires sampling_order: interleaved")
-        if solute != "both_ligands":
-            raise NEQTIConfigError("workflow.neqti.rest2.solute currently supports only 'both_ligands'")
+        if not solute:
+            raise NEQTIConfigError("workflow.neqti.rest2.solute must be a non-empty selection")
+        if endpoint_system == "atm" and any(
+            token in solute for token in ('#bound:"', '#unbound:"')
+        ):
+            raise NEQTIConfigError(
+                "workflow.neqti.rest2.solute cannot use bound/unbound with the shared ATM system; "
+                "use ligand_a, ligand_b, or ligand roles"
+            )
         if len(temperatures) < 2 or temperatures[0] != physical_temperature:
             raise NEQTIConfigError("REST2 temperatures must start at the physical ATM temperature")
         if any(b <= a for a, b in zip(temperatures, temperatures[1:])):
@@ -303,12 +349,54 @@ def normalize_neqti_options(workflow, atom_options):
         "exchange_interval_steps": exchange_interval,
         "checkpoint_interval_cycles": checkpoint_interval,
     }
+    if rest2_enabled and atom_options.get("SELECTION_METADATA"):
+        rest2["selection_metadata"] = deepcopy(atom_options["SELECTION_METADATA"])
+        pdb_path = Path(str(atom_options.get("BASENAME", "")) + ".pdb")
+        if pdb_path.exists():
+            from atom_openmm.equilibration import AmberMaskResolver
+
+            pdb = PDBFile(str(pdb_path))
+            contexts = ("a", "b") if endpoint_system == "native" else (None,)
+            resolved = {}
+            for context in contexts:
+                resolver = AmberMaskResolver(
+                    pdb.topology,
+                    pdb.positions,
+                    keywords=atom_options,
+                    endpoint=context,
+                    base_dir=atom_options.get("WORKDIR", "."),
+                )
+                key = "shared_atm" if context is None else f"endpoint_{context}"
+                resolved[key] = resolver.resolve(solute, "workflow.neqti.rest2.solute")
+            rest2["resolved_atom_indices"] = resolved
+
+    switch_steps_per_segment = int(raw.get("switch_steps_per_segment", atom_options.get("PRODUCTION_STEPS", 1)))
+    total_switch_steps = switch_steps_per_segment * (len(paths["leg_a_forward"]) - 1)
+    invalid_intervals = [value for value in work_sample_intervals if total_switch_steps % value]
+    if invalid_intervals:
+        raise NEQTIConfigError(
+            f"total switch steps ({total_switch_steps}) must be divisible by every work sample interval; "
+            f"invalid intervals: {invalid_intervals}"
+        )
+
+    receptor_exclusion_atoms = [
+        int(value) for value in atom_options.get("EXCLUSION_POT_MOL1_INDEXES", [])
+    ]
+    receptor_exclusion_signature = None
+    if receptor_exclusion_atoms:
+        encoded_atoms = json.dumps(receptor_exclusion_atoms, separators=(",", ":")).encode()
+        receptor_exclusion_signature = {
+            "atom_count": len(receptor_exclusion_atoms),
+            "sha256": hashlib.sha256(encoded_atoms).hexdigest(),
+        }
 
     return {
         "initial_equilibration_steps": initial_steps,
         "n_snapshots": int(raw.get("n_snapshots", atom_options.get("MAX_SAMPLES", 1))),
         "decorrelation_steps": decorrelation_steps,
-        "switch_steps_per_segment": int(raw.get("switch_steps_per_segment", atom_options.get("PRODUCTION_STEPS", 1))),
+        "switch_steps_per_segment": switch_steps_per_segment,
+        "work_sample_intervals": work_sample_intervals,
+        "receptor_exclusion_signature": receptor_exclusion_signature,
         "preparation_annealing_steps_per_segment": int(raw.get("preparation_annealing_steps_per_segment", 0)),
         "hamiltonian": "atm_softplus_single_midpoint",
         "paths": paths,
@@ -409,18 +497,27 @@ def _read_failed_rows(path):
         return [row for row in csv.DictReader(f) if row.get("status") == "failed"]
 
 
-def _ensure_work_csv(path):
+def _ensure_work_csv(path, intervals=()):
+    fields = _work_csv_fields(intervals)
     if path.exists():
+        with open(path, newline="") as f:
+            existing = next(csv.reader(f), [])
+        if existing != fields:
+            raise NEQTIConfigError(
+                f"Existing work CSV {path} has a different estimator schema; "
+                "restore work_sample_intervals or start a clean run"
+            )
         return
     with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
 
 
-def _append_row(path, row):
+def _append_row(path, row, intervals=()):
+    fields = _work_csv_fields(intervals)
     write_header = not path.exists()
     with open(path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer = csv.DictWriter(f, fieldnames=fields)
         if write_header:
             writer.writeheader()
         writer.writerow(row)
@@ -562,9 +659,10 @@ def _potential_kcal(worker):
     return pot["potential_energy"] / kilocalories_per_mole
 
 
-def _run_switch(worker, start_par, schedule, steps_per_segment, state_path, logger=None, label=None):
+def _run_switch(worker, start_par, schedule, steps_per_segment, state_path, logger=None, label=None, work_sample_intervals=()):
     worker.set_state(start_par)
     work = 0.0
+    sampled_work = {int(interval): 0.0 for interval in work_sample_intervals}
     total = len(schedule)
     segment_started = time.perf_counter()
     previous_log_run_timing = getattr(worker, "log_run_timing", True)
@@ -574,7 +672,11 @@ def _run_switch(worker, start_par, schedule, steps_per_segment, state_path, logg
             old_energy = _potential_kcal(worker)
             worker.set_state(par)
             new_energy = _potential_kcal(worker)
-            work += new_energy - old_energy
+            increment = new_energy - old_energy
+            work += increment
+            for interval in sampled_work:
+                if step % interval == 0:
+                    sampled_work[interval] += interval * increment
             worker.run(1)
             if logger is not None and label and step % steps_per_segment == 0:
                 segment = step // steps_per_segment
@@ -608,7 +710,7 @@ def _run_switch(worker, start_par, schedule, steps_per_segment, state_path, logg
                 segment_started = time.perf_counter()
     finally:
         worker.log_run_timing = previous_log_run_timing
-    return work
+    return {"exact": work, "sampled": sampled_work}
 
 
 def _run_switch_custom(worker, start_par, steps_per_segment, state_path, direction, logger=None, label=None):
@@ -635,7 +737,13 @@ def _run_switch_custom(worker, start_par, steps_per_segment, state_path, directi
                     work,
                     ns_per_day,
                 )
-        return integrator.get_protocol_work() / kilocalories_per_mole
+        return {
+            "exact": integrator.get_protocol_work() / kilocalories_per_mole,
+            "sampled": {
+                interval: value / kilocalories_per_mole
+                for interval, value in integrator.get_sampled_protocol_work().items()
+            },
+        }
     finally:
         worker.end_switch()
 
@@ -664,7 +772,7 @@ def _validate_switch_implementations(
     worker.set_chkpt(snapshot)
     worker.set_state(start_state)
     custom_started = time.perf_counter()
-    custom_work = _run_switch_custom(
+    custom_result = _run_switch_custom(
         worker,
         start_state,
         steps_per_segment,
@@ -678,7 +786,7 @@ def _validate_switch_implementations(
     worker.set_chkpt(snapshot)
     worker.set_state(start_state)
     python_started = time.perf_counter()
-    python_work = _run_switch(
+    python_result = _run_switch(
         worker,
         start_state,
         schedule,
@@ -688,6 +796,8 @@ def _validate_switch_implementations(
         f"validation python {direction}",
     )
     python_seconds = time.perf_counter() - python_started
+    custom_work = custom_result["exact"] if isinstance(custom_result, dict) else custom_result
+    python_work = python_result["exact"] if isinstance(python_result, dict) else python_result
     worker.set_chkpt(snapshot)
     worker.set_state(start_state)
 
@@ -769,7 +879,7 @@ def analyze_neqti_work(forward_work_kcal, reverse_work_kcal, temperature_kelvin,
 
 
 def _bar_overlap_score(forward_work, reverse_work, dg, temperature_kelvin):
-    if dg is None or not forward_work or not reverse_work:
+    if dg is None or len(forward_work) == 0 or len(reverse_work) == 0:
         return None
     beta = 1.0 / (KB_KCAL_PER_MOL_K * float(temperature_kelvin))
     forward_acceptance = np.mean(1.0 / (1.0 + np.exp(np.clip(beta * (np.asarray(forward_work) - dg), -700, 700))))
@@ -825,6 +935,69 @@ def analyze_two_leg_work(work, temperature_kelvin, bootstrap_samples=200, random
     }
 
 
+def _paired_bootstrap_difference(exact_work, variant_work, temperature_kelvin, bootstrap_samples, random_seed):
+    if bootstrap_samples <= 0 or any(len(values) < 2 for values in exact_work.values()):
+        return None
+    rng = np.random.default_rng(random_seed)
+    differences = []
+    for _ in range(bootstrap_samples):
+        exact_sample = {}
+        variant_sample = {}
+        for key, exact_values in exact_work.items():
+            indices = rng.integers(0, len(exact_values), size=len(exact_values))
+            exact_sample[key] = np.asarray(exact_values)[indices]
+            variant_sample[key] = np.asarray(variant_work[key])[indices]
+        exact = analyze_two_leg_work(exact_sample, temperature_kelvin, bootstrap_samples=0)
+        variant = analyze_two_leg_work(variant_sample, temperature_kelvin, bootstrap_samples=0)
+        if exact is not None and variant is not None:
+            differences.append(
+                variant["bar_dg_kcal_per_mol"] - exact["bar_dg_kcal_per_mol"]
+            )
+    if not differences:
+        return None
+    return float(np.std(differences, ddof=1)) if len(differences) > 1 else 0.0
+
+
+def analyze_work_estimators(rows, intervals, temperature_kelvin, bootstrap_samples=200, random_seed=2026):
+    columns = {"exact": "work_kcal_per_mol"}
+    columns.update({f"interval_{value}": _work_column(value) for value in intervals})
+    estimator_work = {
+        estimator: {
+            direction: [float(row[column]) for row in direction_rows]
+            for direction, direction_rows in rows.items()
+        }
+        for estimator, column in columns.items()
+    }
+    analyses = {}
+    for estimator, work in estimator_work.items():
+        analysis = analyze_two_leg_work(
+            work,
+            temperature_kelvin,
+            bootstrap_samples=bootstrap_samples,
+            random_seed=random_seed,
+        )
+        analyses[estimator] = analysis
+    exact = analyses["exact"]
+    for estimator, analysis in analyses.items():
+        if estimator == "exact" or analysis is None or exact is None:
+            continue
+        difference = analysis["bar_dg_kcal_per_mol"] - exact["bar_dg_kcal_per_mol"]
+        analysis["difference_from_exact_kcal_per_mol"] = float(difference)
+        analysis["difference_from_exact_kj_per_mol"] = float(difference) * KCAL_TO_KJ
+        paired_std = _paired_bootstrap_difference(
+            estimator_work["exact"],
+            estimator_work[estimator],
+            temperature_kelvin,
+            bootstrap_samples,
+            random_seed,
+        )
+        analysis["paired_bootstrap_difference_std_kcal_per_mol"] = paired_std
+        analysis["paired_bootstrap_difference_std_kj_per_mol"] = (
+            None if paired_std is None else paired_std * KCAL_TO_KJ
+        )
+    return analyses
+
+
 def summarize_existing_neqti_work(options, neqti_options, paths, *, bootstrap_samples=None):
     work_files = {
         "leg_a_forward": Path("neqti_leg_a_forward.csv"),
@@ -839,15 +1012,16 @@ def summarize_existing_neqti_work(options, neqti_options, paths, *, bootstrap_sa
     rows = {name: _read_analyzed_rows(path) for name, path in work_files.items()}
     for name, values in rows.items():
         _write_integrated_work(Path(f"integ_{name}.dat"), values, name)
-    work = {name: [float(row["work_kcal_per_mol"]) for row in values] for name, values in rows.items()}
     states = build_atm_state_parameters(options)
     temperature_kelvin = states[paths["leg_a_forward"][0]]["temperature"] / kelvin
-    analysis = analyze_two_leg_work(
-        work,
+    work_estimator_analyses = analyze_work_estimators(
+        rows,
+        neqti_options.get("work_sample_intervals", []),
         temperature_kelvin,
         bootstrap_samples=neqti_options["bootstrap_samples"] if bootstrap_samples is None else bootstrap_samples,
         random_seed=neqti_options["random_seed"],
     )
+    analysis = work_estimator_analyses["exact"]
     complete = all(len(values) >= neqti_options["n_snapshots"] for values in rows.values())
     usable_overlap = analysis is not None and analysis["overlap_score"] >= 0.01
     failed_counts = {
@@ -921,6 +1095,7 @@ def summarize_existing_neqti_work(options, neqti_options, paths, *, bootstrap_sa
         "paths": paths,
         "settings": neqti_options,
         "analysis": analysis,
+        "work_estimator_analyses": work_estimator_analyses,
         "rest2": rest2_summary,
         "warnings": warnings,
     }
@@ -981,6 +1156,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
     if neqti_options is None:
         neqti_options = normalize_neqti_options({"neqti": {}}, options)
     neqti_options.setdefault("sampling_order", "interleaved")
+    neqti_options.setdefault("work_sample_intervals", [])
 
     basename = options["BASENAME"]
     logger = logging.getLogger("atom_openmm.neqti")
@@ -1151,6 +1327,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                         initial_state_path=native_input,
                         atm_state=None,
                         swapped_diagnostics_keywords=options,
+                        selection_endpoint=name,
                         logger=logger,
                     )
                     logger.info("Completed native NEQTI %s endpoint equilibration", name)
@@ -1166,6 +1343,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                         final_pdb_path={"a": "neqti_endpoint_A.pdb", "b": "neqti_endpoint_B.pdb"}[name],
                         initial_state_path=endpoint_sources[name],
                         atm_state=states[name],
+                        selection_endpoint=name,
                         logger=logger,
                     )
                     logger.info("Completed NEQTI %s equilibration", name)
@@ -1177,6 +1355,9 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
     system_options = deepcopy(options)
     atm_rest2_enabled = rest2_enabled and neqti_options.get("endpoint_system", "atm") == "atm"
     system_options["REST2_ENABLED"] = atm_rest2_enabled
+    system_options["REST2_SOLUTE"] = neqti_options.get("rest2", {}).get(
+        "solute", '#ligand:"*"'
+    )
     ommsystem = OMMSystemRBFE(
         basename, system_options, basename + ".pdb", basename + "_sys.xml", logger
     )
@@ -1198,6 +1379,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
             switch_schedules={name: [stateparams[index] for index in path] for name, path in paths.items()},
             steps_per_segment=neqti_options["switch_steps_per_segment"],
             random_seed=neqti_options["random_seed"],
+            work_sample_intervals=neqti_options["work_sample_intervals"],
         )
     else:
         worker = OMMWorkerATMSync(
@@ -1242,13 +1424,13 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
         if neqti_options.get("endpoint_system") == "native":
             shutil.rmtree("neqti_rest2", ignore_errors=True)
     for path in work_files.values():
-        _ensure_work_csv(path)
+        _ensure_work_csv(path, neqti_options["work_sample_intervals"])
 
     def execute_switch(switch_name, start_state, schedule, path, label):
         if atm_rest2_enabled:
             set_rest2_scale(worker.context, 1.0, ommsystem.rest2_system)
         if neqti_options["switch_integrator"] == "custom":
-            work_kcal = _run_switch_custom(
+            work_result = _run_switch_custom(
                 worker,
                 start_state,
                 neqti_options["switch_steps_per_segment"],
@@ -1258,7 +1440,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                 label,
             )
         else:
-            work_kcal = _run_switch(
+            switch_args = (
                 worker,
                 start_state,
                 schedule,
@@ -1267,9 +1449,37 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                 logger,
                 label,
             )
-        if not math.isfinite(float(work_kcal)):
-            raise NEQTINonfiniteWorkError(f"Switch returned non-finite protocol work: {work_kcal}")
-        return work_kcal
+            work_result = (
+                _run_switch(
+                    *switch_args,
+                    work_sample_intervals=neqti_options["work_sample_intervals"],
+                )
+                if neqti_options["work_sample_intervals"]
+                else _run_switch(*switch_args)
+            )
+        if not isinstance(work_result, dict):
+            work_result = {"exact": work_result, "sampled": {}}
+        values = [work_result["exact"], *work_result["sampled"].values()]
+        if not all(math.isfinite(float(value)) for value in values):
+            raise NEQTINonfiniteWorkError(f"Switch returned non-finite protocol work: {work_result}")
+        return work_result
+
+    def completed_work_row(switch_name, attempt, work_result):
+        exact = float(work_result["exact"])
+        row = {
+            "trajectory": attempt,
+            "direction": switch_name,
+            "start_state": paths[switch_name][0],
+            "end_state": paths[switch_name][-1],
+            "work_kcal_per_mol": f"{exact:.12g}",
+            "work_kj_per_mol": f"{exact * KCAL_TO_KJ:.12g}",
+            "switch_steps": len(schedules[switch_name]),
+            "status": "complete",
+        }
+        for interval, value in work_result["sampled"].items():
+            row[_work_column(interval)] = f"{float(value):.12g}"
+            row[f"work_interval_{interval}_kj_per_mol"] = f"{float(value) * KCAL_TO_KJ:.12g}"
+        return row
 
     def current_counts():
         return {name: len(_read_analyzed_rows(path)) for name, path in work_files.items()}
@@ -1300,6 +1510,10 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                 name: len(_read_counted_infinite_rows(path)) for name, path in work_files.items()
             },
             "analysis": None if analysis_summary is None else analysis_summary.get("analysis"),
+            "work_estimator_analyses": (
+                None if analysis_summary is None
+                else analysis_summary.get("work_estimator_analyses")
+            ),
             "warnings": [] if analysis_summary is None else analysis_summary.get("warnings", []),
         })
 
@@ -1309,7 +1523,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
             "retry" if neqti_options.get("tolerate_failed_switches", False) else "abort",
         )
         counted = policy == "count_as_infinite" and _is_numerical_switch_failure(exc)
-        _append_row(work_files[switch_name], {
+        row = {
             "trajectory": attempt, "direction": switch_name,
             "start_state": paths[switch_name][0], "end_state": paths[switch_name][-1],
             "work_kcal_per_mol": "inf" if counted else "",
@@ -1317,7 +1531,11 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
             "switch_steps": len(schedules[switch_name]),
             "status": "counted_infinite" if counted else "failed",
             "error_type": type(exc).__name__, "error_message": str(exc),
-        })
+        }
+        for interval in neqti_options["work_sample_intervals"]:
+            row[_work_column(interval)] = "inf" if counted else ""
+            row[f"work_interval_{interval}_kj_per_mol"] = "inf" if counted else ""
+        _append_row(work_files[switch_name], row, neqti_options["work_sample_intervals"])
         if counted:
             logger.warning(
                 "NEQTI %s trajectory %d failed numerically and was counted as +infinite work: %s",
@@ -1442,7 +1660,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                         logger=logger,
                     )
                 try:
-                    work_kcal = execute_switch(
+                    work_result = execute_switch(
                         switch_name,
                         stateparams[paths[switch_name][0]],
                         schedules[switch_name],
@@ -1453,16 +1671,11 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                         worker,
                         f"neqti_{ensemble}_{switch_name}_snapshot_{attempt}_post_switch.pdb",
                     )
-                    _append_row(work_files[switch_name], {
-                        "trajectory": attempt,
-                        "direction": switch_name,
-                        "start_state": paths[switch_name][0],
-                        "end_state": paths[switch_name][-1],
-                        "work_kcal_per_mol": f"{work_kcal:.12g}",
-                        "work_kj_per_mol": f"{work_kcal * KCAL_TO_KJ:.12g}",
-                        "switch_steps": len(schedules[switch_name]),
-                        "status": "complete",
-                    })
+                    _append_row(
+                        work_files[switch_name],
+                        completed_work_row(switch_name, attempt, work_result),
+                        neqti_options["work_sample_intervals"],
+                    )
                 except Exception as exc:
                     record_switch_failure(switch_name, attempt, exc)
                 finally:
@@ -1588,7 +1801,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                             logger=logger,
                         )
                     try:
-                        work_kcal = execute_switch(
+                        work_result = execute_switch(
                             switch_name,
                             stateparams[paths[switch_name][0]],
                             schedules[switch_name],
@@ -1596,13 +1809,11 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                             f"{switch_name} trajectory {attempt}",
                         )
                         _write_worker_pdb_pair(worker, f"neqti_m_{switch_name}_snapshot_{attempt}_post_switch.pdb")
-                        _append_row(work_files[switch_name], {
-                            "trajectory": attempt, "direction": switch_name,
-                            "start_state": paths[switch_name][0], "end_state": paths[switch_name][-1],
-                            "work_kcal_per_mol": f"{work_kcal:.12g}",
-                            "work_kj_per_mol": f"{work_kcal * KCAL_TO_KJ:.12g}",
-                            "switch_steps": len(schedules[switch_name]), "status": "complete",
-                        })
+                        _append_row(
+                            work_files[switch_name],
+                            completed_work_row(switch_name, attempt, work_result),
+                            neqti_options["work_sample_intervals"],
+                        )
                     except Exception as exc:
                         record_switch_failure(switch_name, attempt, exc)
                     finally:
@@ -1646,7 +1857,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                         logger=logger,
                     )
                 try:
-                    work_kcal = execute_switch(
+                    work_result = execute_switch(
                         switch_name,
                         stateparams[paths[switch_name][0]],
                         schedules[switch_name],
@@ -1654,13 +1865,11 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                         f"{switch_name} trajectory {attempt}",
                     )
                     _write_worker_pdb_pair(worker, f"neqti_{ensemble}_{switch_name}_snapshot_{attempt}_post_switch.pdb")
-                    _append_row(work_files[switch_name], {
-                        "trajectory": attempt, "direction": switch_name,
-                        "start_state": paths[switch_name][0], "end_state": paths[switch_name][-1],
-                        "work_kcal_per_mol": f"{work_kcal:.12g}",
-                        "work_kj_per_mol": f"{work_kcal * KCAL_TO_KJ:.12g}",
-                        "switch_steps": len(schedules[switch_name]), "status": "complete",
-                    })
+                    _append_row(
+                        work_files[switch_name],
+                        completed_work_row(switch_name, attempt, work_result),
+                        neqti_options["work_sample_intervals"],
+                    )
                 except Exception as exc:
                     record_switch_failure(switch_name, attempt, exc)
                 finally:
@@ -1718,15 +1927,13 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                             start_state=stateparams[paths[switch_name][0]], schedule=schedules[switch_name],
                             steps_per_segment=neqti_options["switch_steps_per_segment"], state_path=paths[switch_name], logger=logger)
                     try:
-                        work_kcal = execute_switch(switch_name, stateparams[paths[switch_name][0]], schedules[switch_name], paths[switch_name], f"{switch_name} trajectory {attempt}")
+                        work_result = execute_switch(switch_name, stateparams[paths[switch_name][0]], schedules[switch_name], paths[switch_name], f"{switch_name} trajectory {attempt}")
                         _write_worker_pdb_pair(worker, f"neqti_m_{switch_name}_snapshot_{attempt}_post_switch.pdb")
-                        _append_row(work_files[switch_name], {
-                            "trajectory": attempt, "direction": switch_name,
-                            "start_state": paths[switch_name][0], "end_state": paths[switch_name][-1],
-                            "work_kcal_per_mol": f"{work_kcal:.12g}",
-                            "work_kj_per_mol": f"{work_kcal * KCAL_TO_KJ:.12g}",
-                            "switch_steps": len(schedules[switch_name]), "status": "complete",
-                        })
+                        _append_row(
+                            work_files[switch_name],
+                            completed_work_row(switch_name, attempt, work_result),
+                            neqti_options["work_sample_intervals"],
+                        )
                     except Exception as exc:
                         record_switch_failure(switch_name, attempt, exc)
                     finally:
@@ -1766,15 +1973,13 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                         start_state=stateparams[paths[switch_name][0]], schedule=schedules[switch_name],
                         steps_per_segment=neqti_options["switch_steps_per_segment"], state_path=paths[switch_name], logger=logger)
                 try:
-                    work_kcal = execute_switch(switch_name, stateparams[paths[switch_name][0]], schedules[switch_name], paths[switch_name], f"{switch_name} trajectory {attempt}")
+                    work_result = execute_switch(switch_name, stateparams[paths[switch_name][0]], schedules[switch_name], paths[switch_name], f"{switch_name} trajectory {attempt}")
                     _write_worker_pdb_pair(worker, f"neqti_{ensemble}_{switch_name}_snapshot_{attempt}_post_switch.pdb")
-                    _append_row(work_files[switch_name], {
-                        "trajectory": attempt, "direction": switch_name,
-                        "start_state": paths[switch_name][0], "end_state": paths[switch_name][-1],
-                        "work_kcal_per_mol": f"{work_kcal:.12g}",
-                        "work_kj_per_mol": f"{work_kcal * KCAL_TO_KJ:.12g}",
-                        "switch_steps": len(schedules[switch_name]), "status": "complete",
-                    })
+                    _append_row(
+                        work_files[switch_name],
+                        completed_work_row(switch_name, attempt, work_result),
+                        neqti_options["work_sample_intervals"],
+                    )
                 except Exception as exc:
                     record_switch_failure(switch_name, attempt, exc)
                 finally:

@@ -222,6 +222,7 @@ def do_custom_mintherm(keywords, logger, steps):
         output_dir=Path("equilibration") / "pre_atm",
         final_state_path=basename + "_equil.xml",
         final_pdb_path=basename + "_equil.pdb",
+        selection_endpoint="a",
         logger=logger,
     )
 

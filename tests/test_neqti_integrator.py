@@ -55,6 +55,34 @@ def _test_custom_integrator_accumulates_reverse_protocol_work():
     assert integrator.get_protocol_work() / kilojoules_per_mole == pytest.approx(-1.0)
 
 
+def _test_sampled_work_interval_one_matches_exact_and_other_intervals_share_trajectory():
+    from atom_openmm.neqti_integrator import ATMNonequilibriumLangevinIntegrator
+
+    system = _constant_parameter_system(0.0)
+    integrator = ATMNonequilibriumLangevinIntegrator(
+        temperature=300.0 * kelvin,
+        collision_rate=1.0 / picosecond,
+        timestep=1.0 * femtosecond,
+        parameter_values={"switch_parameter": [0.0, 1.0]},
+        steps_per_segment=50,
+        random_seed=3,
+        work_sample_intervals=[1, 5, 10, 25, 50],
+    )
+    context = mm.Context(system, integrator, mm.Platform.getPlatformByName("Reference"))
+    context.setPositions([[0.0, 0.0, 0.0]])
+
+    integrator.step(50)
+
+    exact = integrator.get_protocol_work() / kilojoules_per_mole
+    sampled = {
+        interval: work / kilojoules_per_mole
+        for interval, work in integrator.get_sampled_protocol_work().items()
+    }
+    assert exact == pytest.approx(1.0)
+    assert sampled[1] == pytest.approx(exact)
+    assert sampled == pytest.approx({1: 1.0, 5: 1.0, 10: 1.0, 25: 1.0, 50: 1.0})
+
+
 def _test_custom_integrator_drift_does_not_double_velocity():
     from atom_openmm.neqti_integrator import ATMNonequilibriumLangevinIntegrator
 

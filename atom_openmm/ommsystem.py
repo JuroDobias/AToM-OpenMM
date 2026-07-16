@@ -634,12 +634,30 @@ class OMMSystemRBFE(OMMSystem):
                 "ATM REST2 currently requires LIGAND1_VAR_ATOMS/LIGAND2_VAR_ATOMS; "
                 "the legacy ATM 1-4 separation path is not REST2-safe"
             )
-        solute_atoms = sorted(set(self.lig1_atoms) | set(self.lig2_atoms))
+        selection = self.keywords.get("REST2_SOLUTE", '#ligand:"*"')
+        if selection == '#ligand:"*"' and not self.keywords.get("SELECTION_METADATA"):
+            solute_atoms = sorted(set(self.lig1_atoms) | set(self.lig2_atoms))
+        else:
+            from atom_openmm.equilibration import AmberMaskResolver
+
+            resolver = AmberMaskResolver(
+                self.topology,
+                self.positions,
+                keywords=self.keywords,
+                endpoint=self.keywords.get("NATIVE_ENDPOINT"),
+                base_dir=self.keywords.get("WORKDIR", "."),
+            )
+            solute_atoms = resolver.resolve(selection, "workflow.neqti.rest2.solute")
         self.rest2_system = create_rest2_system(self.system, solute_atoms)
         self.system = self.rest2_system.system
+        lig1_count = len(set(solute_atoms) & set(self.keywords.get("SELECTION_METADATA", {}).get("ligand_a", {}).get("system_atom_indices", self.lig1_atoms)))
+        lig2_count = len(set(solute_atoms) & set(self.keywords.get("SELECTION_METADATA", {}).get("ligand_b", {}).get("system_atom_indices", self.lig2_atoms)))
         self.logger.info(
-            "Enabled REST2 scaling for both ligand copies (%d atoms)",
+            "Enabled REST2 scaling for selection %r (%d atoms: ligand_a=%d, ligand_b=%d)",
+            selection,
             len(solute_atoms),
+            lig1_count,
+            lig2_count,
         )
 
     def set_displacement(self):

@@ -762,6 +762,37 @@ def setup_small_molecule_system_ambertools(receptor_file, lig1_file, lig2_file, 
     )
 
 
+def _receptor_heavy_atom_indices(topology, chain_names):
+    chain_names = {str(value) for value in chain_names}
+    excluded_residues = {
+        "L1", "L2", "HOH", "WAT", "SOL",
+        "NA", "NA+", "CL", "CL-", "K", "K+", "CA", "CA2", "MG", "MG2", "ZN", "ZN2",
+    }
+    selected = [
+        atom.index
+        for atom in topology.atoms()
+        if atom.residue.chain.id in chain_names
+        and atom.residue.name.upper() not in excluded_residues
+        and atom.element is not None
+        and atom.element.atomic_number != 1
+    ]
+    if selected:
+        return selected
+
+    selected = [
+        atom.index
+        for atom in topology.atoms()
+        if atom.residue.name.upper() not in excluded_residues
+        and atom.element is not None
+        and atom.element.atomic_number != 1
+    ]
+    if not selected:
+        raise WorkflowConfigError(
+            "could not identify receptor heavy atoms for the ligand exclusion potential"
+        )
+    return selected
+
+
 def derive_small_molecule_options(options):
     basename = options["BASENAME"]
     pdb = PDBFile(basename + ".pdb")
@@ -829,12 +860,69 @@ def derive_small_molecule_options(options):
     offset = (lig1cm_pos - rcpt_cm_pos).value_in_unit(angstrom)
     options["LIGOFFSET"] = [offset.x, offset.y, offset.z]
     options["POS_RESTRAINED_ATOMS"] = options["RCPT_CM_ATOMS"]
-    options["EXCLUSION_POT_MOL1_INDEXES"] = get_indexes_from_query(
-        topology, f"( {rcpt_chain_query} ) and (atom.element.atomic_number != 1)"
+    options["EXCLUSION_POT_MOL1_INDEXES"] = _receptor_heavy_atom_indices(
+        topology, rcpt_chain_names
     )
     options["EXCLUSION_POT_MOL2_INDEXES"] = get_indexes_from_residue(
         res2, query="(atom.element.atomic_number != 1)"
     )
+
+
+def _contains_role_smarts(value):
+    if isinstance(value, str):
+        return any(f"#{role}:\"" in value for role in ("ligand", "ligand_a", "ligand_b", "bound", "unbound"))
+    if isinstance(value, dict):
+        return any(_contains_role_smarts(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_role_smarts(item) for item in value)
+    return False
+
+
+def _selection_structure_file(workflow, pair_plan, identity, base_dir):
+    file_key = "lig1_file" if identity == "ligand_a" else "lig2_file"
+    name_key = "lig1_name" if identity == "ligand_a" else "lig2_name"
+    structures = ((workflow.get("alignment") or {}).get("structures") or {})
+    configured = structures.get(pair_plan[name_key])
+    if configured is None:
+        return Path(pair_plan[file_key]).resolve()
+    path = _resolve_path(configured, base_dir)
+    _validate_file(path, f"workflow.alignment.structures.{pair_plan[name_key]}")
+    return path
+
+
+def prepare_selection_metadata(options, workflow, pair_plan, *, base_dir=None):
+    """Persist canonical ligand graphs and their prepared-system atom mappings."""
+    if not _contains_role_smarts(workflow):
+        return
+    pdb = PDBFile(options["BASENAME"] + ".pdb")
+    topology_atoms = list(pdb.topology.atoms())
+    metadata = {}
+    for identity, atom_key in (
+        ("ligand_a", "LIGAND1_ATOMS"),
+        ("ligand_b", "LIGAND2_ATOMS"),
+    ):
+        source = _selection_structure_file(
+            workflow, pair_plan, identity, Path(base_dir or Path.cwd())
+        )
+        molecule = _load_alignment_mol(source)
+        system_indices = [int(value) for value in options[atom_key]]
+        expected = [topology_atoms[index].element.symbol for index in system_indices]
+        observed = [atom.GetSymbol() for atom in molecule.GetAtoms()]
+        if observed != expected:
+            raise WorkflowConfigError(
+                f"{identity} SMARTS graph does not match the prepared ligand atom order: "
+                f"expected {len(expected)} atoms with prepared element sequence, got {len(observed)} atoms. "
+                "Use workflow.alignment.structures to provide a graph with matching explicit hydrogens and atom order."
+            )
+        filename = f"selection_{identity}.sdf"
+        writer = Chem.SDWriter(filename)
+        writer.write(molecule)
+        writer.close()
+        metadata[identity] = {
+            "structure_file": filename,
+            "system_atom_indices": system_indices,
+        }
+    options["SELECTION_METADATA"] = metadata
 
 
 def production_sample_count(options):
@@ -1055,6 +1143,12 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
                 )
 
             derive_small_molecule_options(options)
+            prepare_selection_metadata(
+                options,
+                workflow,
+                pair_plan,
+                base_dir=Path(workflow_yaml).resolve().parent if workflow_yaml else Path.cwd(),
+            )
             write_options_yaml(options)
             create_vmd_infile(options)
 

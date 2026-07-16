@@ -118,10 +118,11 @@ workflow:
     n_snapshots: 10
     decorrelation_steps: 5000
     switch_steps_per_segment: 1000
+    work_sample_intervals: [1, 5, 10, 25, 50]
     failed_switch_policy: count_as_infinite
     rest2:
       enabled: true
-      solute: both_ligands
+      solute: '#ligand:"*"'
       effective_temperatures_k: [300, 351, 411, 481, 563, 658, 770, 900]
       exchange_interval_steps: 500
       checkpoint_interval_cycles: 10
@@ -135,7 +136,9 @@ For production sampling, `failed_switch_policy: count_as_infinite` preserves rec
 
 By default, ATM parameter switching and protocol-work accumulation run inside a dedicated OpenMM `CustomIntegrator`; `openmmtools` is used as a design reference but is not a runtime dependency. Set `workflow.neqti.switch_integrator: python` to use the slower reference path or `validate_switch_integrator: true` for a one-shot comparison.
 
-Optional NEQTI REST2 sampling replaces ordinary A, M, and B decorrelation with synchronous solute-tempering exchange. Both ligand copies are tempered, physical snapshots are taken only from the `s=1` replica, and all nonequilibrium switches remain at `s=1`. The existing equilibration and decorrelation counts are interpreted as steps per REST2 replica.
+Optional NEQTI REST2 sampling replaces ordinary endpoint decorrelation with synchronous solute-tempering exchange. Its hot region can use role-aware SMARTS selectors such as `'#unbound:"*"'`; physical snapshots are taken only from the `s=1` replica, and all nonequilibrium switches remain at `s=1`. The existing equilibration and decorrelation counts are interpreted as steps per REST2 replica.
+
+Role-aware SMARTS leaves can also be embedded in Amber masks used by custom equilibration, for example `'!:HOH,WAT & #bound:"c1ncnc2ncnc12"'`. The RBFE guide defines the canonical ligand and endpoint role semantics. Diagnostic work intervals produce additional BAR estimates from the same switching trajectories; exact per-step work remains the primary result and the diagnostics do not reduce energy-evaluation cost.
 
 Experimental native endpoint sampling removes `ATMForce` from A/B equilibration and REST2 while retaining ATM for M and all switches. Select `endpoint_system: native`, `sampling_order: batched`, and `rest2.ensembles: [a, b]`. Endpoint ligand roles and restraints are exchanged consistently in B, and only one endpoint ladder is resident at a time. Existing workflows continue to use ATM endpoints by default.
 

@@ -22,6 +22,7 @@ from openmm.unit import (
 
 from atom_openmm.atm_coordinates import write_atm_swapped_pdb
 from atom_openmm.atm_coordinates import atm_swapped_positions
+from atom_openmm.selections import SelectionError, compile_selection_expression
 
 
 KCAL_MOL_A2_TO_KJ_MOL_NM2 = 418.4
@@ -67,7 +68,7 @@ class ATMSwappedPDBReporter:
 
 
 class AmberMaskResolver:
-    def __init__(self, topology, positions):
+    def __init__(self, topology, positions, *, keywords=None, endpoint=None, base_dir=None):
         try:
             import parmed as pmd
         except ImportError as exc:
@@ -75,14 +76,25 @@ class AmberMaskResolver:
 
         self._structure = pmd.openmm.load_topology(topology, xyz=positions)
         self._n_atoms = len(self._structure.atoms)
+        self._keywords = keywords or {}
+        self._endpoint = endpoint
+        self._base_dir = base_dir
 
     def resolve(self, mask: str, label: str) -> list[int]:
         if not isinstance(mask, str) or not mask.strip():
             raise EquilibrationConfigError(f"{label} must be a non-empty Amber mask string")
         try:
+            compiled = compile_selection_expression(
+                mask.strip(),
+                self._keywords,
+                endpoint=self._endpoint,
+                base_dir=self._base_dir,
+            )
             from parmed.amber.mask import AmberMask
 
-            flags = AmberMask(self._structure, mask.strip()).Selection()
+            flags = AmberMask(self._structure, compiled).Selection()
+        except SelectionError as exc:
+            raise EquilibrationConfigError(f"{label}: {exc}") from exc
         except Exception as exc:
             raise EquilibrationConfigError(f"{label}: invalid Amber mask {mask!r}: {exc}") from exc
 
@@ -247,8 +259,14 @@ def _build_integrator(step_cfg: dict[str, Any], default_temperature):
     raise EquilibrationConfigError(f"Unsupported integrator `{kind}`")
 
 
-def _resolve_step_restraints(steps, topology, positions):
-    resolver = AmberMaskResolver(topology, positions)
+def _resolve_step_restraints(steps, topology, positions, *, keywords=None, endpoint=None, base_dir=None):
+    resolver = AmberMaskResolver(
+        topology,
+        positions,
+        keywords=keywords,
+        endpoint=endpoint,
+        base_dir=base_dir,
+    )
     resolved = []
     for i, step in enumerate(steps):
         step_resolved = {}
@@ -431,6 +449,7 @@ def run_custom_equilibration(
     initial_state_path: str | Path | None = None,
     atm_state: dict[str, Any] | None = None,
     swapped_diagnostics_keywords: dict[str, Any] | None = None,
+    selection_endpoint: str | None = None,
     logger=None,
 ):
     logger = logger or logging.getLogger("atom_openmm.equilibration")
@@ -441,7 +460,14 @@ def run_custom_equilibration(
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    resolved_restraints = _resolve_step_restraints(steps, ommsystem.topology, ommsystem.positions)
+    resolved_restraints = _resolve_step_restraints(
+        steps,
+        ommsystem.topology,
+        ommsystem.positions,
+        keywords=ommsystem.keywords,
+        endpoint=selection_endpoint,
+        base_dir=ommsystem.keywords.get("WORKDIR", "."),
+    )
     base_positions = ommsystem.positions
     prev_state_path = Path(initial_state_path) if initial_state_path else None
     default_temperature = getattr(ommsystem, "temperature", 300.0 * kelvin)

@@ -69,10 +69,31 @@ def _test_normalize_neqti_options_accepts_rest2_sampling():
     )
 
     assert settings["rest2"]["enabled"] is True
-    assert settings["rest2"]["solute"] == "both_ligands"
+    assert settings["rest2"]["solute"] == '#ligand:"*"'
     assert settings["rest2"]["effective_temperatures_k"] == [300.0, 450.0, 700.0]
     assert settings["rest2"]["ensembles"] == ["a", "m", "b"]
     assert settings["endpoint_system"] == "atm"
+
+
+def _test_normalize_neqti_options_accepts_work_diagnostic_intervals():
+    from atom_openmm.neqti import normalize_neqti_options
+
+    settings = normalize_neqti_options(
+        {"neqti": {"switch_steps_per_segment": 50, "work_sample_intervals": [50, 1, 5, 10, 25]}},
+        _atom_options(),
+    )
+
+    assert settings["work_sample_intervals"] == [1, 5, 10, 25, 50]
+
+
+def _test_normalize_neqti_options_rejects_nondividing_work_interval():
+    from atom_openmm.neqti import NEQTIConfigError, normalize_neqti_options
+
+    with pytest.raises(NEQTIConfigError, match="must be divisible"):
+        normalize_neqti_options(
+            {"neqti": {"switch_steps_per_segment": 50, "work_sample_intervals": [3]}},
+            _atom_options(),
+        )
 
 
 def _test_normalize_neqti_options_accepts_native_endpoint_rest2():
@@ -272,6 +293,20 @@ def _test_disabled_rest2_preserves_existing_protocol_signature():
     assert _protocol_signature(settings) != _protocol_signature(enabled)
 
 
+def _test_empty_diagnostics_and_legacy_rest2_alias_preserve_protocol_signature():
+    from atom_openmm.neqti import _protocol_signature
+
+    base = {"paths": {"leg_a_forward": [0, 1]}, "switch_steps_per_segment": 10}
+    legacy = {**base, "rest2": {"enabled": True, "solute": "both_ligands"}}
+    normalized = {
+        **base,
+        "work_sample_intervals": [],
+        "rest2": {"enabled": True, "solute": '#ligand:"*"'},
+    }
+
+    assert _protocol_signature(legacy) == _protocol_signature(normalized)
+
+
 def _test_switch_progress_reports_effective_ns_per_day():
     from atom_openmm.neqti import _run_switch
 
@@ -348,6 +383,71 @@ def _test_single_midpoint_analysis_combines_two_legs_without_bridge():
     assert result["bar_dg_kcal_per_mol"] == pytest.approx(1.0)
     assert set(result["components"]) == {"leg_a", "leg_b"}
     assert result["overlap_score"] > 0.0
+
+
+def _test_work_estimator_analysis_reports_all_variants_and_paired_difference():
+    from atom_openmm.neqti import analyze_work_estimators
+
+    rows = {}
+    values = {
+        "leg_a_forward": [2.0, 2.1, 1.9],
+        "leg_a_reverse": [-2.0, -2.1, -1.9],
+        "leg_b_forward": [1.0, 1.1, 0.9],
+        "leg_b_reverse": [-1.0, -1.1, -0.9],
+    }
+    for direction, exact in values.items():
+        rows[direction] = [
+            {
+                "work_kcal_per_mol": str(value),
+                "work_interval_1_kcal_per_mol": str(value),
+                "work_interval_5_kcal_per_mol": str(value + (0.05 if "forward" in direction else -0.05)),
+            }
+            for value in exact
+        ]
+
+    analyses = analyze_work_estimators(rows, [1, 5], 300.0, bootstrap_samples=20)
+
+    assert set(analyses) == {"exact", "interval_1", "interval_5"}
+    assert analyses["interval_1"]["bar_dg_kcal_per_mol"] == pytest.approx(
+        analyses["exact"]["bar_dg_kcal_per_mol"]
+    )
+    assert analyses["interval_1"]["difference_from_exact_kcal_per_mol"] == pytest.approx(0.0)
+    assert analyses["interval_5"]["paired_bootstrap_difference_std_kcal_per_mol"] is not None
+
+
+def _test_work_csv_schema_rejects_changed_intervals(tmp_path):
+    from atom_openmm.neqti import NEQTIConfigError, _ensure_work_csv
+
+    path = tmp_path / "work.csv"
+    _ensure_work_csv(path, [1, 5])
+    with pytest.raises(NEQTIConfigError, match="different estimator schema"):
+        _ensure_work_csv(path, [1, 10])
+
+
+def _test_infinite_work_can_be_recorded_for_every_estimator(tmp_path):
+    import csv
+    from atom_openmm.neqti import _append_row, _work_column
+
+    intervals = [1, 5, 10, 25, 50]
+    row = {
+        "trajectory": 0,
+        "direction": "leg_a_forward",
+        "start_state": 0,
+        "end_state": 10,
+        "work_kcal_per_mol": "inf",
+        "work_kj_per_mol": "inf",
+        "switch_steps": 10,
+        "status": "counted_infinite",
+    }
+    for interval in intervals:
+        row[_work_column(interval)] = "inf"
+        row[f"work_interval_{interval}_kj_per_mol"] = "inf"
+    path = tmp_path / "work.csv"
+    _append_row(path, row, intervals)
+
+    recorded = next(csv.DictReader(path.open()))
+    assert recorded["work_kcal_per_mol"] == "inf"
+    assert all(recorded[_work_column(interval)] == "inf" for interval in intervals)
 
 
 def _test_integrated_work_file_is_pmx_compatible(tmp_path):

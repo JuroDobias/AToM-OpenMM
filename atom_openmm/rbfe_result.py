@@ -81,6 +81,7 @@ class RBFEResultWriter:
             "samples_reverse": None,
             "samples_per_replica": None,
             "components": None,
+            "estimator_variants": None,
         }
 
     def _relative_if_exists(self, name):
@@ -167,6 +168,24 @@ class RBFEResultWriter:
             result["samples_forward"] = int((analysis or {}).get("forward_samples", 0))
             result["samples_reverse"] = int((analysis or {}).get("reverse_samples", 0))
             result["components"] = values.get("components")
+            variants = (analysis or {}).get("work_estimator_analyses")
+            if variants:
+                result["estimator_variants"] = {
+                    name: None if variant is None else {
+                        "ddg_kcal_per_mol": variant.get("bar_dg_kcal_per_mol"),
+                        "ddg_error_kcal_per_mol": variant.get("bar_bootstrap_std_kcal_per_mol"),
+                        "ddg_kj_per_mol": variant.get("bar_dg_kj_per_mol"),
+                        "ddg_error_kj_per_mol": variant.get("bar_bootstrap_std_kj_per_mol"),
+                        "overlap_score": variant.get("overlap_score"),
+                        "difference_from_exact_kcal_per_mol": variant.get(
+                            "difference_from_exact_kcal_per_mol", 0.0 if name == "exact" else None
+                        ),
+                        "paired_bootstrap_difference_std_kcal_per_mol": variant.get(
+                            "paired_bootstrap_difference_std_kcal_per_mol"
+                        ),
+                    }
+                    for name, variant in variants.items()
+                }
             self.data["quality"]["overlap_score"] = values.get("overlap_score")
             self.data["quality"]["rest2"] = (analysis or {}).get("rest2")
             self.data["quality"]["finite_sample_counts"] = (analysis or {}).get("finite_sample_counts")

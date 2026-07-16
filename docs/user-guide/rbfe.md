@@ -189,12 +189,13 @@ workflow:
     n_snapshots: 20
     decorrelation_steps: 10000
     switch_steps_per_segment: 100
+    work_sample_intervals: [1, 5, 10, 25, 50]
     switch_integrator: custom
     validate_switch_integrator: false
     failed_switch_policy: count_as_infinite
     rest2:
       enabled: true
-      solute: both_ligands
+      solute: '#ligand:"*"'
       effective_temperatures_k: [300, 351, 411, 481, 563, 658, 770, 900]
       exchange_interval_steps: 500
       checkpoint_interval_cycles: 10
@@ -217,6 +218,7 @@ For the example above, the execution order is:
 | `n_snapshots` | Number of work samples in each of the four half-path directions. |
 | `decorrelation_steps` | Endpoint MD between consecutive switching snapshots. |
 | `switch_steps_per_segment` | Integration steps between neighboring nodes of each derived half path. |
+| `work_sample_intervals` | Diagnostic work quadrature intervals evaluated from the same trajectory. Exact per-step work remains canonical. |
 | `preparation_annealing_steps_per_segment` | Optional switching steps per schedule segment for pre-ATM->M, M->A, and M->B preparation annealing. |
 | `sampling_order` | `interleaved` runs four directions by snapshot cycle; `batched` completes midpoint directions before endpoint directions. |
 | `endpoint_system` | `atm` (default) samples endpoints with ATM; experimental `native` samples physical dual-ligand A and B systems without `ATMForce`. |
@@ -230,7 +232,7 @@ For the example above, the execution order is:
 | `random_seed` | Seed used for bootstrap resampling. |
 | `platform` | Optional OpenMM platform override for NEQTI. |
 
-When `rest2.enabled: true`, the additional NEQTI sampling at A, M, and B uses a synchronous REST2 ladder instead of ordinary MD. `initial_equilibration_steps` and `decorrelation_steps` are steps per replica and must be divisible by `rest2.exchange_interval_steps`. All replicas use the physical thermostat temperature; the effective temperatures define REST2 Hamiltonian scales. Version 1 supports `solute: both_ligands`, which scales both complete ligand copies while leaving protein, solvent, ions, and ATM restraint forces physical.
+When `rest2.enabled: true`, the additional NEQTI sampling at A, M, and B uses a synchronous REST2 ladder instead of ordinary MD. `initial_equilibration_steps` and `decorrelation_steps` are steps per replica and must be divisible by `rest2.exchange_interval_steps`. All replicas use the physical thermostat temperature; the effective temperatures define REST2 Hamiltonian scales. `solute` accepts the selection syntax described below. Legacy `both_ligands` remains accepted and is equivalent to `'#ligand:"*"'`.
 
 Native endpoint REST2 is enabled explicitly:
 
@@ -243,8 +245,8 @@ workflow:
     rest2:
       enabled: true
       ensembles: [a, b]
-      solute: both_ligands
-      effective_temperatures_k: [300, 331, 366, 404, 446, 492, 543, 600]
+      solute: '#unbound:"*"'
+      effective_temperatures_k: [300, 378, 476, 600]
       exchange_interval_steps: 500
 ```
 
@@ -257,6 +259,8 @@ The physical `s=1` replica supplies positions, velocities, and box vectors for e
 Four half-path switches have approximately the same total integration length as two complete A↔B switches. Logs report effective ns/day for equilibration, decorrelation, and switching segments.
 
 The custom switching path uses a dedicated BAOAB-style Langevin `CustomIntegrator` with the ATM parameter update centered in each timestep (`V R H O R V`). Endpoint equilibration and snapshot decorrelation continue to use the existing ATM MTS integrator. A `CompoundIntegrator` keeps both modes in one OpenMM context. The custom path executes one Python call per schedule segment rather than one call per integration step.
+
+`work_sample_intervals` adds diagnostic left-point quadrature estimates without changing the switching trajectory or removing the exact per-step energy evaluations. Interval 1 must match exact work. Each configured interval gets its own two-leg BAR estimate in `neqti_summary.yaml` and `result.result.estimator_variants`, including the DDG difference from exact and a paired-bootstrap uncertainty for that difference. These diagnostics do not improve switching speed.
 
 When `validate_switch_integrator: true`, the first pending snapshot on each half-path direction is switched with both custom and Python implementations after restoring the same state.
 
@@ -298,6 +302,19 @@ workflow:
 ```
 
 Each custom step is either `minimization` or `md`. MD steps support `NVT` and `NPT`, `langevin_middle` or `verlet` integration, optional velocity reset, and state/XTC reporters. Positional restraints use Amber mask syntax. The two ligands are named `L1` and `L2` in the prepared system; for example, `!:L1,L2` excludes both ligands from a restraint selection. A 4 fs time step generally requires appropriate hydrogen mass repartitioning through `atom_options.HMASS`; choosing `timestep_ps: 0.004` alone does not make a system stable.
+
+Amber expressions can contain quoted, role-aware SMARTS leaves. Quote the complete YAML value with single quotes so `#` is not parsed as a YAML comment:
+
+```yaml
+positional_restraints:
+  mask: '(!:HOH,WAT & #bound:"c1ncnc2ncnc12") | @CA'
+rest2:
+  solute: '#unbound:"*"'
+```
+
+`ligand_a` and `ligand_b` mean the canonical first and second input ligands. `bound` and `unbound` resolve by physical endpoint: A binds ligand A and B binds ligand B. `ligand` is the union of both ligand identities, so `'#ligand:"*"'` selects both complete copies. SMARTS is matched independently to the relevant canonical ligand graph, all symmetry matches are unioned, and the result is converted to explicit 1-based Amber atom IDs before ParmEd evaluates the complete mask. Pre-ATM equilibration uses endpoint A roles. Endpoint A/B equilibration and native endpoint REST2 use their respective roles. `bound` and `unbound` are invalid at the shared midpoint and in shared-ATM REST2 because no single role assignment exists there.
+
+The prepared pair stores normalized ligand graph files and canonical system-atom mappings. An older prepared pair can continue using plain Amber masks or legacy `both_ligands`; using SMARTS roles requires re-preparation. Partial-ligand SMARTS hot regions are experimental: bonded terms crossing the hot/cold boundary use square-root REST2 scaling, so validate the chosen region and replica ladder for the system.
 
 Custom equilibration writes one directory per step under `equilibration/`, including `final_state.xml`, `final_state.pdb`, optional reporter files, and `manifest.json`. NEQTI endpoint equilibration is performed independently at A and B rather than alternating between endpoints.
 
@@ -353,8 +370,8 @@ For NEQTI, also inspect:
 | --- | --- |
 | `neqti_endpoint_A.xml`, `neqti_endpoint_B.xml` | Restartable endpoint states. |
 | `neqti_midpoint.xml` | Restartable shared midpoint state. |
-| `neqti_leg_*_*.csv` | Four half-path protocol-work datasets. |
-| `neqti_summary.yaml` | Component BAR estimates, overlap, combined DDG, and uncertainty. |
+| `neqti_leg_*_*.csv` | Four half-path protocol-work datasets, including configured diagnostic work columns. |
+| `neqti_summary.yaml` | Exact and diagnostic component BAR estimates, overlap, combined DDG, and uncertainty. |
 | `neqti_protocol.yaml` | Single-midpoint protocol and resume compatibility signature. |
 | `neqti_rest2/{a,m,b}/` | REST2 walker checkpoints, assignments, exchange history, acceptance, and round-trip state. |
 | `*_swapped.pdb` | Diagnostic coordinates after applying the ATM virtual coordinate swap. |
@@ -449,7 +466,7 @@ The top-level status has the following meaning:
 - The single-YAML wrapper currently supports `workflow.mode: small_molecule`.
 - NEQTI is experimental and has not replaced asynchronous replica exchange as the established production method.
 - NEQTI currently uses the configured discrete ATM schedule as interpolation knots; it does not yet implement an arbitrary continuous OpenMMTools-style alchemical function.
-- NEQTI REST2 currently supports interleaved sampling, both complete ligand copies as the tempered region, and common/variable-region ATM systems. Automatic ladder tuning is not implemented.
+- NEQTI REST2 supports shared-ATM interleaved sampling and native A/B batched sampling. SMARTS-defined partial hot regions are experimental, and automatic ladder tuning is not implemented.
 - GPU, CUDA, OpenMM, Espaloma, and `openmmforcefields` compatibility is the responsibility of the environment.
 - A numerically completed run is not sufficient validation. Inspect endpoint structures, swapped structures, work distributions, forward/reverse overlap, and sensitivity to equilibration and switching time.
 

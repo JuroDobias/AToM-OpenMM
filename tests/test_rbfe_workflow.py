@@ -70,6 +70,26 @@ def _write_minimal_workflow(tmp_path):
     return config_file
 
 
+def _test_receptor_exclusion_atoms_fall_back_when_tleap_rewrites_chain_id():
+    from openmm.app import Element, Topology
+    from atom_openmm.rbfe_workflow import _receptor_heavy_atom_indices
+
+    topology = Topology()
+    chain = topology.addChain("1")
+    protein = topology.addResidue("ALA", chain)
+    topology.addAtom("CA", Element.getBySymbol("C"), protein)
+    topology.addAtom("HA", Element.getBySymbol("H"), protein)
+    water = topology.addResidue("WAT", chain)
+    topology.addAtom("O", Element.getBySymbol("O"), water)
+    ligand = topology.addResidue("L1", chain)
+    topology.addAtom("C1", Element.getBySymbol("C"), ligand)
+    sodium = topology.addResidue("Na+", chain)
+    topology.addAtom("Na+", Element.getBySymbol("Na"), sodium)
+
+    assert _receptor_heavy_atom_indices(topology, ["A"]) == [0]
+    assert _receptor_heavy_atom_indices(topology, ["1"]) == [0]
+
+
 def _test_generate_smarts_alignments_selects_lowest_direct_rmsd_pair(tmp_path):
     from atom_openmm.rbfe_workflow import generate_smarts_alignments
 
