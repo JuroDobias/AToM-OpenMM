@@ -56,6 +56,15 @@ def _resolve_path(path, base_dir):
     return p.resolve()
 
 
+def _workflow_mode(config_file):
+    config_path = Path(config_file).resolve()
+    with config_path.open() as handle:
+        config = yaml.safe_load(handle)
+    if not isinstance(config, dict) or not isinstance(config.get("workflow"), dict):
+        raise WorkflowConfigError("workflow config must contain a workflow mapping")
+    return config["workflow"].get("mode", "small_molecule")
+
+
 def _require_mapping(value, name):
     if not isinstance(value, dict):
         raise WorkflowConfigError(f"{name} must be a mapping")
@@ -1235,6 +1244,10 @@ def _prepare_run_context(config_file):
 
 
 def validate_workflow(config_file):
+    if _workflow_mode(config_file) == "covalent":
+        from atom_openmm.covalent_workflow import validate_covalent_workflow
+
+        return validate_covalent_workflow(config_file)
     config = load_workflow_config(config_file)
     plan = build_small_molecule_plan(config)
     normalize_setup_options(config["workflow"], config["atom_options"])
@@ -1245,6 +1258,11 @@ def validate_workflow(config_file):
 
 
 def plan_workflow(config_file):
+    if _workflow_mode(config_file) == "covalent":
+        from atom_openmm.covalent_workflow import plan_covalent_workflow
+
+        validate_workflow(config_file)
+        return plan_covalent_workflow(config_file)
     config = load_workflow_config(config_file)
     # Build alignments too so --plan-only catches missing alignment inputs.
     plan = build_small_molecule_plan(config)
@@ -1316,6 +1334,10 @@ def analyze_pair_existing(pair_plan, workflow, atom_options, receptor_file, work
 
 
 def run_rbfe_workflow(config_file):
+    if _workflow_mode(config_file) == "covalent":
+        from atom_openmm.covalent_workflow import run_covalent_workflow
+
+        return run_covalent_workflow(config_file)
     config, plan, setup_options, alignments = _prepare_run_context(config_file)
     results = []
     for pair_plan in plan["pairs"]:
@@ -1334,6 +1356,10 @@ def run_rbfe_workflow(config_file):
 
 
 def analyze_existing_workflow(config_file):
+    if _workflow_mode(config_file) == "covalent":
+        from atom_openmm.covalent_workflow import analyze_covalent_workflow
+
+        return analyze_covalent_workflow(config_file)
     config = load_workflow_config(config_file)
     plan = build_small_molecule_plan(config)
     results = []
@@ -1376,7 +1402,10 @@ def main(argv=None):
     for result in results:
         line = f"{result['jobname']}: {result['status']} in {result['workdir']}"
         if result.get("ddg") is not None:
-            line += f" DG = {result['ddg']:8.3f} +/- {result['ddg_std']:8.3f} kcal/mol"
+            line += f" DG = {result['ddg']:8.3f}"
+            if result.get("ddg_std") is not None:
+                line += f" +/- {result['ddg_std']:8.3f}"
+            line += " kcal/mol"
         print(line)
     return 0
 

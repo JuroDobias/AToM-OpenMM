@@ -503,3 +503,67 @@ For either RBFE type, tune these files first:
 | `scripts/run_template.sh` | Conda environment activation, SLURM resources, time limit, and command-line options passed to `run-atm.py`. |
 
 Tutorial defaults are intentionally short. For production work, increase `MAX_SAMPLES`, increase `WALL_TIME`, keep scheduler limits consistent, and compare quality-control plots and log summaries across the perturbation network before interpreting final rankings.
+
+## Covalent RBFE prototype
+
+`workflow.mode: covalent` is an experimental direct-endpoint NEQTI workflow for
+congeneric cysteine-aldehyde inhibitors. It uses a chemically complete
+ACE-Cys-product-NME thiohemiacetal in the aqueous reference leg and grafts the same
+local product parameters onto the target cysteine in the protein leg. The endpoint
+Hamiltonians are exact at lambda 0 and 1; the default finite-time path is a smooth
+log-sum envelope between them.
+
+Prepare a source dataset containing `protein_annealed.pdb`, `data.csv`,
+`manifest.csv`, and the manifest-referenced ligand SDF files:
+
+```bash
+atom-rbfe-prepare-covalent-dataset SOURCE_DIR NORMALIZED_DIR
+```
+
+The preparation command keeps waters whose oxygen is within 5 A of a protein heavy
+atom, converts the neutral aldehyde pose to the covalent thiohemiacetal, transfers
+the Cys thiol proton to oxygen, records atom maps and stereochemistry, and writes
+assay data without changing its units. The runner then uses ff19SB, OPC,
+OpenFF 2.2.1 valence/Lennard-Jones parameters, and Espaloma NN charges from the
+`espaloma-0.3.2` model. Charge inference has a graph-keyed cache and does not fall
+back to AM1-BCC.
+
+```yaml
+workflow:
+  type: rbfe
+  mode: covalent
+  dataset: normalized/dataset.yaml
+  workdir: run
+  pairs:
+  - ligand_a: I79DJ_543
+    ligand_b: LIBA225
+  setup:
+    protein_forcefield: amber19/protein.ff19SB.xml
+    water_forcefield: amber19/opc.xml
+    ligand_forcefield: openff-2.2.1.offxml
+    ligand_charge_model: espaloma_nn
+    espaloma_model: espaloma-0.3.2
+    solvent_padding_a: 10.0
+    ionic_strength_molar: 0.15
+  neqti:
+    initial_equilibration_steps: 250000
+    decorrelation_steps: 100000
+    switch_steps: 50000
+    timestep_fs: 2.0
+    n_snapshots: 10
+    bootstrap_samples: 500
+    interpolation: envelope
+    failed_switch_policy: count_as_infinite
+    rest2:
+      enabled: true
+      effective_temperatures_k: [300.0, 344.6, 395.9, 454.7, 522.3, 600.0]
+      exchange_interval_steps: 500
+```
+
+Endpoint REST2 trajectories remain independent of switching trajectories: every
+switch starts from a physical REST2 snapshot, and its final coordinates are not fed
+back into decorrelation. Work is saved after each direction, so rerunning an
+interrupted workflow resumes the missing direction without replacing completed
+samples. Each pair directory contains `result.yaml`, four work CSV files, REST2
+checkpoints, prepared endpoint PDBs, and serialized OpenMM systems. The reported
+DDG convention is `G(ligand_b)-G(ligand_a)`.

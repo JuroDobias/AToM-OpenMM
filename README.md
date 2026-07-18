@@ -5,7 +5,7 @@ AToM-OpenMM v8.5
 
 The Alchemical Transfer Method for OpenMM (AToM-OpenMM) is an extensible Python package for estimating absolute and relative binding free energies of molecular complexes. It implements the [Alchemical Transfer Method (ATM)](https://pubs.acs.org/doi/10.1021/acs.jcim.1c01129) with [OpenMM](https://github.com/openmm) and can run on GPU workstations or cluster nodes.
 
-This fork adds a single-YAML small-molecule RBFE workflow on top of the original AToM-OpenMM implementation. The wrapper can prepare and run complete ligand-pair calculations, select setup force fields and ligand charges, define custom equilibration protocols with Amber masks, and use either asynchronous replica exchange or an experimental nonequilibrium switching (NEQTI) protocol.
+This fork adds a single-YAML RBFE workflow on top of the original AToM-OpenMM implementation. The wrapper can prepare and run complete ligand-pair calculations, select setup force fields and ligand charges, define custom equilibration protocols with Amber masks, and use either asynchronous replica exchange or an experimental nonequilibrium switching (NEQTI) protocol. An experimental `workflow.mode: covalent` path supports congeneric cysteine-aldehyde inhibitors through explicit thiohemiacetal product models.
 
 This version of AToM-OpenMM has been tested with OpenMM 8.5 and 8.4; it uses [ATMForce](https://github.com/openmm/openmm/pull/4110) in the 8.4.0 or later versions of [OpenMM](https://github.com/openmm/openmm).
 
@@ -143,6 +143,8 @@ Role-aware SMARTS leaves can also be embedded in Amber masks used by custom equi
 Experimental native endpoint sampling removes `ATMForce` from A/B equilibration and REST2 while retaining ATM for M and all switches. Select `endpoint_system: native` and `rest2.ensembles: [a, b]`. With `sampling_order: interleaved`, both endpoint REST2 ladders remain resident and adaptive pilot scheduling plus automatic convergence stopping are available. Use `sampling_order: batched` when GPU memory permits only one resident ladder. Endpoint ligand roles and restraints are exchanged consistently in B. Existing workflows continue to use ATM endpoints by default.
 
 See the [RBFE user guide](docs/user-guide/rbfe.md) for the complete YAML schema, force-field examples, custom equilibration, restart behavior, outputs, and swapped-coordinate diagnostics.
+
+The covalent prototype is documented in [`examples/RBFE/covalent-rhino`](examples/RBFE/covalent-rhino). It normalizes aldehyde poses into ACE-Cys-product-NME reference molecules, retains crystallographic waters by a configurable distance rule, assigns Espaloma NN charges with OpenFF 2.2.1 parameters, and runs direct endpoint NEQTI in protein and capped-reference environments. This mode currently supports the fixed ff19SB/OPC/OpenFF 2.2.1 protocol described by the example and should be treated as a validation workflow rather than a general covalent transformation engine.
 
 Every ligand-pair directory also contains an atomically updated `result.yaml` for integration with workflow managers and databases. It uses the same schema for asynchronous replica exchange and NEQTI, reports DDG in kcal/mol and kJ/mol, records input provenance and artifacts, and exposes `prepared`, `running`, `partial`, `completed`, or `failed` status.
 

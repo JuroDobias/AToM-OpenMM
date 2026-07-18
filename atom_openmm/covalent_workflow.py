@@ -1,0 +1,775 @@
+from __future__ import annotations
+
+import csv
+import logging
+import os
+from pathlib import Path
+
+import numpy as np
+import openmm as mm
+import yaml
+from openmm import app, unit
+
+from atom_openmm.covalent_alchemy import create_endpoint_hamiltonian
+from atom_openmm.covalent_hybrid import build_covalent_hybrid_molecule
+from atom_openmm.covalent_parameters import parameterize_capped_product
+from atom_openmm.covalent_protein import prepare_protein_covalent_hybrid
+from atom_openmm.covalent_systems import (
+    create_solvated_capped_reference,
+    solvate_capped_reference_hybrid,
+    write_prepared_hybrid,
+)
+from atom_openmm.neqti import _is_numerical_switch_failure, analyze_two_leg_work
+from atom_openmm.neqti_integrator import ATMNonequilibriumLangevinIntegrator
+from atom_openmm.rest2 import create_rest2_system
+from atom_openmm.rest2_exchange import REST2ExchangeSampler
+
+
+LOGGER = logging.getLogger("atom_openmm.covalent_workflow")
+KCAL_TO_KJ = 4.184
+
+
+class CovalentWorkflowError(ValueError):
+    pass
+
+
+def _resolve(path, base):
+    value = Path(path)
+    return (value if value.is_absolute() else base / value).resolve()
+
+
+def load_covalent_workflow(path):
+    workflow_path = Path(path).resolve()
+    if not workflow_path.exists():
+        raise CovalentWorkflowError(f"workflow does not exist: {workflow_path}")
+    config = yaml.safe_load(workflow_path.read_text()) or {}
+    workflow = config.get("workflow") or {}
+    if workflow.get("type") != "rbfe" or workflow.get("mode") != "covalent":
+        raise CovalentWorkflowError("covalent workflow requires workflow.type='rbfe' and mode='covalent'")
+    if not workflow.get("dataset"):
+        raise CovalentWorkflowError("workflow.dataset is required for covalent mode")
+    dataset_path = _resolve(workflow["dataset"], workflow_path.parent)
+    if not dataset_path.exists():
+        raise CovalentWorkflowError(f"covalent dataset does not exist: {dataset_path}")
+    dataset = yaml.safe_load(dataset_path.read_text()) or {}
+    pairs = workflow.get("pairs") or dataset.get("pilot_edges") or []
+    if not pairs:
+        raise CovalentWorkflowError("covalent workflow contains no pairs")
+    settings = {
+        "config_path": workflow_path,
+        "dataset_path": dataset_path,
+        "dataset_root": dataset_path.parent,
+        "dataset": dataset,
+        "workflow": workflow,
+        "pairs": pairs,
+    }
+    return config, settings
+
+
+def plan_covalent_workflow(path):
+    _, settings = load_covalent_workflow(path)
+    workflow = settings["workflow"]
+    workdir = _resolve(workflow.get("workdir", "run"), settings["config_path"].parent)
+    return {
+        "mode": "covalent",
+        "dataset": str(settings["dataset_path"]),
+        "receptor": str(settings["dataset_root"] / settings["dataset"]["receptor"]),
+        "workdir": str(workdir),
+        "pairs": [
+            {
+                "ligand_a": pair["ligand_a"],
+                "ligand_b": pair["ligand_b"],
+                "workdir": str(workdir / f"{pair['ligand_a']}--{pair['ligand_b']}"),
+            }
+            for pair in settings["pairs"]
+        ],
+    }
+
+
+def validate_covalent_workflow(path):
+    _, settings = load_covalent_workflow(path)
+    ligands = {item["ligand_id"]: item for item in settings["dataset"].get("ligands", [])}
+    for pair in settings["pairs"]:
+        for key in ("ligand_a", "ligand_b"):
+            name = pair.get(key)
+            if name not in ligands:
+                raise CovalentWorkflowError(f"unknown dataset ligand {name!r}")
+            product = settings["dataset_root"] / ligands[name]["capped_product_sdf"]
+            if not product.exists():
+                raise CovalentWorkflowError(f"missing capped product: {product}")
+    receptor = settings["dataset_root"] / settings["dataset"]["receptor"]
+    if not receptor.exists():
+        raise CovalentWorkflowError(f"missing receptor: {receptor}")
+    workflow = settings["workflow"]
+    setup = workflow.get("setup") or {}
+    required_setup = {
+        "protein_forcefield": "amber19/protein.ff19SB.xml",
+        "water_forcefield": "amber19/opc.xml",
+        "ligand_forcefield": "openff-2.2.1.offxml",
+        "ligand_charge_model": "espaloma_nn",
+        "espaloma_model": "espaloma-0.3.2",
+    }
+    for key, expected in required_setup.items():
+        if key in setup and setup[key] != expected:
+            raise CovalentWorkflowError(
+                f"workflow.setup.{key} must be {expected!r} in the initial covalent implementation"
+            )
+    if float(settings["dataset"].get("assay_temperature_k", 298.15)) <= 0.0:
+        raise CovalentWorkflowError("dataset assay_temperature_k must be positive")
+    config = _normalized_settings(workflow)
+    if config["failed_switch_policy"] not in {"abort", "count_as_infinite"}:
+        raise CovalentWorkflowError(
+            "covalent NEQTI failed_switch_policy must be 'abort' or 'count_as_infinite'"
+        )
+    if config["n_snapshots"] < 1 or config["switch_steps"] < 1:
+        raise CovalentWorkflowError("NEQTI n_snapshots and switch_steps must be positive")
+    if config["decorrelation_steps"] < 0 or config["initial_equilibration_steps"] < 0:
+        raise CovalentWorkflowError("NEQTI equilibration and decorrelation steps cannot be negative")
+    rest2 = config["rest2"]
+    if rest2["enabled"]:
+        temperatures = rest2["effective_temperatures_k"]
+        if len(temperatures) < 2 or temperatures[0] != config["temperature_k"]:
+            raise CovalentWorkflowError(
+                "REST2 requires at least two temperatures and its first temperature must be physical"
+            )
+        if any(right <= left for left, right in zip(temperatures, temperatures[1:])):
+            raise CovalentWorkflowError("REST2 effective temperatures must increase strictly")
+        interval = rest2["exchange_interval_steps"]
+        if interval < 1 or config["decorrelation_steps"] % interval:
+            raise CovalentWorkflowError(
+                "NEQTI decorrelation_steps must be divisible by REST2 exchange_interval_steps"
+            )
+    return True
+
+
+def _platform(config):
+    requested = str(config.get("platform", "CUDA"))
+    properties = {str(key): str(value) for key, value in (config.get("platform_properties") or {}).items()}
+    names = [requested]
+    if requested == "CUDA":
+        names.append("OpenCL")
+    names.append("CPU")
+    for name in names:
+        try:
+            platform = mm.Platform.getPlatformByName(name)
+        except Exception:
+            continue
+        supported = set(platform.getPropertyNames())
+        return platform, {key: value for key, value in properties.items() if key in supported}
+    raise CovalentWorkflowError("no usable OpenMM platform is available")
+
+
+def _clone_system(system):
+    return mm.XmlSerializer.deserialize(mm.XmlSerializer.serialize(system))
+
+
+def _write_state(path, state):
+    temporary = Path(str(path) + ".tmp")
+    temporary.write_text(mm.XmlSerializer.serialize(state))
+    os.replace(temporary, path)
+
+
+def _write_yaml_atomic(path, payload):
+    path = Path(path)
+    temporary = Path(str(path) + ".tmp")
+    temporary.write_text(yaml.safe_dump(payload, sort_keys=False))
+    os.replace(temporary, path)
+
+
+def _semantic_components(analysis):
+    return {
+        "protein": analysis["components"]["leg_a"],
+        "reference": analysis["components"]["leg_b"],
+    }
+
+
+def _load_state(path):
+    return mm.XmlSerializer.deserialize(Path(path).read_text())
+
+
+def _write_state_pdb(path, topology, state):
+    with Path(path).open("w") as handle:
+        app.PDBFile.writeFile(topology, state.getPositions(), handle, keepIds=True)
+
+
+def _equilibrate_endpoint(
+    system,
+    positions,
+    state_file,
+    *,
+    steps,
+    timestep_fs,
+    temperature_k,
+    pressure_bar,
+    platform,
+    properties,
+    seed,
+):
+    state_file = Path(state_file)
+    if state_file.exists():
+        return _load_state(state_file)
+    equilibrium_system = _clone_system(system)
+    equilibrium_system.addForce(
+        mm.MonteCarloBarostat(float(pressure_bar) * unit.bar, float(temperature_k) * unit.kelvin)
+    )
+    integrator = mm.LangevinMiddleIntegrator(
+        float(temperature_k) * unit.kelvin,
+        1.0 / unit.picosecond,
+        float(timestep_fs) * unit.femtosecond,
+    )
+    integrator.setRandomNumberSeed(int(seed))
+    context = mm.Context(equilibrium_system, integrator, platform, properties)
+    context.setPositions(positions)
+    context.setVelocitiesToTemperature(float(temperature_k) * unit.kelvin, int(seed) + 1)
+    mm.LocalEnergyMinimizer.minimize(context, 10.0, 500)
+    if int(steps):
+        integrator.step(int(steps))
+    state = context.getState(
+        getPositions=True, getVelocities=True, getEnergy=True, enforcePeriodicBox=True
+    )
+    _write_state(state_file, state)
+    del context
+    return state
+
+
+def _append_work(path, sample, work_kj):
+    path = Path(path)
+    new = not path.exists()
+    with path.open("a", newline="") as handle:
+        writer = csv.writer(handle)
+        if new:
+            writer.writerow(["sample", "work_kj_per_mol", "work_kcal_per_mol"])
+        writer.writerow([sample, work_kj, work_kj / KCAL_TO_KJ])
+
+
+def _read_work(path):
+    path = Path(path)
+    if not path.exists():
+        return []
+    with path.open(newline="") as handle:
+        return [float(row["work_kcal_per_mol"]) for row in csv.DictReader(handle)]
+
+
+def _switch_context(
+    endpoint_a,
+    endpoint_b,
+    *,
+    start,
+    steps,
+    timestep_fs,
+    temperature_k,
+    platform,
+    properties,
+    seed,
+    interpolation,
+):
+    hamiltonian = create_endpoint_hamiltonian(
+        endpoint_a, endpoint_b,
+        interpolation=interpolation,
+        temperature_k=temperature_k,
+    )
+    schedule = [0.0, 1.0] if start == "a" else [1.0, 0.0]
+    integrator = ATMNonequilibriumLangevinIntegrator(
+        temperature=float(temperature_k) * unit.kelvin,
+        collision_rate=1.0 / unit.picosecond,
+        timestep=float(timestep_fs) * unit.femtosecond,
+        parameter_values={hamiltonian.lambda_parameter: schedule},
+        steps_per_segment=int(steps),
+        random_seed=int(seed),
+    )
+    context = mm.Context(hamiltonian.system, integrator, platform, properties)
+    return context, integrator
+
+
+def _apply_state(context, state):
+    box = state.getPeriodicBoxVectors()
+    if box is not None:
+        context.setPeriodicBoxVectors(*box)
+    context.setPositions(state.getPositions())
+    velocities = state.getVelocities()
+    if velocities is not None:
+        context.setVelocities(velocities)
+
+
+def _sample_endpoint(
+    system,
+    topology,
+    state_file,
+    hot_atoms,
+    *,
+    ensemble,
+    steps,
+    rest2_config,
+    output_dir,
+    platform,
+    properties,
+    temperature_k,
+    timestep_fs,
+    seed,
+):
+    if rest2_config.get("enabled", False):
+        rest2 = create_rest2_system(system, hot_atoms)
+        base_integrator = mm.LangevinMiddleIntegrator(
+            float(temperature_k) * unit.kelvin,
+            1.0 / unit.picosecond,
+            float(timestep_fs) * unit.femtosecond,
+        )
+        sampler = REST2ExchangeSampler(
+            system=rest2.system,
+            topology=topology,
+            base_integrator=base_integrator,
+            rest2_system=rest2,
+            state_files={ensemble: state_file},
+            config=rest2_config,
+            platform=platform,
+            platform_properties=properties,
+            output_dir=output_dir,
+            resume=True,
+            random_seed=seed,
+            logger=LOGGER,
+        )
+        sampler.run_steps(ensemble, int(steps), label=ensemble)
+        state = sampler.physical_state(ensemble)
+        _write_state(state_file, state)
+        summary = sampler.summary()
+        sampler.close()
+        return state, summary
+    integrator = mm.LangevinMiddleIntegrator(
+        float(temperature_k) * unit.kelvin,
+        1.0 / unit.picosecond,
+        float(timestep_fs) * unit.femtosecond,
+    )
+    integrator.setRandomNumberSeed(int(seed))
+    context = mm.Context(system, integrator, platform, properties)
+    state = _load_state(state_file)
+    _apply_state(context, state)
+    integrator.step(int(steps))
+    state = context.getState(getPositions=True, getVelocities=True, getEnergy=True, enforcePeriodicBox=True)
+    _write_state(state_file, state)
+    del context
+    return state, None
+
+
+def _run_environment(
+    name,
+    prepared,
+    config,
+    workdir,
+    platform,
+    properties,
+    seed,
+):
+    temperature = float(config["temperature_k"])
+    timestep = float(config["timestep_fs"])
+    initial = int(config["initial_equilibration_steps"])
+    state_files = {
+        "a": workdir / f"{name}_endpoint_a_state.xml",
+        "b": workdir / f"{name}_endpoint_b_state.xml",
+    }
+    _equilibrate_endpoint(
+        prepared.endpoint_a, prepared.positions, state_files["a"],
+        steps=initial, timestep_fs=timestep, temperature_k=temperature,
+        pressure_bar=config["pressure_bar"], platform=platform, properties=properties, seed=seed,
+    )
+    _equilibrate_endpoint(
+        prepared.endpoint_b, prepared.positions, state_files["b"],
+        steps=initial, timestep_fs=timestep, temperature_k=temperature,
+        pressure_bar=config["pressure_bar"], platform=platform, properties=properties, seed=seed + 10,
+    )
+    _write_state_pdb(
+        workdir / f"{name}_endpoint_a_equilibrated.pdb",
+        prepared.topology,
+        _load_state(state_files["a"]),
+    )
+    _write_state_pdb(
+        workdir / f"{name}_endpoint_b_equilibrated.pdb",
+        prepared.topology,
+        _load_state(state_files["b"]),
+    )
+    files = {
+        "forward": workdir / f"{name}_forward.csv",
+        "reverse": workdir / f"{name}_reverse.csv",
+    }
+    forward = _read_work(files["forward"])
+    reverse = _read_work(files["reverse"])
+    rest2_summaries = {}
+    for sample in range(int(config["n_snapshots"])):
+        for direction, endpoint, system, offset in (
+            ("forward", "a", prepared.endpoint_a, 0),
+            ("reverse", "b", prepared.endpoint_b, 100),
+        ):
+            existing = forward if direction == "forward" else reverse
+            if len(existing) > sample:
+                continue
+            state, rest2_summary = _sample_endpoint(
+                system, prepared.topology, state_files[endpoint], prepared.hot_atom_indices,
+                ensemble=endpoint,
+                steps=config["decorrelation_steps"],
+                rest2_config=config["rest2"],
+                output_dir=workdir / f"{name}_rest2_{endpoint}",
+                platform=platform, properties=properties,
+                temperature_k=temperature, timestep_fs=timestep,
+                seed=seed + sample * 1000 + offset,
+            )
+            if rest2_summary is not None:
+                rest2_summaries[endpoint] = rest2_summary
+            _write_state_pdb(
+                workdir / f"{name}_endpoint_{endpoint}_equilibrated.pdb",
+                prepared.topology,
+                state,
+            )
+            context = None
+            try:
+                context, integrator = _switch_context(
+                    prepared.endpoint_a, prepared.endpoint_b,
+                    start=endpoint,
+                    steps=config["switch_steps"], timestep_fs=timestep,
+                    temperature_k=temperature, platform=platform, properties=properties,
+                    seed=seed + sample * 1000 + offset + 1,
+                    interpolation=config["interpolation"],
+                )
+                _apply_state(context, state)
+                integrator.step(int(config["switch_steps"]))
+                work_kj = integrator.get_protocol_work().value_in_unit(
+                    unit.kilojoules_per_mole
+                )
+            except Exception as exc:
+                if (
+                    config["failed_switch_policy"] == "count_as_infinite"
+                    and _is_numerical_switch_failure(exc)
+                ):
+                    work_kj = float("inf")
+                    LOGGER.warning(
+                        "%s %s sample %d failed numerically and was recorded as +inf work: %s",
+                        name, direction, sample + 1, exc,
+                    )
+                else:
+                    raise
+            _append_work(files[direction], sample + 1, work_kj)
+            if context is not None:
+                del context
+            if direction == "forward":
+                forward = _read_work(files[direction])
+            else:
+                reverse = _read_work(files[direction])
+        forward = _read_work(files["forward"])
+        reverse = _read_work(files["reverse"])
+        LOGGER.info(
+            "%s sample %d/%d complete: forward %.3f, reverse %.3f kJ/mol",
+            name, sample + 1, config["n_snapshots"],
+            forward[-1] * KCAL_TO_KJ, reverse[-1] * KCAL_TO_KJ,
+        )
+    return forward, reverse, rest2_summaries
+
+
+def _normalized_settings(workflow):
+    neqti = workflow.get("neqti") or {}
+    rest2 = neqti.get("rest2") or {}
+    enabled = bool(rest2.get("enabled", True))
+    temperatures = rest2.get(
+        "effective_temperatures_k",
+        [300.0, 344.6, 395.9, 454.7, 522.3, 600.0],
+    )
+    return {
+        "temperature_k": float(neqti.get("temperature_k", 300.0)),
+        "pressure_bar": float(neqti.get("pressure_bar", 1.0)),
+        "timestep_fs": float(neqti.get("timestep_fs", 2.0)),
+        "initial_equilibration_steps": int(neqti.get("initial_equilibration_steps", 50000)),
+        "decorrelation_steps": int(neqti.get("decorrelation_steps", 100000)),
+        "switch_steps": int(neqti.get("switch_steps", 50000)),
+        "n_snapshots": int(neqti.get("n_snapshots", 10)),
+        "bootstrap_samples": int(neqti.get("bootstrap_samples", 500)),
+        "random_seed": int(neqti.get("random_seed", 2026)),
+        "interpolation": str(neqti.get("interpolation", "envelope")),
+        "failed_switch_policy": str(
+            neqti.get("failed_switch_policy", "count_as_infinite")
+        ),
+        "rest2": {
+            "enabled": enabled,
+            "effective_temperatures_k": [float(value) for value in temperatures],
+            "exchange_interval_steps": int(rest2.get("exchange_interval_steps", 500)),
+            "checkpoint_interval_cycles": int(rest2.get("checkpoint_interval_cycles", 10)),
+        },
+    }
+
+
+def _pair_inputs(settings, pair):
+    ligands = {item["ligand_id"]: item for item in settings["dataset"]["ligands"]}
+    root = settings["dataset_root"]
+    inputs = {}
+    for key in ("ligand_a", "ligand_b"):
+        name = pair[key]
+        info = ligands[name]
+        metadata = yaml.safe_load((root / Path(info["capped_product_sdf"]).parent / "product_metadata.yaml").read_text())
+        inputs[key] = {
+            "name": name,
+            "info": info,
+            "metadata": metadata,
+            "product": root / info["capped_product_sdf"],
+        }
+    return inputs
+
+
+def run_covalent_pair(settings, pair):
+    workflow = settings["workflow"]
+    config = _normalized_settings(workflow)
+    if config["failed_switch_policy"] not in {"abort", "count_as_infinite"}:
+        raise CovalentWorkflowError(
+            "covalent NEQTI failed_switch_policy must be 'abort' or 'count_as_infinite'"
+        )
+    workroot = _resolve(workflow.get("workdir", "run"), settings["config_path"].parent)
+    jobname = f"{pair['ligand_a']}--{pair['ligand_b']}"
+    workdir = workroot / jobname
+    workdir.mkdir(parents=True, exist_ok=True)
+    _write_yaml_atomic(
+        workdir / "result.yaml",
+        {
+            "schema_version": 1,
+            "tool": "atom_openmm_rbfe",
+            "jobname": jobname,
+            "status": "running",
+            "method": "neqti",
+            "system_mode": "covalent",
+            "ligand_a": pair["ligand_a"],
+            "ligand_b": pair["ligand_b"],
+            "workdir": str(workdir.resolve()),
+            "progress": {"stage": "setup"},
+        },
+    )
+    inputs = _pair_inputs(settings, pair)
+    cache = workroot / "forcefield_cache"
+    parameters_a = parameterize_capped_product(inputs["ligand_a"]["product"], cache_dir=cache)
+    parameters_b = parameterize_capped_product(inputs["ligand_b"]["product"], cache_dir=cache)
+    meta_a = inputs["ligand_a"]["metadata"]
+    meta_b = inputs["ligand_b"]["metadata"]
+    required = [(index, index) for index in range(int(meta_a["capped_cys_atom_count"]))]
+    required.extend(
+        (
+            int(meta_a["ligand_atom_offset"]) + atom_a - 1,
+            int(meta_b["ligand_atom_offset"]) + atom_b - 1,
+        )
+        for atom_a, atom_b in zip(
+            inputs["ligand_a"]["info"]["core_match_atom_indices_1based"],
+            inputs["ligand_b"]["info"]["core_match_atom_indices_1based"],
+        )
+    )
+    hybrid = build_covalent_hybrid_molecule(parameters_a, parameters_b, required_pairs=required)
+    setup = workflow.get("setup") or {}
+    padding = float(setup.get("solvent_padding_a", 10.0))
+    ionic_strength = float(setup.get("ionic_strength_molar", 0.15))
+    physical_reference_a = create_solvated_capped_reference(
+        parameters_a,
+        padding_a=padding,
+        ionic_strength_molar=ionic_strength,
+        template_cache=cache / "templates.json",
+    )
+    reference = solvate_capped_reference_hybrid(hybrid, physical_reference_a)
+    protein = prepare_protein_covalent_hybrid(
+        settings["dataset_root"] / settings["dataset"]["receptor"],
+        parameters_a, parameters_b, hybrid, meta_a, meta_b,
+        residue_id=int(settings["dataset"]["covalent_residue"]["id"]),
+        padding_a=padding, ionic_strength_molar=ionic_strength,
+    )
+    write_prepared_hybrid(protein, workdir / "protein")
+    write_prepared_hybrid(reference, workdir / "reference")
+    platform, properties = _platform(workflow)
+    running = yaml.safe_load((workdir / "result.yaml").read_text()) or {}
+    running["progress"] = {"stage": "production", "environment": "protein"}
+    _write_yaml_atomic(workdir / "result.yaml", running)
+    protein_forward, protein_reverse, protein_rest2 = _run_environment(
+        "protein", protein, config, workdir, platform, properties, config["random_seed"]
+    )
+    running["progress"] = {"stage": "production", "environment": "reference"}
+    _write_yaml_atomic(workdir / "result.yaml", running)
+    reference_forward, reference_reverse, reference_rest2 = _run_environment(
+        "reference", reference, config, workdir, platform, properties, config["random_seed"] + 100000
+    )
+    work = {
+        "leg_a_forward": protein_forward,
+        "leg_a_reverse": protein_reverse,
+        "leg_b_forward": reference_forward,
+        "leg_b_reverse": reference_reverse,
+    }
+    analysis = analyze_two_leg_work(
+        work, config["temperature_k"], config["bootstrap_samples"], config["random_seed"]
+    )
+    failed_switches = sum(
+        int(np.count_nonzero(~np.isfinite(np.asarray(values, dtype=float))))
+        for values in work.values()
+    )
+    result = {
+        "schema_version": 1,
+        "tool": "atom_openmm_rbfe",
+        "jobname": jobname,
+        "status": "completed" if analysis is not None else "partial",
+        "method": "neqti",
+        "system_mode": "covalent",
+        "ligand_a": pair["ligand_a"],
+        "ligand_b": pair["ligand_b"],
+        "workdir": str(workdir.resolve()),
+        "convention": {
+            "ddg_definition": "G(ligand_b)-G(ligand_a)",
+            "positive_value_meaning": "ligand_b binds weaker than ligand_a",
+        },
+        "experimental": {
+            key: pair[key]
+            for key in ("serotype", "experimental_ddg_kj_per_mol")
+            if key in pair
+        } or None,
+        "result": None if analysis is None else {
+            "ddg_kcal_per_mol": analysis["bar_dg_kcal_per_mol"],
+            "ddg_error_kcal_per_mol": analysis["bar_bootstrap_std_kcal_per_mol"],
+            "ddg_kj_per_mol": analysis["bar_dg_kj_per_mol"],
+            "ddg_error_kj_per_mol": analysis["bar_bootstrap_std_kj_per_mol"],
+            "estimator": "BAR",
+            "components": _semantic_components(analysis),
+            "samples": {
+                "protein_forward": len(protein_forward),
+                "protein_reverse": len(protein_reverse),
+                "reference_forward": len(reference_forward),
+                "reference_reverse": len(reference_reverse),
+            },
+        },
+        "quality": {
+            "convergence_status": "usable" if analysis and analysis["overlap_score"] >= 0.01 else "partial",
+            "overlap_score": None if analysis is None else analysis["overlap_score"],
+            "warnings": [],
+            "rest2": {"protein": protein_rest2, "reference": reference_rest2},
+        },
+        "inputs": {
+            "dataset": str(settings["dataset_path"]),
+            "receptor": str((settings["dataset_root"] / settings["dataset"]["receptor"]).resolve()),
+            "ligand_a_file": str(inputs["ligand_a"]["product"].resolve()),
+            "ligand_b_file": str(inputs["ligand_b"]["product"].resolve()),
+            "workflow_yaml": str(settings["config_path"]),
+        },
+        "parameterization": {
+            "ligand_a": parameters_a.provenance,
+            "ligand_b": parameters_b.provenance,
+            "protein": protein.provenance,
+            "reference": reference.provenance,
+        },
+        "artifacts": {
+            "protein_endpoint_a_pdb": "protein_endpoint_a.pdb",
+            "protein_endpoint_b_pdb": "protein_endpoint_b.pdb",
+            "protein_endpoint_a_system": "protein_endpoint_a.xml",
+            "protein_endpoint_b_system": "protein_endpoint_b.xml",
+            "protein_endpoint_a_state": "protein_endpoint_a_state.xml",
+            "protein_endpoint_b_state": "protein_endpoint_b_state.xml",
+            "protein_endpoint_a_equilibrated": "protein_endpoint_a_equilibrated.pdb",
+            "protein_endpoint_b_equilibrated": "protein_endpoint_b_equilibrated.pdb",
+            "reference_endpoint_a_pdb": "reference_endpoint_a.pdb",
+            "reference_endpoint_b_pdb": "reference_endpoint_b.pdb",
+            "reference_endpoint_a_system": "reference_endpoint_a.xml",
+            "reference_endpoint_b_system": "reference_endpoint_b.xml",
+            "reference_endpoint_a_state": "reference_endpoint_a_state.xml",
+            "reference_endpoint_b_state": "reference_endpoint_b_state.xml",
+            "reference_endpoint_a_equilibrated": "reference_endpoint_a_equilibrated.pdb",
+            "reference_endpoint_b_equilibrated": "reference_endpoint_b_equilibrated.pdb",
+            "protein_forward_work_csv": "protein_forward.csv",
+            "protein_reverse_work_csv": "protein_reverse.csv",
+            "reference_forward_work_csv": "reference_forward.csv",
+            "reference_reverse_work_csv": "reference_reverse.csv",
+        },
+    }
+    if failed_switches:
+        result["quality"]["warnings"].append(
+            f"{failed_switches} numerical switches were retained as +inf work observations"
+        )
+    _write_yaml_atomic(workdir / "result.yaml", result)
+    return {
+        "jobname": jobname,
+        "status": result["status"],
+        "workdir": str(workdir),
+        "ddg": None if analysis is None else analysis["bar_dg_kcal_per_mol"],
+        "ddg_std": None if analysis is None else analysis["bar_bootstrap_std_kcal_per_mol"],
+    }
+
+
+def run_covalent_workflow(path):
+    validate_covalent_workflow(path)
+    _, settings = load_covalent_workflow(path)
+    results = []
+    workflow = settings["workflow"]
+    workroot = _resolve(workflow.get("workdir", "run"), settings["config_path"].parent)
+    for pair in settings["pairs"]:
+        try:
+            results.append(run_covalent_pair(settings, pair))
+        except (Exception, KeyboardInterrupt) as exc:
+            jobname = f"{pair['ligand_a']}--{pair['ligand_b']}"
+            workdir = workroot / jobname
+            workdir.mkdir(parents=True, exist_ok=True)
+            result_path = workdir / "result.yaml"
+            payload = (
+                yaml.safe_load(result_path.read_text()) or {}
+                if result_path.exists()
+                else {}
+            )
+            payload.update(
+                {
+                    "schema_version": 1,
+                    "tool": "atom_openmm_rbfe",
+                    "jobname": jobname,
+                    "status": "failed",
+                    "method": "neqti",
+                    "system_mode": "covalent",
+                    "ligand_a": pair["ligand_a"],
+                    "ligand_b": pair["ligand_b"],
+                    "workdir": str(workdir.resolve()),
+                    "error": {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "stage": (payload.get("progress") or {}).get("stage", "production"),
+                    },
+                }
+            )
+            _write_yaml_atomic(result_path, payload)
+            raise
+    return results
+
+
+def analyze_covalent_workflow(path):
+    validate_covalent_workflow(path)
+    _, settings = load_covalent_workflow(path)
+    workflow = settings["workflow"]
+    config = _normalized_settings(workflow)
+    workroot = _resolve(workflow.get("workdir", "run"), settings["config_path"].parent)
+    results = []
+    for pair in settings["pairs"]:
+        jobname = f"{pair['ligand_a']}--{pair['ligand_b']}"
+        workdir = workroot / jobname
+        work = {
+            "leg_a_forward": _read_work(workdir / "protein_forward.csv"),
+            "leg_a_reverse": _read_work(workdir / "protein_reverse.csv"),
+            "leg_b_forward": _read_work(workdir / "reference_forward.csv"),
+            "leg_b_reverse": _read_work(workdir / "reference_reverse.csv"),
+        }
+        analysis = analyze_two_leg_work(
+            work, config["temperature_k"], config["bootstrap_samples"], config["random_seed"]
+        )
+        if analysis is None:
+            raise CovalentWorkflowError(f"no finite covalent BAR estimate is available for {jobname}")
+        result_path = workdir / "result.yaml"
+        if result_path.exists():
+            payload = yaml.safe_load(result_path.read_text()) or {}
+            payload["status"] = "completed"
+            payload["result"] = {
+                "ddg_kcal_per_mol": analysis["bar_dg_kcal_per_mol"],
+                "ddg_error_kcal_per_mol": analysis["bar_bootstrap_std_kcal_per_mol"],
+                "ddg_kj_per_mol": analysis["bar_dg_kj_per_mol"],
+                "ddg_error_kj_per_mol": analysis["bar_bootstrap_std_kj_per_mol"],
+                "estimator": "BAR",
+                "components": _semantic_components(analysis),
+            }
+            payload.setdefault("quality", {})["overlap_score"] = analysis["overlap_score"]
+            temporary = workdir / "result.yaml.tmp"
+            temporary.write_text(yaml.safe_dump(payload, sort_keys=False))
+            os.replace(temporary, result_path)
+        results.append({
+            "jobname": jobname,
+            "status": "completed",
+            "workdir": str(workdir),
+            "ddg": analysis["bar_dg_kcal_per_mol"],
+            "ddg_std": analysis["bar_bootstrap_std_kcal_per_mol"],
+        })
+    return results

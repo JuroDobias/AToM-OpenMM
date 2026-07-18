@@ -148,6 +148,16 @@ def create_rest2_system(
         elif isinstance(force, mm.NonbondedForce):
             _transform_nonbonded(force, solute, scale_parameter, sqrt_scale_parameter)
             nonbonded_count += 1
+        elif isinstance(force, mm.CMAPTorsionForce):
+            for torsion_index in range(force.getNumTorsions()):
+                parameters = force.getTorsionParameters(torsion_index)
+                atoms = [int(index) for index in parameters[1:]]
+                if any(index in solute for index in atoms):
+                    raise REST2Error(
+                        "CMAP terms touching REST2 solute atoms are not supported"
+                    )
+            # Protein-backbone CMAP terms outside the hot region remain unscaled.
+            continue
         elif isinstance(force, (mm.CMMotionRemover, mm.MonteCarloBarostat, mm.CustomExternalForce)):
             continue
         else:

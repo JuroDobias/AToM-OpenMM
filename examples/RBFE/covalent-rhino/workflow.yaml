@@ -1,0 +1,36 @@
+workflow:
+  type: rbfe
+  mode: covalent
+  dataset: ../../../../rhino_benchmarks/normalized/dataset.yaml
+  workdir: run
+  pairs:
+  - ligand_a: I79DJ_543
+    ligand_b: LIBA225
+  platform: CUDA
+  platform_properties:
+    Precision: mixed
+  setup:
+    protein_forcefield: amber19/protein.ff19SB.xml
+    water_forcefield: amber19/opc.xml
+    ligand_forcefield: openff-2.2.1.offxml
+    ligand_charge_model: espaloma_nn
+    espaloma_model: espaloma-0.3.2
+    solvent_padding_a: 10.0
+    ionic_strength_molar: 0.15
+  neqti:
+    temperature_k: 300.0
+    pressure_bar: 1.0
+    timestep_fs: 2.0
+    initial_equilibration_steps: 250000
+    n_snapshots: 10
+    decorrelation_steps: 100000
+    switch_steps: 50000
+    interpolation: envelope
+    failed_switch_policy: count_as_infinite
+    bootstrap_samples: 500
+    random_seed: 2026
+    rest2:
+      enabled: true
+      effective_temperatures_k: [300.0, 344.6, 395.9, 454.7, 522.3, 600.0]
+      exchange_interval_steps: 500
+      checkpoint_interval_cycles: 10
