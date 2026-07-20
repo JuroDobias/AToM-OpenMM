@@ -510,8 +510,9 @@ Tutorial defaults are intentionally short. For production work, increase `MAX_SA
 congeneric cysteine-aldehyde inhibitors. It uses a chemically complete
 ACE-Cys-product-NME thiohemiacetal in the aqueous reference leg and grafts the same
 local product parameters onto the target cysteine in the protein leg. The endpoint
-Hamiltonians are exact at lambda 0 and 1; the default finite-time path is a smooth
-log-sum envelope between them.
+Hamiltonians are exact at lambda 0 and 1. Two finite-time paths are available: the
+original smooth log-sum `envelope` and a faster conventional staged
+`softcore_linear` dual-topology path.
 
 Prepare a source dataset containing `protein_annealed.pdb`, `data.csv`,
 `manifest.csv`, and the manifest-referenced ligand SDF files:
@@ -554,11 +555,16 @@ workflow:
   neqti:
     initial_equilibration_steps: 250000
     decorrelation_steps: 100000
-    switch_steps: 50000
     timestep_fs: 2.0
     n_snapshots: 10
     bootstrap_samples: 500
-    interpolation: envelope
+    interpolation: softcore_linear
+    softcore:
+      alpha: 0.3
+      sigma_nm: 0.25
+      power: 1
+      charge_steps_per_stage: 10000
+      sterics_steps: 30000
     failed_switch_policy: count_as_infinite
     rest2:
       enabled: true
@@ -585,3 +591,21 @@ For charge consistency, ff19SB charges are copied for Cys N, H, CA, HA, C, and O
 The remaining Cys sidechain, transferred hydrogen, and ligand charges are corrected
 together to a neutral modified residue and copied unchanged into both protein and
 capped-reference systems.
+
+For `softcore_linear`, the forward protocol removes A-branch electrostatics,
+softcore-transforms sterics and bonded parameters, then introduces B-branch
+electrostatics. Mapped charges move through their endpoint midpoint during the two
+charge stages. Reverse work uses the exactly reversed protocol. The total number
+of steps is
+`2 * charge_steps_per_stage + sterics_steps`; do not also set `switch_steps`.
+The defaults (`alpha: 0.3`, `sigma_nm: 0.25`, `power: 1`) match the established
+GROMACS softcore settings used for the RHINO calculations. Endpoint total charges
+must currently be equal.
+
+The softcore system evaluates common PME, protein, and solvent terms once. Unique
+A/B cross interactions remain excluded, while the existing unique-branch vacuum
+interactions remain active. Work is still accumulated exactly on-device from the
+energy change at every lambda update. `switch_protocol.yaml` prevents incompatible
+resume, and `switch_timing.csv` records elapsed time and ns/day for every switch.
+Use `interpolation: envelope` with `switch_steps` to reproduce the original
+two-endpoint log-envelope implementation.

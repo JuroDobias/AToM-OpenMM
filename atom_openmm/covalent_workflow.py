@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import logging
 import os
 import time
@@ -19,6 +20,7 @@ from atom_openmm.covalent_parameters import (
     parameterize_capped_product,
 )
 from atom_openmm.covalent_protein import prepare_protein_covalent_hybrid
+from atom_openmm.covalent_softcore import create_softcore_hamiltonian
 from atom_openmm.covalent_systems import (
     create_solvated_capped_reference,
     solvate_capped_reference_hybrid,
@@ -122,12 +124,29 @@ def validate_covalent_workflow(path):
     if float(settings["dataset"].get("assay_temperature_k", 298.15)) <= 0.0:
         raise CovalentWorkflowError("dataset assay_temperature_k must be positive")
     config = _normalized_settings(workflow)
+    if config["interpolation"] == "softcore_linear":
+        for pair in settings["pairs"]:
+            charge_a = ligands[pair["ligand_a"]].get("formal_charge")
+            charge_b = ligands[pair["ligand_b"]].get("formal_charge")
+            if charge_a is not None and charge_b is not None and int(charge_a) != int(charge_b):
+                raise CovalentWorkflowError(
+                    "softcore_linear currently requires equal endpoint formal charge"
+                )
     if config["failed_switch_policy"] not in {"abort", "count_as_infinite"}:
         raise CovalentWorkflowError(
             "covalent NEQTI failed_switch_policy must be 'abort' or 'count_as_infinite'"
         )
     if config["n_snapshots"] < 1 or config["switch_steps"] < 1:
-        raise CovalentWorkflowError("NEQTI n_snapshots and switch_steps must be positive")
+        raise CovalentWorkflowError("NEQTI n_snapshots and switching stage steps must be positive")
+    if config["interpolation"] not in {"envelope", "linear", "softcore_linear"}:
+        raise CovalentWorkflowError(
+            "covalent NEQTI interpolation must be 'envelope', 'linear', or 'softcore_linear'"
+        )
+    if config["interpolation"] == "softcore_linear" and config["legacy_switch_steps_set"]:
+        raise CovalentWorkflowError(
+            "workflow.neqti.switch_steps cannot be combined with softcore_linear; "
+            "set softcore.charge_steps_per_stage and softcore.sterics_steps"
+        )
     if any(value < 0.0 for value in config["dummy_bonded_scales"].values()):
         raise CovalentWorkflowError("workflow.setup.dummy_bonded_scales values cannot be negative")
     equilibration = config["endpoint_equilibration"]
@@ -357,6 +376,46 @@ def _append_work(path, sample, work_kj):
         writer.writerow([sample, work_kj, work_kj / KCAL_TO_KJ])
 
 
+def _append_switch_timing(path, environment, direction, sample, steps, timestep_fs, elapsed):
+    path = Path(path)
+    new = not path.exists()
+    simulated_ns = float(steps) * float(timestep_fs) * 1.0e-6
+    ns_per_day = simulated_ns * 86400.0 / elapsed
+    with path.open("a", newline="") as handle:
+        writer = csv.writer(handle)
+        if new:
+            writer.writerow(
+                [
+                    "environment", "direction", "sample", "steps", "timestep_fs",
+                    "elapsed_seconds", "ns_per_day",
+                ]
+            )
+        writer.writerow(
+            [environment, direction, sample, steps, timestep_fs, elapsed, ns_per_day]
+        )
+    return ns_per_day
+
+
+def _switch_timing_summary(path):
+    path = Path(path)
+    if not path.exists():
+        return {}
+    grouped = {}
+    with path.open(newline="") as handle:
+        for row in csv.DictReader(handle):
+            key = f"{row['environment']}_{row['direction']}"
+            grouped.setdefault(key, []).append(float(row["ns_per_day"]))
+    return {
+        key: {
+            "samples": len(values),
+            "mean_ns_per_day": float(np.mean(values)),
+            "min_ns_per_day": float(np.min(values)),
+            "max_ns_per_day": float(np.max(values)),
+        }
+        for key, values in grouped.items()
+    }
+
+
 def _read_work(path):
     path = Path(path)
     if not path.exists():
@@ -394,6 +453,42 @@ def _switch_context(
     )
     context = mm.Context(hamiltonian.system, integrator, platform, properties)
     return context, integrator
+
+
+def _softcore_switch_context(
+    hamiltonian,
+    *,
+    start,
+    timestep_fs,
+    temperature_k,
+    platform,
+    properties,
+    seed,
+):
+    forward = start == "a"
+    values = {
+        name: list(schedule if forward else reversed(schedule))
+        for name, schedule in hamiltonian.parameter_values.items()
+    }
+    steps = list(
+        hamiltonian.segment_steps if forward else reversed(hamiltonian.segment_steps)
+    )
+    integrator = ATMNonequilibriumLangevinIntegrator(
+        temperature=float(temperature_k) * unit.kelvin,
+        collision_rate=1.0 / unit.picosecond,
+        timestep=float(timestep_fs) * unit.femtosecond,
+        parameter_values=values,
+        steps_per_segment=steps,
+        random_seed=int(seed),
+    )
+    context = mm.Context(hamiltonian.system, integrator, platform, properties)
+    return context, integrator, values
+
+
+def _reset_softcore_context(context, integrator, parameter_values):
+    integrator.reset_protocol()
+    for name, values in parameter_values.items():
+        context.setParameter(name, float(values[0]))
 
 
 def _apply_state(context, state):
@@ -506,9 +601,31 @@ def _run_environment(
         "forward": workdir / f"{name}_forward.csv",
         "reverse": workdir / f"{name}_reverse.csv",
     }
+    timing_file = workdir / "switch_timing.csv"
     forward = _read_work(files["forward"])
     reverse = _read_work(files["reverse"])
     rest2_summaries = {}
+    softcore = None
+    softcore_contexts = {}
+    if config["interpolation"] == "softcore_linear":
+        unique_a = prepared.provenance["unique_a_particle_indices"]
+        unique_b = prepared.provenance["unique_b_particle_indices"]
+        softcore = create_softcore_hamiltonian(
+            prepared.endpoint_a,
+            prepared.endpoint_b,
+            unique_a,
+            unique_b,
+            **config["softcore"],
+        )
+        LOGGER.info(
+            "%s softcore switching system ready: charge %d + sterics %d + charge %d "
+            "= %d steps",
+            name,
+            config["softcore"]["charge_steps_per_stage"],
+            config["softcore"]["sterics_steps"],
+            config["softcore"]["charge_steps_per_stage"],
+            softcore.total_steps,
+        )
     for sample in range(int(config["n_snapshots"])):
         for direction, endpoint, system, offset in (
             ("forward", "a", prepared.endpoint_a, 0),
@@ -549,17 +666,48 @@ def _run_environment(
             )
             context = None
             post_switch_written = False
+            switch_elapsed = None
+            switch_ns_per_day = None
             try:
-                context, integrator = _switch_context(
-                    prepared.endpoint_a, prepared.endpoint_b,
-                    start=endpoint,
-                    steps=config["switch_steps"], timestep_fs=timestep,
-                    temperature_k=temperature, platform=platform, properties=properties,
-                    seed=seed + sample * 1000 + offset + 1,
-                    interpolation=config["interpolation"],
-                )
+                if softcore is None:
+                    context, integrator = _switch_context(
+                        prepared.endpoint_a, prepared.endpoint_b,
+                        start=endpoint,
+                        steps=config["switch_steps"], timestep_fs=timestep,
+                        temperature_k=temperature, platform=platform, properties=properties,
+                        seed=seed + sample * 1000 + offset + 1,
+                        interpolation=config["interpolation"],
+                    )
+                else:
+                    cached = softcore_contexts.get(direction)
+                    if cached is None:
+                        cached = _softcore_switch_context(
+                            softcore,
+                            start=endpoint,
+                            timestep_fs=timestep,
+                            temperature_k=temperature,
+                            platform=platform,
+                            properties=properties,
+                            seed=seed + offset + 1,
+                        )
+                        softcore_contexts[direction] = cached
+                    context, integrator, parameter_values = cached
+                    _reset_softcore_context(context, integrator, parameter_values)
                 _apply_state(context, state)
+                started = time.perf_counter()
                 integrator.step(int(config["switch_steps"]))
+                switch_elapsed = time.perf_counter() - started
+                simulated_ns = config["switch_steps"] * timestep * 1.0e-6
+                switch_ns_per_day = simulated_ns * 86400.0 / switch_elapsed
+                LOGGER.info(
+                    "%s %s sample %d switch complete: %d steps in %.3f s, %.3f ns/day",
+                    name,
+                    direction,
+                    sample + 1,
+                    config["switch_steps"],
+                    switch_elapsed,
+                    switch_ns_per_day,
+                )
                 final_endpoint = "b" if endpoint == "a" else "a"
                 post_switch_state = context.getState(
                     getPositions=True, enforcePeriodicBox=True
@@ -585,6 +733,8 @@ def _run_environment(
                         "%s %s sample %d failed numerically and was recorded as +inf work: %s",
                         name, direction, sample + 1, exc,
                     )
+                    if softcore is not None:
+                        softcore_contexts.pop(direction, None)
                 else:
                     raise
             finally:
@@ -608,7 +758,17 @@ def _run_environment(
                             diagnostic_exc,
                         )
             _append_work(files[direction], sample + 1, work_kj)
-            if context is not None:
+            if switch_elapsed is not None:
+                _append_switch_timing(
+                    timing_file,
+                    name,
+                    direction,
+                    sample + 1,
+                    config["switch_steps"],
+                    timestep,
+                    switch_elapsed,
+                )
+            if context is not None and softcore is None:
                 del context
             if direction == "forward":
                 forward = _read_work(files[direction])
@@ -630,10 +790,24 @@ def _normalized_settings(workflow):
     neqti = workflow.get("neqti") or {}
     equilibration = neqti.get("endpoint_equilibration") or {}
     rest2 = neqti.get("rest2") or {}
+    softcore = neqti.get("softcore") or {}
+    interpolation = str(neqti.get("interpolation", "envelope"))
     enabled = bool(rest2.get("enabled", True))
     temperatures = rest2.get(
         "effective_temperatures_k",
         [300.0, 344.6, 395.9, 454.7, 522.3, 600.0],
+    )
+    softcore_settings = {
+        "alpha": float(softcore.get("alpha", 0.3)),
+        "sigma_nm": float(softcore.get("sigma_nm", 0.25)),
+        "power": int(softcore.get("power", 1)),
+        "charge_steps_per_stage": int(softcore.get("charge_steps_per_stage", 10000)),
+        "sterics_steps": int(softcore.get("sterics_steps", 30000)),
+    }
+    switch_steps = (
+        2 * softcore_settings["charge_steps_per_stage"] + softcore_settings["sterics_steps"]
+        if interpolation == "softcore_linear"
+        else int(neqti.get("switch_steps", 50000))
     )
     return {
         "temperature_k": float(neqti.get("temperature_k", 300.0)),
@@ -658,11 +832,13 @@ def _normalized_settings(workflow):
             ),
         },
         "decorrelation_steps": int(neqti.get("decorrelation_steps", 100000)),
-        "switch_steps": int(neqti.get("switch_steps", 50000)),
+        "switch_steps": switch_steps,
         "n_snapshots": int(neqti.get("n_snapshots", 10)),
         "bootstrap_samples": int(neqti.get("bootstrap_samples", 500)),
         "random_seed": int(neqti.get("random_seed", 2026)),
-        "interpolation": str(neqti.get("interpolation", "envelope")),
+        "interpolation": interpolation,
+        "legacy_switch_steps_set": "switch_steps" in neqti,
+        "softcore": softcore_settings,
         "failed_switch_policy": str(
             neqti.get("failed_switch_policy", "count_as_infinite")
         ),
@@ -701,6 +877,73 @@ def _pair_inputs(settings, pair):
     return inputs
 
 
+def _validate_softcore_endpoint_charge(config, parameters_a, parameters_b):
+    if config["interpolation"] != "softcore_linear":
+        return
+    charge_a = float(np.sum(parameters_a.charges_e))
+    charge_b = float(np.sum(parameters_b.charges_e))
+    if not np.isclose(charge_a, charge_b, atol=1.0e-6):
+        raise CovalentWorkflowError(
+            "softcore_linear currently requires equal endpoint total charge; "
+            f"observed {charge_a:.8f} e and {charge_b:.8f} e"
+        )
+
+
+def _switch_protocol(config):
+    protocol = {
+        "schema_version": 1,
+        "interpolation": config["interpolation"],
+        "timestep_fs": config["timestep_fs"],
+        "total_steps": config["switch_steps"],
+    }
+    if config["interpolation"] == "softcore_linear":
+        protocol["softcore"] = dict(config["softcore"])
+        protocol["stages"] = [
+            {
+                "name": "discharge_a",
+                "steps": config["softcore"]["charge_steps_per_stage"],
+            },
+            {"name": "sterics_a_to_b", "steps": config["softcore"]["sterics_steps"]},
+            {
+                "name": "charge_b",
+                "steps": config["softcore"]["charge_steps_per_stage"],
+            },
+        ]
+    serialized = yaml.safe_dump(protocol, sort_keys=True)
+    protocol["fingerprint"] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return protocol
+
+
+def _ensure_switch_protocol(workdir, config):
+    workdir = Path(workdir)
+    path = workdir / "switch_protocol.yaml"
+    expected = _switch_protocol(config)
+    existing_work = any(
+        (workdir / f"{environment}_{direction}.csv").exists()
+        for environment in ("protein", "reference")
+        for direction in ("forward", "reverse")
+    )
+    if path.exists():
+        observed = yaml.safe_load(path.read_text()) or {}
+        if observed != expected:
+            raise CovalentWorkflowError(
+                "existing covalent work uses a different switching protocol; "
+                "use a new workdir or restore the original workflow settings"
+            )
+    elif existing_work and config["interpolation"] == "softcore_linear":
+        raise CovalentWorkflowError(
+            "cannot resume softcore covalent work without switch_protocol.yaml; use a new workdir"
+        )
+    else:
+        if existing_work:
+            LOGGER.warning(
+                "Accepting legacy %s work without protocol provenance and recording current settings",
+                config["interpolation"],
+            )
+        _write_yaml_atomic(path, expected)
+    return expected
+
+
 def run_covalent_pair(settings, pair):
     workflow = settings["workflow"]
     config = _normalized_settings(workflow)
@@ -712,6 +955,7 @@ def run_covalent_pair(settings, pair):
     jobname = f"{pair['ligand_a']}--{pair['ligand_b']}"
     workdir = workroot / jobname
     workdir.mkdir(parents=True, exist_ok=True)
+    switch_protocol = _ensure_switch_protocol(workdir, config)
     _write_yaml_atomic(
         workdir / "result.yaml",
         {
@@ -742,6 +986,7 @@ def run_covalent_pair(settings, pair):
     parameters_b = apply_modified_residue_charges(
         parameters_b, meta_b, backbone_charges
     )
+    _validate_softcore_endpoint_charge(config, parameters_a, parameters_b)
     required = [(index, index) for index in range(int(meta_a["capped_cys_atom_count"]))]
     required.extend(
         (
@@ -884,8 +1129,14 @@ def run_covalent_pair(settings, pair):
             "protein": protein.provenance,
             "reference": reference.provenance,
         },
+        "switching_protocol": switch_protocol,
+        "performance": {
+            "switching": _switch_timing_summary(workdir / "switch_timing.csv"),
+        },
         "artifacts": {
             "covalent_mapping": "covalent_mapping.yaml",
+            "switch_protocol": "switch_protocol.yaml",
+            "switch_timing_csv": "switch_timing.csv",
             "protein_endpoint_a_pdb": "protein_endpoint_a.pdb",
             "protein_endpoint_b_pdb": "protein_endpoint_b.pdb",
             "protein_endpoint_a_system": "protein_endpoint_a.xml",

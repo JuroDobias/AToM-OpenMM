@@ -36,8 +36,13 @@ workflow:
       npt_timestep_fs: 2.0
     n_snapshots: 10
     decorrelation_steps: 100000
-    switch_steps: 50000
-    interpolation: envelope
+    interpolation: softcore_linear
+    softcore:
+      alpha: 0.3
+      sigma_nm: 0.25
+      power: 1
+      charge_steps_per_stage: 10000
+      sterics_steps: 30000
     failed_switch_policy: count_as_infinite
     bootstrap_samples: 500
     random_seed: 2026

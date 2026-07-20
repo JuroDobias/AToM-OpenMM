@@ -11,6 +11,8 @@ from atom_openmm.covalent_workflow import (
     validate_covalent_workflow,
     _dummy_particles,
     _write_switch_pdb,
+    _ensure_switch_protocol,
+    _validate_softcore_endpoint_charge,
 )
 
 
@@ -76,6 +78,54 @@ def test_covalent_endpoint_equilibration_defaults_and_legacy_npt_alias():
     )["endpoint_equilibration"]
     assert configured["nvt_steps"] == 25000
     assert configured["npt_steps"] == 250000
+
+
+def test_softcore_settings_derive_total_switch_steps():
+    config = _normalized_settings(
+        {
+            "neqti": {
+                "interpolation": "softcore_linear",
+                "softcore": {
+                    "alpha": 0.3,
+                    "sigma_nm": 0.25,
+                    "power": 1,
+                    "charge_steps_per_stage": 1200,
+                    "sterics_steps": 7600,
+                },
+            }
+        }
+    )
+    assert config["switch_steps"] == 10000
+    assert config["softcore"]["charge_steps_per_stage"] == 1200
+    assert config["softcore"]["sterics_steps"] == 7600
+
+
+def test_softcore_resume_rejects_changed_protocol(tmp_path):
+    first = _normalized_settings(
+        {"neqti": {"interpolation": "softcore_linear", "softcore": {"sterics_steps": 30}}}
+    )
+    _ensure_switch_protocol(tmp_path, first)
+    changed = _normalized_settings(
+        {"neqti": {"interpolation": "softcore_linear", "softcore": {"sterics_steps": 31}}}
+    )
+    try:
+        _ensure_switch_protocol(tmp_path, changed)
+    except CovalentWorkflowError as exc:
+        assert "different switching protocol" in str(exc)
+    else:
+        raise AssertionError("changed softcore protocol was accepted for resume")
+
+
+def test_softcore_rejects_different_endpoint_total_charge():
+    config = _normalized_settings({"neqti": {"interpolation": "softcore_linear"}})
+    left = type("Parameters", (), {"charges_e": [0.2, -0.2]})()
+    right = type("Parameters", (), {"charges_e": [0.2, 0.8]})()
+    try:
+        _validate_softcore_endpoint_charge(config, left, right)
+    except CovalentWorkflowError as exc:
+        assert "equal endpoint total charge" in str(exc)
+    else:
+        raise AssertionError("charge-changing softcore edge was accepted")
 from atom_openmm.rbfe_workflow import plan_workflow, validate_workflow
 
 

@@ -44,3 +44,17 @@ Inactive dummy atoms remain present with PDB occupancy `0.00`; active and common
 atoms have occupancy `1.00`. `REMARK 901` lists the one-based dummy particle
 indices for the represented endpoint, making the dummy branch directly selectable
 in VMD or PyMOL.
+
+The example uses the native `softcore_linear` path. A forward switch first removes
+endpoint-A unique-branch charges, then transforms bonded and softcore Lennard-Jones
+terms, and finally introduces endpoint-B charges. The reverse path executes the
+same stages in reverse. `charge_steps_per_stage` applies independently to each
+charge stage, so the configured 10000 + 30000 + 10000 steps produce a 100 ps
+switch at 2 fs. The implementation keeps PME and common protein/water forces in a
+single system rather than evaluating two complete endpoint Hamiltonians.
+
+Each pair directory records the resolved settings and compatibility fingerprint in
+`switch_protocol.yaml`. Existing work is resumed only when that protocol matches.
+`switch_timing.csv` and `result.yaml` report measured switching throughput. The
+older `interpolation: envelope` path remains available and continues to use the
+single `switch_steps` setting.

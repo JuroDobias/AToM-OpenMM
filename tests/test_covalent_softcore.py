@@ -1,0 +1,151 @@
+import numpy as np
+import openmm as mm
+from openmm import unit
+
+from atom_openmm.covalent_softcore import create_softcore_hamiltonian
+from atom_openmm.neqti_integrator import ATMNonequilibriumLangevinIntegrator
+
+
+def _endpoint(state):
+    system = mm.System()
+    for _ in range(5):
+        system.addParticle(12.0)
+    system.setDefaultPeriodicBoxVectors(
+        mm.Vec3(2.5, 0.0, 0.0),
+        mm.Vec3(0.0, 2.5, 0.0),
+        mm.Vec3(0.0, 0.0, 2.5),
+    )
+    bonds = mm.HarmonicBondForce()
+    bonds.addBond(0, 1, 0.15, 1000.0)
+    bonds.addBond(1, 2 if state == "a" else 3, 0.14 if state == "a" else 0.16, 800.0)
+    system.addForce(bonds)
+    angles = mm.HarmonicAngleForce()
+    angles.addAngle(0, 1, 2 if state == "a" else 3, 2.0, 100.0)
+    system.addForce(angles)
+    torsions = mm.PeriodicTorsionForce()
+    torsions.addTorsion(0, 1, 2 if state == "a" else 3, 4, 3, 0.0, 2.0)
+    system.addForce(torsions)
+    nonbonded = mm.NonbondedForce()
+    nonbonded.setNonbondedMethod(mm.NonbondedForce.PME)
+    nonbonded.setCutoffDistance(1.0)
+    nonbonded.setEwaldErrorTolerance(1.0e-5)
+    nonbonded.setUseDispersionCorrection(True)
+    parameters = [
+        (-0.20, 0.30, 0.40),
+        (0.10, 0.31, 0.30),
+        (0.15, 0.32, 0.20) if state == "a" else (0.0, 0.32, 0.0),
+        (0.0, 0.33, 0.0) if state == "a" else (-0.05, 0.33, 0.25),
+        (0.0, 0.34, 0.20),
+    ]
+    for values in parameters:
+        nonbonded.addParticle(*values)
+    nonbonded.addException(0, 1, 0.0, 0.3, 0.0)
+    nonbonded.addException(
+        1, 2, -0.015 if state == "a" else 0.0, 0.315, 0.08 if state == "a" else 0.0
+    )
+    nonbonded.addException(
+        1, 3, 0.0 if state == "a" else -0.005, 0.32, 0.0 if state == "a" else 0.07
+    )
+    nonbonded.addException(2, 3, 0.0, 1.0, 0.0)
+    system.addForce(nonbonded)
+    return system
+
+
+def _energy_forces(system, positions, parameters=None):
+    context = mm.Context(system, mm.VerletIntegrator(0.001))
+    context.setPositions(positions)
+    for name, value in (parameters or {}).items():
+        context.setParameter(name, value)
+    state = context.getState(getEnergy=True, getForces=True)
+    energy = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+    forces = state.getForces(asNumpy=True).value_in_unit(
+        unit.kilojoule_per_mole / unit.nanometer
+    )
+    del context
+    return energy, forces
+
+
+def _test_softcore_nodes_reproduce_endpoint_energies_and_forces():
+    endpoint_a = _endpoint("a")
+    endpoint_b = _endpoint("b")
+    hamiltonian = create_softcore_hamiltonian(
+        endpoint_a,
+        endpoint_b,
+        [2],
+        [3],
+        charge_steps_per_stage=2,
+        sterics_steps=3,
+    )
+    positions = np.asarray(
+        [[0, 0, 0], [0.15, 0, 0], [0.28, 0.08, 0], [0.29, -0.09, 0.03], [0.7, 0.4, 0.3]]
+    ) * unit.nanometer
+    for endpoint, node in ((endpoint_a, 0), (endpoint_b, 3)):
+        expected_energy, expected_forces = _energy_forces(endpoint, positions)
+        parameters = {
+            name: values[node] for name, values in hamiltonian.parameter_values.items()
+        }
+        observed_energy, observed_forces = _energy_forces(
+            hamiltonian.system, positions, parameters
+        )
+        assert np.isclose(observed_energy, expected_energy, atol=1.0e-5)
+        assert np.allclose(observed_forces, expected_forces, atol=1.0e-3)
+
+
+def _test_softcore_schedule_is_symmetric_and_finite_at_overlap():
+    hamiltonian = create_softcore_hamiltonian(
+        _endpoint("a"),
+        _endpoint("b"),
+        [2],
+        [3],
+        charge_steps_per_stage=11,
+        sterics_steps=17,
+    )
+    assert hamiltonian.segment_steps == [11, 17, 11]
+    assert hamiltonian.total_steps == 39
+    positions = np.asarray(
+        [[0, 0, 0], [0.15, 0, 0], [0.28, 0.08, 0], [0.28, 0.08, 0], [0.7, 0.4, 0.3]]
+    ) * unit.nanometer
+    midpoint = {
+        name: 0.5 * (values[1] + values[2])
+        for name, values in hamiltonian.parameter_values.items()
+    }
+    energy, forces = _energy_forces(hamiltonian.system, positions, midpoint)
+    assert np.isfinite(energy)
+    assert np.all(np.isfinite(forces))
+
+
+def _test_softcore_schedule_runs_forward_and_reverse_on_device():
+    hamiltonian = create_softcore_hamiltonian(
+        _endpoint("a"),
+        _endpoint("b"),
+        [2],
+        [3],
+        charge_steps_per_stage=2,
+        sterics_steps=3,
+    )
+    positions = np.asarray(
+        [[0, 0, 0], [0.15, 0, 0], [0.28, 0.08, 0], [0.29, -0.09, 0.03], [0.7, 0.4, 0.3]]
+    ) * unit.nanometer
+    for reverse in (False, True):
+        schedules = {
+            name: list(reversed(values)) if reverse else values
+            for name, values in hamiltonian.parameter_values.items()
+        }
+        steps = list(reversed(hamiltonian.segment_steps)) if reverse else hamiltonian.segment_steps
+        integrator = ATMNonequilibriumLangevinIntegrator(
+            temperature=300.0 * unit.kelvin,
+            collision_rate=1.0 / unit.picosecond,
+            timestep=1.0 * unit.femtosecond,
+            parameter_values=schedules,
+            steps_per_segment=steps,
+            random_seed=9,
+        )
+        context = mm.Context(hamiltonian.system, integrator)
+        context.setPositions(positions)
+        context.setVelocitiesToTemperature(300.0 * unit.kelvin, 9)
+        for name, values in schedules.items():
+            context.setParameter(name, values[0])
+        integrator.step(hamiltonian.total_steps)
+        work = integrator.get_protocol_work().value_in_unit(unit.kilojoule_per_mole)
+        assert np.isfinite(work)
+        del context
