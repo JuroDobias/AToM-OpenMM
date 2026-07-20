@@ -8,7 +8,11 @@ import openmm as mm
 from openmm import app, unit
 
 from atom_openmm.covalent_alchemy import CovalentAlchemyError
-from atom_openmm.covalent_hybrid import CovalentHybridMolecule
+from atom_openmm.covalent_hybrid import (
+    CovalentHybridMolecule,
+    _add_unique_vacuum_nonbonded,
+    _inactive_scales,
+)
 from atom_openmm.covalent_parameters import CovalentParameterBundle
 from atom_openmm.covalent_systems import PreparedCovalentHybrid, _copy_virtual_site
 
@@ -146,7 +150,16 @@ def _zero_base_thiol_terms(system, sulfur, hydrogen):
                 torsion_force.setTorsionParameters(index, p1, p2, p3, p4, periodicity, phase, 0 * k)
 
 
-def _source_terms(target, source_system, source_to_global, include):
+def _source_terms(
+    target,
+    source_system,
+    source_to_global,
+    include,
+    *,
+    bond_scale=lambda _: 1.0,
+    angle_scale=lambda _: 1.0,
+    torsion_scale=lambda _: 1.0,
+):
     for cls, count, get, add, width in (
         (mm.HarmonicBondForce, "getNumBonds", "getBondParameters", "addBond", 2),
         (mm.HarmonicAngleForce, "getNumAngles", "getAngleParameters", "addAngle", 3),
@@ -164,6 +177,12 @@ def _source_terms(target, source_system, source_to_global, include):
             atoms = [int(value) for value in parameters[:width]]
             if all(atom in source_to_global for atom in atoms) and include(atoms):
                 parameters[:width] = [source_to_global[atom] for atom in atoms]
+                scale = {
+                    mm.HarmonicBondForce: bond_scale,
+                    mm.HarmonicAngleForce: angle_scale,
+                    mm.PeriodicTorsionForce: torsion_scale,
+                }[cls](tuple(atoms))
+                parameters[-1] *= scale
                 getattr(destination, add)(*parameters)
 
 
@@ -205,6 +224,7 @@ def _graft_endpoint(
     active_atoms_a,
     active_atoms_b,
     state,
+    dummy_bonded_scales,
 ):
     sulfur = receptor_atoms["SG"]
     hydrogen = receptor_atoms["HG"]
@@ -227,6 +247,14 @@ def _graft_endpoint(
             (parameters_b.system, source_to_global_b, active_atoms_b),
         ),
     )
+    molecule_a = parameters_a.molecule.to_rdkit()
+    molecule_b = parameters_b.molecule.to_rdkit()
+    angle_scale_a, torsion_scale_a = _inactive_scales(
+        molecule_a, unique_a, dummy_bonded_scales
+    )
+    angle_scale_b, torsion_scale_b = _inactive_scales(
+        molecule_b, unique_b, dummy_bonded_scales
+    )
 
     if state == "a":
         _source_terms(
@@ -236,6 +264,9 @@ def _graft_endpoint(
         _source_terms(
             output, parameters_b.system, source_to_global_b,
             lambda atoms: any(atom in unique_b for atom in atoms),
+            bond_scale=lambda _: dummy_bonded_scales.bond,
+            angle_scale=angle_scale_b,
+            torsion_scale=torsion_scale_b,
         )
         active_parameters = parameters_a
         active_map = source_to_global_a
@@ -250,6 +281,9 @@ def _graft_endpoint(
         _source_terms(
             output, parameters_a.system, source_to_global_a,
             lambda atoms: any(atom in unique_a for atom in atoms),
+            bond_scale=lambda _: dummy_bonded_scales.bond,
+            angle_scale=angle_scale_a,
+            torsion_scale=torsion_scale_a,
         )
         active_parameters = parameters_b
         active_map = source_to_global_b
@@ -267,7 +301,7 @@ def _graft_endpoint(
             _, sigma, _ = inactive_nb.getParticleParameters(inactive_reverse[global_index])
             nonbonded.addParticle(0.0, sigma, 0.0)
     for source_atom, global_index in active_map.items():
-        if global_index in {sulfur, hydrogen}:
+        if global_index < base_particles:
             nonbonded.setParticleParameters(global_index, *source_nb.getParticleParameters(source_atom))
 
     existing = {}
@@ -290,6 +324,14 @@ def _graft_endpoint(
             nonbonded.setExceptionParameters(existing[global_pair], *global_pair, charge, sigma, epsilon)
         else:
             existing[global_pair] = nonbonded.addException(*global_pair, charge, sigma, epsilon)
+    _add_unique_vacuum_nonbonded(
+        output,
+        (
+            (parameters_a.system, source_to_global_a, unique_a),
+            (parameters_b.system, source_to_global_b, unique_b),
+        ),
+        nonbonded,
+    )
     output.addForce(mm.CMMotionRemover())
     return output
 
@@ -392,11 +434,13 @@ def prepare_protein_covalent_hybrid(
         base_system, parameters_a, parameters_b, hybrid,
         source_to_global_a, source_to_global_b, receptor_atoms, unique_a, unique_b,
         active_atoms_a, active_atoms_b, "a",
+        hybrid.dummy_bonded_scales,
     )
     endpoint_b = _graft_endpoint(
         base_system, parameters_a, parameters_b, hybrid,
         source_to_global_a, source_to_global_b, receptor_atoms, unique_a, unique_b,
         active_atoms_a, active_atoms_b, "b",
+        hybrid.dummy_bonded_scales,
     )
 
     # Clone the base topology and append the ligand-union residue atoms and bonds.
@@ -474,6 +518,18 @@ def prepare_protein_covalent_hybrid(
         "mapped_product_atom_count": len(hybrid.map_a_to_b),
         "unique_a_count": len(unique_a),
         "unique_b_count": len(unique_b),
+        "unique_a_particle_indices": sorted(
+            int(source_to_global_a[index]) for index in unique_a
+        ),
+        "unique_b_particle_indices": sorted(
+            int(source_to_global_b[index]) for index in unique_b
+        ),
+        "anchor_pairs": [list(pair) for pair in hybrid.anchor_pairs],
+        "attachment_pairs": None if hybrid.attachment_pairs is None else [
+            list(pair) for pair in hybrid.attachment_pairs
+        ],
+        "dummy_bonded_scales": dict(hybrid.dummy_bonded_scales.__dict__),
+        "dummy_nonbonded": "unique_branch_vacuum",
     }
     hot_atoms = tuple(sorted({receptor_atoms["CB"], receptor_atoms["SG"], *global_to_atom.keys()}))
     return PreparedCovalentHybrid(

@@ -60,6 +60,32 @@ def _transform_bonds(force, solute, scale_parameter, sqrt_scale_parameter):
     return transformed
 
 
+def _transform_custom_bonds(force, solute, scale_parameter, sqrt_scale_parameter):
+    if force.getName() != "CovalentUniqueVacuumNonbondedForce":
+        raise REST2Error(f"unsupported CustomBondForce for REST2: {force.getName()!r}")
+    transformed = mm.CustomBondForce(
+        _scale_expression(f"({force.getEnergyFunction()})", scale_parameter, sqrt_scale_parameter)
+    )
+    existing_globals = set()
+    for index in range(force.getNumGlobalParameters()):
+        name = force.getGlobalParameterName(index)
+        existing_globals.add(name)
+        transformed.addGlobalParameter(name, force.getGlobalParameterDefaultValue(index))
+    if scale_parameter in existing_globals or sqrt_scale_parameter in existing_globals:
+        raise REST2Error("covalent vacuum force conflicts with REST2 global parameter names")
+    transformed.addGlobalParameter(scale_parameter, 1.0)
+    transformed.addGlobalParameter(sqrt_scale_parameter, 1.0)
+    for index in range(force.getNumPerBondParameters()):
+        transformed.addPerBondParameter(force.getPerBondParameterName(index))
+    for name in ("rest_unscaled", "rest_scaled", "rest_mixed"):
+        transformed.addPerBondParameter(name)
+    for index in range(force.getNumBonds()):
+        atom1, atom2, parameters = force.getBondParameters(index)
+        transformed.addBond(atom1, atom2, [*parameters, *_term_weights((atom1, atom2), solute)])
+    _copy_force_metadata(force, transformed)
+    return transformed
+
+
 def _transform_angles(force, solute, scale_parameter, sqrt_scale_parameter):
     transformed = mm.CustomAngleForce(
         _scale_expression("0.5*k*(theta-theta0)^2", scale_parameter, sqrt_scale_parameter)
@@ -141,6 +167,10 @@ def create_rest2_system(
         force = transformed_system.getForce(index)
         if isinstance(force, mm.HarmonicBondForce):
             replacements.append((index, _transform_bonds(force, solute, scale_parameter, sqrt_scale_parameter)))
+        elif isinstance(force, mm.CustomBondForce):
+            replacements.append(
+                (index, _transform_custom_bonds(force, solute, scale_parameter, sqrt_scale_parameter))
+            )
         elif isinstance(force, mm.HarmonicAngleForce):
             replacements.append((index, _transform_angles(force, solute, scale_parameter, sqrt_scale_parameter)))
         elif isinstance(force, mm.PeriodicTorsionForce):

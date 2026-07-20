@@ -1,12 +1,81 @@
 from pathlib import Path
 
+import openmm as mm
+from openmm import app, unit
 import yaml
 
 from atom_openmm.covalent_workflow import (
     CovalentWorkflowError,
+    _normalized_settings,
     plan_covalent_workflow,
     validate_covalent_workflow,
+    _dummy_particles,
+    _write_switch_pdb,
 )
+
+
+def test_switch_pdb_marks_dummy_atoms_with_zero_occupancy(tmp_path):
+    topology = app.Topology()
+    chain = topology.addChain("L")
+    residue = topology.addResidue("HYB", chain, "1")
+    topology.addAtom("C1", app.Element.getBySymbol("C"), residue)
+    topology.addAtom("N1", app.Element.getBySymbol("N"), residue)
+    system = mm.System()
+    system.addParticle(12.0)
+    system.addParticle(14.0)
+    context = mm.Context(system, mm.VerletIntegrator(0.001))
+    context.setPositions([[0, 0, 0], [0.1, 0, 0]] * unit.nanometer)
+    state = context.getState(getPositions=True)
+    output = tmp_path / "switch.pdb"
+
+    _write_switch_pdb(
+        output,
+        topology,
+        state,
+        endpoint="a",
+        dummy_atom_indices=[1],
+    )
+
+    text = output.read_text()
+    atoms = [line for line in text.splitlines() if line.startswith("ATOM")]
+    assert "ENDPOINT A" in text
+    assert "INDICES (1-BASED): 2" in text
+    assert float(atoms[0][54:60]) == 1.0
+    assert float(atoms[1][54:60]) == 0.0
+
+
+def test_dummy_particles_selects_branch_inactive_at_endpoint():
+    prepared = type("Prepared", (), {
+        "provenance": {
+            "unique_a_particle_indices": [4, 5],
+            "unique_b_particle_indices": [8, 9],
+        }
+    })()
+
+    assert _dummy_particles(prepared, "a") == (8, 9)
+    assert _dummy_particles(prepared, "b") == (4, 5)
+
+
+def test_covalent_endpoint_equilibration_defaults_and_legacy_npt_alias():
+    defaults = _normalized_settings({})["endpoint_equilibration"]
+    assert defaults == {
+        "minimization_tolerance_kj_mol_nm": 10.0,
+        "minimization_max_iterations": 2000,
+        "nvt_steps": 50000,
+        "nvt_timestep_fs": 1.0,
+        "npt_steps": 50000,
+        "npt_timestep_fs": 2.0,
+    }
+    configured = _normalized_settings(
+        {
+            "neqti": {
+                "initial_equilibration_steps": 250000,
+                "endpoint_equilibration": {"nvt_steps": 25000},
+            }
+        }
+    )["endpoint_equilibration"]
+    assert configured["nvt_steps"] == 25000
+    assert configured["npt_steps"] == 250000
 from atom_openmm.rbfe_workflow import plan_workflow, validate_workflow
 
 

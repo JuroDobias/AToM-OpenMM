@@ -545,6 +545,12 @@ workflow:
     espaloma_model: espaloma-0.3.2
     solvent_padding_a: 10.0
     ionic_strength_molar: 0.15
+    dummy_bonded_scales:
+      bond: 1.0
+      angle: 1.0
+      proper_torsion: 1.0
+      junction_angle: 1.0
+      junction_proper_torsion: 0.0
   neqti:
     initial_equilibration_steps: 250000
     decorrelation_steps: 100000
@@ -567,3 +573,15 @@ interrupted workflow resumes the missing direction without replacing completed
 samples. Each pair directory contains `result.yaml`, four work CSV files, REST2
 checkpoints, prepared endpoint PDBs, and serialized OpenMM systems. The reported
 DDG convention is `G(ligand_b)-G(ligand_a)`.
+
+Covalent atom mapping uses a connected heavy-atom MCS anchored through the
+Cys-SG--warhead bond; explicit hydrogens are attached after the heavy-atom match.
+Warhead mutations are rejected. Unique A and B branches are noninteracting with
+the environment when inactive but retain full unique-unique vacuum electrostatics,
+Lennard-Jones, exclusions, and 1-4 interactions. The mapping and atom roles are
+recorded in `covalent_mapping.yaml`.
+
+For charge consistency, ff19SB charges are copied for Cys N, H, CA, HA, C, and O.
+The remaining Cys sidechain, transferred hydrogen, and ligand charges are corrected
+together to a neutral modified residue and copied unchanged into both protein and
+capped-reference systems.

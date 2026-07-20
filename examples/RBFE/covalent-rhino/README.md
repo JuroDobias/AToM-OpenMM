@@ -20,3 +20,27 @@ The first setup can be CPU-heavy because Espaloma is loaded and both solvated
 endpoint systems are built. Production switching and five-replica REST2 should be
 run on a CUDA-capable GPU. This prototype is restricted to the prepared
 cysteine-aldehyde thiohemiacetal series and the force fields shown in the workflow.
+
+The A/B products are mapped with a connected heavy-atom MCS that must include the
+Cys-SG--warhead attachment bond. Unique branches are dummies against the common
+core and environment, but retain their complete unique-unique vacuum nonbonded
+energy, including source-force-field 1-4 terms. `dummy_bonded_scales` reproduces
+the earlier PMX defaults: full bonds, angles, and internal proper torsions, with
+junction proper torsions disabled while the branch is inactive. The resolved map,
+unique atom roles, and scaling values are written to `covalent_mapping.yaml`.
+
+The modified residue uses the receptor ff19SB charges for N, H, CA, HA, C, and O.
+CB, HB2, HB3, SG, the transferred hydrogen, and ligand atoms are adjusted together
+to make the modified Cys-ligand residue neutral. These exact charges are reused in
+the protein and capped-reference systems.
+
+Each physical endpoint is equilibrated with separately checkpointed minimization,
+NVT, and NPT stages. A resumed workflow skips every completed stage, including
+completed protein samples, before continuing the capped-reference calculation.
+
+Every nonequilibrium switch writes a full hybrid structure named
+`{protein|reference}_{forward|reverse}_sample_NNN_{pre|post}_switch.pdb`.
+Inactive dummy atoms remain present with PDB occupancy `0.00`; active and common
+atoms have occupancy `1.00`. `REMARK 901` lists the one-based dummy particle
+indices for the represented endpoint, making the dummy branch directly selectable
+in VMD or PyMOL.

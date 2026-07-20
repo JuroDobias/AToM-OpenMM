@@ -17,11 +17,23 @@ workflow:
     espaloma_model: espaloma-0.3.2
     solvent_padding_a: 10.0
     ionic_strength_molar: 0.15
+    dummy_bonded_scales:
+      bond: 1.0
+      angle: 1.0
+      proper_torsion: 1.0
+      junction_angle: 1.0
+      junction_proper_torsion: 0.0
   neqti:
     temperature_k: 300.0
     pressure_bar: 1.0
     timestep_fs: 2.0
-    initial_equilibration_steps: 250000
+    endpoint_equilibration:
+      minimization_tolerance_kj_mol_nm: 10.0
+      minimization_max_iterations: 2000
+      nvt_steps: 50000
+      nvt_timestep_fs: 1.0
+      npt_steps: 250000
+      npt_timestep_fs: 2.0
     n_snapshots: 10
     decorrelation_steps: 100000
     switch_steps: 50000

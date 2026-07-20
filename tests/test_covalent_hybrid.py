@@ -1,8 +1,13 @@
 import numpy as np
+import openmm as mm
+from openmm import unit
 from openff.toolkit import ForceField, Molecule
 from openff.units import unit as offunit
 
-from atom_openmm.covalent_hybrid import build_covalent_hybrid_molecule
+from atom_openmm.covalent_hybrid import (
+    _add_unique_vacuum_nonbonded,
+    build_covalent_hybrid_molecule,
+)
 from atom_openmm.covalent_parameters import CovalentParameterBundle
 
 
@@ -27,10 +32,55 @@ def _test_hybrid_molecule_has_identical_endpoint_particles():
     assert hybrid.endpoint_a.getNumConstraints() > 0
 
 
-def _test_required_mapping_expands_without_global_mcs():
+def _test_required_mapping_selects_an_anchored_mcs():
     left = _bundle("CCO")
-    right = _bundle("CCCO")
+    right = _bundle("CCN")
     hybrid = build_covalent_hybrid_molecule(left, right, required_pairs=[(0, 0), (1, 1)])
     assert hybrid.map_a_to_b[0] == 0
     assert hybrid.map_a_to_b[1] == 1
     assert len(hybrid.map_a_to_b) > 2
+
+
+def _test_unique_vacuum_force_exactly_replaces_internal_nonbonded_energy():
+    source = mm.System()
+    endpoint = mm.System()
+    original = mm.NonbondedForce()
+    replacement = mm.NonbondedForce()
+    original.setNonbondedMethod(mm.NonbondedForce.NoCutoff)
+    replacement.setNonbondedMethod(mm.NonbondedForce.NoCutoff)
+    parameters = [
+        (-0.20, 0.30, 0.40),
+        (0.15, 0.31, 0.35),
+        (0.10, 0.32, 0.30),
+        (-0.05, 0.33, 0.25),
+    ]
+    for charge, sigma, epsilon in parameters:
+        source.addParticle(12.0)
+        endpoint.addParticle(12.0)
+        original.addParticle(charge, sigma, epsilon)
+        replacement.addParticle(charge, sigma, epsilon)
+    original.addException(0, 1, 0.0, 0.3, 0.0)
+    original.addException(1, 2, 0.0, 0.3, 0.0)
+    original.addException(2, 3, 0.0, 0.3, 0.0)
+    original.addException(0, 3, -0.005, 0.315, 0.08)
+    for index in range(original.getNumExceptions()):
+        replacement.addException(*original.getExceptionParameters(index))
+    source.addForce(original)
+    endpoint.addForce(replacement)
+    _add_unique_vacuum_nonbonded(
+        endpoint,
+        ((source, {index: index for index in range(4)}, set(range(4))),),
+        replacement,
+    )
+    positions = np.asarray(
+        [[0.0, 0.0, 0.0], [0.15, 0.0, 0.0], [0.30, 0.1, 0.0], [0.44, 0.1, 0.1]]
+    ) * unit.nanometer
+
+    def energy(system):
+        context = mm.Context(system, mm.VerletIntegrator(1.0 * unit.femtosecond))
+        context.setPositions(positions)
+        value = context.getState(getEnergy=True).getPotentialEnergy()
+        del context
+        return value.value_in_unit(unit.kilojoule_per_mole)
+
+    assert np.isclose(energy(source), energy(endpoint), atol=1.0e-8)

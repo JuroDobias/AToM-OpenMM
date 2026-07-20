@@ -123,6 +123,36 @@ def _test_rest2_rejects_unsupported_force():
         create_rest2_system(system, [0])
 
 
+def _test_rest2_scales_covalent_unique_vacuum_force():
+    from atom_openmm.rest2 import create_rest2_system, set_rest2_scale
+
+    system = mm.System()
+    system.addParticle(12.0)
+    system.addParticle(12.0)
+    vacuum = mm.CustomBondForce("k/r")
+    vacuum.setName("CovalentUniqueVacuumNonbondedForce")
+    vacuum.addPerBondParameter("k")
+    vacuum.addBond(0, 1, [2.0])
+    system.addForce(vacuum)
+    nonbonded = mm.NonbondedForce()
+    nonbonded.addParticle(0.0, 0.3, 0.0)
+    nonbonded.addParticle(0.0, 0.3, 0.0)
+    system.addForce(nonbonded)
+    rest2 = create_rest2_system(system, [0, 1])
+    context = mm.Context(
+        rest2.system, mm.VerletIntegrator(0.001), mm.Platform.getPlatformByName("Reference")
+    )
+    context.setPositions([[0, 0, 0], [0.5, 0, 0]])
+    physical = context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(
+        unit.kilojoule_per_mole
+    )
+    set_rest2_scale(context, 0.25, rest2)
+    scaled = context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(
+        unit.kilojoule_per_mole
+    )
+    assert scaled == pytest.approx(0.25 * physical)
+
+
 def _test_rest2_parameters_remain_active_inside_atmforce():
     from atom_openmm.rest2 import create_rest2_system, set_rest2_scale
 

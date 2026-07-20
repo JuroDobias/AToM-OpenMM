@@ -199,6 +199,10 @@ def _merge_hybrid_with_environment(
         if count:
             output.addForce(target)
 
+    for force in hybrid_system.getForces():
+        if isinstance(force, mm.CustomBondForce):
+            output.addForce(mm.XmlSerializer.deserialize(mm.XmlSerializer.serialize(force)))
+
     hybrid_nonbonded = _single_force(hybrid_system, mm.NonbondedForce)
     environment_nonbonded = _single_force(environment_system, mm.NonbondedForce)
     if hybrid_nonbonded is None or environment_nonbonded is None:
@@ -286,6 +290,18 @@ def solvate_capped_reference_hybrid(
             "mapped_atom_count": len(hybrid.map_a_to_b),
             "unique_a_count": len(hybrid.unique_a),
             "unique_b_count": len(hybrid.unique_b),
+            "unique_a_particle_indices": [
+                int(hybrid.map_a_to_hybrid[index]) for index in hybrid.unique_a
+            ],
+            "unique_b_particle_indices": [
+                int(hybrid.map_b_to_hybrid[index]) for index in hybrid.unique_b
+            ],
+            "anchor_pairs": [list(pair) for pair in hybrid.anchor_pairs],
+            "attachment_pairs": None if hybrid.attachment_pairs is None else [
+                list(pair) for pair in hybrid.attachment_pairs
+            ],
+            "dummy_bonded_scales": dict(hybrid.dummy_bonded_scales.__dict__),
+            "dummy_nonbonded": "unique_branch_vacuum",
             "solvent_source": "endpoint_a_single_solvation",
         }
     )

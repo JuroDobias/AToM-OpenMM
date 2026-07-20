@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import logging
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -11,8 +12,12 @@ import yaml
 from openmm import app, unit
 
 from atom_openmm.covalent_alchemy import create_endpoint_hamiltonian
-from atom_openmm.covalent_hybrid import build_covalent_hybrid_molecule
-from atom_openmm.covalent_parameters import parameterize_capped_product
+from atom_openmm.covalent_hybrid import DummyBondedScales, build_covalent_hybrid_molecule
+from atom_openmm.covalent_parameters import (
+    apply_modified_residue_charges,
+    ff19sb_backbone_charges,
+    parameterize_capped_product,
+)
 from atom_openmm.covalent_protein import prepare_protein_covalent_hybrid
 from atom_openmm.covalent_systems import (
     create_solvated_capped_reference,
@@ -123,8 +128,20 @@ def validate_covalent_workflow(path):
         )
     if config["n_snapshots"] < 1 or config["switch_steps"] < 1:
         raise CovalentWorkflowError("NEQTI n_snapshots and switch_steps must be positive")
-    if config["decorrelation_steps"] < 0 or config["initial_equilibration_steps"] < 0:
+    if any(value < 0.0 for value in config["dummy_bonded_scales"].values()):
+        raise CovalentWorkflowError("workflow.setup.dummy_bonded_scales values cannot be negative")
+    equilibration = config["endpoint_equilibration"]
+    if config["decorrelation_steps"] < 0 or any(
+        equilibration[key] < 0
+        for key in ("minimization_max_iterations", "nvt_steps", "npt_steps")
+    ):
         raise CovalentWorkflowError("NEQTI equilibration and decorrelation steps cannot be negative")
+    if (
+        equilibration["minimization_tolerance_kj_mol_nm"] <= 0
+        or equilibration["nvt_timestep_fs"] <= 0
+        or equilibration["npt_timestep_fs"] <= 0
+    ):
+        raise CovalentWorkflowError("covalent endpoint equilibration tolerances and timesteps must be positive")
     rest2 = config["rest2"]
     if rest2["enabled"]:
         temperatures = rest2["effective_temperatures_k"]
@@ -192,42 +209,140 @@ def _write_state_pdb(path, topology, state):
         app.PDBFile.writeFile(topology, state.getPositions(), handle, keepIds=True)
 
 
+def _write_switch_pdb(path, topology, state, *, endpoint, dummy_atom_indices):
+    path = Path(path)
+    temporary = Path(str(path) + ".tmp")
+    with temporary.open("w") as handle:
+        app.PDBFile.writeFile(topology, state.getPositions(), handle, keepIds=True)
+    dummy = {int(index) for index in dummy_atom_indices}
+    output = [
+        f"REMARK 900 COVALENT HYBRID ENDPOINT {str(endpoint).upper()}\n",
+        "REMARK 900 DUMMY ATOMS HAVE OCCUPANCY 0.00; ACTIVE/COMMON ATOMS HAVE 1.00\n",
+        "REMARK 901 DUMMY PARTICLE INDICES (1-BASED): "
+        + (" ".join(str(index + 1) for index in sorted(dummy)) or "NONE")
+        + "\n",
+    ]
+    atom_index = 0
+    for line in temporary.read_text().splitlines(keepends=True):
+        if line.startswith(("ATOM  ", "HETATM")):
+            occupancy = 0.0 if atom_index in dummy else 1.0
+            line = f"{line[:54]}{occupancy:6.2f}{line[60:]}"
+            atom_index += 1
+        output.append(line)
+    path.write_text("".join(output))
+    temporary.unlink()
+
+
+def _dummy_particles(prepared, endpoint):
+    inactive = "unique_b_particle_indices" if endpoint == "a" else "unique_a_particle_indices"
+    try:
+        return tuple(int(index) for index in prepared.provenance[inactive])
+    except KeyError as exc:
+        raise CovalentWorkflowError(
+            f"prepared covalent system lacks {inactive} diagnostic metadata"
+        ) from exc
+
+
 def _equilibrate_endpoint(
     system,
     positions,
     state_file,
     *,
-    steps,
-    timestep_fs,
+    protocol,
     temperature_k,
     pressure_bar,
     platform,
     properties,
     seed,
+    label,
 ):
     state_file = Path(state_file)
     if state_file.exists():
+        LOGGER.info("%s equilibration already complete; resuming from %s", label, state_file)
         return _load_state(state_file)
+
+    minimized_file = state_file.with_name(f"{state_file.stem}_minimized.xml")
+    nvt_file = state_file.with_name(f"{state_file.stem}_nvt.xml")
+
+    if minimized_file.exists():
+        minimized = _load_state(minimized_file)
+        LOGGER.info("%s minimization already complete; resuming from %s", label, minimized_file)
+    else:
+        integrator = mm.VerletIntegrator(1.0 * unit.femtosecond)
+        context = mm.Context(system, integrator, platform, properties)
+        context.setPositions(positions)
+        started = time.perf_counter()
+        LOGGER.info(
+            "%s minimization started: tolerance %.3f kJ/mol/nm, max %d iterations",
+            label,
+            protocol["minimization_tolerance_kj_mol_nm"],
+            protocol["minimization_max_iterations"],
+        )
+        mm.LocalEnergyMinimizer.minimize(
+            context,
+            float(protocol["minimization_tolerance_kj_mol_nm"]),
+            int(protocol["minimization_max_iterations"]),
+        )
+        minimized = context.getState(getPositions=True, getEnergy=True, enforcePeriodicBox=True)
+        _write_state(minimized_file, minimized)
+        LOGGER.info("%s minimization complete in %.3f s", label, time.perf_counter() - started)
+        del context
+
+    if nvt_file.exists():
+        nvt_state = _load_state(nvt_file)
+        LOGGER.info("%s NVT equilibration already complete; resuming from %s", label, nvt_file)
+    else:
+        nvt_steps = int(protocol["nvt_steps"])
+        nvt_timestep_fs = float(protocol["nvt_timestep_fs"])
+        integrator = mm.LangevinMiddleIntegrator(
+            float(temperature_k) * unit.kelvin,
+            1.0 / unit.picosecond,
+            nvt_timestep_fs * unit.femtosecond,
+        )
+        integrator.setRandomNumberSeed(int(seed))
+        context = mm.Context(system, integrator, platform, properties)
+        context.setPositions(minimized.getPositions())
+        context.setVelocitiesToTemperature(float(temperature_k) * unit.kelvin, int(seed) + 1)
+        started = time.perf_counter()
+        LOGGER.info(
+            "%s NVT equilibration started: %d steps at %.3f fs",
+            label, nvt_steps, nvt_timestep_fs,
+        )
+        if nvt_steps:
+            integrator.step(nvt_steps)
+        nvt_state = context.getState(
+            getPositions=True, getVelocities=True, getEnergy=True, enforcePeriodicBox=True
+        )
+        _write_state(nvt_file, nvt_state)
+        LOGGER.info("%s NVT equilibration complete in %.3f s", label, time.perf_counter() - started)
+        del context
+
     equilibrium_system = _clone_system(system)
     equilibrium_system.addForce(
         mm.MonteCarloBarostat(float(pressure_bar) * unit.bar, float(temperature_k) * unit.kelvin)
     )
+    npt_steps = int(protocol["npt_steps"])
+    npt_timestep_fs = float(protocol["npt_timestep_fs"])
     integrator = mm.LangevinMiddleIntegrator(
         float(temperature_k) * unit.kelvin,
         1.0 / unit.picosecond,
-        float(timestep_fs) * unit.femtosecond,
+        npt_timestep_fs * unit.femtosecond,
     )
-    integrator.setRandomNumberSeed(int(seed))
+    integrator.setRandomNumberSeed(int(seed) + 2)
     context = mm.Context(equilibrium_system, integrator, platform, properties)
-    context.setPositions(positions)
-    context.setVelocitiesToTemperature(float(temperature_k) * unit.kelvin, int(seed) + 1)
-    mm.LocalEnergyMinimizer.minimize(context, 10.0, 500)
-    if int(steps):
-        integrator.step(int(steps))
+    _apply_state(context, nvt_state)
+    started = time.perf_counter()
+    LOGGER.info(
+        "%s NPT equilibration started: %d steps at %.3f fs and %.3f bar",
+        label, npt_steps, npt_timestep_fs, pressure_bar,
+    )
+    if npt_steps:
+        integrator.step(npt_steps)
     state = context.getState(
         getPositions=True, getVelocities=True, getEnergy=True, enforcePeriodicBox=True
     )
     _write_state(state_file, state)
+    LOGGER.info("%s NPT equilibration complete in %.3f s", label, time.perf_counter() - started)
     del context
     return state
 
@@ -361,20 +476,21 @@ def _run_environment(
 ):
     temperature = float(config["temperature_k"])
     timestep = float(config["timestep_fs"])
-    initial = int(config["initial_equilibration_steps"])
     state_files = {
         "a": workdir / f"{name}_endpoint_a_state.xml",
         "b": workdir / f"{name}_endpoint_b_state.xml",
     }
     _equilibrate_endpoint(
         prepared.endpoint_a, prepared.positions, state_files["a"],
-        steps=initial, timestep_fs=timestep, temperature_k=temperature,
+        protocol=config["endpoint_equilibration"], temperature_k=temperature,
         pressure_bar=config["pressure_bar"], platform=platform, properties=properties, seed=seed,
+        label=f"{name} endpoint A",
     )
     _equilibrate_endpoint(
         prepared.endpoint_b, prepared.positions, state_files["b"],
-        steps=initial, timestep_fs=timestep, temperature_k=temperature,
+        protocol=config["endpoint_equilibration"], temperature_k=temperature,
         pressure_bar=config["pressure_bar"], platform=platform, properties=properties, seed=seed + 10,
+        label=f"{name} endpoint B",
     )
     _write_state_pdb(
         workdir / f"{name}_endpoint_a_equilibrated.pdb",
@@ -418,7 +534,21 @@ def _run_environment(
                 prepared.topology,
                 state,
             )
+            pre_switch_path = workdir / (
+                f"{name}_{direction}_sample_{sample + 1:03d}_pre_switch.pdb"
+            )
+            post_switch_path = workdir / (
+                f"{name}_{direction}_sample_{sample + 1:03d}_post_switch.pdb"
+            )
+            _write_switch_pdb(
+                pre_switch_path,
+                prepared.topology,
+                state,
+                endpoint=endpoint,
+                dummy_atom_indices=_dummy_particles(prepared, endpoint),
+            )
             context = None
+            post_switch_written = False
             try:
                 context, integrator = _switch_context(
                     prepared.endpoint_a, prepared.endpoint_b,
@@ -430,6 +560,18 @@ def _run_environment(
                 )
                 _apply_state(context, state)
                 integrator.step(int(config["switch_steps"]))
+                final_endpoint = "b" if endpoint == "a" else "a"
+                post_switch_state = context.getState(
+                    getPositions=True, enforcePeriodicBox=True
+                )
+                _write_switch_pdb(
+                    post_switch_path,
+                    prepared.topology,
+                    post_switch_state,
+                    endpoint=final_endpoint,
+                    dummy_atom_indices=_dummy_particles(prepared, final_endpoint),
+                )
+                post_switch_written = True
                 work_kj = integrator.get_protocol_work().value_in_unit(
                     unit.kilojoules_per_mole
                 )
@@ -445,6 +587,26 @@ def _run_environment(
                     )
                 else:
                     raise
+            finally:
+                if context is not None and not post_switch_written:
+                    try:
+                        final_endpoint = "b" if endpoint == "a" else "a"
+                        post_switch_state = context.getState(
+                            getPositions=True, enforcePeriodicBox=True
+                        )
+                        _write_switch_pdb(
+                            post_switch_path,
+                            prepared.topology,
+                            post_switch_state,
+                            endpoint=final_endpoint,
+                            dummy_atom_indices=_dummy_particles(prepared, final_endpoint),
+                        )
+                    except Exception as diagnostic_exc:
+                        LOGGER.warning(
+                            "Could not write %s post-switch diagnostic: %s",
+                            post_switch_path,
+                            diagnostic_exc,
+                        )
             _append_work(files[direction], sample + 1, work_kj)
             if context is not None:
                 del context
@@ -463,7 +625,10 @@ def _run_environment(
 
 
 def _normalized_settings(workflow):
+    setup = workflow.get("setup") or {}
+    dummy = setup.get("dummy_bonded_scales") or {}
     neqti = workflow.get("neqti") or {}
+    equilibration = neqti.get("endpoint_equilibration") or {}
     rest2 = neqti.get("rest2") or {}
     enabled = bool(rest2.get("enabled", True))
     temperatures = rest2.get(
@@ -474,7 +639,24 @@ def _normalized_settings(workflow):
         "temperature_k": float(neqti.get("temperature_k", 300.0)),
         "pressure_bar": float(neqti.get("pressure_bar", 1.0)),
         "timestep_fs": float(neqti.get("timestep_fs", 2.0)),
-        "initial_equilibration_steps": int(neqti.get("initial_equilibration_steps", 50000)),
+        "endpoint_equilibration": {
+            "minimization_tolerance_kj_mol_nm": float(
+                equilibration.get("minimization_tolerance_kj_mol_nm", 10.0)
+            ),
+            "minimization_max_iterations": int(
+                equilibration.get("minimization_max_iterations", 2000)
+            ),
+            "nvt_steps": int(equilibration.get("nvt_steps", 50000)),
+            "nvt_timestep_fs": float(equilibration.get("nvt_timestep_fs", 1.0)),
+            "npt_steps": int(
+                equilibration.get(
+                    "npt_steps", neqti.get("initial_equilibration_steps", 50000)
+                )
+            ),
+            "npt_timestep_fs": float(
+                equilibration.get("npt_timestep_fs", neqti.get("timestep_fs", 2.0))
+            ),
+        },
         "decorrelation_steps": int(neqti.get("decorrelation_steps", 100000)),
         "switch_steps": int(neqti.get("switch_steps", 50000)),
         "n_snapshots": int(neqti.get("n_snapshots", 10)),
@@ -484,6 +666,15 @@ def _normalized_settings(workflow):
         "failed_switch_policy": str(
             neqti.get("failed_switch_policy", "count_as_infinite")
         ),
+        "dummy_bonded_scales": {
+            "bond": float(dummy.get("bond", 1.0)),
+            "angle": float(dummy.get("angle", 1.0)),
+            "proper_torsion": float(dummy.get("proper_torsion", 1.0)),
+            "junction_angle": float(dummy.get("junction_angle", 1.0)),
+            "junction_proper_torsion": float(
+                dummy.get("junction_proper_torsion", 0.0)
+            ),
+        },
         "rest2": {
             "enabled": enabled,
             "effective_temperatures_k": [float(value) for value in temperatures],
@@ -542,6 +733,15 @@ def run_covalent_pair(settings, pair):
     parameters_b = parameterize_capped_product(inputs["ligand_b"]["product"], cache_dir=cache)
     meta_a = inputs["ligand_a"]["metadata"]
     meta_b = inputs["ligand_b"]["metadata"]
+    receptor = settings["dataset_root"] / settings["dataset"]["receptor"]
+    residue_id = int(settings["dataset"]["covalent_residue"]["id"])
+    backbone_charges = ff19sb_backbone_charges(receptor, residue_id)
+    parameters_a = apply_modified_residue_charges(
+        parameters_a, meta_a, backbone_charges
+    )
+    parameters_b = apply_modified_residue_charges(
+        parameters_b, meta_b, backbone_charges
+    )
     required = [(index, index) for index in range(int(meta_a["capped_cys_atom_count"]))]
     required.extend(
         (
@@ -553,7 +753,26 @@ def run_covalent_pair(settings, pair):
             inputs["ligand_b"]["info"]["core_match_atom_indices_1based"],
         )
     )
-    hybrid = build_covalent_hybrid_molecule(parameters_a, parameters_b, required_pairs=required)
+    attachment_pairs = (
+        (
+            int(meta_a["cys_sulfur_atom_index"]),
+            int(meta_b["cys_sulfur_atom_index"]),
+        ),
+        (
+            int(meta_a["electrophile_carbon_atom_index"]),
+            int(meta_b["electrophile_carbon_atom_index"]),
+        ),
+    )
+    for pair_to_require in attachment_pairs:
+        if pair_to_require not in required:
+            required.append(pair_to_require)
+    hybrid = build_covalent_hybrid_molecule(
+        parameters_a,
+        parameters_b,
+        required_pairs=required,
+        attachment_pairs=attachment_pairs,
+        dummy_bonded_scales=DummyBondedScales(**config["dummy_bonded_scales"]),
+    )
     setup = workflow.get("setup") or {}
     padding = float(setup.get("solvent_padding_a", 10.0))
     ionic_strength = float(setup.get("ionic_strength_molar", 0.15))
@@ -565,13 +784,29 @@ def run_covalent_pair(settings, pair):
     )
     reference = solvate_capped_reference_hybrid(hybrid, physical_reference_a)
     protein = prepare_protein_covalent_hybrid(
-        settings["dataset_root"] / settings["dataset"]["receptor"],
+        receptor,
         parameters_a, parameters_b, hybrid, meta_a, meta_b,
-        residue_id=int(settings["dataset"]["covalent_residue"]["id"]),
+        residue_id=residue_id,
         padding_a=padding, ionic_strength_molar=ionic_strength,
     )
     write_prepared_hybrid(protein, workdir / "protein")
     write_prepared_hybrid(reference, workdir / "reference")
+    _write_yaml_atomic(
+        workdir / "covalent_mapping.yaml",
+        {
+            "schema_version": 1,
+            "mapping_mode": "protein_connected_mcs",
+            "map_a_to_b_0based": {
+                int(atom_a): int(atom_b) for atom_a, atom_b in sorted(hybrid.map_a_to_b.items())
+            },
+            "anchor_pairs_0based": [list(pair) for pair in hybrid.anchor_pairs],
+            "attachment_pairs_0based": [list(pair) for pair in attachment_pairs],
+            "unique_a_0based": list(hybrid.unique_a),
+            "unique_b_0based": list(hybrid.unique_b),
+            "dummy_bonded_scales": config["dummy_bonded_scales"],
+            "dummy_nonbonded": "full_unique_branch_vacuum",
+        },
+    )
     platform, properties = _platform(workflow)
     running = yaml.safe_load((workdir / "result.yaml").read_text()) or {}
     running["progress"] = {"stage": "production", "environment": "protein"}
@@ -650,6 +885,7 @@ def run_covalent_pair(settings, pair):
             "reference": reference.provenance,
         },
         "artifacts": {
+            "covalent_mapping": "covalent_mapping.yaml",
             "protein_endpoint_a_pdb": "protein_endpoint_a.pdb",
             "protein_endpoint_b_pdb": "protein_endpoint_b.pdb",
             "protein_endpoint_a_system": "protein_endpoint_a.xml",

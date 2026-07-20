@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import permutations
 
 import numpy as np
 import openmm as mm
@@ -23,6 +24,23 @@ class CovalentHybridMolecule:
     map_b_to_hybrid: dict[int, int]
     unique_a: tuple[int, ...]
     unique_b: tuple[int, ...]
+    anchor_pairs: tuple[tuple[int, int], ...]
+    attachment_pairs: tuple[tuple[int, int], tuple[int, int]] | None
+    dummy_bonded_scales: "DummyBondedScales"
+
+
+@dataclass(frozen=True)
+class DummyBondedScales:
+    bond: float = 1.0
+    angle: float = 1.0
+    proper_torsion: float = 1.0
+    junction_angle: float = 1.0
+    junction_proper_torsion: float = 0.0
+
+    def __post_init__(self):
+        for name, value in self.__dict__.items():
+            if float(value) < 0.0:
+                raise CovalentAlchemyError(f"dummy bonded scale {name} cannot be negative")
 
 
 def _rdkit_molecule(bundle: CovalentParameterBundle) -> Chem.Mol:
@@ -39,10 +57,14 @@ def find_covalent_atom_map(
     required_pairs: list[tuple[int, int]] | None = None,
     timeout_seconds: int = 30,
 ) -> dict[int, int]:
-    if required_pairs:
-        return _expand_required_mapping(molecule_a, molecule_b, required_pairs)
+    heavy_molecules = []
+    for molecule in (molecule_a, molecule_b):
+        copied = Chem.Mol(molecule)
+        for atom in copied.GetAtoms():
+            atom.SetIntProp("_covalent_original_index", atom.GetIdx())
+        heavy_molecules.append(Chem.RemoveHs(copied))
     result = rdFMCS.FindMCS(
-        [molecule_a, molecule_b],
+        heavy_molecules,
         atomCompare=rdFMCS.AtomCompare.CompareElements,
         bondCompare=rdFMCS.BondCompare.CompareOrderExact,
         ringMatchesRingOnly=True,
@@ -53,16 +75,37 @@ def find_covalent_atom_map(
     if result.canceled or result.numAtoms == 0:
         raise CovalentAlchemyError("could not determine a complete covalent-product MCS")
     query = Chem.MolFromSmarts(result.smartsString)
-    matches_a = molecule_a.GetSubstructMatches(query, uniquify=True, useChirality=True)
-    matches_b = molecule_b.GetSubstructMatches(query, uniquify=True, useChirality=True)
+    matches_a = heavy_molecules[0].GetSubstructMatches(query, uniquify=True, useChirality=True)
+    matches_b = heavy_molecules[1].GetSubstructMatches(query, uniquify=True, useChirality=True)
     required = set(required_pairs or [])
+    if len(required) != len(required_pairs or ()):
+        raise CovalentAlchemyError("required covalent atom pairs contain duplicates")
+    if len({atom_a for atom_a, _ in required}) != len(required) or len(
+        {atom_b for _, atom_b in required}
+    ) != len(required):
+        raise CovalentAlchemyError("required covalent atom pairs must be one-to-one")
+    if any(
+        atom_a < 0 or atom_a >= molecule_a.GetNumAtoms()
+        or atom_b < 0 or atom_b >= molecule_b.GetNumAtoms()
+        for atom_a, atom_b in required
+    ):
+        raise CovalentAlchemyError("required covalent atom pair is outside the molecule")
+    required_heavy = {
+        pair for pair in required
+        if molecule_a.GetAtomWithIdx(pair[0]).GetAtomicNum() != 1
+        and molecule_b.GetAtomWithIdx(pair[1]).GetAtomicNum() != 1
+    }
     candidates = []
     conformer_a = molecule_a.GetConformer()
     conformer_b = molecule_b.GetConformer()
     for match_a in matches_a:
         for match_b in matches_b:
-            mapping = dict(zip(match_a, match_b))
-            if not required.issubset(mapping.items()):
+            mapping = {
+                heavy_molecules[0].GetAtomWithIdx(atom_a).GetIntProp("_covalent_original_index"):
+                heavy_molecules[1].GetAtomWithIdx(atom_b).GetIntProp("_covalent_original_index")
+                for atom_a, atom_b in zip(match_a, match_b)
+            }
+            if not required_heavy.issubset(mapping.items()):
                 continue
             squared = []
             for atom_a, atom_b in mapping.items():
@@ -72,8 +115,46 @@ def find_covalent_atom_map(
                 squared.append(float(difference @ difference))
             candidates.append((float(np.sqrt(np.mean(squared))), mapping))
     if not candidates:
-        raise CovalentAlchemyError("no MCS mapping contains all required core atom pairs")
+        raise CovalentAlchemyError("no connected MCS mapping contains all covalent anchor pairs")
     mapping = min(candidates, key=lambda item: item[0])[1]
+    required_by_a = dict(required)
+    conformer_a = molecule_a.GetConformer()
+    conformer_b = molecule_b.GetConformer()
+    for atom_a, atom_b in list(mapping.items()):
+        hydrogens_a = sorted(
+            atom.GetIdx() for atom in molecule_a.GetAtomWithIdx(atom_a).GetNeighbors()
+            if atom.GetAtomicNum() == 1
+        )
+        hydrogens_b = sorted(
+            atom.GetIdx() for atom in molecule_b.GetAtomWithIdx(atom_b).GetNeighbors()
+            if atom.GetAtomicNum() == 1
+        )
+        if len(hydrogens_a) != len(hydrogens_b):
+            continue
+        fixed = {
+            hydrogen_a: required_by_a[hydrogen_a]
+            for hydrogen_a in hydrogens_a if hydrogen_a in required_by_a
+        }
+        if any(hydrogen_b not in hydrogens_b for hydrogen_b in fixed.values()):
+            continue
+        remaining_a = [atom for atom in hydrogens_a if atom not in fixed]
+        remaining_b = [atom for atom in hydrogens_b if atom not in fixed.values()]
+        best = None
+        for ordered_b in permutations(remaining_b):
+            squared = 0.0
+            for hydrogen_a, hydrogen_b in zip(remaining_a, ordered_b):
+                difference = np.asarray(conformer_a.GetAtomPosition(hydrogen_a)) - np.asarray(
+                    conformer_b.GetAtomPosition(hydrogen_b)
+                )
+                squared += float(difference @ difference)
+            candidate = (squared, ordered_b)
+            if best is None or candidate < best:
+                best = candidate
+        mapping.update(fixed)
+        if best is not None:
+            mapping.update(zip(remaining_a, best[1]))
+    if not required.issubset(mapping.items()):
+        raise CovalentAlchemyError("anchored MCS could not preserve all required explicit-hydrogen pairs")
     for atom_a, atom_b in mapping.items():
         left = molecule_a.GetAtomWithIdx(atom_a)
         right = molecule_b.GetAtomWithIdx(atom_b)
@@ -99,53 +180,6 @@ def _atom_signature(atom: Chem.Atom):
 
 def _bond_signature(bond: Chem.Bond):
     return (bond.GetBondType(), bond.GetIsAromatic(), bond.IsInRing())
-
-
-def _expand_required_mapping(molecule_a, molecule_b, required_pairs):
-    mapping = dict(required_pairs)
-    if len(mapping) != len(required_pairs) or len(set(mapping.values())) != len(mapping):
-        raise CovalentAlchemyError("required atom pairs must be one-to-one")
-    for atom_a, atom_b in mapping.items():
-        if _atom_signature(molecule_a.GetAtomWithIdx(atom_a)) != _atom_signature(
-            molecule_b.GetAtomWithIdx(atom_b)
-        ):
-            raise CovalentAlchemyError(f"required atom pair {atom_a}:{atom_b} is chemically incompatible")
-
-    reverse = {atom_b: atom_a for atom_a, atom_b in mapping.items()}
-    conformer_a = molecule_a.GetConformer()
-    conformer_b = molecule_b.GetConformer()
-    changed = True
-    while changed:
-        changed = False
-        proposals = []
-        for atom_a, atom_b in list(mapping.items()):
-            center_a = molecule_a.GetAtomWithIdx(atom_a)
-            center_b = molecule_b.GetAtomWithIdx(atom_b)
-            neighbors_a = [neighbor for neighbor in center_a.GetNeighbors() if neighbor.GetIdx() not in mapping]
-            neighbors_b = [neighbor for neighbor in center_b.GetNeighbors() if neighbor.GetIdx() not in reverse]
-            for neighbor_a in neighbors_a:
-                bond_a = molecule_a.GetBondBetweenAtoms(atom_a, neighbor_a.GetIdx())
-                candidates = []
-                for neighbor_b in neighbors_b:
-                    bond_b = molecule_b.GetBondBetweenAtoms(atom_b, neighbor_b.GetIdx())
-                    if _atom_signature(neighbor_a) != _atom_signature(neighbor_b):
-                        continue
-                    if _bond_signature(bond_a) != _bond_signature(bond_b):
-                        continue
-                    distance = np.linalg.norm(
-                        np.asarray(conformer_a.GetAtomPosition(neighbor_a.GetIdx()))
-                        - np.asarray(conformer_b.GetAtomPosition(neighbor_b.GetIdx()))
-                    )
-                    candidates.append((float(distance), neighbor_b.GetIdx()))
-                if candidates:
-                    proposals.append((min(candidates), neighbor_a.GetIdx()))
-        for (distance, atom_b), atom_a in sorted(proposals):
-            if atom_a in mapping or atom_b in reverse:
-                continue
-            mapping[atom_a] = atom_b
-            reverse[atom_b] = atom_a
-            changed = True
-    return mapping
 
 
 def _source_force(system: mm.System, cls):
@@ -175,34 +209,126 @@ def _add_union_constraints(output, systems_and_maps):
         output.addConstraint(*pair, distance_nm * unit.nanometer)
 
 
-def _add_bonds(target, source, mapping, include):
+def _add_bonds(target, source, mapping, include, scale=lambda _: 1.0):
     if source is None:
         return
     for index in range(source.getNumBonds()):
         particle1, particle2, length, k = source.getBondParameters(index)
         particles = (int(particle1), int(particle2))
         if include(particles):
-            target.addBond(*_mapped_indices(particles, mapping), length, k)
+            target.addBond(*_mapped_indices(particles, mapping), length, k * scale(particles))
 
 
-def _add_angles(target, source, mapping, include):
+def _add_angles(target, source, mapping, include, scale=lambda _: 1.0):
     if source is None:
         return
     for index in range(source.getNumAngles()):
         particle1, particle2, particle3, angle, k = source.getAngleParameters(index)
         particles = (int(particle1), int(particle2), int(particle3))
         if include(particles):
-            target.addAngle(*_mapped_indices(particles, mapping), angle, k)
+            target.addAngle(*_mapped_indices(particles, mapping), angle, k * scale(particles))
 
 
-def _add_torsions(target, source, mapping, include):
+def _add_torsions(target, source, mapping, include, scale=lambda _: 1.0):
     if source is None:
         return
     for index in range(source.getNumTorsions()):
         p1, p2, p3, p4, periodicity, phase, k = source.getTorsionParameters(index)
         particles = (int(p1), int(p2), int(p3), int(p4))
         if include(particles):
-            target.addTorsion(*_mapped_indices(particles, mapping), periodicity, phase, k)
+            target.addTorsion(
+                *_mapped_indices(particles, mapping), periodicity, phase, k * scale(particles)
+            )
+
+
+def _is_proper_torsion(molecule: Chem.Mol, atoms: tuple[int, ...]) -> bool:
+    return all(
+        molecule.GetBondBetweenAtoms(atoms[index], atoms[index + 1]) is not None
+        for index in range(3)
+    )
+
+
+def _inactive_scales(molecule, unique, scales):
+    def angle(atoms):
+        terminal_unique = sum(atom in unique for atom in (atoms[0], atoms[2]))
+        if terminal_unique == 1 and atoms[1] not in unique:
+            return scales.junction_angle
+        return scales.angle
+
+    def torsion(atoms):
+        if not _is_proper_torsion(molecule, atoms):
+            return scales.proper_torsion
+        terminal_unique = sum(atom in unique for atom in (atoms[0], atoms[3]))
+        if terminal_unique == 1:
+            return scales.junction_proper_torsion
+        return scales.proper_torsion
+
+    return angle, torsion
+
+
+def _exception_parameters(force: mm.NonbondedForce):
+    return {
+        tuple(sorted((int(force.getExceptionParameters(index)[0]), int(force.getExceptionParameters(index)[1])))):
+        force.getExceptionParameters(index)[2:]
+        for index in range(force.getNumExceptions())
+    }
+
+
+def _add_unique_vacuum_nonbonded(
+    output,
+    sources_and_maps,
+    endpoint_nonbonded,
+):
+    """Keep each unique branch's complete internal nonbonded Hamiltonian always on."""
+    vacuum = mm.CustomBondForce(
+        "ONE_4PI_EPS0*chargeprod/r + 4*epsilon*((sigma/r)^12-(sigma/r)^6)"
+    )
+    vacuum.setName("CovalentUniqueVacuumNonbondedForce")
+    vacuum.addGlobalParameter("ONE_4PI_EPS0", 138.935456)
+    for parameter in ("chargeprod", "sigma", "epsilon"):
+        vacuum.addPerBondParameter(parameter)
+
+    existing = {
+        tuple(sorted((int(endpoint_nonbonded.getExceptionParameters(index)[0]),
+                      int(endpoint_nonbonded.getExceptionParameters(index)[1])))): index
+        for index in range(endpoint_nonbonded.getNumExceptions())
+    }
+    for source, mapping, unique in sources_and_maps:
+        source_nb = _source_force(source, mm.NonbondedForce)
+        exceptions = _exception_parameters(source_nb)
+        for offset, atom1 in enumerate(sorted(unique)):
+            q1, sigma1, epsilon1 = source_nb.getParticleParameters(atom1)
+            for atom2 in sorted(unique)[offset + 1:]:
+                pair = tuple(sorted((atom1, atom2)))
+                if pair in exceptions:
+                    chargeprod, sigma, epsilon = exceptions[pair]
+                    if (
+                        abs(chargeprod.value_in_unit(unit.elementary_charge**2)) < 1.0e-14
+                        and abs(epsilon.value_in_unit(unit.kilojoule_per_mole)) < 1.0e-14
+                    ):
+                        parameters = None
+                    else:
+                        parameters = (chargeprod, sigma, epsilon)
+                else:
+                    q2, sigma2, epsilon2 = source_nb.getParticleParameters(atom2)
+                    parameters = (
+                        q1 * q2,
+                        0.5 * (sigma1 + sigma2),
+                        (epsilon1 * epsilon2) ** 0.5,
+                    )
+                hybrid_pair = tuple(sorted((mapping[atom1], mapping[atom2])))
+                if parameters is not None:
+                    vacuum.addBond(*hybrid_pair, parameters)
+                if hybrid_pair in existing:
+                    index = existing[hybrid_pair]
+                    p1, p2, _, sigma, _ = endpoint_nonbonded.getExceptionParameters(index)
+                    endpoint_nonbonded.setExceptionParameters(index, p1, p2, 0.0, sigma, 0.0)
+                else:
+                    existing[hybrid_pair] = endpoint_nonbonded.addException(
+                        *hybrid_pair, 0.0, 1.0, 0.0
+                    )
+    if vacuum.getNumBonds():
+        output.addForce(vacuum)
 
 
 def _build_endpoint(
@@ -213,6 +339,9 @@ def _build_endpoint(
     unique_a: set[int],
     unique_b: set[int],
     state: str,
+    molecule_a: Chem.Mol,
+    molecule_b: Chem.Mol,
+    dummy_bonded_scales: DummyBondedScales,
 ) -> mm.System:
     output = mm.System()
     reverse_a = {hybrid: atom for atom, hybrid in map_a_to_hybrid.items()}
@@ -238,20 +367,28 @@ def _build_endpoint(
     force_b_angle = _source_force(system_b, mm.HarmonicAngleForce)
     force_a_torsion = _source_force(system_a, mm.PeriodicTorsionForce)
     force_b_torsion = _source_force(system_b, mm.PeriodicTorsionForce)
+    angle_scale_a, torsion_scale_a = _inactive_scales(
+        molecule_a, unique_a, dummy_bonded_scales
+    )
+    angle_scale_b, torsion_scale_b = _inactive_scales(
+        molecule_b, unique_b, dummy_bonded_scales
+    )
     if state == "a":
         _add_bonds(bonds, force_a_bond, map_a_to_hybrid, lambda _: True)
         _add_angles(angles, force_a_angle, map_a_to_hybrid, lambda _: True)
         _add_torsions(torsions, force_a_torsion, map_a_to_hybrid, lambda _: True)
-        _add_bonds(bonds, force_b_bond, map_b_to_hybrid, lambda atoms: any(i in unique_b for i in atoms))
-        _add_angles(angles, force_b_angle, map_b_to_hybrid, lambda atoms: any(i in unique_b for i in atoms))
-        _add_torsions(torsions, force_b_torsion, map_b_to_hybrid, lambda atoms: any(i in unique_b for i in atoms))
+        include = lambda atoms: any(i in unique_b for i in atoms)
+        _add_bonds(bonds, force_b_bond, map_b_to_hybrid, include, lambda _: dummy_bonded_scales.bond)
+        _add_angles(angles, force_b_angle, map_b_to_hybrid, include, angle_scale_b)
+        _add_torsions(torsions, force_b_torsion, map_b_to_hybrid, include, torsion_scale_b)
     else:
         _add_bonds(bonds, force_b_bond, map_b_to_hybrid, lambda _: True)
         _add_angles(angles, force_b_angle, map_b_to_hybrid, lambda _: True)
         _add_torsions(torsions, force_b_torsion, map_b_to_hybrid, lambda _: True)
-        _add_bonds(bonds, force_a_bond, map_a_to_hybrid, lambda atoms: any(i in unique_a for i in atoms))
-        _add_angles(angles, force_a_angle, map_a_to_hybrid, lambda atoms: any(i in unique_a for i in atoms))
-        _add_torsions(torsions, force_a_torsion, map_a_to_hybrid, lambda atoms: any(i in unique_a for i in atoms))
+        include = lambda atoms: any(i in unique_a for i in atoms)
+        _add_bonds(bonds, force_a_bond, map_a_to_hybrid, include, lambda _: dummy_bonded_scales.bond)
+        _add_angles(angles, force_a_angle, map_a_to_hybrid, include, angle_scale_a)
+        _add_torsions(torsions, force_a_torsion, map_a_to_hybrid, include, torsion_scale_a)
     for force in (bonds, angles, torsions):
         if (hasattr(force, "getNumBonds") and force.getNumBonds()) or (
             hasattr(force, "getNumAngles") and force.getNumAngles()
@@ -279,6 +416,14 @@ def _build_endpoint(
         p1, p2, charge, sigma, epsilon = source_nonbonded.getExceptionParameters(index)
         nonbonded.addException(source_mapping[int(p1)], source_mapping[int(p2)], charge, sigma, epsilon)
     output.addForce(nonbonded)
+    _add_unique_vacuum_nonbonded(
+        output,
+        (
+            (system_a, map_a_to_hybrid, unique_a),
+            (system_b, map_b_to_hybrid, unique_b),
+        ),
+        nonbonded,
+    )
     return output
 
 
@@ -319,12 +464,25 @@ def build_covalent_hybrid_molecule(
     parameters_b: CovalentParameterBundle,
     *,
     required_pairs: list[tuple[int, int]] | None = None,
+    attachment_pairs: tuple[tuple[int, int], tuple[int, int]] | None = None,
+    dummy_bonded_scales: DummyBondedScales | None = None,
 ) -> CovalentHybridMolecule:
     molecule_a = _rdkit_molecule(parameters_a)
     molecule_b = _rdkit_molecule(parameters_b)
+    scales = dummy_bonded_scales or DummyBondedScales()
     map_a_to_b = find_covalent_atom_map(
         molecule_a, molecule_b, required_pairs=required_pairs
     )
+    if attachment_pairs is not None:
+        sulfur_pair, ligand_pair = attachment_pairs
+        if map_a_to_b.get(sulfur_pair[0]) != sulfur_pair[1] or map_a_to_b.get(
+            ligand_pair[0]
+        ) != ligand_pair[1]:
+            raise CovalentAlchemyError("covalent MCS does not contain the required attachment atoms")
+        bond_a = molecule_a.GetBondBetweenAtoms(sulfur_pair[0], ligand_pair[0])
+        bond_b = molecule_b.GetBondBetweenAtoms(sulfur_pair[1], ligand_pair[1])
+        if bond_a is None or bond_b is None or _bond_signature(bond_a) != _bond_signature(bond_b):
+            raise CovalentAlchemyError("covalent attachment bond differs between endpoints")
     map_a_to_hybrid = {index: index for index in range(molecule_a.GetNumAtoms())}
     map_b_to_hybrid = {atom_b: atom_a for atom_a, atom_b in map_a_to_b.items()}
     next_index = molecule_a.GetNumAtoms()
@@ -342,6 +500,9 @@ def build_covalent_hybrid_molecule(
         unique_a,
         unique_b,
         "a",
+        molecule_a,
+        molecule_b,
+        scales,
     )
     endpoint_b = _build_endpoint(
         parameters_a.system,
@@ -351,6 +512,9 @@ def build_covalent_hybrid_molecule(
         unique_a,
         unique_b,
         "b",
+        molecule_a,
+        molecule_b,
+        scales,
     )
     positions = np.zeros((next_index, 3), dtype=float)
     conformer_a = molecule_a.GetConformer()
@@ -370,4 +534,7 @@ def build_covalent_hybrid_molecule(
         map_b_to_hybrid,
         tuple(sorted(unique_a)),
         tuple(sorted(unique_b)),
+        tuple(required_pairs or ()),
+        attachment_pairs,
+        scales,
     )
