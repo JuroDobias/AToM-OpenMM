@@ -37,6 +37,7 @@ from atom_openmm.rest2_exchange import REST2ExchangeSampler
 
 LOGGER = logging.getLogger("atom_openmm.covalent_workflow")
 KCAL_TO_KJ = 4.184
+LRC_CORRECTION_VERSION = 2
 
 
 class CovalentWorkflowError(ValueError):
@@ -424,6 +425,8 @@ def _append_lrc_diagnostic(
     initial_correction_kj,
     final_correction_kj,
     volume_nm3,
+    correction_version=None,
+    evaluation_platform=None,
 ):
     path = Path(path)
     new = not path.exists()
@@ -443,6 +446,8 @@ def _append_lrc_diagnostic(
                     "lrc_delta_kj_per_mol",
                     "corrected_work_kj_per_mol",
                     "volume_nm3",
+                    "correction_version",
+                    "evaluation_platform",
                 ]
             )
         writer.writerow(
@@ -456,6 +461,8 @@ def _append_lrc_diagnostic(
                 delta,
                 corrected,
                 volume_nm3,
+                correction_version,
+                evaluation_platform,
             ]
         )
     return corrected
@@ -550,12 +557,6 @@ def _softcore_switch_context(
     return context, integrator, values
 
 
-def _softcore_correction_context(hamiltonian, platform, properties):
-    integrator = mm.VerletIntegrator(1.0 * unit.femtosecond)
-    context = mm.Context(hamiltonian.system, integrator, platform, properties)
-    return context, integrator
-
-
 def _set_softcore_parameters(context, parameter_values, node):
     for name, values in parameter_values.items():
         context.setParameter(name, float(values[node]))
@@ -568,18 +569,72 @@ def _softcore_group_energy(context):
     ).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
 
 
-def _lrc_energy_correction(
-    no_lrc_context,
-    lrc_context,
-    state,
-    parameter_values,
-    node,
-):
-    _apply_state(lrc_context, state)
-    _set_softcore_parameters(lrc_context, parameter_values, node)
-    no_lrc = _softcore_group_energy(no_lrc_context)
-    with_lrc = _softcore_group_energy(lrc_context)
-    return with_lrc - no_lrc
+def _lrc_correction_platform():
+    try:
+        platform = mm.Platform.getPlatformByName("CPU")
+        properties = {}
+        if "Threads" in set(platform.getPropertyNames()):
+            properties["Threads"] = "1"
+        return platform, properties
+    except Exception:
+        return mm.Platform.getPlatformByName("Reference"), {}
+
+
+class _EndpointLRCCorrectionEvaluator:
+    """Evaluate endpoint LRC values in paired, identically configured contexts."""
+
+    def __init__(self, no_lrc_hamiltonian, lrc_hamiltonian):
+        platform, properties = _lrc_correction_platform()
+        self.platform_name = platform.getName()
+        self.no_lrc_integrator = mm.VerletIntegrator(1.0 * unit.femtosecond)
+        self.lrc_integrator = mm.VerletIntegrator(1.0 * unit.femtosecond)
+        self.no_lrc_context = mm.Context(
+            no_lrc_hamiltonian.system,
+            self.no_lrc_integrator,
+            platform,
+            properties,
+        )
+        self.lrc_context = mm.Context(
+            lrc_hamiltonian.system,
+            self.lrc_integrator,
+            platform,
+            properties,
+        )
+
+    def correction(self, state, parameter_values, node):
+        for context in (self.no_lrc_context, self.lrc_context):
+            _apply_state(context, state)
+            _set_softcore_parameters(context, parameter_values, node)
+        no_lrc = _softcore_group_energy(self.no_lrc_context)
+        with_lrc = _softcore_group_energy(self.lrc_context)
+        correction = with_lrc - no_lrc
+        if not np.isfinite(correction):
+            raise CovalentWorkflowError("non-finite softcore endpoint LRC correction")
+        return float(correction)
+
+    def close(self):
+        self.no_lrc_context = None
+        self.lrc_context = None
+        self.no_lrc_integrator = None
+        self.lrc_integrator = None
+
+
+def _precompute_endpoint_lrc_corrections(evaluator, state_a, state_b, parameter_values):
+    try:
+        return {
+            "forward": {
+                "initial": evaluator.correction(state_a, parameter_values, 0),
+                "final": evaluator.correction(state_a, parameter_values, -1),
+                "volume_nm3": _state_volume_nm3(state_a),
+            },
+            "reverse": {
+                "initial": evaluator.correction(state_b, parameter_values, -1),
+                "final": evaluator.correction(state_b, parameter_values, 0),
+                "volume_nm3": _state_volume_nm3(state_b),
+            },
+        }
+    finally:
+        evaluator.close()
 
 
 def _state_volume_nm3(state):
@@ -720,8 +775,8 @@ def _run_environment(
     rest2_summaries = {}
     softcore = None
     softcore_contexts = {}
-    lrc_context = None
-    lrc_integrator = None
+    lrc_corrections = None
+    lrc_evaluation_platform = None
     if config["interpolation"] == "softcore_linear":
         unique_a = prepared.provenance["unique_a_particle_indices"]
         unique_b = prepared.provenance["unique_b_particle_indices"]
@@ -749,8 +804,29 @@ def _run_environment(
                 use_long_range_correction=True,
                 **softcore_options,
             )
-            lrc_context, lrc_integrator = _softcore_correction_context(
-                lrc_hamiltonian, platform, properties
+            lrc_evaluator = _EndpointLRCCorrectionEvaluator(
+                softcore,
+                lrc_hamiltonian,
+            )
+            lrc_evaluation_platform = lrc_evaluator.platform_name
+            lrc_corrections = _precompute_endpoint_lrc_corrections(
+                lrc_evaluator,
+                _load_state(state_files["a"]),
+                _load_state(state_files["b"]),
+                softcore.parameter_values,
+            )
+            LOGGER.info(
+                "%s endpoint LRC corrections precomputed in paired %s contexts: "
+                "forward delta %.6f kJ/mol at %.6f nm^3; reverse delta %.6f "
+                "kJ/mol at %.6f nm^3",
+                name,
+                lrc_evaluation_platform,
+                lrc_corrections["forward"]["final"]
+                - lrc_corrections["forward"]["initial"],
+                lrc_corrections["forward"]["volume_nm3"],
+                lrc_corrections["reverse"]["final"]
+                - lrc_corrections["reverse"]["initial"],
+                lrc_corrections["reverse"]["volume_nm3"],
             )
         LOGGER.info(
             "%s softcore switching system ready: charge %d + sterics %d + charge %d "
@@ -833,15 +909,21 @@ def _run_environment(
                     context, integrator, parameter_values = cached
                     _reset_softcore_context(context, integrator, parameter_values)
                 _apply_state(context, state)
-                if lrc_context is not None:
-                    initial_lrc_kj = _lrc_energy_correction(
-                        context,
-                        lrc_context,
-                        state,
-                        parameter_values,
-                        0,
-                    )
+                if lrc_corrections is not None:
+                    correction = lrc_corrections[direction]
+                    initial_lrc_kj = correction["initial"]
+                    final_lrc_kj = correction["final"]
                     volume_nm3 = _state_volume_nm3(state)
+                    if not np.isclose(
+                        volume_nm3,
+                        correction["volume_nm3"],
+                        atol=1.0e-8,
+                        rtol=0.0,
+                    ):
+                        raise CovalentWorkflowError(
+                            f"{name} {direction} endpoint volume changed after LRC "
+                            "precomputation"
+                        )
                 started = time.perf_counter()
                 integrator.step(int(config["switch_steps"]))
                 switch_elapsed = time.perf_counter() - started
@@ -872,14 +954,7 @@ def _run_environment(
                     unit.kilojoules_per_mole
                 )
                 work_kj = raw_work_kj
-                if lrc_context is not None:
-                    final_lrc_kj = _lrc_energy_correction(
-                        context,
-                        lrc_context,
-                        post_switch_state,
-                        parameter_values,
-                        -1,
-                    )
+                if lrc_corrections is not None:
                     final_volume_nm3 = _state_volume_nm3(post_switch_state)
                     if not np.isclose(final_volume_nm3, volume_nm3, atol=1.0e-8):
                         raise CovalentWorkflowError(
@@ -894,6 +969,8 @@ def _run_environment(
                         initial_lrc_kj,
                         final_lrc_kj,
                         volume_nm3,
+                        correction_version=LRC_CORRECTION_VERSION,
+                        evaluation_platform=lrc_evaluation_platform,
                     )
                     LOGGER.info(
                         "%s %s sample %d LRC correction: raw %.6f + delta %.6f "
@@ -1085,6 +1162,12 @@ def _switch_protocol(config):
     }
     if config["interpolation"] == "softcore_linear":
         protocol["softcore"] = dict(config["softcore"])
+        if config["softcore"]["long_range_correction"] == "endpoint_correction":
+            protocol["softcore_endpoint_correction"] = {
+                "version": LRC_CORRECTION_VERSION,
+                "evaluation_platform": "CPU",
+                "evaluation": "precomputed_per_endpoint_and_switch_volume",
+            }
         protocol["stages"] = [
             {
                 "name": "discharge_a",

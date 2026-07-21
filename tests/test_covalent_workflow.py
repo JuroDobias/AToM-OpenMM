@@ -13,8 +13,43 @@ from atom_openmm.covalent_workflow import (
     _dummy_particles,
     _write_switch_pdb,
     _ensure_switch_protocol,
+    _precompute_endpoint_lrc_corrections,
+    _switch_protocol,
     _validate_softcore_endpoint_charge,
 )
+
+
+class _BoxState:
+    def __init__(self, length_nm):
+        self.vectors = unit.Quantity(
+            [
+                [length_nm, 0.0, 0.0],
+                [0.0, length_nm, 0.0],
+                [0.0, 0.0, length_nm],
+            ],
+            unit.nanometer,
+        )
+
+    def getPeriodicBoxVectors(self, asNumpy=False):
+        if asNumpy:
+            return self.vectors
+        values = self.vectors.value_in_unit(unit.nanometer)
+        return tuple(mm.Vec3(*row) * unit.nanometer for row in values)
+
+
+class _RecordingLRCEvaluator:
+    platform_name = "CPU"
+
+    def __init__(self):
+        self.calls = []
+        self.closed = False
+
+    def correction(self, state, parameter_values, node):
+        self.calls.append((state, parameter_values, node))
+        return float(len(self.calls))
+
+    def close(self):
+        self.closed = True
 
 
 def test_apply_state_accepts_positions_without_velocities():
@@ -29,6 +64,29 @@ def test_apply_state_accepts_positions_without_velocities():
 
     observed = target.getState(getPositions=True).getPositions(asNumpy=True)
     assert observed[0].x == positions_only.getPositions(asNumpy=True)[0].x
+
+
+def test_endpoint_lrc_corrections_are_precomputed_for_both_fixed_boxes():
+    state_a = _BoxState(2.0)
+    state_b = _BoxState(3.0)
+    values = {"lambda_sterics_a": [1.0, 0.0]}
+    evaluator = _RecordingLRCEvaluator()
+
+    corrections = _precompute_endpoint_lrc_corrections(
+        evaluator, state_a, state_b, values
+    )
+
+    assert corrections == {
+        "forward": {"initial": 1.0, "final": 2.0, "volume_nm3": 8.0},
+        "reverse": {"initial": 3.0, "final": 4.0, "volume_nm3": 27.0},
+    }
+    assert [(call[0], call[2]) for call in evaluator.calls] == [
+        (state_a, 0),
+        (state_a, -1),
+        (state_b, -1),
+        (state_b, 0),
+    ]
+    assert evaluator.closed
 
 
 def test_switch_pdb_marks_dummy_atoms_with_zero_occupancy(tmp_path):
@@ -151,6 +209,21 @@ def test_softcore_resume_rejects_changed_lrc_mode(tmp_path):
         assert "different switching protocol" in str(exc)
     else:
         raise AssertionError("changed LRC mode was accepted for resume")
+
+
+def test_endpoint_lrc_protocol_records_stable_correction_version():
+    config = _normalized_settings(
+        {
+            "neqti": {
+                "interpolation": "softcore_linear",
+                "softcore": {"long_range_correction": "endpoint_correction"},
+            }
+        }
+    )
+    correction = _switch_protocol(config)["softcore_endpoint_correction"]
+    assert correction["version"] == 2
+    assert correction["evaluation_platform"] == "CPU"
+    assert correction["evaluation"] == "precomputed_per_endpoint_and_switch_volume"
 
 
 def test_softcore_rejects_different_endpoint_total_charge():

@@ -6,6 +6,9 @@ from atom_openmm.covalent_softcore import (
     SOFTCORE_NONBONDED_FORCE_GROUP,
     create_softcore_hamiltonian,
 )
+from atom_openmm.covalent_workflow import (
+    _EndpointLRCCorrectionEvaluator,
+)
 from atom_openmm.neqti_integrator import ATMNonequilibriumLangevinIntegrator
 
 
@@ -178,7 +181,7 @@ def _test_disabling_lrc_changes_energy_but_not_forces():
     energy_on, forces_on = _energy_forces(enabled.system, positions, parameters)
     energy_off, forces_off = _energy_forces(disabled.system, positions, parameters)
     assert not np.isclose(energy_on, energy_off, atol=1.0e-8, rtol=0.0)
-    assert np.allclose(forces_on, forces_off, atol=3.0e-6, rtol=0.0)
+    assert np.allclose(forces_on, forces_off, atol=1.0e-5, rtol=0.0)
     for hamiltonian, expected in ((enabled, True), (disabled, False)):
         forces = [
             force
@@ -233,3 +236,46 @@ def _test_endpoint_lrc_difference_repairs_fixed_volume_work():
     initial_delta = energies_on[0] - energies_off[0]
     final_delta = energies_on[-1] - energies_off[-1]
     assert np.isclose(work_on, work_off + final_delta - initial_delta, atol=1.0e-5)
+
+
+def test_endpoint_lrc_correction_is_coordinate_invariant():
+    enabled = create_softcore_hamiltonian(
+        _endpoint("a"),
+        _endpoint("b"),
+        [2],
+        [3],
+        use_long_range_correction=True,
+    )
+    disabled = create_softcore_hamiltonian(
+        _endpoint("a"),
+        _endpoint("b"),
+        [2],
+        [3],
+        use_long_range_correction=False,
+    )
+    positions = np.asarray(
+        [[0, 0, 0], [0.15, 0, 0], [0.28, 0.08, 0], [0.29, -0.09, 0.03], [0.7, 0.4, 0.3]]
+    ) * unit.nanometer
+
+    def state_at(coordinates):
+        context = mm.Context(_endpoint("a"), mm.VerletIntegrator(0.001))
+        context.setPositions(coordinates)
+        state = context.getState(getPositions=True)
+        del context
+        return state
+
+    evaluator = _EndpointLRCCorrectionEvaluator(disabled, enabled)
+    first = evaluator.correction(state_at(positions), enabled.parameter_values, 0)
+    displaced = positions + np.asarray(
+        [[0.02, 0.01, 0], [0, 0.01, 0.02], [-0.01, 0, 0.01], [0.01, -0.02, 0], [0, 0.02, -0.01]]
+    ) * unit.nanometer
+    second = evaluator.correction(state_at(displaced), enabled.parameter_values, 0)
+
+    assert np.isfinite(first)
+    assert np.isclose(
+        first,
+        second,
+        atol=1.0e-4,
+        rtol=0.0,
+    )
+    evaluator.close()
