@@ -50,6 +50,141 @@ def _rdkit_molecule(bundle: CovalentParameterBundle) -> Chem.Mol:
     return molecule
 
 
+def complete_covalent_atom_map(
+    molecule_a: Chem.Mol,
+    molecule_b: Chem.Mol,
+    mapping: dict[int, int],
+    *,
+    required_pairs: list[tuple[int, int]] | None = None,
+) -> dict[int, int]:
+    """Complete mapped heavy atoms with compatible hydrogens and validate the map."""
+    mapping = {int(atom_a): int(atom_b) for atom_a, atom_b in mapping.items()}
+    required = set(required_pairs or [])
+    if len(required) != len(required_pairs or ()):
+        raise CovalentAlchemyError("required covalent atom pairs contain duplicates")
+    if len(set(mapping.values())) != len(mapping):
+        raise CovalentAlchemyError("covalent atom map must be one-to-one")
+    if any(
+        atom_a < 0 or atom_a >= molecule_a.GetNumAtoms()
+        or atom_b < 0 or atom_b >= molecule_b.GetNumAtoms()
+        for atom_a, atom_b in set(mapping.items()) | required
+    ):
+        raise CovalentAlchemyError("covalent atom pair is outside the molecule")
+    if not required.issubset(mapping.items()):
+        raise CovalentAlchemyError("covalent atom map does not contain all required pairs")
+
+    required_by_a = dict(required)
+    conformer_a = molecule_a.GetConformer()
+    conformer_b = molecule_b.GetConformer()
+    for atom_a, atom_b in list(mapping.items()):
+        if molecule_a.GetAtomWithIdx(atom_a).GetAtomicNum() == 1:
+            continue
+        hydrogens_a = sorted(
+            atom.GetIdx() for atom in molecule_a.GetAtomWithIdx(atom_a).GetNeighbors()
+            if atom.GetAtomicNum() == 1
+        )
+        hydrogens_b = sorted(
+            atom.GetIdx() for atom in molecule_b.GetAtomWithIdx(atom_b).GetNeighbors()
+            if atom.GetAtomicNum() == 1
+        )
+        if len(hydrogens_a) != len(hydrogens_b):
+            continue
+        fixed = {
+            hydrogen_a: required_by_a[hydrogen_a]
+            for hydrogen_a in hydrogens_a if hydrogen_a in required_by_a
+        }
+        if any(hydrogen_b not in hydrogens_b for hydrogen_b in fixed.values()):
+            continue
+        remaining_a = [
+            atom for atom in hydrogens_a
+            if atom not in fixed and atom not in mapping
+        ]
+        mapped_b = set(mapping.values()) | set(fixed.values())
+        remaining_b = [atom for atom in hydrogens_b if atom not in mapped_b]
+        if len(remaining_a) != len(remaining_b):
+            continue
+        best = None
+        for ordered_b in permutations(remaining_b):
+            squared = 0.0
+            for hydrogen_a, hydrogen_b in zip(remaining_a, ordered_b):
+                difference = np.asarray(conformer_a.GetAtomPosition(hydrogen_a)) - np.asarray(
+                    conformer_b.GetAtomPosition(hydrogen_b)
+                )
+                squared += float(difference @ difference)
+            candidate = (squared, ordered_b)
+            if best is None or candidate < best:
+                best = candidate
+        mapping.update(fixed)
+        if best is not None:
+            mapping.update(zip(remaining_a, best[1]))
+
+    if not required.issubset(mapping.items()):
+        raise CovalentAlchemyError(
+            "covalent atom map could not preserve all required explicit-hydrogen pairs"
+        )
+    for atom_a, atom_b in mapping.items():
+        left = molecule_a.GetAtomWithIdx(atom_a)
+        right = molecule_b.GetAtomWithIdx(atom_b)
+        if (
+            left.GetAtomicNum() != right.GetAtomicNum()
+            or left.GetFormalCharge() != right.GetFormalCharge()
+            or left.GetIsAromatic() != right.GetIsAromatic()
+            or left.IsInRing() != right.IsInRing()
+        ):
+            raise CovalentAlchemyError(f"invalid mapped atom pair {atom_a}:{atom_b}")
+
+    mapped_heavy = {
+        atom_a for atom_a in mapping
+        if molecule_a.GetAtomWithIdx(atom_a).GetAtomicNum() != 1
+    }
+    for atom_a in mapped_heavy:
+        atom_b = mapping[atom_a]
+        for neighbor_a in molecule_a.GetAtomWithIdx(atom_a).GetNeighbors():
+            other_a = neighbor_a.GetIdx()
+            if other_a not in mapped_heavy or atom_a > other_a:
+                continue
+            other_b = mapping[other_a]
+            bond_a = molecule_a.GetBondBetweenAtoms(atom_a, other_a)
+            bond_b = molecule_b.GetBondBetweenAtoms(atom_b, other_b)
+            if bond_b is None or _bond_signature(bond_a) != _bond_signature(bond_b):
+                raise CovalentAlchemyError(
+                    f"mapped bond {atom_a}:{other_a} is incompatible with {atom_b}:{other_b}"
+                )
+    reverse_mapping = {atom_b: atom_a for atom_a, atom_b in mapping.items()}
+    mapped_heavy_b = set(reverse_mapping)
+    for atom_b in mapped_heavy_b:
+        atom_a = reverse_mapping[atom_b]
+        for neighbor_b in molecule_b.GetAtomWithIdx(atom_b).GetNeighbors():
+            other_b = neighbor_b.GetIdx()
+            if other_b not in mapped_heavy_b or atom_b > other_b:
+                continue
+            other_a = reverse_mapping[other_b]
+            bond_b = molecule_b.GetBondBetweenAtoms(atom_b, other_b)
+            bond_a = molecule_a.GetBondBetweenAtoms(atom_a, other_a)
+            if bond_a is None or _bond_signature(bond_a) != _bond_signature(bond_b):
+                raise CovalentAlchemyError(
+                    f"mapped bond {atom_b}:{other_b} is incompatible with {atom_a}:{other_a}"
+                )
+    if mapped_heavy:
+        pending = [next(iter(mapped_heavy))]
+        visited = set()
+        while pending:
+            atom = pending.pop()
+            if atom in visited:
+                continue
+            visited.add(atom)
+            pending.extend(
+                neighbor.GetIdx()
+                for neighbor in molecule_a.GetAtomWithIdx(atom).GetNeighbors()
+                if neighbor.GetIdx() in mapped_heavy
+            )
+        if visited != mapped_heavy:
+            raise CovalentAlchemyError(
+                "covalent common atom map must be a connected protein-linked subgraph"
+            )
+    return mapping
+
+
 def find_covalent_atom_map(
     molecule_a: Chem.Mol,
     molecule_b: Chem.Mol,
@@ -117,55 +252,12 @@ def find_covalent_atom_map(
     if not candidates:
         raise CovalentAlchemyError("no connected MCS mapping contains all covalent anchor pairs")
     mapping = min(candidates, key=lambda item: item[0])[1]
-    required_by_a = dict(required)
-    conformer_a = molecule_a.GetConformer()
-    conformer_b = molecule_b.GetConformer()
-    for atom_a, atom_b in list(mapping.items()):
-        hydrogens_a = sorted(
-            atom.GetIdx() for atom in molecule_a.GetAtomWithIdx(atom_a).GetNeighbors()
-            if atom.GetAtomicNum() == 1
-        )
-        hydrogens_b = sorted(
-            atom.GetIdx() for atom in molecule_b.GetAtomWithIdx(atom_b).GetNeighbors()
-            if atom.GetAtomicNum() == 1
-        )
-        if len(hydrogens_a) != len(hydrogens_b):
-            continue
-        fixed = {
-            hydrogen_a: required_by_a[hydrogen_a]
-            for hydrogen_a in hydrogens_a if hydrogen_a in required_by_a
-        }
-        if any(hydrogen_b not in hydrogens_b for hydrogen_b in fixed.values()):
-            continue
-        remaining_a = [atom for atom in hydrogens_a if atom not in fixed]
-        remaining_b = [atom for atom in hydrogens_b if atom not in fixed.values()]
-        best = None
-        for ordered_b in permutations(remaining_b):
-            squared = 0.0
-            for hydrogen_a, hydrogen_b in zip(remaining_a, ordered_b):
-                difference = np.asarray(conformer_a.GetAtomPosition(hydrogen_a)) - np.asarray(
-                    conformer_b.GetAtomPosition(hydrogen_b)
-                )
-                squared += float(difference @ difference)
-            candidate = (squared, ordered_b)
-            if best is None or candidate < best:
-                best = candidate
-        mapping.update(fixed)
-        if best is not None:
-            mapping.update(zip(remaining_a, best[1]))
-    if not required.issubset(mapping.items()):
-        raise CovalentAlchemyError("anchored MCS could not preserve all required explicit-hydrogen pairs")
-    for atom_a, atom_b in mapping.items():
-        left = molecule_a.GetAtomWithIdx(atom_a)
-        right = molecule_b.GetAtomWithIdx(atom_b)
-        if (
-            left.GetAtomicNum() != right.GetAtomicNum()
-            or left.GetFormalCharge() != right.GetFormalCharge()
-            or left.GetIsAromatic() != right.GetIsAromatic()
-            or left.IsInRing() != right.IsInRing()
-        ):
-            raise CovalentAlchemyError(f"invalid mapped atom pair {atom_a}:{atom_b}")
-    return mapping
+    return complete_covalent_atom_map(
+        molecule_a,
+        molecule_b,
+        mapping,
+        required_pairs=list(required),
+    )
 
 
 def _atom_signature(atom: Chem.Atom):
@@ -464,15 +556,24 @@ def build_covalent_hybrid_molecule(
     parameters_b: CovalentParameterBundle,
     *,
     required_pairs: list[tuple[int, int]] | None = None,
+    atom_map: dict[int, int] | None = None,
     attachment_pairs: tuple[tuple[int, int], tuple[int, int]] | None = None,
     dummy_bonded_scales: DummyBondedScales | None = None,
 ) -> CovalentHybridMolecule:
     molecule_a = _rdkit_molecule(parameters_a)
     molecule_b = _rdkit_molecule(parameters_b)
     scales = dummy_bonded_scales or DummyBondedScales()
-    map_a_to_b = find_covalent_atom_map(
-        molecule_a, molecule_b, required_pairs=required_pairs
-    )
+    if atom_map is None:
+        map_a_to_b = find_covalent_atom_map(
+            molecule_a, molecule_b, required_pairs=required_pairs
+        )
+    else:
+        map_a_to_b = complete_covalent_atom_map(
+            molecule_a,
+            molecule_b,
+            atom_map,
+            required_pairs=required_pairs,
+        )
     if attachment_pairs is not None:
         sulfur_pair, ligand_pair = attachment_pairs
         if map_a_to_b.get(sulfur_pair[0]) != sulfur_pair[1] or map_a_to_b.get(

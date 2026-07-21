@@ -28,6 +28,12 @@ energy, including source-force-field 1-4 terms. `dummy_bonded_scales` reproduces
 the earlier PMX defaults: full bonds, angles, and internal proper torsions, with
 junction proper torsions disabled while the branch is inactive. The resolved map,
 unique atom roles, and scaling values are written to `covalent_mapping.yaml`.
+For edges where the unrestricted MCS is chemically undesirable, set
+`workflow.mapping.method: mcs_core_smarts` and provide a molecule-like SMARTS.
+The code calculates the MCS of both aldehyde ligands and that core, selects
+ambiguous matches by the smallest direct coordinate RMSD without alignment, and
+transfers the result into the generated covalent products. A pair-level `mapping`
+can override the workflow default.
 
 The modified residue uses the receptor ff19SB charges for N, H, CA, HA, C, and O.
 CB, HB2, HB3, SG, the transferred hydrogen, and ligand atoms are adjusted together

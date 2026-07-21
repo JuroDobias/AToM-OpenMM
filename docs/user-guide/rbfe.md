@@ -590,12 +590,30 @@ device index per replica. CUDA MPS can improve same-GPU process concurrency when
 it is available; checkpoint and exchange files are compatible between execution
 modes.
 
-Covalent atom mapping uses a connected heavy-atom MCS anchored through the
-Cys-SG--warhead bond; explicit hydrogens are attached after the heavy-atom match.
-Warhead mutations are rejected. Unique A and B branches are noninteracting with
-the environment when inactive but retain full unique-unique vacuum electrostatics,
-Lennard-Jones, exclusions, and 1-4 interactions. The mapping and atom roles are
-recorded in `covalent_mapping.yaml`.
+Covalent atom mapping defaults to `method: dataset_core`, which uses the prepared
+dataset scaffold to anchor a connected heavy-atom MCS through the
+Cys-SG--warhead bond. `method: mcs_core_smarts` instead calculates the MCS among
+ligand A, ligand B, and the supplied core pattern. This caps the common region so
+that chemically shared atoms outside the selected core remain alchemical. All
+matching combinations are evaluated without coordinate alignment and the pair
+with the smallest direct RMSD is selected. A workflow-level `mapping` applies to
+the series; a pair-level `mapping` shallow-overrides it, and
+`method: dataset_core` opts an individual pair back into the default behavior.
+
+```yaml
+workflow:
+  mapping:
+    method: mcs_core_smarts
+    smarts: "O=CNc1cccn(C2(C(=O)N[C@H](C=O)C[C@@H]3CCNC3=O)Cc3ccccc3C2)c1=O"
+```
+
+The constrained core must include the common electrophile carbon and produce a
+single protein-connected product subgraph. Explicit hydrogens are attached after
+the heavy-atom match. Warhead mutations are rejected. Unique A and B branches are
+noninteracting with the environment when inactive but retain full unique-unique
+vacuum electrostatics, Lennard-Jones, exclusions, and 1-4 interactions. The input
+core, generated MCS, selected match/RMSD, resolved map, and atom roles are recorded
+in `covalent_mapping.yaml`.
 
 For charge consistency, ff19SB charges are copied for Cys N, H, CA, HA, C, and O.
 The remaining Cys sidechain, transferred hydrogen, and ligand charges are corrected

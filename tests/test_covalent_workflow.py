@@ -2,6 +2,8 @@ from pathlib import Path
 
 import openmm as mm
 from openmm import app, unit
+from rdkit import Chem
+from rdkit.Chem import AllChem
 import yaml
 
 from atom_openmm.covalent_workflow import (
@@ -13,6 +15,8 @@ from atom_openmm.covalent_workflow import (
     _dummy_particles,
     _write_switch_pdb,
     _ensure_switch_protocol,
+    _constrained_ligand_atom_map,
+    _mapping_settings,
     _precompute_endpoint_lrc_corrections,
     _switch_protocol,
     _validate_softcore_endpoint_charge,
@@ -52,6 +56,14 @@ class _RecordingLRCEvaluator:
         self.closed = True
 
 
+def _write_3d_sdf(path, smiles, seed):
+    molecule = Chem.AddHs(Chem.MolFromSmiles(smiles))
+    assert AllChem.EmbedMolecule(molecule, randomSeed=seed) == 0
+    writer = Chem.SDWriter(str(path))
+    writer.write(molecule)
+    writer.close()
+
+
 def test_apply_state_accepts_positions_without_velocities():
     system = mm.System()
     system.addParticle(12.0)
@@ -64,6 +76,50 @@ def test_apply_state_accepts_positions_without_velocities():
 
     observed = target.getState(getPositions=True).getPositions(asNumpy=True)
     assert observed[0].x == positions_only.getPositions(asNumpy=True)[0].x
+
+
+def test_covalent_mapping_settings_support_default_and_pair_override():
+    workflow = {
+        "mapping": {
+            "method": "mcs_core_smarts",
+            "smarts": "c1ccccc1",
+        }
+    }
+
+    inherited = _mapping_settings(workflow, {})
+    overridden = _mapping_settings(
+        workflow,
+        {"mapping": {"smarts": "c1ncccc1"}},
+    )
+    disabled = _mapping_settings(
+        workflow,
+        {"mapping": {"method": "dataset_core"}},
+    )
+
+    assert inherited == {"method": "mcs_core_smarts", "smarts": "c1ccccc1"}
+    assert overridden == {"method": "mcs_core_smarts", "smarts": "c1ncccc1"}
+    assert disabled == {"method": "dataset_core"}
+
+
+def test_constrained_ligand_mcs_is_capped_by_smarts_and_reports_rmsd(tmp_path):
+    ligand_a = tmp_path / "a.sdf"
+    ligand_b = tmp_path / "b.sdf"
+    _write_3d_sdf(ligand_a, "Cc1ccccc1", 11)
+    _write_3d_sdf(ligand_b, "Oc1ccccc1", 22)
+    inputs = {
+        "ligand_a": {"name": "A", "aldehyde": ligand_a},
+        "ligand_b": {"name": "B", "aldehyde": ligand_b},
+    }
+
+    mapping, provenance = _constrained_ligand_atom_map(
+        inputs, "c1ccccc1"
+    )
+
+    assert len(mapping) == 6
+    assert provenance["mcs_heavy_atom_count"] == 6
+    assert provenance["candidate_matches_a"] > 1
+    assert provenance["candidate_matches_b"] > 1
+    assert provenance["selected_direct_rmsd_angstrom"] >= 0.0
 
 
 def test_endpoint_lrc_corrections_are_precomputed_for_both_fixed_boxes():

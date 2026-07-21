@@ -11,9 +11,15 @@ import numpy as np
 import openmm as mm
 import yaml
 from openmm import app, unit
+from rdkit import Chem
+from rdkit.Chem import rdFMCS
 
 from atom_openmm.covalent_alchemy import create_endpoint_hamiltonian
-from atom_openmm.covalent_hybrid import DummyBondedScales, build_covalent_hybrid_molecule
+from atom_openmm.covalent_hybrid import (
+    DummyBondedScales,
+    build_covalent_hybrid_molecule,
+    complete_covalent_atom_map,
+)
 from atom_openmm.covalent_parameters import (
     apply_modified_residue_charges,
     ff19sb_backbone_charges,
@@ -47,6 +53,36 @@ class CovalentWorkflowError(ValueError):
 def _resolve(path, base):
     value = Path(path)
     return (value if value.is_absolute() else base / value).resolve()
+
+
+def _mapping_settings(workflow, pair):
+    default = workflow.get("mapping")
+    override = pair.get("mapping")
+    if default is not None and not isinstance(default, dict):
+        raise CovalentWorkflowError("workflow.mapping must be a mapping")
+    if override is not None and not isinstance(override, dict):
+        raise CovalentWorkflowError("workflow.pairs[].mapping must be a mapping")
+    settings = dict(default or {})
+    settings.update(override or {})
+    method = settings.get("method")
+    if method is None:
+        method = "mcs_core_smarts" if settings.get("smarts") else "dataset_core"
+    method = str(method)
+    if method not in {"dataset_core", "mcs_core_smarts"}:
+        raise CovalentWorkflowError(
+            "covalent mapping.method must be 'dataset_core' or 'mcs_core_smarts'"
+        )
+    normalized = {"method": method}
+    if method == "mcs_core_smarts":
+        smarts = settings.get("smarts")
+        if not isinstance(smarts, str) or not smarts.strip():
+            raise CovalentWorkflowError(
+                "covalent mcs_core_smarts mapping requires a non-empty smarts string"
+            )
+        if Chem.MolFromSmarts(smarts) is None:
+            raise CovalentWorkflowError("covalent mapping.smarts is invalid")
+        normalized["smarts"] = smarts.strip()
+    return normalized
 
 
 def load_covalent_workflow(path):
@@ -90,6 +126,7 @@ def plan_covalent_workflow(path):
             {
                 "ligand_a": pair["ligand_a"],
                 "ligand_b": pair["ligand_b"],
+                "mapping": _mapping_settings(workflow, pair),
                 "workdir": str(workdir / f"{pair['ligand_a']}--{pair['ligand_b']}"),
             }
             for pair in settings["pairs"]
@@ -101,6 +138,7 @@ def validate_covalent_workflow(path):
     _, settings = load_covalent_workflow(path)
     ligands = {item["ligand_id"]: item for item in settings["dataset"].get("ligands", [])}
     for pair in settings["pairs"]:
+        mapping = _mapping_settings(settings["workflow"], pair)
         for key in ("ligand_a", "ligand_b"):
             name = pair.get(key)
             if name not in ligands:
@@ -108,6 +146,12 @@ def validate_covalent_workflow(path):
             product = settings["dataset_root"] / ligands[name]["capped_product_sdf"]
             if not product.exists():
                 raise CovalentWorkflowError(f"missing capped product: {product}")
+            if mapping["method"] == "mcs_core_smarts":
+                aldehyde = settings["dataset_root"] / ligands[name].get(
+                    "aldehyde_sdf", ""
+                )
+                if not aldehyde.is_file():
+                    raise CovalentWorkflowError(f"missing aldehyde ligand: {aldehyde}")
     receptor = settings["dataset_root"] / settings["dataset"]["receptor"]
     if not receptor.exists():
         raise CovalentWorkflowError(f"missing receptor: {receptor}")
@@ -1137,8 +1181,173 @@ def _pair_inputs(settings, pair):
             "info": info,
             "metadata": metadata,
             "product": root / info["capped_product_sdf"],
+            "aldehyde": root / info["aldehyde_sdf"] if info.get("aldehyde_sdf") else None,
         }
     return inputs
+
+
+def _load_covalent_sdf(path, label):
+    supplier = Chem.SDMolSupplier(str(path), removeHs=False)
+    molecule = supplier[0] if supplier and len(supplier) else None
+    if molecule is None or molecule.GetNumConformers() != 1:
+        raise CovalentWorkflowError(
+            f"could not read one 3D molecule for covalent mapping from {label}: {path}"
+        )
+    return molecule
+
+
+def _direct_match_rmsd(molecule_a, match_a, molecule_b, match_b):
+    conformer_a = molecule_a.GetConformer()
+    conformer_b = molecule_b.GetConformer()
+    squared = 0.0
+    for atom_a, atom_b in zip(match_a, match_b):
+        difference = np.asarray(conformer_a.GetAtomPosition(atom_a)) - np.asarray(
+            conformer_b.GetAtomPosition(atom_b)
+        )
+        squared += float(difference @ difference)
+    return float(np.sqrt(squared / len(match_a)))
+
+
+def _constrained_ligand_atom_map(inputs, smarts, timeout_seconds=30):
+    molecule_a = _load_covalent_sdf(
+        inputs["ligand_a"]["aldehyde"], inputs["ligand_a"]["name"]
+    )
+    molecule_b = _load_covalent_sdf(
+        inputs["ligand_b"]["aldehyde"], inputs["ligand_b"]["name"]
+    )
+    core = Chem.MolFromSmarts(smarts)
+    result = rdFMCS.FindMCS(
+        [molecule_a, molecule_b, core],
+        bondCompare=rdFMCS.BondCompare.CompareOrderExact,
+        timeout=int(timeout_seconds),
+    )
+    if result.canceled or result.numAtoms == 0:
+        raise CovalentWorkflowError("SMARTS-constrained covalent MCS failed or timed out")
+    query = result.queryMol
+    matches_a = molecule_a.GetSubstructMatches(
+        query, uniquify=False, useChirality=True
+    )
+    matches_b = molecule_b.GetSubstructMatches(
+        query, uniquify=False, useChirality=True
+    )
+    if not matches_a or not matches_b:
+        raise CovalentWorkflowError(
+            "SMARTS-constrained covalent MCS did not match both ligands"
+        )
+    candidates = []
+    for index_a, match_a in enumerate(matches_a, start=1):
+        for index_b, match_b in enumerate(matches_b, start=1):
+            candidates.append(
+                (
+                    _direct_match_rmsd(molecule_a, match_a, molecule_b, match_b),
+                    index_a,
+                    index_b,
+                    match_a,
+                    match_b,
+                )
+            )
+    rmsd, index_a, index_b, match_a, match_b = min(
+        candidates, key=lambda item: item[:3]
+    )
+    return dict(zip(match_a, match_b)), {
+        "core_smarts": smarts,
+        "mcs_smarts": Chem.MolToSmarts(query),
+        "mcs_atom_count": int(result.numAtoms),
+        "mcs_heavy_atom_count": sum(
+            atom.GetAtomicNum() != 1 for atom in query.GetAtoms()
+        ),
+        "selected_match_a": int(index_a),
+        "selected_match_b": int(index_b),
+        "selected_direct_rmsd_angstrom": float(rmsd),
+        "candidate_matches_a": len(matches_a),
+        "candidate_matches_b": len(matches_b),
+    }
+
+
+def _prepare_covalent_atom_map(inputs, mapping_settings):
+    meta_a = inputs["ligand_a"]["metadata"]
+    meta_b = inputs["ligand_b"]["metadata"]
+    cap_count_a = int(meta_a["capped_cys_atom_count"])
+    cap_count_b = int(meta_b["capped_cys_atom_count"])
+    if cap_count_a != cap_count_b:
+        raise CovalentWorkflowError("capped cysteine atom counts differ between ligands")
+    required = [(index, index) for index in range(cap_count_a)]
+    provenance = {"mapping_mode": mapping_settings["method"]}
+    atom_map = None
+    if mapping_settings["method"] == "dataset_core":
+        core_a = inputs["ligand_a"]["info"]["core_match_atom_indices_1based"]
+        core_b = inputs["ligand_b"]["info"]["core_match_atom_indices_1based"]
+        if len(core_a) != len(core_b):
+            raise CovalentWorkflowError(
+                "dataset core atom lists must contain the same number of atoms"
+            )
+        required.extend(
+            (
+                int(meta_a["ligand_atom_offset"]) + atom_a - 1,
+                int(meta_b["ligand_atom_offset"]) + atom_b - 1,
+            )
+            for atom_a, atom_b in zip(
+                core_a,
+                core_b,
+            )
+        )
+    else:
+        ligand_map, constrained = _constrained_ligand_atom_map(
+            inputs, mapping_settings["smarts"]
+        )
+        product_a = {
+            int(atom): int(product)
+            for atom, product in meta_a["ligand_to_product_atom_indices"].items()
+        }
+        product_b = {
+            int(atom): int(product)
+            for atom, product in meta_b["ligand_to_product_atom_indices"].items()
+        }
+        transferred = {
+            product_a[atom_a]: product_b[atom_b]
+            for atom_a, atom_b in ligand_map.items()
+        }
+        atom_map = dict(required)
+        if set(atom_map).intersection(transferred):
+            raise CovalentWorkflowError(
+                "SMARTS-constrained ligand map overlaps capped cysteine atoms"
+            )
+        atom_map.update(transferred)
+        provenance.update(constrained)
+        provenance["transferred_ligand_pairs_0based"] = {
+            int(atom_a): int(atom_b) for atom_a, atom_b in sorted(transferred.items())
+        }
+    attachment_pairs = (
+        (
+            int(meta_a["cys_sulfur_atom_index"]),
+            int(meta_b["cys_sulfur_atom_index"]),
+        ),
+        (
+            int(meta_a["electrophile_carbon_atom_index"]),
+            int(meta_b["electrophile_carbon_atom_index"]),
+        ),
+    )
+    for pair_to_require in attachment_pairs:
+        if pair_to_require not in required:
+            required.append(pair_to_require)
+    if atom_map is not None:
+        if attachment_pairs[1] not in atom_map.items():
+            raise CovalentWorkflowError(
+                "SMARTS-constrained MCS must contain the ligand electrophile carbon"
+            )
+        product_molecule_a = _load_covalent_sdf(
+            inputs["ligand_a"]["product"], inputs["ligand_a"]["name"]
+        )
+        product_molecule_b = _load_covalent_sdf(
+            inputs["ligand_b"]["product"], inputs["ligand_b"]["name"]
+        )
+        atom_map = complete_covalent_atom_map(
+            product_molecule_a,
+            product_molecule_b,
+            atom_map,
+            required_pairs=required,
+        )
+    return required, attachment_pairs, atom_map, provenance
 
 
 def _validate_softcore_endpoint_charge(config, parameters_a, parameters_b):
@@ -1153,7 +1362,7 @@ def _validate_softcore_endpoint_charge(config, parameters_a, parameters_b):
         )
 
 
-def _switch_protocol(config):
+def _switch_protocol(config, mapping_settings=None):
     protocol = {
         "schema_version": 1,
         "interpolation": config["interpolation"],
@@ -1179,15 +1388,17 @@ def _switch_protocol(config):
                 "steps": config["softcore"]["charge_steps_per_stage"],
             },
         ]
+    if mapping_settings and mapping_settings["method"] != "dataset_core":
+        protocol["covalent_mapping"] = dict(mapping_settings)
     serialized = yaml.safe_dump(protocol, sort_keys=True)
     protocol["fingerprint"] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
     return protocol
 
 
-def _ensure_switch_protocol(workdir, config):
+def _ensure_switch_protocol(workdir, config, mapping_settings=None):
     workdir = Path(workdir)
     path = workdir / "switch_protocol.yaml"
-    expected = _switch_protocol(config)
+    expected = _switch_protocol(config, mapping_settings)
     existing_work = any(
         (workdir / f"{environment}_{direction}.csv").exists()
         for environment in ("protein", "reference")
@@ -1225,7 +1436,8 @@ def run_covalent_pair(settings, pair):
     jobname = f"{pair['ligand_a']}--{pair['ligand_b']}"
     workdir = workroot / jobname
     workdir.mkdir(parents=True, exist_ok=True)
-    switch_protocol = _ensure_switch_protocol(workdir, config)
+    mapping_settings = _mapping_settings(workflow, pair)
+    switch_protocol = _ensure_switch_protocol(workdir, config, mapping_settings)
     _write_yaml_atomic(
         workdir / "result.yaml",
         {
@@ -1242,6 +1454,9 @@ def run_covalent_pair(settings, pair):
         },
     )
     inputs = _pair_inputs(settings, pair)
+    required, attachment_pairs, atom_map, mapping_provenance = (
+        _prepare_covalent_atom_map(inputs, mapping_settings)
+    )
     cache = workroot / "forcefield_cache"
     parameters_a = parameterize_capped_product(inputs["ligand_a"]["product"], cache_dir=cache)
     parameters_b = parameterize_capped_product(inputs["ligand_b"]["product"], cache_dir=cache)
@@ -1257,34 +1472,11 @@ def run_covalent_pair(settings, pair):
         parameters_b, meta_b, backbone_charges
     )
     _validate_softcore_endpoint_charge(config, parameters_a, parameters_b)
-    required = [(index, index) for index in range(int(meta_a["capped_cys_atom_count"]))]
-    required.extend(
-        (
-            int(meta_a["ligand_atom_offset"]) + atom_a - 1,
-            int(meta_b["ligand_atom_offset"]) + atom_b - 1,
-        )
-        for atom_a, atom_b in zip(
-            inputs["ligand_a"]["info"]["core_match_atom_indices_1based"],
-            inputs["ligand_b"]["info"]["core_match_atom_indices_1based"],
-        )
-    )
-    attachment_pairs = (
-        (
-            int(meta_a["cys_sulfur_atom_index"]),
-            int(meta_b["cys_sulfur_atom_index"]),
-        ),
-        (
-            int(meta_a["electrophile_carbon_atom_index"]),
-            int(meta_b["electrophile_carbon_atom_index"]),
-        ),
-    )
-    for pair_to_require in attachment_pairs:
-        if pair_to_require not in required:
-            required.append(pair_to_require)
     hybrid = build_covalent_hybrid_molecule(
         parameters_a,
         parameters_b,
         required_pairs=required,
+        atom_map=atom_map,
         attachment_pairs=attachment_pairs,
         dummy_bonded_scales=DummyBondedScales(**config["dummy_bonded_scales"]),
     )
@@ -1310,7 +1502,7 @@ def run_covalent_pair(settings, pair):
         workdir / "covalent_mapping.yaml",
         {
             "schema_version": 1,
-            "mapping_mode": "protein_connected_mcs",
+            **mapping_provenance,
             "map_a_to_b_0based": {
                 int(atom_a): int(atom_b) for atom_a, atom_b in sorted(hybrid.map_a_to_b.items())
             },

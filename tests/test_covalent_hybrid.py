@@ -41,6 +41,24 @@ def _test_required_mapping_selects_an_anchored_mcs():
     assert len(hybrid.map_a_to_b) > 2
 
 
+def test_explicit_atom_map_does_not_expand_to_unrestricted_mcs():
+    left = _bundle("CCCO")
+    right = _bundle("CCCCO")
+
+    hybrid = build_covalent_hybrid_molecule(
+        left,
+        right,
+        atom_map={0: 0, 1: 1},
+        required_pairs=[(0, 0), (1, 1)],
+    )
+
+    assert hybrid.map_a_to_b[0] == 0
+    assert hybrid.map_a_to_b[1] == 1
+    assert 2 not in hybrid.map_a_to_b
+    assert 2 in hybrid.unique_a
+    assert 2 in hybrid.unique_b
+
+
 def _test_unique_vacuum_force_exactly_replaces_internal_nonbonded_energy():
     source = mm.System()
     endpoint = mm.System()
