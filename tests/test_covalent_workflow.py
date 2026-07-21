@@ -7,6 +7,7 @@ import yaml
 from atom_openmm.covalent_workflow import (
     CovalentWorkflowError,
     _normalized_settings,
+    _apply_state,
     plan_covalent_workflow,
     validate_covalent_workflow,
     _dummy_particles,
@@ -14,6 +15,20 @@ from atom_openmm.covalent_workflow import (
     _ensure_switch_protocol,
     _validate_softcore_endpoint_charge,
 )
+
+
+def test_apply_state_accepts_positions_without_velocities():
+    system = mm.System()
+    system.addParticle(12.0)
+    source = mm.Context(system, mm.VerletIntegrator(0.001))
+    source.setPositions([[0.1, 0.2, 0.3]] * unit.nanometer)
+    positions_only = source.getState(getPositions=True)
+    target = mm.Context(system, mm.VerletIntegrator(0.001))
+
+    _apply_state(target, positions_only)
+
+    observed = target.getState(getPositions=True).getPositions(asNumpy=True)
+    assert observed[0].x == positions_only.getPositions(asNumpy=True)[0].x
 
 
 def test_switch_pdb_marks_dummy_atoms_with_zero_occupancy(tmp_path):
@@ -98,6 +113,7 @@ def test_softcore_settings_derive_total_switch_steps():
     assert config["switch_steps"] == 10000
     assert config["softcore"]["charge_steps_per_stage"] == 1200
     assert config["softcore"]["sterics_steps"] == 7600
+    assert config["softcore"]["long_range_correction"] == "dynamic"
 
 
 def test_softcore_resume_rejects_changed_protocol(tmp_path):
@@ -114,6 +130,27 @@ def test_softcore_resume_rejects_changed_protocol(tmp_path):
         assert "different switching protocol" in str(exc)
     else:
         raise AssertionError("changed softcore protocol was accepted for resume")
+
+
+def test_softcore_resume_rejects_changed_lrc_mode(tmp_path):
+    first = _normalized_settings(
+        {"neqti": {"interpolation": "softcore_linear"}}
+    )
+    _ensure_switch_protocol(tmp_path, first)
+    changed = _normalized_settings(
+        {
+            "neqti": {
+                "interpolation": "softcore_linear",
+                "softcore": {"long_range_correction": "endpoint_correction"},
+            }
+        }
+    )
+    try:
+        _ensure_switch_protocol(tmp_path, changed)
+    except CovalentWorkflowError as exc:
+        assert "different switching protocol" in str(exc)
+    else:
+        raise AssertionError("changed LRC mode was accepted for resume")
 
 
 def test_softcore_rejects_different_endpoint_total_charge():

@@ -565,11 +565,13 @@ workflow:
       power: 1
       charge_steps_per_stage: 10000
       sterics_steps: 30000
+      long_range_correction: dynamic
     failed_switch_policy: count_as_infinite
     rest2:
       enabled: true
       effective_temperatures_k: [300.0, 344.6, 395.9, 454.7, 522.3, 600.0]
       exchange_interval_steps: 500
+      execution: serial
 ```
 
 Endpoint REST2 trajectories remain independent of switching trajectories: every
@@ -579,6 +581,14 @@ interrupted workflow resumes the missing direction without replacing completed
 samples. Each pair directory contains `result.yaml`, four work CSV files, REST2
 checkpoints, prepared endpoint PDBs, and serialized OpenMM systems. The reported
 DDG convention is `G(ligand_b)-G(ligand_a)`.
+
+REST2 `execution` defaults to `serial`, where resident replica Contexts are stepped
+one after another. `execution: process` assigns each replica to a persistent worker
+process and propagates all replicas concurrently before the synchronous exchange
+barrier. `device_indices` may contain one device reused by every replica or one
+device index per replica. CUDA MPS can improve same-GPU process concurrency when
+it is available; checkpoint and exchange files are compatible between execution
+modes.
 
 Covalent atom mapping uses a connected heavy-atom MCS anchored through the
 Cys-SG--warhead bond; explicit hydrogens are attached after the heavy-atom match.
@@ -601,6 +611,15 @@ of steps is
 The defaults (`alpha: 0.3`, `sigma_nm: 0.25`, `power: 1`) match the established
 GROMACS softcore settings used for the RHINO calculations. Endpoint total charges
 must currently be equal.
+
+`softcore.long_range_correction` accepts `dynamic` or `endpoint_correction`.
+`dynamic` is the backward-compatible default. `endpoint_correction` disables
+long-range correction on the lambda-dependent custom Lennard-Jones forces during
+integration, evaluates that correction only at the two fixed-volume endpoints,
+and adds the final-minus-initial difference to protocol work. Switching systems
+with a barostat are rejected in this mode. Corrected work remains in the standard
+forward/reverse CSV files; `switch_lrc_diagnostics.csv` additionally records raw
+work, endpoint corrections, their difference, and box volume.
 
 The softcore system evaluates common PME, protein, and solvent terms once. Unique
 A/B cross interactions remain excluded, while the existing unique-branch vacuum

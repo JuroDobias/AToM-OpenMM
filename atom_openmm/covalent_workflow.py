@@ -20,7 +20,10 @@ from atom_openmm.covalent_parameters import (
     parameterize_capped_product,
 )
 from atom_openmm.covalent_protein import prepare_protein_covalent_hybrid
-from atom_openmm.covalent_softcore import create_softcore_hamiltonian
+from atom_openmm.covalent_softcore import (
+    SOFTCORE_NONBONDED_FORCE_GROUP,
+    create_softcore_hamiltonian,
+)
 from atom_openmm.covalent_systems import (
     create_solvated_capped_reference,
     solvate_capped_reference_hybrid,
@@ -147,6 +150,14 @@ def validate_covalent_workflow(path):
             "workflow.neqti.switch_steps cannot be combined with softcore_linear; "
             "set softcore.charge_steps_per_stage and softcore.sterics_steps"
         )
+    if config["softcore"]["long_range_correction"] not in {
+        "dynamic",
+        "endpoint_correction",
+    }:
+        raise CovalentWorkflowError(
+            "workflow.neqti.softcore.long_range_correction must be "
+            "'dynamic' or 'endpoint_correction'"
+        )
     if any(value < 0.0 for value in config["dummy_bonded_scales"].values()):
         raise CovalentWorkflowError("workflow.setup.dummy_bonded_scales values cannot be negative")
     equilibration = config["endpoint_equilibration"]
@@ -163,6 +174,14 @@ def validate_covalent_workflow(path):
         raise CovalentWorkflowError("covalent endpoint equilibration tolerances and timesteps must be positive")
     rest2 = config["rest2"]
     if rest2["enabled"]:
+        if rest2["execution"] not in {"serial", "process"}:
+            raise CovalentWorkflowError(
+                "REST2 execution must be 'serial' or 'process'"
+            )
+        if rest2["device_indices"] is not None and not isinstance(
+            rest2["device_indices"], list
+        ):
+            raise CovalentWorkflowError("REST2 device_indices must be a list")
         temperatures = rest2["effective_temperatures_k"]
         if len(temperatures) < 2 or temperatures[0] != config["temperature_k"]:
             raise CovalentWorkflowError(
@@ -396,6 +415,52 @@ def _append_switch_timing(path, environment, direction, sample, steps, timestep_
     return ns_per_day
 
 
+def _append_lrc_diagnostic(
+    path,
+    environment,
+    direction,
+    sample,
+    raw_work_kj,
+    initial_correction_kj,
+    final_correction_kj,
+    volume_nm3,
+):
+    path = Path(path)
+    new = not path.exists()
+    delta = final_correction_kj - initial_correction_kj
+    corrected = raw_work_kj + delta
+    with path.open("a", newline="") as handle:
+        writer = csv.writer(handle)
+        if new:
+            writer.writerow(
+                [
+                    "environment",
+                    "direction",
+                    "sample",
+                    "raw_work_kj_per_mol",
+                    "initial_lrc_kj_per_mol",
+                    "final_lrc_kj_per_mol",
+                    "lrc_delta_kj_per_mol",
+                    "corrected_work_kj_per_mol",
+                    "volume_nm3",
+                ]
+            )
+        writer.writerow(
+            [
+                environment,
+                direction,
+                sample,
+                raw_work_kj,
+                initial_correction_kj,
+                final_correction_kj,
+                delta,
+                corrected,
+                volume_nm3,
+            ]
+        )
+    return corrected
+
+
 def _switch_timing_summary(path):
     path = Path(path)
     if not path.exists():
@@ -485,6 +550,50 @@ def _softcore_switch_context(
     return context, integrator, values
 
 
+def _softcore_correction_context(hamiltonian, platform, properties):
+    integrator = mm.VerletIntegrator(1.0 * unit.femtosecond)
+    context = mm.Context(hamiltonian.system, integrator, platform, properties)
+    return context, integrator
+
+
+def _set_softcore_parameters(context, parameter_values, node):
+    for name, values in parameter_values.items():
+        context.setParameter(name, float(values[node]))
+
+
+def _softcore_group_energy(context):
+    return context.getState(
+        getEnergy=True,
+        groups={SOFTCORE_NONBONDED_FORCE_GROUP},
+    ).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+
+
+def _lrc_energy_correction(
+    no_lrc_context,
+    lrc_context,
+    state,
+    parameter_values,
+    node,
+):
+    _apply_state(lrc_context, state)
+    _set_softcore_parameters(lrc_context, parameter_values, node)
+    no_lrc = _softcore_group_energy(no_lrc_context)
+    with_lrc = _softcore_group_energy(lrc_context)
+    return with_lrc - no_lrc
+
+
+def _state_volume_nm3(state):
+    vectors = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer)
+    return float(abs(np.linalg.det(np.asarray(vectors, dtype=float))))
+
+
+def _assert_fixed_volume_switch(system):
+    if any(isinstance(force, mm.MonteCarloBarostat) for force in system.getForces()):
+        raise CovalentWorkflowError(
+            "softcore endpoint LRC correction requires fixed-volume switching"
+        )
+
+
 def _reset_softcore_context(context, integrator, parameter_values):
     integrator.reset_protocol()
     for name, values in parameter_values.items():
@@ -496,7 +605,10 @@ def _apply_state(context, state):
     if box is not None:
         context.setPeriodicBoxVectors(*box)
     context.setPositions(state.getPositions())
-    velocities = state.getVelocities()
+    try:
+        velocities = state.getVelocities()
+    except Exception:
+        velocities = None
     if velocities is not None:
         context.setVelocities(velocities)
 
@@ -602,21 +714,44 @@ def _run_environment(
         "reverse": workdir / f"{name}_reverse.csv",
     }
     timing_file = workdir / "switch_timing.csv"
+    lrc_diagnostics_file = workdir / "switch_lrc_diagnostics.csv"
     forward = _read_work(files["forward"])
     reverse = _read_work(files["reverse"])
     rest2_summaries = {}
     softcore = None
     softcore_contexts = {}
+    lrc_context = None
+    lrc_integrator = None
     if config["interpolation"] == "softcore_linear":
         unique_a = prepared.provenance["unique_a_particle_indices"]
         unique_b = prepared.provenance["unique_b_particle_indices"]
+        softcore_options = {
+            key: value
+            for key, value in config["softcore"].items()
+            if key != "long_range_correction"
+        }
+        lrc_mode = config["softcore"]["long_range_correction"]
         softcore = create_softcore_hamiltonian(
             prepared.endpoint_a,
             prepared.endpoint_b,
             unique_a,
             unique_b,
-            **config["softcore"],
+            use_long_range_correction=lrc_mode == "dynamic",
+            **softcore_options,
         )
+        _assert_fixed_volume_switch(softcore.system)
+        if lrc_mode == "endpoint_correction":
+            lrc_hamiltonian = create_softcore_hamiltonian(
+                prepared.endpoint_a,
+                prepared.endpoint_b,
+                unique_a,
+                unique_b,
+                use_long_range_correction=True,
+                **softcore_options,
+            )
+            lrc_context, lrc_integrator = _softcore_correction_context(
+                lrc_hamiltonian, platform, properties
+            )
         LOGGER.info(
             "%s softcore switching system ready: charge %d + sterics %d + charge %d "
             "= %d steps",
@@ -668,6 +803,10 @@ def _run_environment(
             post_switch_written = False
             switch_elapsed = None
             switch_ns_per_day = None
+            raw_work_kj = None
+            initial_lrc_kj = None
+            final_lrc_kj = None
+            volume_nm3 = None
             try:
                 if softcore is None:
                     context, integrator = _switch_context(
@@ -694,6 +833,15 @@ def _run_environment(
                     context, integrator, parameter_values = cached
                     _reset_softcore_context(context, integrator, parameter_values)
                 _apply_state(context, state)
+                if lrc_context is not None:
+                    initial_lrc_kj = _lrc_energy_correction(
+                        context,
+                        lrc_context,
+                        state,
+                        parameter_values,
+                        0,
+                    )
+                    volume_nm3 = _state_volume_nm3(state)
                 started = time.perf_counter()
                 integrator.step(int(config["switch_steps"]))
                 switch_elapsed = time.perf_counter() - started
@@ -720,9 +868,43 @@ def _run_environment(
                     dummy_atom_indices=_dummy_particles(prepared, final_endpoint),
                 )
                 post_switch_written = True
-                work_kj = integrator.get_protocol_work().value_in_unit(
+                raw_work_kj = integrator.get_protocol_work().value_in_unit(
                     unit.kilojoules_per_mole
                 )
+                work_kj = raw_work_kj
+                if lrc_context is not None:
+                    final_lrc_kj = _lrc_energy_correction(
+                        context,
+                        lrc_context,
+                        post_switch_state,
+                        parameter_values,
+                        -1,
+                    )
+                    final_volume_nm3 = _state_volume_nm3(post_switch_state)
+                    if not np.isclose(final_volume_nm3, volume_nm3, atol=1.0e-8):
+                        raise CovalentWorkflowError(
+                            "box volume changed during fixed-volume LRC-corrected switch"
+                        )
+                    work_kj = _append_lrc_diagnostic(
+                        lrc_diagnostics_file,
+                        name,
+                        direction,
+                        sample + 1,
+                        raw_work_kj,
+                        initial_lrc_kj,
+                        final_lrc_kj,
+                        volume_nm3,
+                    )
+                    LOGGER.info(
+                        "%s %s sample %d LRC correction: raw %.6f + delta %.6f "
+                        "= %.6f kJ/mol",
+                        name,
+                        direction,
+                        sample + 1,
+                        raw_work_kj,
+                        final_lrc_kj - initial_lrc_kj,
+                        work_kj,
+                    )
             except Exception as exc:
                 if (
                     config["failed_switch_policy"] == "count_as_infinite"
@@ -803,6 +985,9 @@ def _normalized_settings(workflow):
         "power": int(softcore.get("power", 1)),
         "charge_steps_per_stage": int(softcore.get("charge_steps_per_stage", 10000)),
         "sterics_steps": int(softcore.get("sterics_steps", 30000)),
+        "long_range_correction": str(
+            softcore.get("long_range_correction", "dynamic")
+        ),
     }
     switch_steps = (
         2 * softcore_settings["charge_steps_per_stage"] + softcore_settings["sterics_steps"]
@@ -856,6 +1041,8 @@ def _normalized_settings(workflow):
             "effective_temperatures_k": [float(value) for value in temperatures],
             "exchange_interval_steps": int(rest2.get("exchange_interval_steps", 500)),
             "checkpoint_interval_cycles": int(rest2.get("checkpoint_interval_cycles", 10)),
+            "execution": str(rest2.get("execution", "serial")),
+            "device_indices": rest2.get("device_indices"),
         },
     }
 
@@ -1131,6 +1318,7 @@ def run_covalent_pair(settings, pair):
         },
         "switching_protocol": switch_protocol,
         "performance": {
+            "long_range_correction": config["softcore"]["long_range_correction"],
             "switching": _switch_timing_summary(workdir / "switch_timing.csv"),
         },
         "artifacts": {
@@ -1159,6 +1347,10 @@ def run_covalent_pair(settings, pair):
             "reference_reverse_work_csv": "reference_reverse.csv",
         },
     }
+    if config["softcore"]["long_range_correction"] == "endpoint_correction":
+        result["artifacts"]["switch_lrc_diagnostics_csv"] = (
+            "switch_lrc_diagnostics.csv"
+        )
     if failed_switches:
         result["quality"]["warnings"].append(
             f"{failed_switches} numerical switches were retained as +inf work observations"

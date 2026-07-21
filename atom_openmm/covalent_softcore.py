@@ -17,6 +17,7 @@ CHARGE_A_PARAMETER = "COVALENT_CHARGE_A"
 CHARGE_B_PARAMETER = "COVALENT_CHARGE_B"
 MAPPED_CHARGE_PARAMETER = "COVALENT_MAPPED_CHARGE"
 STERICS_PARAMETER = "COVALENT_STERICS"
+SOFTCORE_NONBONDED_FORCE_GROUP = 31
 
 
 @dataclass(frozen=True)
@@ -223,7 +224,9 @@ def _configure_nonbonded_like(source, target):
         target.setSwitchingDistance(source.getSwitchingDistance())
 
 
-def _configure_custom_nonbonded_like(source, target):
+def _configure_custom_nonbonded_like(
+    source, target, *, use_long_range_correction=True
+):
     method = source.getNonbondedMethod()
     target.setNonbondedMethod(
         mm.CustomNonbondedForce.NoCutoff
@@ -235,7 +238,9 @@ def _configure_custom_nonbonded_like(source, target):
     if source.getUseSwitchingFunction():
         target.setUseSwitchingFunction(True)
         target.setSwitchingDistance(source.getSwitchingDistance())
-    target.setUseLongRangeCorrection(source.getUseDispersionCorrection())
+    target.setUseLongRangeCorrection(
+        bool(use_long_range_correction and source.getUseDispersionCorrection())
+    )
 
 
 def _exception_dict(force):
@@ -279,7 +284,16 @@ def _softcore_bond_expression(scale):
     )
 
 
-def _new_softcore_force(source, label, scale, alpha, sigma_nm, power):
+def _new_softcore_force(
+    source,
+    label,
+    scale,
+    alpha,
+    sigma_nm,
+    power,
+    *,
+    use_long_range_correction,
+):
     force = mm.CustomNonbondedForce(_softcore_expression(scale))
     force.setName(f"CovalentSoftcoreNonbonded{label}")
     force.addGlobalParameter(STERICS_PARAMETER, 0.0)
@@ -288,7 +302,12 @@ def _new_softcore_force(source, label, scale, alpha, sigma_nm, power):
     force.addGlobalParameter("SOFTCORE_POWER", float(power))
     force.addPerParticleParameter("sigma")
     force.addPerParticleParameter("epsilon")
-    _configure_custom_nonbonded_like(source, force)
+    force.setForceGroup(SOFTCORE_NONBONDED_FORCE_GROUP)
+    _configure_custom_nonbonded_like(
+        source,
+        force,
+        use_long_range_correction=use_long_range_correction,
+    )
     return force
 
 
@@ -315,6 +334,7 @@ def _add_nonbonded_forces(
     alpha,
     sigma_nm,
     power,
+    use_long_range_correction,
 ):
     source_a = _force(endpoint_a, mm.NonbondedForce)
     source_b = _force(endpoint_b, mm.NonbondedForce)
@@ -367,10 +387,22 @@ def _add_nonbonded_forces(
         for particle_a in unique_a for particle_b in unique_b
     )
     softcore_a = _new_softcore_force(
-        source_a, "A", f"1-{STERICS_PARAMETER}", alpha, sigma_nm, power
+        source_a,
+        "A",
+        f"1-{STERICS_PARAMETER}",
+        alpha,
+        sigma_nm,
+        power,
+        use_long_range_correction=use_long_range_correction,
     )
     softcore_b = _new_softcore_force(
-        source_b, "B", STERICS_PARAMETER, alpha, sigma_nm, power
+        source_b,
+        "B",
+        STERICS_PARAMETER,
+        alpha,
+        sigma_nm,
+        power,
+        use_long_range_correction=use_long_range_correction,
     )
     for particle in range(endpoint_a.getNumParticles()):
         _, sigma_a, epsilon_a = source_a.getParticleParameters(particle)
@@ -480,6 +512,7 @@ def create_softcore_hamiltonian(
     power: int = 1,
     charge_steps_per_stage: int = 10000,
     sterics_steps: int = 30000,
+    use_long_range_correction: bool = True,
 ) -> CovalentSoftcoreHamiltonian:
     _assert_compatible_endpoints(endpoint_a, endpoint_b)
     if alpha <= 0.0 or sigma_nm <= 0.0 or power < 1:
@@ -497,6 +530,7 @@ def create_softcore_hamiltonian(
         alpha=float(alpha),
         sigma_nm=float(sigma_nm),
         power=int(power),
+        use_long_range_correction=bool(use_long_range_correction),
     )
     _copy_other_forces(output, endpoint_a, endpoint_b)
     steps = [int(charge_steps_per_stage), int(sterics_steps), int(charge_steps_per_stage)]

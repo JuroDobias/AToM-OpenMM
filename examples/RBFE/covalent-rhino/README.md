@@ -53,8 +53,21 @@ charge stage, so the configured 10000 + 30000 + 10000 steps produce a 100 ps
 switch at 2 fs. The implementation keeps PME and common protein/water forces in a
 single system rather than evaluating two complete endpoint Hamiltonians.
 
+`softcore.long_range_correction` defaults to `dynamic`, which evaluates the
+custom softcore Lennard-Jones long-range correction throughout the switch. The
+alternative `endpoint_correction` runs the fixed-volume switch without that
+expensive dynamic correction and adds its exact final-minus-initial energy
+difference to the recorded work. Raw work and both endpoint corrections are
+retained in `switch_lrc_diagnostics.csv`; the normal work CSVs contain corrected
+values and remain the inputs to BAR.
+
 Each pair directory records the resolved settings and compatibility fingerprint in
 `switch_protocol.yaml`. Existing work is resumed only when that protocol matches.
 `switch_timing.csv` and `result.yaml` report measured switching throughput. The
 older `interpolation: envelope` path remains available and continues to use the
 single `switch_steps` setting.
+
+Set `neqti.rest2.execution: process` to propagate each resident REST2 replica in
+its own persistent process. Exchanges remain synchronous. Optional
+`device_indices` accepts either one GPU index shared by all replicas or one index
+per replica; `serial` remains the default.

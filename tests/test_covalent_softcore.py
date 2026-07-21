@@ -2,7 +2,10 @@ import numpy as np
 import openmm as mm
 from openmm import unit
 
-from atom_openmm.covalent_softcore import create_softcore_hamiltonian
+from atom_openmm.covalent_softcore import (
+    SOFTCORE_NONBONDED_FORCE_GROUP,
+    create_softcore_hamiltonian,
+)
 from atom_openmm.neqti_integrator import ATMNonequilibriumLangevinIntegrator
 
 
@@ -149,3 +152,84 @@ def _test_softcore_schedule_runs_forward_and_reverse_on_device():
         work = integrator.get_protocol_work().value_in_unit(unit.kilojoule_per_mole)
         assert np.isfinite(work)
         del context
+
+
+def _test_disabling_lrc_changes_energy_but_not_forces():
+    enabled = create_softcore_hamiltonian(
+        _endpoint("a"),
+        _endpoint("b"),
+        [2],
+        [3],
+        use_long_range_correction=True,
+    )
+    disabled = create_softcore_hamiltonian(
+        _endpoint("a"),
+        _endpoint("b"),
+        [2],
+        [3],
+        use_long_range_correction=False,
+    )
+    positions = np.asarray(
+        [[0, 0, 0], [0.15, 0, 0], [0.28, 0.08, 0], [0.29, -0.09, 0.03], [0.7, 0.4, 0.3]]
+    ) * unit.nanometer
+    parameters = {
+        name: values[0] for name, values in enabled.parameter_values.items()
+    }
+    energy_on, forces_on = _energy_forces(enabled.system, positions, parameters)
+    energy_off, forces_off = _energy_forces(disabled.system, positions, parameters)
+    assert not np.isclose(energy_on, energy_off, atol=1.0e-8, rtol=0.0)
+    assert np.allclose(forces_on, forces_off, atol=3.0e-6, rtol=0.0)
+    for hamiltonian, expected in ((enabled, True), (disabled, False)):
+        forces = [
+            force
+            for force in hamiltonian.system.getForces()
+            if isinstance(force, mm.CustomNonbondedForce)
+        ]
+        assert len(forces) == 2
+        assert all(force.getForceGroup() == SOFTCORE_NONBONDED_FORCE_GROUP for force in forces)
+        assert all(force.getUseLongRangeCorrection() is expected for force in forces)
+
+
+def _test_endpoint_lrc_difference_repairs_fixed_volume_work():
+    enabled = create_softcore_hamiltonian(
+        _endpoint("a"),
+        _endpoint("b"),
+        [2],
+        [3],
+        charge_steps_per_stage=2,
+        sterics_steps=3,
+        use_long_range_correction=True,
+    )
+    disabled = create_softcore_hamiltonian(
+        _endpoint("a"),
+        _endpoint("b"),
+        [2],
+        [3],
+        charge_steps_per_stage=2,
+        sterics_steps=3,
+        use_long_range_correction=False,
+    )
+    positions = np.asarray(
+        [[0, 0, 0], [0.15, 0, 0], [0.28, 0.08, 0], [0.29, -0.09, 0.03], [0.7, 0.4, 0.3]]
+    ) * unit.nanometer
+    contexts = []
+    for hamiltonian in (enabled, disabled):
+        integrator = mm.VerletIntegrator(1.0 * unit.femtosecond)
+        context = mm.Context(hamiltonian.system, integrator)
+        context.setPositions(positions)
+        contexts.append(context)
+
+    def group_energy(context, hamiltonian, node):
+        for name, values in hamiltonian.parameter_values.items():
+            context.setParameter(name, values[node])
+        return context.getState(
+            getEnergy=True, groups={SOFTCORE_NONBONDED_FORCE_GROUP}
+        ).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+
+    energies_on = [group_energy(contexts[0], enabled, node) for node in range(4)]
+    energies_off = [group_energy(contexts[1], disabled, node) for node in range(4)]
+    work_on = sum(right - left for left, right in zip(energies_on, energies_on[1:]))
+    work_off = sum(right - left for left, right in zip(energies_off, energies_off[1:]))
+    initial_delta = energies_on[0] - energies_off[0]
+    final_delta = energies_on[-1] - energies_off[-1]
+    assert np.isclose(work_on, work_off + final_delta - initial_delta, atol=1.0e-5)
