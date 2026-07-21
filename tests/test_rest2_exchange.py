@@ -74,6 +74,7 @@ def _test_rest2_exchange_sampler_preserves_independent_atm_banks(tmp_path):
             "effective_temperatures_k": [300, 600],
             "exchange_interval_steps": 1,
             "checkpoint_interval_cycles": 1,
+            "execution": "process",
         },
         platform=mm.Platform.getPlatformByName("Reference"),
         platform_properties={},
@@ -113,17 +114,19 @@ def _test_rest2_exchange_sampler_supports_fixed_native_hamiltonian(tmp_path):
         state_context.getState(getPositions=True, getVelocities=True)
     ))
 
+    process_config = {
+        "effective_temperatures_k": [300, 600],
+        "exchange_interval_steps": 1,
+        "checkpoint_interval_cycles": 1,
+        "execution": "process",
+    }
     sampler = REST2ExchangeSampler(
         system=rest2.system,
         topology=None,
         base_integrator=mm.LangevinMiddleIntegrator(300, 1, 0.001),
         rest2_system=rest2,
         state_files={"a": state_file},
-        config={
-            "effective_temperatures_k": [300, 600],
-            "exchange_interval_steps": 1,
-            "checkpoint_interval_cycles": 1,
-        },
+        config=process_config,
         platform=mm.Platform.getPlatformByName("Reference"),
         platform_properties={},
         output_dir=tmp_path / "native_rest2",
@@ -132,6 +135,22 @@ def _test_rest2_exchange_sampler_supports_fixed_native_hamiltonian(tmp_path):
     sampler.run_steps("a", 2)
 
     assert sampler.cycle == 2
-    assert sampler.contexts[0].getParameter("REST2_SCALE") in (0.5, 1.0)
+    assert sampler.workers[0].request("parameter", "REST2_SCALE") in (0.5, 1.0)
     assert sampler.physical_state("a").getPositions() is not None
     sampler.close()
+
+    resumed = REST2ExchangeSampler(
+        system=rest2.system,
+        topology=None,
+        base_integrator=mm.LangevinMiddleIntegrator(300, 1, 0.001),
+        rest2_system=rest2,
+        state_files={"a": state_file},
+        config=process_config,
+        platform=mm.Platform.getPlatformByName("Reference"),
+        platform_properties={},
+        output_dir=tmp_path / "native_rest2",
+        resume=True,
+    )
+    resumed.run_steps("a", 1)
+    assert resumed.cycle == 3
+    resumed.close()

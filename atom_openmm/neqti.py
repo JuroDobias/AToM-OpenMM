@@ -301,6 +301,8 @@ def normalize_neqti_options(workflow, atom_options):
     ]
     exchange_interval = int(rest2_raw.get("exchange_interval_steps", 500))
     checkpoint_interval = int(rest2_raw.get("checkpoint_interval_cycles", 10))
+    rest2_execution = str(rest2_raw.get("execution", "serial"))
+    rest2_device_indices = rest2_raw.get("device_indices")
     solute = str(rest2_raw.get("solute", "both_ligands")).strip()
     if solute == "both_ligands":
         solute = '#ligand:"*"'
@@ -324,6 +326,8 @@ def normalize_neqti_options(workflow, atom_options):
             raise NEQTIConfigError("REST2 effective temperatures must be strictly increasing")
         if exchange_interval < 1 or checkpoint_interval < 1:
             raise NEQTIConfigError("REST2 exchange and checkpoint intervals must be positive")
+        if rest2_execution not in {"serial", "process"}:
+            raise NEQTIConfigError("REST2 execution must be 'serial' or 'process'")
         for name, value in (
             ("initial_equilibration_steps", initial_steps),
             ("decorrelation_steps", decorrelation_steps),
@@ -352,6 +356,8 @@ def normalize_neqti_options(workflow, atom_options):
         "effective_temperatures_k": temperatures,
         "exchange_interval_steps": exchange_interval,
         "checkpoint_interval_cycles": checkpoint_interval,
+        "execution": rest2_execution,
+        "device_indices": rest2_device_indices,
     }
     if rest2_enabled and atom_options.get("SELECTION_METADATA"):
         rest2["selection_metadata"] = deepcopy(atom_options["SELECTION_METADATA"])

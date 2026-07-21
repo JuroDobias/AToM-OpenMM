@@ -7,6 +7,7 @@ import json
 import math
 import os
 import shutil
+import time
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +15,7 @@ import openmm as mm
 from openmm import unit
 
 from atom_openmm.rest2 import set_rest2_scale
+from atom_openmm.rest2_process import REST2ReplicaProcess
 
 
 R_KJ_MOL_K = unit.MOLAR_GAS_CONSTANT_R.value_in_unit(
@@ -41,6 +43,26 @@ def set_atm_state(context, ommsystem, state):
     context.setParameter(atmforce.Ubcore(), state[atmforce.Ubcore()] / unit.kilojoule_per_mole)
     context.setParameter(atmforce.Acore(), state[atmforce.Acore()])
     context.setParameter("UOffset", state["uoffset"] / unit.kilojoule_per_mole)
+
+
+def _atm_parameter_values(ommsystem, state):
+    atmforce = ommsystem.atmforce
+    values = {
+        atmforce.Lambda1(): state["lambda1"],
+        atmforce.Lambda2(): state["lambda2"],
+        atmforce.Alpha(): state["alpha"] * unit.kilojoule_per_mole,
+        atmforce.Uh(): state["uh"] / unit.kilojoule_per_mole,
+        atmforce.W0(): state["w0"] / unit.kilojoule_per_mole,
+        atmforce.Direction(): state["atmdirection"],
+        atmforce.Umax(): state[atmforce.Umax()] / unit.kilojoule_per_mole,
+        atmforce.Ubcore(): state[atmforce.Ubcore()] / unit.kilojoule_per_mole,
+        atmforce.Acore(): state[atmforce.Acore()],
+        "UOffset": state["uoffset"] / unit.kilojoule_per_mole,
+    }
+    if ommsystem.multisoftplus:
+        values["Lambda3"] = state["lambda3"]
+        values["Uh1"] = state["uh1"] / unit.kilojoule_per_mole
+    return {name: float(value) for name, value in values.items()}
 
 
 def _energy_kj(context):
@@ -88,6 +110,12 @@ class REST2ExchangeSampler:
         self.state_files = {key: str(value) for key, value in state_files.items()}
         self.atm_states = atm_states
         self.config = config
+        self.timestep_fs = float(
+            base_integrator.getStepSize().value_in_unit(unit.femtosecond)
+        )
+        self.execution = str(config.get("execution", "serial"))
+        if self.execution not in {"serial", "process"}:
+            raise ValueError("REST2 execution must be 'serial' or 'process'")
         self.output_dir = Path(output_dir)
         self.resume = bool(resume)
         self.logger = logger
@@ -100,24 +128,94 @@ class REST2ExchangeSampler:
         self.rng = np.random.default_rng(int(random_seed) + 71000)
         self.contexts = []
         self.integrators = []
+        self.workers = []
         self.assignments = list(range(len(self.scales)))
         self.attempts = np.zeros(len(self.scales) - 1, dtype=int)
         self.accepts = np.zeros(len(self.scales) - 1, dtype=int)
         self.round_trips = np.zeros(len(self.scales), dtype=int)
         self.trip_phase = np.asarray([1, *([0] * (len(self.scales) - 1))], dtype=int)
         self.active_ensemble = None
+        self.last_run_performance = None
         if not self.resume and self.output_dir.exists():
             shutil.rmtree(self.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        serialized_system = mm.XmlSerializer.serialize(system)
+        device_indices = config.get("device_indices")
+        if device_indices is not None:
+            device_indices = [str(value) for value in device_indices]
+            if len(device_indices) == 1:
+                device_indices *= len(self.scales)
+            if len(device_indices) != len(self.scales):
+                raise ValueError(
+                    "REST2 device_indices must contain one value or one value per replica"
+                )
         for index, scale in enumerate(self.scales):
             integrator = mm.XmlSerializer.deserialize(mm.XmlSerializer.serialize(base_integrator))
             if hasattr(integrator, "setRandomNumberSeed"):
                 integrator.setRandomNumberSeed(int(random_seed) + 72000 + index)
-            context = mm.Context(system, integrator, platform, platform_properties)
-            set_rest2_scale(context, scale, self.rest2_system)
-            self.integrators.append(integrator)
-            self.contexts.append(context)
+            properties = dict(platform_properties)
+            if device_indices is not None:
+                properties["DeviceIndex"] = device_indices[index]
+            if self.execution == "serial":
+                context = mm.Context(system, integrator, platform, properties)
+                set_rest2_scale(context, scale, self.rest2_system)
+                self.integrators.append(integrator)
+                self.contexts.append(context)
+            else:
+                worker = REST2ReplicaProcess(
+                    system_xml=serialized_system,
+                    integrator_xml=mm.XmlSerializer.serialize(integrator),
+                    platform_name=platform.getName(),
+                    platform_properties=properties,
+                    scale_parameter=self.rest2_system.scale_parameter,
+                    sqrt_scale_parameter=self.rest2_system.sqrt_scale_parameter,
+                )
+                self.workers.append(worker)
+        if self.execution == "process":
+            try:
+                for worker in self.workers:
+                    worker.wait_ready()
+                for worker, scale in zip(self.workers, self.scales):
+                    worker.request("set_scale", scale)
+            except Exception:
+                for worker in self.workers:
+                    worker.close()
+                raise
+
+    def _set_scale(self, walker, scale):
+        if self.execution == "serial":
+            set_rest2_scale(self.contexts[walker], scale, self.rest2_system)
+        else:
+            self.workers[walker].request("set_scale", scale)
+
+    def _set_atm_state(self, walker, ensemble):
+        if self.atm_states is None:
+            return
+        if self.execution == "serial":
+            set_atm_state(
+                self.contexts[walker], self.ommsystem, self.atm_states[ensemble]
+            )
+        else:
+            self.workers[walker].request(
+                "set_parameters",
+                _atm_parameter_values(self.ommsystem, self.atm_states[ensemble]),
+            )
+
+    def _energy(self, walker):
+        if self.execution == "serial":
+            return _energy_kj(self.contexts[walker])
+        return float(self.workers[walker].request("energy"))
+
+    def _step_all(self):
+        if self.execution == "serial":
+            for integrator in self.integrators:
+                integrator.step(self.exchange_interval)
+            return
+        for worker in self.workers:
+            worker.send("step", self.exchange_interval)
+        for worker in self.workers:
+            worker.receive()
 
     def _directory(self, ensemble):
         return self.output_dir / str(ensemble)
@@ -129,29 +227,44 @@ class REST2ExchangeSampler:
         return self._metadata_path(ensemble).exists()
 
     def _initialize_bank(self, ensemble):
-        source = mm.XmlSerializer.deserialize(Path(self.state_files[ensemble]).read_text())
+        source_xml = Path(self.state_files[ensemble]).read_text()
+        source = mm.XmlSerializer.deserialize(source_xml)
         temperature = (
             self.atm_states[ensemble]["temperature"]
             if self.atm_states is not None else self.physical_temperature * unit.kelvin
         )
-        for index, context in enumerate(self.contexts):
-            if self.atm_states is not None:
-                context.setState(source)
-                set_atm_state(context, self.ommsystem, self.atm_states[ensemble])
+        temperature_k = float(temperature.value_in_unit(unit.kelvin))
+        for index in range(len(self.scales)):
+            if self.execution == "serial":
+                context = self.contexts[index]
+                if self.atm_states is not None:
+                    context.setState(source)
+                    set_atm_state(context, self.ommsystem, self.atm_states[ensemble])
+                else:
+                    box_vectors = source.getPeriodicBoxVectors()
+                    if box_vectors is not None:
+                        context.setPeriodicBoxVectors(*box_vectors)
+                    context.setPositions(source.getPositions())
+                    try:
+                        velocities = source.getVelocities()
+                        if velocities is not None:
+                            context.setVelocities(velocities)
+                    except Exception:
+                        pass
             else:
-                box_vectors = source.getPeriodicBoxVectors()
-                if box_vectors is not None:
-                    context.setPeriodicBoxVectors(*box_vectors)
-                context.setPositions(source.getPositions())
-                try:
-                    velocities = source.getVelocities()
-                    if velocities is not None:
-                        context.setVelocities(velocities)
-                except Exception:
-                    pass
-            set_rest2_scale(context, self.scales[index], self.rest2_system)
+                self.workers[index].request("set_state", source_xml)
+                self._set_atm_state(index, ensemble)
+            self._set_scale(index, self.scales[index])
             ensemble_offset = {"a": 1000, "m": 2000, "b": 3000}.get(ensemble, 4000)
-            context.setVelocitiesToTemperature(temperature, 73000 + ensemble_offset + index)
+            velocity_seed = 73000 + ensemble_offset + index
+            if self.execution == "serial":
+                self.contexts[index].setVelocitiesToTemperature(
+                    temperature, velocity_seed
+                )
+            else:
+                self.workers[index].request(
+                    "set_velocities", (temperature_k, velocity_seed)
+                )
         self.assignments = list(range(len(self.scales)))
         self.attempts = np.zeros(len(self.scales) - 1, dtype=int)
         self.accepts = np.zeros(len(self.scales) - 1, dtype=int)
@@ -162,8 +275,12 @@ class REST2ExchangeSampler:
     def _load_bank(self, ensemble):
         directory = self._directory(ensemble)
         metadata = json.loads(self._metadata_path(ensemble).read_text())
-        for index, context in enumerate(self.contexts):
-            context.loadCheckpoint((directory / f"walker_{index}.chk").read_bytes())
+        for index in range(len(self.scales)):
+            checkpoint = (directory / f"walker_{index}.chk").read_bytes()
+            if self.execution == "serial":
+                self.contexts[index].loadCheckpoint(checkpoint)
+            else:
+                self.workers[index].request("load_checkpoint", checkpoint)
         self.assignments = [int(value) for value in metadata["assignments"]]
         self.attempts = np.asarray(metadata["attempts"], dtype=int)
         self.accepts = np.asarray(metadata["accepts"], dtype=int)
@@ -171,12 +288,9 @@ class REST2ExchangeSampler:
         self.trip_phase = np.asarray(metadata.get("trip_phase", [0] * len(self.scales)), dtype=int)
         self.cycle = int(metadata["cycle"])
         self.rng.bit_generator.state = metadata["rng_state"]
-        for walker, context in enumerate(self.contexts):
-            if self.atm_states is not None:
-                set_atm_state(context, self.ommsystem, self.atm_states[ensemble])
-            set_rest2_scale(
-                context, self.scales[self.assignments[walker]], self.rest2_system
-            )
+        for walker in range(len(self.scales)):
+            self._set_atm_state(walker, ensemble)
+            self._set_scale(walker, self.scales[self.assignments[walker]])
 
     def activate(self, ensemble):
         if self.active_ensemble == ensemble:
@@ -198,9 +312,14 @@ class REST2ExchangeSampler:
             return
         directory = self._directory(ensemble)
         directory.mkdir(parents=True, exist_ok=True)
-        for index, context in enumerate(self.contexts):
+        for index in range(len(self.scales)):
             temporary = directory / f"walker_{index}.chk.tmp"
-            temporary.write_bytes(context.createCheckpoint())
+            checkpoint = (
+                self.contexts[index].createCheckpoint()
+                if self.execution == "serial"
+                else self.workers[index].request("checkpoint")
+            )
+            temporary.write_bytes(checkpoint)
             os.replace(temporary, directory / f"walker_{index}.chk")
         payload = {
             "schema_version": 1,
@@ -223,14 +342,12 @@ class REST2ExchangeSampler:
         upper_state = lower_state + 1
         walker_i = self.assignments.index(lower_state)
         walker_j = self.assignments.index(upper_state)
-        context_i = self.contexts[walker_i]
-        context_j = self.contexts[walker_j]
-        u_ii = _energy_kj(context_i)
-        u_jj = _energy_kj(context_j)
-        set_rest2_scale(context_i, self.scales[upper_state], self.rest2_system)
-        set_rest2_scale(context_j, self.scales[lower_state], self.rest2_system)
-        u_ij = _energy_kj(context_i)
-        u_ji = _energy_kj(context_j)
+        u_ii = self._energy(walker_i)
+        u_jj = self._energy(walker_j)
+        self._set_scale(walker_i, self.scales[upper_state])
+        self._set_scale(walker_j, self.scales[lower_state])
+        u_ij = self._energy(walker_i)
+        u_ji = self._energy(walker_j)
         log_acceptance = exchange_log_acceptance(self.beta, u_ii, u_ij, u_jj, u_ji)
         accepted = math.log(self.rng.random()) < min(0.0, log_acceptance)
         self.attempts[lower_state] += 1
@@ -238,8 +355,8 @@ class REST2ExchangeSampler:
             self.accepts[lower_state] += 1
             self.assignments[walker_i], self.assignments[walker_j] = upper_state, lower_state
         else:
-            set_rest2_scale(context_i, self.scales[lower_state], self.rest2_system)
-            set_rest2_scale(context_j, self.scales[upper_state], self.rest2_system)
+            self._set_scale(walker_i, self.scales[lower_state])
+            self._set_scale(walker_j, self.scales[upper_state])
         _append_csv(
             self._directory(self.active_ensemble) / "exchanges.csv",
             ["cycle", "lower_state", "upper_state", "walker_i", "walker_j", "accepted", "log_acceptance"],
@@ -252,9 +369,9 @@ class REST2ExchangeSampler:
         if steps % self.exchange_interval:
             raise ValueError("REST2 sampling steps must be divisible by exchange_interval_steps")
         cycles = steps // self.exchange_interval
+        started = time.perf_counter()
         for _ in range(cycles):
-            for integrator in self.integrators:
-                integrator.step(self.exchange_interval)
+            self._step_all()
             parity = self.cycle % 2
             self.cycle += 1
             for lower_state in range(parity, len(self.scales) - 1, 2):
@@ -274,22 +391,40 @@ class REST2ExchangeSampler:
             if self.cycle % self.checkpoint_interval == 0:
                 self.save_bank()
         self.save_bank()
+        elapsed = time.perf_counter() - started
+        simulated_ns = steps * len(self.scales) * 1.0e-6 * self.timestep_fs
+        self.last_run_performance = {
+            "execution": self.execution,
+            "elapsed_seconds": elapsed,
+            "aggregate_ns_per_day": simulated_ns * 86400.0 / elapsed,
+        }
         if self.logger:
             rates = np.divide(
                 self.accepts, self.attempts,
                 out=np.zeros_like(self.accepts, dtype=float), where=self.attempts > 0,
             )
             self.logger.info(
-                "%s REST2 complete: %d steps per replica, cycle %d, neighbor acceptance %s",
-                label or ensemble, steps, self.cycle, np.round(rates, 3).tolist(),
+                "%s REST2 complete: %d steps per replica, cycle %d, neighbor acceptance %s, "
+                "execution %s, aggregate %.3f ns/day",
+                label or ensemble,
+                steps,
+                self.cycle,
+                np.round(rates, 3).tolist(),
+                self.execution,
+                self.last_run_performance["aggregate_ns_per_day"],
             )
 
     def physical_state(self, ensemble):
         self.activate(ensemble)
         walker = self.assignments.index(0)
-        return self.contexts[walker].getState(
-            getPositions=True, getVelocities=True, getEnergy=True, enforcePeriodicBox=True
-        )
+        if self.execution == "serial":
+            return self.contexts[walker].getState(
+                getPositions=True,
+                getVelocities=True,
+                getEnergy=True,
+                enforcePeriodicBox=True,
+            )
+        return mm.XmlSerializer.deserialize(self.workers[walker].request("state"))
 
     def summary(self):
         rates = np.divide(
@@ -297,14 +432,19 @@ class REST2ExchangeSampler:
             out=np.zeros_like(self.accepts, dtype=float), where=self.attempts > 0,
         )
         return {
+            "execution": self.execution,
             "effective_temperatures_k": self.temperatures,
             "acceptance_rates": rates.tolist(),
             "attempts": self.attempts.tolist(),
             "accepts": self.accepts.tolist(),
             "round_trips": self.round_trips.tolist(),
+            "performance": self.last_run_performance,
         }
 
     def close(self):
         self.save_bank()
+        for worker in self.workers:
+            worker.close()
+        self.workers.clear()
         self.contexts.clear()
         self.integrators.clear()
