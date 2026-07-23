@@ -8,6 +8,7 @@ import yaml
 
 from atom_openmm.covalent_workflow import (
     CovalentWorkflowError,
+    CovalentResumeError,
     _normalized_settings,
     _apply_state,
     plan_covalent_workflow,
@@ -20,7 +21,11 @@ from atom_openmm.covalent_workflow import (
     _precompute_endpoint_lrc_corrections,
     _switch_protocol,
     _validate_softcore_endpoint_charge,
+    _load_prepared_pair_bundle,
+    _validate_state_system_compatibility,
+    _write_prepared_pair_bundle,
 )
+from atom_openmm.covalent_systems import PreparedCovalentHybrid
 
 
 class _BoxState:
@@ -76,6 +81,104 @@ def test_apply_state_accepts_positions_without_velocities():
 
     observed = target.getState(getPositions=True).getPositions(asNumpy=True)
     assert observed[0].x == positions_only.getPositions(asNumpy=True)[0].x
+
+
+def _prepared_fixture():
+    topology = app.Topology()
+    chain = topology.addChain("A")
+    residue = topology.addResidue("MOL", chain, "1")
+    first = topology.addAtom("C1", app.Element.getBySymbol("C"), residue)
+    second = topology.addAtom("C2", app.Element.getBySymbol("C"), residue)
+    topology.addBond(first, second)
+    systems = []
+    for distance in (0.15, 0.16):
+        system = mm.System()
+        system.addParticle(12.0)
+        system.addParticle(12.0)
+        bonds = mm.HarmonicBondForce()
+        bonds.addBond(0, 1, distance, 100.0)
+        system.addForce(bonds)
+        nonbonded = mm.NonbondedForce()
+        nonbonded.addParticle(0.0, 0.3, 0.1)
+        nonbonded.addParticle(0.0, 0.3, 0.1)
+        system.addForce(nonbonded)
+        systems.append(system)
+    return PreparedCovalentHybrid(
+        topology,
+        [[0, 0, 0], [0.15, 0, 0]] * unit.nanometer,
+        systems[0],
+        systems[1],
+        2,
+        (0, 1),
+        {"environment": "test", "unique_a_particle_indices": [0]},
+    )
+
+
+def _test_prepared_pair_bundle_round_trips_and_rejects_changed_fingerprint(tmp_path):
+    prepared = _prepared_fixture()
+    _write_prepared_pair_bundle(
+        tmp_path,
+        prepared,
+        prepared,
+        fingerprint="expected",
+        fingerprint_inputs={"schema_version": 1},
+        mapping_payload={"schema_version": 1},
+        parameterization={"ligand_a": {}, "ligand_b": {}},
+    )
+
+    protein, reference, manifest = _load_prepared_pair_bundle(
+        tmp_path, "expected"
+    )
+
+    assert protein.endpoint_a.getNumParticles() == 2
+    assert reference.topology.getNumAtoms() == 2
+    assert manifest["fingerprint"] == "expected"
+    try:
+        _load_prepared_pair_bundle(tmp_path, "changed")
+    except CovalentResumeError as exc:
+        assert "fingerprint differs" in str(exc)
+    else:
+        raise AssertionError("changed preparation fingerprint was accepted")
+
+
+def _test_prepared_pair_bundle_rejects_corrupt_artifact(tmp_path):
+    prepared = _prepared_fixture()
+    _write_prepared_pair_bundle(
+        tmp_path,
+        prepared,
+        prepared,
+        fingerprint="expected",
+        fingerprint_inputs={},
+        mapping_payload={},
+        parameterization={},
+    )
+    (tmp_path / "prepared" / "protein_endpoint_a.xml").write_text("corrupt")
+
+    try:
+        _load_prepared_pair_bundle(tmp_path, "expected")
+    except CovalentResumeError as exc:
+        assert "checksum differs" in str(exc)
+    else:
+        raise AssertionError("corrupt prepared artifact was accepted")
+
+
+def _test_state_compatibility_reports_particle_count_mismatch():
+    source = mm.System()
+    source.addParticle(12.0)
+    context = mm.Context(source, mm.VerletIntegrator(0.001))
+    context.setPositions([[0, 0, 0]] * unit.nanometer)
+    state = context.getState(getPositions=True)
+    target = mm.System()
+    target.addParticle(12.0)
+    target.addParticle(12.0)
+
+    try:
+        _validate_state_system_compatibility(state, target, "endpoint A")
+    except CovalentResumeError as exc:
+        assert "1 positions" in str(exc)
+        assert "2 particles" in str(exc)
+    else:
+        raise AssertionError("incompatible state particle count was accepted")
 
 
 def test_covalent_mapping_settings_support_default_and_pair_override():

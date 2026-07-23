@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
+import random
 
 import numpy as np
 import openmm as mm
@@ -32,6 +35,121 @@ class PreparedCovalentHybrid:
     provenance: dict[str, object]
 
 
+@contextmanager
+def _seeded_python_random(seed):
+    state = random.getstate()
+    random.seed(int(seed))
+    try:
+        yield
+    finally:
+        random.setstate(state)
+
+
+def add_deterministic_ions(
+    modeller,
+    forcefield,
+    *,
+    ionic_strength_molar,
+    seed,
+):
+    waters = {}
+    for residue in modeller.topology.residues():
+        if residue.name not in {"HOH", "WAT"}:
+            continue
+        oxygen = next(
+            (
+                atom
+                for atom in residue.atoms()
+                if atom.element is not None and atom.element.symbol == "O"
+            ),
+            None,
+        )
+        if oxygen is not None:
+            waters[residue] = modeller.positions[oxygen.index]
+    with _seeded_python_random(seed):
+        modeller._addIons(
+            forcefield,
+            len(waters),
+            waters,
+            ionicStrength=float(ionic_strength_molar) * unit.molar,
+            neutralize=True,
+        )
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def write_prepared_hybrid_bundle(prepared, directory, name):
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "topology": directory / f"{name}_topology.pdb",
+        "endpoint_a": directory / f"{name}_endpoint_a.xml",
+        "endpoint_b": directory / f"{name}_endpoint_b.xml",
+    }
+    with paths["topology"].open("w") as handle:
+        app.PDBFile.writeFile(prepared.topology, prepared.positions, handle, keepIds=True)
+    paths["endpoint_a"].write_text(mm.XmlSerializer.serialize(prepared.endpoint_a))
+    paths["endpoint_b"].write_text(mm.XmlSerializer.serialize(prepared.endpoint_b))
+    particle_count = prepared.endpoint_a.getNumParticles()
+    if prepared.endpoint_b.getNumParticles() != particle_count:
+        raise CovalentParameterError("prepared endpoint systems have different particle counts")
+    if prepared.topology.getNumAtoms() != particle_count:
+        raise CovalentParameterError(
+            "prepared topology atom count does not match endpoint particle count"
+        )
+    return {
+        "artifacts": {
+            key: {"file": path.name, "sha256": _sha256(path)}
+            for key, path in paths.items()
+        },
+        "particle_count": particle_count,
+        "solute_atom_count": int(prepared.solute_atom_count),
+        "hot_atom_indices": [int(value) for value in prepared.hot_atom_indices],
+        "provenance": prepared.provenance,
+    }
+
+
+def load_prepared_hybrid_bundle(directory, payload):
+    directory = Path(directory)
+    paths = {}
+    for key in ("topology", "endpoint_a", "endpoint_b"):
+        artifact = payload["artifacts"][key]
+        path = directory / artifact["file"]
+        if not path.is_file():
+            raise CovalentParameterError(f"prepared artifact is missing: {path}")
+        if _sha256(path) != artifact["sha256"]:
+            raise CovalentParameterError(f"prepared artifact checksum differs: {path}")
+        paths[key] = path
+    pdb = app.PDBFile(str(paths["topology"]))
+    endpoint_a = mm.XmlSerializer.deserialize(paths["endpoint_a"].read_text())
+    endpoint_b = mm.XmlSerializer.deserialize(paths["endpoint_b"].read_text())
+    expected = int(payload["particle_count"])
+    observed = {
+        "topology": pdb.topology.getNumAtoms(),
+        "endpoint_a": endpoint_a.getNumParticles(),
+        "endpoint_b": endpoint_b.getNumParticles(),
+    }
+    if any(value != expected for value in observed.values()):
+        raise CovalentParameterError(
+            f"prepared particle counts differ from manifest {expected}: {observed}"
+        )
+    return PreparedCovalentHybrid(
+        pdb.topology,
+        pdb.positions,
+        endpoint_a,
+        endpoint_b,
+        int(payload["solute_atom_count"]),
+        tuple(int(value) for value in payload["hot_atom_indices"]),
+        dict(payload["provenance"]),
+    )
+
+
 def _nonbonded_force(system: mm.System) -> mm.NonbondedForce:
     forces = [force for force in system.getForces() if isinstance(force, mm.NonbondedForce)]
     if len(forces) != 1:
@@ -46,6 +164,7 @@ def create_solvated_capped_reference(
     ionic_strength_molar: float = 0.15,
     nonbonded_cutoff_a: float = 9.0,
     template_cache: Path | None = None,
+    solvation_seed: int = 2026,
 ) -> PreparedCovalentSystem:
     molecule = parameters.molecule
     topology = molecule.to_topology().to_openmm()
@@ -60,13 +179,14 @@ def create_solvated_capped_reference(
     forcefield.registerTemplateGenerator(generator.generator)
     # OpenMM supplies TIP4P-Ew coordinates as the generic four-site water box.
     # OPC parameters and virtual-site positions are assigned by amber19/opc.xml.
-    modeller.addSolvent(
-        forcefield,
-        model="tip4pew",
-        padding=float(padding_a) * unit.angstrom,
-        ionicStrength=float(ionic_strength_molar) * unit.molar,
-        neutralize=True,
-    )
+    with _seeded_python_random(solvation_seed):
+        modeller.addSolvent(
+            forcefield,
+            model="tip4pew",
+            padding=float(padding_a) * unit.angstrom,
+            ionicStrength=float(ionic_strength_molar) * unit.molar,
+            neutralize=True,
+        )
     system = forcefield.createSystem(
         modeller.topology,
         nonbondedMethod=app.PME,
@@ -94,6 +214,7 @@ def create_solvated_capped_reference(
             "water_coordinate_template": "tip4pew",
             "padding_a": float(padding_a),
             "ionic_strength_molar": float(ionic_strength_molar),
+            "solvation_seed": int(solvation_seed),
             "solute_atom_count": molecule.n_atoms,
             "total_particle_count": system.getNumParticles(),
         }

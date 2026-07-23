@@ -1,10 +1,12 @@
 import numpy as np
 import openmm as mm
+from openmm import app, unit
 from openff.toolkit import ForceField, Molecule
 from openff.units import unit as offunit
 
 from atom_openmm.covalent_parameters import CovalentParameterBundle
 from atom_openmm.covalent_systems import create_solvated_capped_reference
+from atom_openmm.covalent_systems import add_deterministic_ions
 from atom_openmm.covalent_hybrid import build_covalent_hybrid_molecule
 from atom_openmm.covalent_systems import solvate_capped_reference_hybrid
 
@@ -66,3 +68,39 @@ def _test_hybrid_reference_uses_one_solvent_environment(tmp_path):
     assert prepared.endpoint_a.getNumParticles() == prepared.endpoint_b.getNumParticles()
     assert prepared.endpoint_a.getNumParticles() == prepared.topology.getNumAtoms()
     assert prepared.endpoint_a.getDefaultPeriodicBoxVectors() == prepared.endpoint_b.getDefaultPeriodicBoxVectors()
+
+
+def _test_deterministic_ion_placement_restores_global_random_state():
+    topology = app.Topology()
+    chain = topology.addChain("W")
+    positions = []
+    for index in range(4):
+        residue = topology.addResidue("HOH", chain, str(index + 1))
+        topology.addAtom("O", app.Element.getBySymbol("O"), residue)
+        positions.append(mm.Vec3(index, 0, 0) * unit.nanometer)
+
+    class FakeModeller:
+        def __init__(self):
+            self.topology = topology
+            self.positions = positions
+            self.values = []
+
+        def _addIons(self, *args, **kwargs):
+            import random
+            self.values.append(random.random())
+
+    import random
+    random.seed(91)
+    expected_next = random.random()
+    random.seed(91)
+    first = FakeModeller()
+    second = FakeModeller()
+    add_deterministic_ions(
+        first, object(), ionic_strength_molar=0.15, seed=17
+    )
+    add_deterministic_ions(
+        second, object(), ionic_strength_molar=0.15, seed=17
+    )
+
+    assert first.values == second.values
+    assert random.random() == expected_next

@@ -4,6 +4,7 @@ import csv
 import hashlib
 import logging
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from atom_openmm.covalent_hybrid import (
     complete_covalent_atom_map,
 )
 from atom_openmm.covalent_parameters import (
+    CovalentParameterError,
     apply_modified_residue_charges,
     ff19sb_backbone_charges,
     parameterize_capped_product,
@@ -32,8 +34,9 @@ from atom_openmm.covalent_softcore import (
 )
 from atom_openmm.covalent_systems import (
     create_solvated_capped_reference,
+    load_prepared_hybrid_bundle,
     solvate_capped_reference_hybrid,
-    write_prepared_hybrid,
+    write_prepared_hybrid_bundle,
 )
 from atom_openmm.neqti import _is_numerical_switch_failure, analyze_two_leg_work
 from atom_openmm.neqti_integrator import ATMNonequilibriumLangevinIntegrator
@@ -48,6 +51,13 @@ LRC_CORRECTION_VERSION = 2
 
 class CovalentWorkflowError(ValueError):
     pass
+
+
+class CovalentResumeError(CovalentWorkflowError):
+    pass
+
+
+PREPARATION_SCHEMA_VERSION = 1
 
 
 def _resolve(path, base):
@@ -276,6 +286,185 @@ def _write_yaml_atomic(path, payload):
     os.replace(temporary, path)
 
 
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _preparation_fingerprint(settings, pair, inputs, mapping_settings, solvation_seed):
+    receptor = settings["dataset_root"] / settings["dataset"]["receptor"]
+    files = {
+        "dataset": settings["dataset_path"],
+        "receptor": receptor,
+        "ligand_a_product": inputs["ligand_a"]["product"],
+        "ligand_b_product": inputs["ligand_b"]["product"],
+    }
+    for side in ("ligand_a", "ligand_b"):
+        aldehyde = inputs[side].get("aldehyde")
+        if aldehyde is not None:
+            files[f"{side}_aldehyde"] = aldehyde
+    workflow = settings["workflow"]
+    payload = {
+        "schema_version": PREPARATION_SCHEMA_VERSION,
+        "pair": {
+            "ligand_a": pair["ligand_a"],
+            "ligand_b": pair["ligand_b"],
+        },
+        "files": {
+            name: {"path": str(Path(path).resolve()), "sha256": _file_sha256(path)}
+            for name, path in sorted(files.items())
+        },
+        "mapping": mapping_settings,
+        "setup": workflow.get("setup") or {},
+        "covalent_residue": settings["dataset"]["covalent_residue"],
+        "solvation_seed": int(solvation_seed),
+    }
+    serialized = yaml.safe_dump(payload, sort_keys=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest(), payload
+
+
+def _runtime_artifacts_exist(workdir):
+    workdir = Path(workdir)
+    patterns = (
+        "*_endpoint_*_state*.xml",
+        "*_forward.csv",
+        "*_reverse.csv",
+        "*_rest2_*",
+    )
+    return any(any(workdir.glob(pattern)) for pattern in patterns)
+
+
+def _write_prepared_pair_bundle(
+    workdir,
+    protein,
+    reference,
+    *,
+    fingerprint,
+    fingerprint_inputs,
+    mapping_payload,
+    parameterization,
+):
+    workdir = Path(workdir)
+    target = workdir / "prepared"
+    temporary = workdir / f".prepared.tmp-{os.getpid()}"
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    temporary.mkdir(parents=True)
+    try:
+        manifest = {
+            "schema_version": PREPARATION_SCHEMA_VERSION,
+            "fingerprint": fingerprint,
+            "fingerprint_inputs": fingerprint_inputs,
+            "environments": {
+                "protein": write_prepared_hybrid_bundle(
+                    protein, temporary, "protein"
+                ),
+                "reference": write_prepared_hybrid_bundle(
+                    reference, temporary, "reference"
+                ),
+            },
+            "mapping": mapping_payload,
+            "parameterization": parameterization,
+        }
+        _write_yaml_atomic(temporary / "manifest.yaml", manifest)
+        if target.exists():
+            raise CovalentResumeError(
+                f"prepared-system bundle already exists and will not be overwritten: {target}"
+            )
+        os.replace(temporary, target)
+    except Exception:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        raise
+    return manifest
+
+
+def _load_prepared_pair_bundle(workdir, expected_fingerprint):
+    directory = Path(workdir) / "prepared"
+    manifest_path = directory / "manifest.yaml"
+    if not manifest_path.is_file():
+        raise CovalentResumeError(
+            f"prepared-system manifest is missing: {manifest_path}"
+        )
+    manifest = yaml.safe_load(manifest_path.read_text()) or {}
+    if manifest.get("schema_version") != PREPARATION_SCHEMA_VERSION:
+        raise CovalentResumeError(
+            "prepared-system schema is incompatible; use a new workdir"
+        )
+    if manifest.get("fingerprint") != expected_fingerprint:
+        raise CovalentResumeError(
+            "prepared-system fingerprint differs from current inputs or setup; "
+            "use a new workdir or restore the original inputs"
+        )
+    try:
+        protein = load_prepared_hybrid_bundle(
+            directory, manifest["environments"]["protein"]
+        )
+        reference = load_prepared_hybrid_bundle(
+            directory, manifest["environments"]["reference"]
+        )
+    except (KeyError, ValueError, CovalentParameterError) as exc:
+        raise CovalentResumeError(f"prepared-system bundle is invalid: {exc}") from exc
+    return protein, reference, manifest
+
+
+def _state_particle_count(state):
+    try:
+        return len(state.getPositions())
+    except Exception as exc:
+        raise CovalentResumeError("saved state does not contain positions") from exc
+
+
+def _validate_state_system_compatibility(state, system, label):
+    positions = _state_particle_count(state)
+    particles = system.getNumParticles()
+    if positions != particles:
+        raise CovalentResumeError(
+            f"{label} contains {positions} positions but its prepared system has "
+            f"{particles} particles"
+        )
+
+
+def _system_total_charge(system):
+    force = next(
+        (
+            force
+            for force in system.getForces()
+            if isinstance(force, mm.NonbondedForce)
+        ),
+        None,
+    )
+    if force is None:
+        raise CovalentWorkflowError("prepared endpoint lacks a NonbondedForce")
+    return float(
+        sum(
+            force.getParticleParameters(index)[0].value_in_unit(
+                unit.elementary_charge
+            )
+            for index in range(force.getNumParticles())
+        )
+    )
+
+
+def _validate_prepared_endpoint_charges(prepared, label):
+    charges = [
+        _system_total_charge(prepared.endpoint_a),
+        _system_total_charge(prepared.endpoint_b),
+    ]
+    if not np.isclose(charges[0], charges[1], atol=1.0e-6):
+        raise CovalentWorkflowError(
+            f"{label} endpoint charges differ: {charges[0]:.8f} and {charges[1]:.8f} e"
+        )
+    if not all(np.isclose(value, 0.0, atol=1.0e-5) for value in charges):
+        raise CovalentWorkflowError(
+            f"{label} endpoint systems are not neutral: {charges[0]:.8f} and "
+            f"{charges[1]:.8f} e"
+        )
+
+
 def _semantic_components(analysis):
     return {
         "protein": analysis["components"]["leg_a"],
@@ -342,13 +531,16 @@ def _equilibrate_endpoint(
     state_file = Path(state_file)
     if state_file.exists():
         LOGGER.info("%s equilibration already complete; resuming from %s", label, state_file)
-        return _load_state(state_file)
+        state = _load_state(state_file)
+        _validate_state_system_compatibility(state, system, label)
+        return state
 
     minimized_file = state_file.with_name(f"{state_file.stem}_minimized.xml")
     nvt_file = state_file.with_name(f"{state_file.stem}_nvt.xml")
 
     if minimized_file.exists():
         minimized = _load_state(minimized_file)
+        _validate_state_system_compatibility(minimized, system, f"{label} minimization")
         LOGGER.info("%s minimization already complete; resuming from %s", label, minimized_file)
     else:
         integrator = mm.VerletIntegrator(1.0 * unit.femtosecond)
@@ -373,6 +565,7 @@ def _equilibrate_endpoint(
 
     if nvt_file.exists():
         nvt_state = _load_state(nvt_file)
+        _validate_state_system_compatibility(nvt_state, system, f"{label} NVT")
         LOGGER.info("%s NVT equilibration already complete; resuming from %s", label, nvt_file)
     else:
         nvt_steps = int(protocol["nvt_steps"])
@@ -1454,53 +1647,82 @@ def run_covalent_pair(settings, pair):
         },
     )
     inputs = _pair_inputs(settings, pair)
-    required, attachment_pairs, atom_map, mapping_provenance = (
-        _prepare_covalent_atom_map(inputs, mapping_settings)
-    )
-    cache = workroot / "forcefield_cache"
-    parameters_a = parameterize_capped_product(inputs["ligand_a"]["product"], cache_dir=cache)
-    parameters_b = parameterize_capped_product(inputs["ligand_b"]["product"], cache_dir=cache)
-    meta_a = inputs["ligand_a"]["metadata"]
-    meta_b = inputs["ligand_b"]["metadata"]
-    receptor = settings["dataset_root"] / settings["dataset"]["receptor"]
-    residue_id = int(settings["dataset"]["covalent_residue"]["id"])
-    backbone_charges = ff19sb_backbone_charges(receptor, residue_id)
-    parameters_a = apply_modified_residue_charges(
-        parameters_a, meta_a, backbone_charges
-    )
-    parameters_b = apply_modified_residue_charges(
-        parameters_b, meta_b, backbone_charges
-    )
-    _validate_softcore_endpoint_charge(config, parameters_a, parameters_b)
-    hybrid = build_covalent_hybrid_molecule(
-        parameters_a,
-        parameters_b,
-        required_pairs=required,
-        atom_map=atom_map,
-        attachment_pairs=attachment_pairs,
-        dummy_bonded_scales=DummyBondedScales(**config["dummy_bonded_scales"]),
-    )
     setup = workflow.get("setup") or {}
     padding = float(setup.get("solvent_padding_a", 10.0))
     ionic_strength = float(setup.get("ionic_strength_molar", 0.15))
-    physical_reference_a = create_solvated_capped_reference(
-        parameters_a,
-        padding_a=padding,
-        ionic_strength_molar=ionic_strength,
-        template_cache=cache / "templates.json",
+    solvation_seed = int(setup.get("solvation_seed", config["random_seed"]))
+    preparation_fingerprint, fingerprint_inputs = _preparation_fingerprint(
+        settings, pair, inputs, mapping_settings, solvation_seed
     )
-    reference = solvate_capped_reference_hybrid(hybrid, physical_reference_a)
-    protein = prepare_protein_covalent_hybrid(
-        receptor,
-        parameters_a, parameters_b, hybrid, meta_a, meta_b,
-        residue_id=residue_id,
-        padding_a=padding, ionic_strength_molar=ionic_strength,
-    )
-    write_prepared_hybrid(protein, workdir / "protein")
-    write_prepared_hybrid(reference, workdir / "reference")
-    _write_yaml_atomic(
-        workdir / "covalent_mapping.yaml",
-        {
+    prepared_manifest = workdir / "prepared" / "manifest.yaml"
+    if prepared_manifest.is_file():
+        protein, reference, preparation_manifest = _load_prepared_pair_bundle(
+            workdir, preparation_fingerprint
+        )
+        mapping_payload = preparation_manifest["mapping"]
+        parameterization = preparation_manifest["parameterization"]
+        LOGGER.info(
+            "Loaded persistent covalent preparation %s", preparation_fingerprint
+        )
+    else:
+        if _runtime_artifacts_exist(workdir):
+            raise CovalentResumeError(
+                "resume_incompatible: existing covalent states or work lack the "
+                "persistent prepared-system bundle; use a new workdir"
+            )
+        required, attachment_pairs, atom_map, mapping_provenance = (
+            _prepare_covalent_atom_map(inputs, mapping_settings)
+        )
+        cache = workroot / "forcefield_cache"
+        parameters_a = parameterize_capped_product(
+            inputs["ligand_a"]["product"], cache_dir=cache
+        )
+        parameters_b = parameterize_capped_product(
+            inputs["ligand_b"]["product"], cache_dir=cache
+        )
+        meta_a = inputs["ligand_a"]["metadata"]
+        meta_b = inputs["ligand_b"]["metadata"]
+        receptor = settings["dataset_root"] / settings["dataset"]["receptor"]
+        residue_id = int(settings["dataset"]["covalent_residue"]["id"])
+        backbone_charges = ff19sb_backbone_charges(receptor, residue_id)
+        parameters_a = apply_modified_residue_charges(
+            parameters_a, meta_a, backbone_charges
+        )
+        parameters_b = apply_modified_residue_charges(
+            parameters_b, meta_b, backbone_charges
+        )
+        _validate_softcore_endpoint_charge(config, parameters_a, parameters_b)
+        hybrid = build_covalent_hybrid_molecule(
+            parameters_a,
+            parameters_b,
+            required_pairs=required,
+            atom_map=atom_map,
+            attachment_pairs=attachment_pairs,
+            dummy_bonded_scales=DummyBondedScales(**config["dummy_bonded_scales"]),
+        )
+        physical_reference_a = create_solvated_capped_reference(
+            parameters_a,
+            padding_a=padding,
+            ionic_strength_molar=ionic_strength,
+            template_cache=cache / "templates.json",
+            solvation_seed=solvation_seed + 1,
+        )
+        reference = solvate_capped_reference_hybrid(hybrid, physical_reference_a)
+        protein = prepare_protein_covalent_hybrid(
+            receptor,
+            parameters_a,
+            parameters_b,
+            hybrid,
+            meta_a,
+            meta_b,
+            residue_id=residue_id,
+            padding_a=padding,
+            ionic_strength_molar=ionic_strength,
+            solvation_seed=solvation_seed,
+        )
+        _validate_prepared_endpoint_charges(protein, "protein")
+        _validate_prepared_endpoint_charges(reference, "reference")
+        mapping_payload = {
             "schema_version": 1,
             **mapping_provenance,
             "map_a_to_b_0based": {
@@ -1512,8 +1734,28 @@ def run_covalent_pair(settings, pair):
             "unique_b_0based": list(hybrid.unique_b),
             "dummy_bonded_scales": config["dummy_bonded_scales"],
             "dummy_nonbonded": "full_unique_branch_vacuum",
-        },
-    )
+        }
+        parameterization = {
+            "ligand_a": parameters_a.provenance,
+            "ligand_b": parameters_b.provenance,
+            "protein": protein.provenance,
+            "reference": reference.provenance,
+        }
+        preparation_manifest = _write_prepared_pair_bundle(
+            workdir,
+            protein,
+            reference,
+            fingerprint=preparation_fingerprint,
+            fingerprint_inputs=fingerprint_inputs,
+            mapping_payload=mapping_payload,
+            parameterization=parameterization,
+        )
+        LOGGER.info(
+            "Persisted covalent preparation %s", preparation_fingerprint
+        )
+    _validate_prepared_endpoint_charges(protein, "protein")
+    _validate_prepared_endpoint_charges(reference, "reference")
+    _write_yaml_atomic(workdir / "covalent_mapping.yaml", mapping_payload)
     platform, properties = _platform(workflow)
     running = yaml.safe_load((workdir / "result.yaml").read_text()) or {}
     running["progress"] = {"stage": "production", "environment": "protein"}
@@ -1586,10 +1828,8 @@ def run_covalent_pair(settings, pair):
             "workflow_yaml": str(settings["config_path"]),
         },
         "parameterization": {
-            "ligand_a": parameters_a.provenance,
-            "ligand_b": parameters_b.provenance,
-            "protein": protein.provenance,
-            "reference": reference.provenance,
+            **parameterization,
+            "preparation_fingerprint": preparation_fingerprint,
         },
         "switching_protocol": switch_protocol,
         "performance": {
@@ -1600,18 +1840,17 @@ def run_covalent_pair(settings, pair):
             "covalent_mapping": "covalent_mapping.yaml",
             "switch_protocol": "switch_protocol.yaml",
             "switch_timing_csv": "switch_timing.csv",
-            "protein_endpoint_a_pdb": "protein_endpoint_a.pdb",
-            "protein_endpoint_b_pdb": "protein_endpoint_b.pdb",
-            "protein_endpoint_a_system": "protein_endpoint_a.xml",
-            "protein_endpoint_b_system": "protein_endpoint_b.xml",
+            "prepared_manifest": "prepared/manifest.yaml",
+            "protein_topology": "prepared/protein_topology.pdb",
+            "protein_endpoint_a_system": "prepared/protein_endpoint_a.xml",
+            "protein_endpoint_b_system": "prepared/protein_endpoint_b.xml",
             "protein_endpoint_a_state": "protein_endpoint_a_state.xml",
             "protein_endpoint_b_state": "protein_endpoint_b_state.xml",
             "protein_endpoint_a_equilibrated": "protein_endpoint_a_equilibrated.pdb",
             "protein_endpoint_b_equilibrated": "protein_endpoint_b_equilibrated.pdb",
-            "reference_endpoint_a_pdb": "reference_endpoint_a.pdb",
-            "reference_endpoint_b_pdb": "reference_endpoint_b.pdb",
-            "reference_endpoint_a_system": "reference_endpoint_a.xml",
-            "reference_endpoint_b_system": "reference_endpoint_b.xml",
+            "reference_topology": "prepared/reference_topology.pdb",
+            "reference_endpoint_a_system": "prepared/reference_endpoint_a.xml",
+            "reference_endpoint_b_system": "prepared/reference_endpoint_b.xml",
             "reference_endpoint_a_state": "reference_endpoint_a_state.xml",
             "reference_endpoint_b_state": "reference_endpoint_b_state.xml",
             "reference_endpoint_a_equilibrated": "reference_endpoint_a_equilibrated.pdb",

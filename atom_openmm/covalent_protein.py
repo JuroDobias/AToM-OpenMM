@@ -14,7 +14,11 @@ from atom_openmm.covalent_hybrid import (
     _inactive_scales,
 )
 from atom_openmm.covalent_parameters import CovalentParameterBundle
-from atom_openmm.covalent_systems import PreparedCovalentHybrid, _copy_virtual_site
+from atom_openmm.covalent_systems import (
+    PreparedCovalentHybrid,
+    _copy_virtual_site,
+    add_deterministic_ions,
+)
 
 
 def _force(system, cls):
@@ -41,6 +45,7 @@ def _build_base_receptor(
     *,
     padding_a: float,
     ionic_strength_molar: float,
+    solvation_seed: int,
     clash_cutoff_a: float = 2.2,
 ):
     pdb = app.PDBFile(str(receptor_pdb))
@@ -51,8 +56,8 @@ def _build_base_receptor(
         forcefield,
         model="tip4pew",
         padding=float(padding_a) * unit.angstrom,
-        ionicStrength=float(ionic_strength_molar) * unit.molar,
-        neutralize=True,
+        ionicStrength=0.0 * unit.molar,
+        neutralize=False,
     )
     ligand_positions = np.concatenate((ligand_positions_a, ligand_positions_b), axis=0)
     modeller_nm = np.asarray(modeller.positions.value_in_unit(unit.nanometer))
@@ -74,6 +79,12 @@ def _build_base_receptor(
             delete.append(residue)
     if delete:
         modeller.delete(delete)
+    add_deterministic_ions(
+        modeller,
+        forcefield,
+        ionic_strength_molar=ionic_strength_molar,
+        seed=solvation_seed,
+    )
     system = forcefield.createSystem(
         modeller.topology,
         nonbondedMethod=app.PME,
@@ -379,6 +390,7 @@ def prepare_protein_covalent_hybrid(
     residue_id: int = 147,
     padding_a: float = 10.0,
     ionic_strength_molar: float = 0.15,
+    solvation_seed: int = 2026,
 ) -> PreparedCovalentHybrid:
     offset_a = int(metadata_a["ligand_atom_offset"])
     offset_b = int(metadata_b["ligand_atom_offset"])
@@ -392,7 +404,9 @@ def prepare_protein_covalent_hybrid(
     )
     modeller, base_system = _build_base_receptor(
         receptor_pdb, ligand_positions_a, ligand_positions_b,
-        padding_a=padding_a, ionic_strength_molar=ionic_strength_molar,
+        padding_a=padding_a,
+        ionic_strength_molar=ionic_strength_molar,
+        solvation_seed=solvation_seed,
     )
     receptor_atoms = _residue_atoms(modeller.topology, residue_id)
     cys_map_a = _product_cys_map(parameters_a, metadata_a, receptor_atoms)
@@ -514,6 +528,7 @@ def prepare_protein_covalent_hybrid(
         "protein_forcefield": "amber19/protein.ff19SB.xml",
         "water_forcefield": "amber19/opc.xml",
         "covalent_residue_id": residue_id,
+        "solvation_seed": int(solvation_seed),
         "hybrid_solute_atom_count": len(global_to_atom),
         "mapped_product_atom_count": len(hybrid.map_a_to_b),
         "unique_a_count": len(unique_a),
