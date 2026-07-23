@@ -333,6 +333,30 @@ def test_softcore_settings_derive_total_switch_steps():
     assert config["softcore"]["long_range_correction"] == "dynamic"
 
 
+def _test_covalent_schedule_optimization_settings_enable_subdivision():
+    config = _normalized_settings(
+        {
+            "neqti": {
+                "interpolation": "softcore_linear",
+                "softcore": {
+                    "charge_steps_per_stage": 30000,
+                    "sterics_steps": 90000,
+                },
+                "schedule_optimization": {
+                    "enabled": True,
+                    "pilot_samples": 10,
+                    "subdivisions_per_stage": 10,
+                },
+            }
+        }
+    )
+
+    assert config["schedule_optimization"]["enabled"]
+    assert config["schedule_optimization"]["pilot_samples"] == 10
+    assert config["softcore"]["subdivisions_per_stage"] == 10
+    assert config["switch_steps"] == 150000
+
+
 def test_softcore_resume_rejects_changed_protocol(tmp_path):
     first = _normalized_settings(
         {"neqti": {"interpolation": "softcore_linear", "softcore": {"sterics_steps": 30}}}

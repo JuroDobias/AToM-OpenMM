@@ -38,7 +38,13 @@ from atom_openmm.covalent_systems import (
     solvate_capped_reference_hybrid,
     write_prepared_hybrid_bundle,
 )
-from atom_openmm.neqti import _is_numerical_switch_failure, analyze_two_leg_work
+from atom_openmm.neqti import (
+    _allocate_segment_steps,
+    _is_numerical_switch_failure,
+    _optimizer_cycle_scores,
+    _schedule_change_fraction,
+    analyze_two_leg_work,
+)
 from atom_openmm.neqti_integrator import ATMNonequilibriumLangevinIntegrator
 from atom_openmm.rest2 import create_rest2_system
 from atom_openmm.rest2_exchange import REST2ExchangeSampler
@@ -205,6 +211,57 @@ def validate_covalent_workflow(path):
             "workflow.neqti.switch_steps cannot be combined with softcore_linear; "
             "set softcore.charge_steps_per_stage and softcore.sterics_steps"
         )
+    optimization = config["schedule_optimization"]
+    if optimization["enabled"]:
+        if config["interpolation"] != "softcore_linear":
+            raise CovalentWorkflowError(
+                "covalent schedule optimization requires interpolation: softcore_linear"
+            )
+        if optimization["pilot_samples"] < 1:
+            raise CovalentWorkflowError(
+                "schedule_optimization.pilot_samples must be positive"
+            )
+        subdivisions = optimization["subdivisions_per_stage"]
+        if subdivisions < 1:
+            raise CovalentWorkflowError(
+                "schedule_optimization.subdivisions_per_stage must be positive"
+            )
+        if min(
+            config["softcore"]["charge_steps_per_stage"],
+            config["softcore"]["sterics_steps"],
+        ) < subdivisions:
+            raise CovalentWorkflowError(
+                "each softcore stage must contain at least one step per subdivision"
+            )
+        nsegments = 3 * subdivisions
+        if optimization["min_segment_steps"] * nsegments > config["switch_steps"]:
+            raise CovalentWorkflowError(
+                "schedule_optimization.min_segment_steps is too large"
+            )
+        if optimization["max_segment_steps"] * nsegments < config["switch_steps"]:
+            raise CovalentWorkflowError(
+                "schedule_optimization.max_segment_steps is too small"
+            )
+        if not 0.0 < optimization["score_ewma_alpha"] <= 1.0:
+            raise CovalentWorkflowError(
+                "schedule_optimization.score_ewma_alpha must be in (0, 1]"
+            )
+        if not 0.0 < optimization["min_update_factor"] <= 1.0:
+            raise CovalentWorkflowError(
+                "schedule_optimization.min_update_factor must be in (0, 1]"
+            )
+        if optimization["max_update_factor"] < 1.0:
+            raise CovalentWorkflowError(
+                "schedule_optimization.max_update_factor must be at least 1"
+            )
+        if any(
+            optimization[key] < 0.0
+            for key in ("score_hysteresis_weight", "score_absolute_weight")
+        ) or optimization["score_power"] <= 0.0:
+            raise CovalentWorkflowError(
+                "schedule optimization score weights must be nonnegative and "
+                "score_power must be positive"
+            )
     if config["softcore"]["long_range_correction"] not in {
         "dynamic",
         "endpoint_correction",
@@ -892,6 +949,47 @@ def _reset_softcore_context(context, integrator, parameter_values):
         context.setParameter(name, float(values[0]))
 
 
+def _run_segmented_protocol(integrator, segment_steps):
+    segment_work = []
+    previous = 0.0
+    for steps in segment_steps:
+        integrator.step(int(steps))
+        cumulative = integrator.get_protocol_work().value_in_unit(
+            unit.kilojoules_per_mole
+        )
+        segment_work.append(float(cumulative - previous))
+        previous = cumulative
+    return float(previous), segment_work
+
+
+def _optimizer_csv_fields(nsegments):
+    return [
+        "cycle",
+        "forward_work_kj_per_mol",
+        "reverse_work_kj_per_mol",
+        *[f"forward_segment_{index + 1}_kj_per_mol" for index in range(nsegments)],
+        *[f"reverse_segment_{index + 1}_kj_per_mol" for index in range(nsegments)],
+    ]
+
+
+def _rewrite_optimizer_rows(path, rows, nsegments):
+    path = Path(path)
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_optimizer_csv_fields(nsegments))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _append_optimizer_row(path, row, nsegments):
+    path = Path(path)
+    exists = path.exists()
+    with path.open("a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_optimizer_csv_fields(nsegments))
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def _apply_state(context, state):
     box = state.getPeriodicBoxVectors()
     if box is not None:
@@ -1012,6 +1110,7 @@ def _run_environment(
     rest2_summaries = {}
     softcore = None
     softcore_contexts = {}
+    segment_steps = None
     lrc_corrections = None
     lrc_evaluation_platform = None
     if config["interpolation"] == "softcore_linear":
@@ -1031,6 +1130,7 @@ def _run_environment(
             use_long_range_correction=lrc_mode == "dynamic",
             **softcore_options,
         )
+        segment_steps = list(softcore.segment_steps)
         _assert_fixed_volume_switch(softcore.system)
         if lrc_mode == "endpoint_correction":
             lrc_hamiltonian = create_softcore_hamiltonian(
@@ -1073,6 +1173,193 @@ def _run_environment(
             config["softcore"]["sterics_steps"],
             config["softcore"]["charge_steps_per_stage"],
             softcore.total_steps,
+        )
+    optimization = config["schedule_optimization"]
+    if optimization["enabled"]:
+        optimizer_path = workdir / "covalent_schedule_optimization.yaml"
+        optimizer_csv = workdir / f"{name}_schedule_optimization.csv"
+        nsegments = len(segment_steps)
+        if optimizer_path.exists():
+            optimizer_state = yaml.safe_load(optimizer_path.read_text()) or {}
+        else:
+            optimizer_state = {
+                "schema_version": 1,
+                "status": "running",
+                "settings": optimization,
+                "environments": {},
+            }
+        if optimizer_state.get("settings") != optimization:
+            raise CovalentResumeError(
+                "existing covalent schedule optimization uses different settings"
+            )
+        environment_state = optimizer_state["environments"].setdefault(
+            name,
+            {
+                "status": "running",
+                "completed_pilot_cycles": 0,
+                "segment_steps": list(segment_steps),
+                "scores": None,
+                "history": [],
+            },
+        )
+        segment_steps = [
+            int(value) for value in environment_state["segment_steps"]
+        ]
+        completed_cycles = int(environment_state["completed_pilot_cycles"])
+        if optimizer_csv.exists():
+            with optimizer_csv.open(newline="") as handle:
+                rows = [
+                    row
+                    for row in csv.DictReader(handle)
+                    if int(row["cycle"]) <= completed_cycles
+                ]
+            _rewrite_optimizer_rows(optimizer_csv, rows, nsegments)
+
+        for cycle in range(completed_cycles, optimization["pilot_samples"]):
+            LOGGER.info(
+                "%s schedule optimization cycle %d/%d starting with steps %s",
+                name,
+                cycle + 1,
+                optimization["pilot_samples"],
+                segment_steps,
+            )
+            pilot = {}
+            for direction, endpoint, system, offset in (
+                ("forward", "a", prepared.endpoint_a, 0),
+                ("reverse", "b", prepared.endpoint_b, 100),
+            ):
+                state, rest2_summary = _sample_endpoint(
+                    system,
+                    prepared.topology,
+                    state_files[endpoint],
+                    prepared.hot_atom_indices,
+                    ensemble=endpoint,
+                    steps=config["decorrelation_steps"],
+                    rest2_config=config["rest2"],
+                    output_dir=workdir / f"{name}_rest2_{endpoint}",
+                    platform=platform,
+                    properties=properties,
+                    temperature_k=temperature,
+                    timestep_fs=timestep,
+                    seed=seed + 900000 + cycle * 1000 + offset,
+                )
+                if rest2_summary is not None:
+                    rest2_summaries[endpoint] = rest2_summary
+                cached = softcore_contexts.get(direction)
+                if cached is None:
+                    cached = _softcore_switch_context(
+                        softcore,
+                        start=endpoint,
+                        timestep_fs=timestep,
+                        temperature_k=temperature,
+                        platform=platform,
+                        properties=properties,
+                        seed=seed + 800000 + offset,
+                    )
+                    softcore_contexts[direction] = cached
+                context, integrator, parameter_values = cached
+                direction_steps = (
+                    list(segment_steps)
+                    if direction == "forward"
+                    else list(reversed(segment_steps))
+                )
+                integrator.set_segment_steps(direction_steps)
+                _reset_softcore_context(context, integrator, parameter_values)
+                _apply_state(context, state)
+                raw_work, increments = _run_segmented_protocol(
+                    integrator, direction_steps
+                )
+                corrected_work = raw_work
+                if lrc_corrections is not None:
+                    correction = lrc_corrections[direction]
+                    corrected_work += correction["final"] - correction["initial"]
+                pilot[direction] = {
+                    "work": corrected_work,
+                    "segment_work": increments,
+                }
+            cycle_scores = _optimizer_cycle_scores(
+                np.asarray(pilot["forward"]["segment_work"]) / KCAL_TO_KJ,
+                np.asarray(pilot["reverse"]["segment_work"]) / KCAL_TO_KJ,
+                optimization,
+            )
+            previous_scores = environment_state.get("scores")
+            aggregate_scores = (
+                cycle_scores
+                if previous_scores is None
+                else optimization["score_ewma_alpha"] * cycle_scores
+                + (1.0 - optimization["score_ewma_alpha"])
+                * np.asarray(previous_scores, dtype=float)
+            )
+            previous_steps = list(segment_steps)
+            segment_steps = _allocate_segment_steps(
+                aggregate_scores,
+                sum(previous_steps),
+                previous_steps,
+                optimization,
+            )
+            row = {
+                "cycle": cycle + 1,
+                "forward_work_kj_per_mol": pilot["forward"]["work"],
+                "reverse_work_kj_per_mol": pilot["reverse"]["work"],
+            }
+            row.update(
+                {
+                    f"forward_segment_{index + 1}_kj_per_mol": value
+                    for index, value in enumerate(
+                        pilot["forward"]["segment_work"]
+                    )
+                }
+            )
+            row.update(
+                {
+                    f"reverse_segment_{index + 1}_kj_per_mol": value
+                    for index, value in enumerate(
+                        pilot["reverse"]["segment_work"]
+                    )
+                }
+            )
+            _append_optimizer_row(optimizer_csv, row, nsegments)
+            environment_state["completed_pilot_cycles"] = cycle + 1
+            environment_state["segment_steps"] = list(segment_steps)
+            environment_state["scores"] = aggregate_scores.tolist()
+            environment_state["history"].append(
+                {
+                    "cycle": cycle + 1,
+                    "cycle_scores": cycle_scores.tolist(),
+                    "aggregate_scores": aggregate_scores.tolist(),
+                    "previous_steps": previous_steps,
+                    "next_steps": list(segment_steps),
+                    "allocation_change_fraction": _schedule_change_fraction(
+                        previous_steps, segment_steps
+                    ),
+                }
+            )
+            environment_state["status"] = (
+                "frozen"
+                if cycle + 1 >= optimization["pilot_samples"]
+                else "running"
+            )
+            optimizer_state["status"] = (
+                "frozen"
+                if all(
+                    item.get("status") == "frozen"
+                    for item in optimizer_state["environments"].values()
+                )
+                and len(optimizer_state["environments"]) == 2
+                else "running"
+            )
+            _write_yaml_atomic(optimizer_path, optimizer_state)
+            LOGGER.info(
+                "%s schedule optimization cycle %d complete; steps %s",
+                name,
+                cycle + 1,
+                segment_steps,
+            )
+        LOGGER.info(
+            "%s schedule optimization frozen after %d cycles with steps %s",
+            name,
+            optimization["pilot_samples"],
+            segment_steps,
         )
     for sample in range(int(config["n_snapshots"])):
         for direction, endpoint, system, offset in (
@@ -1144,6 +1431,12 @@ def _run_environment(
                         )
                         softcore_contexts[direction] = cached
                     context, integrator, parameter_values = cached
+                    direction_steps = (
+                        list(segment_steps)
+                        if direction == "forward"
+                        else list(reversed(segment_steps))
+                    )
+                    integrator.set_segment_steps(direction_steps)
                     _reset_softcore_context(context, integrator, parameter_values)
                 _apply_state(context, state)
                 if lrc_corrections is not None:
@@ -1162,7 +1455,12 @@ def _run_environment(
                             "precomputation"
                         )
                 started = time.perf_counter()
-                integrator.step(int(config["switch_steps"]))
+                if softcore is None:
+                    integrator.step(int(config["switch_steps"]))
+                else:
+                    raw_work_kj, _ = _run_segmented_protocol(
+                        integrator, direction_steps
+                    )
                 switch_elapsed = time.perf_counter() - started
                 simulated_ns = config["switch_steps"] * timestep * 1.0e-6
                 switch_ns_per_day = simulated_ns * 86400.0 / switch_elapsed
@@ -1187,9 +1485,10 @@ def _run_environment(
                     dummy_atom_indices=_dummy_particles(prepared, final_endpoint),
                 )
                 post_switch_written = True
-                raw_work_kj = integrator.get_protocol_work().value_in_unit(
-                    unit.kilojoules_per_mole
-                )
+                if raw_work_kj is None:
+                    raw_work_kj = integrator.get_protocol_work().value_in_unit(
+                        unit.kilojoules_per_mole
+                    )
                 work_kj = raw_work_kj
                 if lrc_corrections is not None:
                     final_volume_nm3 = _state_volume_nm3(post_switch_state)
@@ -1287,6 +1586,7 @@ def _normalized_settings(workflow):
     equilibration = neqti.get("endpoint_equilibration") or {}
     rest2 = neqti.get("rest2") or {}
     softcore = neqti.get("softcore") or {}
+    optimization_raw = neqti.get("schedule_optimization") or {}
     interpolation = str(neqti.get("interpolation", "envelope"))
     enabled = bool(rest2.get("enabled", True))
     temperatures = rest2.get(
@@ -1301,6 +1601,40 @@ def _normalized_settings(workflow):
         "sterics_steps": int(softcore.get("sterics_steps", 30000)),
         "long_range_correction": str(
             softcore.get("long_range_correction", "dynamic")
+        ),
+        "subdivisions_per_stage": int(
+            optimization_raw.get("subdivisions_per_stage", 10)
+            if optimization_raw.get("enabled", False)
+            else 1
+        ),
+    }
+    schedule_optimization = {
+        "enabled": bool(optimization_raw.get("enabled", False)),
+        "pilot_samples": int(optimization_raw.get("pilot_samples", 10)),
+        "subdivisions_per_stage": int(
+            optimization_raw.get("subdivisions_per_stage", 10)
+        ),
+        "score_hysteresis_weight": float(
+            optimization_raw.get("score_hysteresis_weight", 0.7)
+        ),
+        "score_absolute_weight": float(
+            optimization_raw.get("score_absolute_weight", 0.3)
+        ),
+        "score_power": float(optimization_raw.get("score_power", 1.5)),
+        "score_ewma_alpha": float(
+            optimization_raw.get("score_ewma_alpha", 0.3)
+        ),
+        "min_segment_steps": int(
+            optimization_raw.get("min_segment_steps", 1000)
+        ),
+        "max_segment_steps": int(
+            optimization_raw.get("max_segment_steps", 15000)
+        ),
+        "min_update_factor": float(
+            optimization_raw.get("min_update_factor", 0.5)
+        ),
+        "max_update_factor": float(
+            optimization_raw.get("max_update_factor", 2.0)
         ),
     }
     switch_steps = (
@@ -1338,6 +1672,7 @@ def _normalized_settings(workflow):
         "interpolation": interpolation,
         "legacy_switch_steps_set": "switch_steps" in neqti,
         "softcore": softcore_settings,
+        "schedule_optimization": schedule_optimization,
         "failed_switch_policy": str(
             neqti.get("failed_switch_policy", "count_as_infinite")
         ),
@@ -1564,6 +1899,9 @@ def _switch_protocol(config, mapping_settings=None):
     }
     if config["interpolation"] == "softcore_linear":
         protocol["softcore"] = dict(config["softcore"])
+        protocol["schedule_optimization"] = dict(
+            config["schedule_optimization"]
+        )
         if config["softcore"]["long_range_correction"] == "endpoint_correction":
             protocol["softcore_endpoint_correction"] = {
                 "version": LRC_CORRECTION_VERSION,
@@ -1768,6 +2106,11 @@ def run_covalent_pair(settings, pair):
     reference_forward, reference_reverse, reference_rest2 = _run_environment(
         "reference", reference, config, workdir, platform, properties, config["random_seed"] + 100000
     )
+    optimizer_summary = None
+    if config["schedule_optimization"]["enabled"]:
+        optimizer_summary = yaml.safe_load(
+            (workdir / "covalent_schedule_optimization.yaml").read_text()
+        )
     work = {
         "leg_a_forward": protein_forward,
         "leg_a_reverse": protein_reverse,
@@ -1864,6 +2207,20 @@ def run_covalent_pair(settings, pair):
     if config["softcore"]["long_range_correction"] == "endpoint_correction":
         result["artifacts"]["switch_lrc_diagnostics_csv"] = (
             "switch_lrc_diagnostics.csv"
+        )
+    if optimizer_summary is not None:
+        result["switching_protocol"]["optimized_schedules"] = {
+            name: payload["segment_steps"]
+            for name, payload in optimizer_summary["environments"].items()
+        }
+        result["artifacts"]["schedule_optimization"] = (
+            "covalent_schedule_optimization.yaml"
+        )
+        result["artifacts"]["protein_schedule_pilot_csv"] = (
+            "protein_schedule_optimization.csv"
+        )
+        result["artifacts"]["reference_schedule_pilot_csv"] = (
+            "reference_schedule_optimization.csv"
         )
     if failed_switches:
         result["quality"]["warnings"].append(

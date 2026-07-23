@@ -512,6 +512,7 @@ def create_softcore_hamiltonian(
     power: int = 1,
     charge_steps_per_stage: int = 10000,
     sterics_steps: int = 30000,
+    subdivisions_per_stage: int = 1,
     use_long_range_correction: bool = True,
 ) -> CovalentSoftcoreHamiltonian:
     _assert_compatible_endpoints(endpoint_a, endpoint_b)
@@ -519,6 +520,8 @@ def create_softcore_hamiltonian(
         raise CovalentAlchemyError("softcore alpha, sigma_nm, and power must be positive")
     if charge_steps_per_stage < 1 or sterics_steps < 1:
         raise CovalentAlchemyError("softcore stage steps must be positive")
+    if subdivisions_per_stage < 1:
+        raise CovalentAlchemyError("softcore subdivisions_per_stage must be positive")
     output = _system_shell(endpoint_a)
     _add_bonded_forces(output, endpoint_a, endpoint_b)
     _add_nonbonded_forces(
@@ -533,11 +536,30 @@ def create_softcore_hamiltonian(
         use_long_range_correction=bool(use_long_range_correction),
     )
     _copy_other_forces(output, endpoint_a, endpoint_b)
-    steps = [int(charge_steps_per_stage), int(sterics_steps), int(charge_steps_per_stage)]
-    values = {
+    stage_steps = [
+        int(charge_steps_per_stage),
+        int(sterics_steps),
+        int(charge_steps_per_stage),
+    ]
+    stage_values = {
         CHARGE_A_PARAMETER: [1.0, 0.0, 0.0, 0.0],
         CHARGE_B_PARAMETER: [0.0, 0.0, 0.0, 1.0],
         MAPPED_CHARGE_PARAMETER: [0.0, 0.5, 0.5, 1.0],
         STERICS_PARAMETER: [0.0, 0.0, 1.0, 1.0],
     }
+    values = {name: [nodes[0]] for name, nodes in stage_values.items()}
+    steps = []
+    for stage, total in enumerate(stage_steps):
+        quotient, remainder = divmod(total, int(subdivisions_per_stage))
+        if quotient < 1:
+            raise CovalentAlchemyError(
+                "softcore stage steps must be at least subdivisions_per_stage"
+            )
+        for subdivision in range(int(subdivisions_per_stage)):
+            fraction = (subdivision + 1) / float(subdivisions_per_stage)
+            for name, nodes in stage_values.items():
+                values[name].append(
+                    nodes[stage] + fraction * (nodes[stage + 1] - nodes[stage])
+                )
+            steps.append(quotient + (1 if subdivision < remainder else 0))
     return CovalentSoftcoreHamiltonian(output, values, steps, sum(steps))

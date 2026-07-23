@@ -8,6 +8,7 @@ from atom_openmm.covalent_softcore import (
 )
 from atom_openmm.covalent_workflow import (
     _EndpointLRCCorrectionEvaluator,
+    _run_segmented_protocol,
 )
 from atom_openmm.neqti_integrator import ATMNonequilibriumLangevinIntegrator
 
@@ -118,6 +119,66 @@ def _test_softcore_schedule_is_symmetric_and_finite_at_overlap():
     energy, forces = _energy_forces(hamiltonian.system, positions, midpoint)
     assert np.isfinite(energy)
     assert np.all(np.isfinite(forces))
+
+
+def _test_softcore_subdivision_preserves_path_and_total_steps():
+    hamiltonian = create_softcore_hamiltonian(
+        _endpoint("a"),
+        _endpoint("b"),
+        [2],
+        [3],
+        charge_steps_per_stage=11,
+        sterics_steps=17,
+        subdivisions_per_stage=4,
+    )
+
+    assert len(hamiltonian.segment_steps) == 12
+    assert sum(hamiltonian.segment_steps) == 39
+    assert hamiltonian.parameter_values["COVALENT_CHARGE_A"][0] == 1.0
+    assert hamiltonian.parameter_values["COVALENT_CHARGE_A"][4] == 0.0
+    assert hamiltonian.parameter_values["COVALENT_STERICS"][4] == 0.0
+    assert hamiltonian.parameter_values["COVALENT_STERICS"][8] == 1.0
+    assert hamiltonian.parameter_values["COVALENT_CHARGE_B"][-1] == 1.0
+    assert hamiltonian.segment_steps == [3, 3, 3, 2, 5, 4, 4, 4, 3, 3, 3, 2]
+
+
+def _test_segment_work_increments_sum_to_total_protocol_work():
+    hamiltonian = create_softcore_hamiltonian(
+        _endpoint("a"),
+        _endpoint("b"),
+        [2],
+        [3],
+        charge_steps_per_stage=4,
+        sterics_steps=6,
+        subdivisions_per_stage=2,
+    )
+    integrator = ATMNonequilibriumLangevinIntegrator(
+        temperature=300.0 * unit.kelvin,
+        collision_rate=1.0 / unit.picosecond,
+        timestep=1.0 * unit.femtosecond,
+        parameter_values=hamiltonian.parameter_values,
+        steps_per_segment=hamiltonian.segment_steps,
+        random_seed=9,
+    )
+    context = mm.Context(hamiltonian.system, integrator)
+    positions = np.asarray(
+        [[0, 0, 0], [0.15, 0, 0], [0.28, 0.08, 0], [0.29, -0.09, 0.03], [0.7, 0.4, 0.3]]
+    ) * unit.nanometer
+    context.setPositions(positions)
+    context.setVelocitiesToTemperature(300.0 * unit.kelvin, 9)
+    for name, values in hamiltonian.parameter_values.items():
+        context.setParameter(name, values[0])
+
+    total, increments = _run_segmented_protocol(
+        integrator, hamiltonian.segment_steps
+    )
+
+    assert len(increments) == 6
+    assert np.isclose(sum(increments), total)
+    assert np.isclose(
+        total,
+        integrator.get_protocol_work().value_in_unit(unit.kilojoule_per_mole),
+    )
 
 
 def _test_softcore_schedule_runs_forward_and_reverse_on_device():
