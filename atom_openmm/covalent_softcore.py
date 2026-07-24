@@ -17,6 +17,8 @@ CHARGE_A_PARAMETER = "COVALENT_CHARGE_A"
 CHARGE_B_PARAMETER = "COVALENT_CHARGE_B"
 MAPPED_CHARGE_PARAMETER = "COVALENT_MAPPED_CHARGE"
 STERICS_PARAMETER = "COVALENT_STERICS"
+STERICS_A_PARAMETER = "COVALENT_STERICS_A"
+STERICS_B_PARAMETER = "COVALENT_STERICS_B"
 SOFTCORE_NONBONDED_FORCE_GROUP = 31
 
 
@@ -26,6 +28,7 @@ class CovalentSoftcoreHamiltonian:
     parameter_values: dict[str, list[float]]
     segment_steps: list[int]
     total_steps: int
+    resolved_path: dict
 
 
 def _force(system: mm.System, cls):
@@ -199,11 +202,14 @@ def _add_bonded_forces(output, endpoint_a, endpoint_b):
         common_torsions.setName("CovalentCommonTorsions")
         output.addForce(common_torsions)
     for label, terms, expression in (
-        ("A", only_a, "(1-COVALENT_STERICS)*k*(1+cos(periodicity*theta-phase))"),
-        ("B", only_b, "COVALENT_STERICS*k*(1+cos(periodicity*theta-phase))"),
+        ("A", only_a, "COVALENT_STERICS_A*k*(1+cos(periodicity*theta-phase))"),
+        ("B", only_b, "COVALENT_STERICS_B*k*(1+cos(periodicity*theta-phase))"),
     ):
         force = mm.CustomTorsionForce(expression)
-        force.addGlobalParameter(STERICS_PARAMETER, 0.0)
+        force.addGlobalParameter(
+            STERICS_A_PARAMETER if label == "A" else STERICS_B_PARAMETER,
+            0.0,
+        )
         for name in ("periodicity", "phase", "k"):
             force.addPerTorsionParameter(name)
         for particles, periodicity, phase, k in terms:
@@ -296,7 +302,7 @@ def _new_softcore_force(
 ):
     force = mm.CustomNonbondedForce(_softcore_expression(scale))
     force.setName(f"CovalentSoftcoreNonbonded{label}")
-    force.addGlobalParameter(STERICS_PARAMETER, 0.0)
+    force.addGlobalParameter(scale, 0.0)
     force.addGlobalParameter("SOFTCORE_ALPHA", float(alpha))
     force.addGlobalParameter("SOFTCORE_SIGMA", float(sigma_nm))
     force.addGlobalParameter("SOFTCORE_POWER", float(power))
@@ -314,7 +320,7 @@ def _new_softcore_force(
 def _new_softcore_exception_force(label, scale, alpha, sigma_nm, power):
     force = mm.CustomBondForce(_softcore_bond_expression(scale))
     force.setName(f"CovalentSoftcoreExceptions{label}")
-    force.addGlobalParameter(STERICS_PARAMETER, 0.0)
+    force.addGlobalParameter(scale, 0.0)
     force.addGlobalParameter("SOFTCORE_ALPHA", float(alpha))
     force.addGlobalParameter("SOFTCORE_SIGMA", float(sigma_nm))
     force.addGlobalParameter("SOFTCORE_POWER", float(power))
@@ -357,6 +363,8 @@ def _add_nonbonded_forces(
         CHARGE_B_PARAMETER,
         MAPPED_CHARGE_PARAMETER,
         STERICS_PARAMETER,
+        STERICS_A_PARAMETER,
+        STERICS_B_PARAMETER,
     ):
         force.addGlobalParameter(parameter, 0.0)
     for particle in range(endpoint_a.getNumParticles()):
@@ -389,7 +397,7 @@ def _add_nonbonded_forces(
     softcore_a = _new_softcore_force(
         source_a,
         "A",
-        f"1-{STERICS_PARAMETER}",
+        STERICS_A_PARAMETER,
         alpha,
         sigma_nm,
         power,
@@ -398,7 +406,7 @@ def _add_nonbonded_forces(
     softcore_b = _new_softcore_force(
         source_b,
         "B",
-        STERICS_PARAMETER,
+        STERICS_B_PARAMETER,
         alpha,
         sigma_nm,
         power,
@@ -414,10 +422,10 @@ def _add_nonbonded_forces(
     if unique_b and environment:
         softcore_b.addInteractionGroup(unique_b, environment)
     exception_lj_a = _new_softcore_exception_force(
-        "A", f"1-{STERICS_PARAMETER}", alpha, sigma_nm, power
+        "A", STERICS_A_PARAMETER, alpha, sigma_nm, power
     )
     exception_lj_b = _new_softcore_exception_force(
-        "B", STERICS_PARAMETER, alpha, sigma_nm, power
+        "B", STERICS_B_PARAMETER, alpha, sigma_nm, power
     )
 
     for pair in sorted(exception_pairs):
@@ -501,6 +509,164 @@ def _copy_other_forces(output, endpoint_a, endpoint_b):
         raise CovalentAlchemyError(f"endpoint A is missing forces present in endpoint B: {leftovers}")
 
 
+def _allocate_interval_steps(total_steps, nodes, segment_counts):
+    boundaries = [0.0, *nodes, 1.0]
+    widths = [
+        boundaries[index + 1] - boundaries[index]
+        for index in range(len(boundaries) - 1)
+    ]
+    raw = [float(total_steps) * width for width in widths]
+    steps = [int(value) for value in raw]
+    remainder = int(total_steps) - sum(steps)
+    order = sorted(
+        range(len(raw)),
+        key=lambda index: (raw[index] - steps[index], -index),
+        reverse=True,
+    )
+    for index in order[:remainder]:
+        steps[index] += 1
+    if any(total < count for total, count in zip(steps, segment_counts)):
+        raise CovalentAlchemyError(
+            "softcore total_steps must provide at least one step per segment"
+        )
+    return steps
+
+
+def resolve_softcore_path(
+    *,
+    charge_steps_per_stage=10000,
+    sterics_steps=30000,
+    subdivisions_per_stage=1,
+    total_steps=None,
+    path_nodes=None,
+    vdw_a=None,
+    charge_a=None,
+    segments_per_interval=None,
+):
+    general_values = (total_steps, path_nodes, vdw_a, charge_a, segments_per_interval)
+    general = any(value is not None for value in general_values)
+    if general:
+        if any(value is None for value in general_values):
+            raise CovalentAlchemyError(
+                "general softcore paths require total_steps, path_nodes, vdw_a, "
+                "charge_a, and segments_per_interval"
+            )
+        nodes = [float(value) for value in path_nodes]
+        vdw = [float(value) for value in vdw_a]
+        charge = [float(value) for value in charge_a]
+        segments = [int(value) for value in segments_per_interval]
+        total = int(total_steps)
+        if charge_steps_per_stage != 10000 or sterics_steps != 30000:
+            raise CovalentAlchemyError(
+                "general softcore paths cannot be combined with legacy stage steps"
+            )
+        if subdivisions_per_stage != 1:
+            raise CovalentAlchemyError(
+                "segments_per_interval replaces subdivisions_per_stage for "
+                "general softcore paths"
+            )
+        if any(
+            not 0.0 < value < 1.0 for value in nodes
+        ) or any(right <= left for left, right in zip(nodes, nodes[1:])):
+            raise CovalentAlchemyError(
+                "softcore path nodes must be strictly increasing values in (0, 1)"
+            )
+        expected_values = len(nodes) + 2
+        if len(vdw) != expected_values or len(charge) != expected_values:
+            raise CovalentAlchemyError(
+                "softcore vdw_a and charge_a must contain len(nodes)+2 values"
+            )
+        if len(segments) != len(nodes) + 1 or any(value < 1 for value in segments):
+            raise CovalentAlchemyError(
+                "segments_per_interval must contain one positive value per path interval"
+            )
+        if any(value < 0.0 or value > 1.0 for value in (*vdw, *charge)):
+            raise CovalentAlchemyError("softcore path scales must be in [0, 1]")
+        if vdw[0] != 1.0 or vdw[-1] != 0.0:
+            raise CovalentAlchemyError("softcore vdw_a must begin at 1 and end at 0")
+        if charge[0] != 1.0 or charge[-1] != 0.0:
+            raise CovalentAlchemyError(
+                "softcore charge_a must begin at 1 and end at 0"
+            )
+        if total < 1:
+            raise CovalentAlchemyError("softcore total_steps must be positive")
+        interval_steps = _allocate_interval_steps(total, nodes, segments)
+        source = "general"
+    else:
+        if charge_steps_per_stage < 1 or sterics_steps < 1:
+            raise CovalentAlchemyError("softcore stage steps must be positive")
+        if subdivisions_per_stage < 1:
+            raise CovalentAlchemyError(
+                "softcore subdivisions_per_stage must be positive"
+            )
+        if min(charge_steps_per_stage, sterics_steps) < subdivisions_per_stage:
+            raise CovalentAlchemyError(
+                "softcore stage steps must be at least subdivisions_per_stage"
+            )
+        total = 2 * int(charge_steps_per_stage) + int(sterics_steps)
+        nodes = [
+            float(charge_steps_per_stage) / total,
+            float(charge_steps_per_stage + sterics_steps) / total,
+        ]
+        vdw = [1.0, 1.0, 0.0, 0.0]
+        charge = [1.0, 0.0, 0.0, 0.0]
+        segments = [int(subdivisions_per_stage)] * 3
+        interval_steps = [
+            int(charge_steps_per_stage),
+            int(sterics_steps),
+            int(charge_steps_per_stage),
+        ]
+        source = "legacy_staged"
+
+    vdw_b = list(reversed(vdw))
+    charge_b = list(reversed(charge))
+    mapped_vdw = [
+        0.5 * (1.0 - left + right) for left, right in zip(vdw, vdw_b)
+    ]
+    mapped_charge = [
+        0.5 * (1.0 - left + right) for left, right in zip(charge, charge_b)
+    ]
+    return {
+        "source": source,
+        "nodes": nodes,
+        "vdw_a": vdw,
+        "vdw_b": vdw_b,
+        "charge_a": charge,
+        "charge_b": charge_b,
+        "mapped_vdw": mapped_vdw,
+        "mapped_charge": mapped_charge,
+        "segments_per_interval": segments,
+        "interval_steps": interval_steps,
+        "total_steps": total,
+    }
+
+
+def _expand_path(resolved):
+    node_values = {
+        CHARGE_A_PARAMETER: resolved["charge_a"],
+        CHARGE_B_PARAMETER: resolved["charge_b"],
+        MAPPED_CHARGE_PARAMETER: resolved["mapped_charge"],
+        STERICS_A_PARAMETER: resolved["vdw_a"],
+        STERICS_B_PARAMETER: resolved["vdw_b"],
+        STERICS_PARAMETER: resolved["mapped_vdw"],
+    }
+    values = {name: [nodes[0]] for name, nodes in node_values.items()}
+    steps = []
+    for interval, (count, total) in enumerate(
+        zip(resolved["segments_per_interval"], resolved["interval_steps"])
+    ):
+        quotient, remainder = divmod(int(total), int(count))
+        for subdivision in range(int(count)):
+            fraction = (subdivision + 1) / float(count)
+            for name, nodes in node_values.items():
+                values[name].append(
+                    nodes[interval]
+                    + fraction * (nodes[interval + 1] - nodes[interval])
+                )
+            steps.append(quotient + (1 if subdivision < remainder else 0))
+    return values, steps
+
+
 def create_softcore_hamiltonian(
     endpoint_a: mm.System,
     endpoint_b: mm.System,
@@ -513,15 +679,26 @@ def create_softcore_hamiltonian(
     charge_steps_per_stage: int = 10000,
     sterics_steps: int = 30000,
     subdivisions_per_stage: int = 1,
+    total_steps: int | None = None,
+    path_nodes=None,
+    vdw_a=None,
+    charge_a=None,
+    segments_per_interval=None,
     use_long_range_correction: bool = True,
 ) -> CovalentSoftcoreHamiltonian:
     _assert_compatible_endpoints(endpoint_a, endpoint_b)
     if alpha <= 0.0 or sigma_nm <= 0.0 or power < 1:
         raise CovalentAlchemyError("softcore alpha, sigma_nm, and power must be positive")
-    if charge_steps_per_stage < 1 or sterics_steps < 1:
-        raise CovalentAlchemyError("softcore stage steps must be positive")
-    if subdivisions_per_stage < 1:
-        raise CovalentAlchemyError("softcore subdivisions_per_stage must be positive")
+    resolved_path = resolve_softcore_path(
+        charge_steps_per_stage=int(charge_steps_per_stage),
+        sterics_steps=int(sterics_steps),
+        subdivisions_per_stage=int(subdivisions_per_stage),
+        total_steps=total_steps,
+        path_nodes=path_nodes,
+        vdw_a=vdw_a,
+        charge_a=charge_a,
+        segments_per_interval=segments_per_interval,
+    )
     output = _system_shell(endpoint_a)
     _add_bonded_forces(output, endpoint_a, endpoint_b)
     _add_nonbonded_forces(
@@ -536,30 +713,11 @@ def create_softcore_hamiltonian(
         use_long_range_correction=bool(use_long_range_correction),
     )
     _copy_other_forces(output, endpoint_a, endpoint_b)
-    stage_steps = [
-        int(charge_steps_per_stage),
-        int(sterics_steps),
-        int(charge_steps_per_stage),
-    ]
-    stage_values = {
-        CHARGE_A_PARAMETER: [1.0, 0.0, 0.0, 0.0],
-        CHARGE_B_PARAMETER: [0.0, 0.0, 0.0, 1.0],
-        MAPPED_CHARGE_PARAMETER: [0.0, 0.5, 0.5, 1.0],
-        STERICS_PARAMETER: [0.0, 0.0, 1.0, 1.0],
-    }
-    values = {name: [nodes[0]] for name, nodes in stage_values.items()}
-    steps = []
-    for stage, total in enumerate(stage_steps):
-        quotient, remainder = divmod(total, int(subdivisions_per_stage))
-        if quotient < 1:
-            raise CovalentAlchemyError(
-                "softcore stage steps must be at least subdivisions_per_stage"
-            )
-        for subdivision in range(int(subdivisions_per_stage)):
-            fraction = (subdivision + 1) / float(subdivisions_per_stage)
-            for name, nodes in stage_values.items():
-                values[name].append(
-                    nodes[stage] + fraction * (nodes[stage + 1] - nodes[stage])
-                )
-            steps.append(quotient + (1 if subdivision < remainder else 0))
-    return CovalentSoftcoreHamiltonian(output, values, steps, sum(steps))
+    values, steps = _expand_path(resolved_path)
+    return CovalentSoftcoreHamiltonian(
+        output,
+        values,
+        steps,
+        sum(steps),
+        resolved_path,
+    )

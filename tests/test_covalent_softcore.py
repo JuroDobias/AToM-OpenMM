@@ -4,6 +4,8 @@ from openmm import unit
 
 from atom_openmm.covalent_softcore import (
     SOFTCORE_NONBONDED_FORCE_GROUP,
+    STERICS_A_PARAMETER,
+    STERICS_B_PARAMETER,
     create_softcore_hamiltonian,
 )
 from atom_openmm.covalent_workflow import (
@@ -140,6 +142,69 @@ def _test_softcore_subdivision_preserves_path_and_total_steps():
     assert hamiltonian.parameter_values["COVALENT_STERICS"][8] == 1.0
     assert hamiltonian.parameter_values["COVALENT_CHARGE_B"][-1] == 1.0
     assert hamiltonian.segment_steps == [3, 3, 3, 2, 5, 4, 4, 4, 3, 3, 3, 2]
+
+
+def _test_general_linear_path_preserves_endpoints_and_budget():
+    endpoint_a = _endpoint("a")
+    endpoint_b = _endpoint("b")
+    hamiltonian = create_softcore_hamiltonian(
+        endpoint_a,
+        endpoint_b,
+        [2],
+        [3],
+        total_steps=150,
+        path_nodes=[],
+        vdw_a=[1.0, 0.0],
+        charge_a=[1.0, 0.0],
+        segments_per_interval=[30],
+    )
+    assert hamiltonian.segment_steps == [5] * 30
+    assert hamiltonian.resolved_path["vdw_b"] == [0.0, 1.0]
+    assert hamiltonian.resolved_path["mapped_charge"] == [0.0, 1.0]
+    positions = np.asarray(
+        [[0, 0, 0], [0.15, 0, 0], [0.28, 0.08, 0], [0.29, -0.09, 0.03], [0.7, 0.4, 0.3]]
+    ) * unit.nanometer
+    for endpoint, node in ((endpoint_a, 0), (endpoint_b, -1)):
+        expected_energy, expected_forces = _energy_forces(endpoint, positions)
+        parameters = {
+            name: values[node]
+            for name, values in hamiltonian.parameter_values.items()
+        }
+        observed_energy, observed_forces = _energy_forces(
+            hamiltonian.system, positions, parameters
+        )
+        assert np.isclose(observed_energy, expected_energy, atol=1.0e-5)
+        assert np.allclose(observed_forces, expected_forces, atol=1.0e-3)
+
+
+def _test_general_midpoint_path_keeps_both_vdw_branches_fully_coupled():
+    hamiltonian = create_softcore_hamiltonian(
+        _endpoint("a"),
+        _endpoint("b"),
+        [2],
+        [3],
+        total_steps=150,
+        path_nodes=[0.5],
+        vdw_a=[1.0, 1.0, 0.0],
+        charge_a=[1.0, 0.5, 0.0],
+        segments_per_interval=[15, 15],
+    )
+    midpoint = 15
+    assert hamiltonian.parameter_values[STERICS_A_PARAMETER][midpoint] == 1.0
+    assert hamiltonian.parameter_values[STERICS_B_PARAMETER][midpoint] == 1.0
+    assert hamiltonian.parameter_values["COVALENT_CHARGE_A"][midpoint] == 0.5
+    assert hamiltonian.parameter_values["COVALENT_CHARGE_B"][midpoint] == 0.5
+    assert hamiltonian.parameter_values["COVALENT_STERICS"][midpoint] == 0.5
+    positions = np.asarray(
+        [[0, 0, 0], [0.15, 0, 0], [0.28, 0.08, 0], [0.28, 0.08, 0], [0.7, 0.4, 0.3]]
+    ) * unit.nanometer
+    parameters = {
+        name: values[midpoint]
+        for name, values in hamiltonian.parameter_values.items()
+    }
+    energy, forces = _energy_forces(hamiltonian.system, positions, parameters)
+    assert np.isfinite(energy)
+    assert np.all(np.isfinite(forces))
 
 
 def _test_segment_work_increments_sum_to_total_protocol_work():
