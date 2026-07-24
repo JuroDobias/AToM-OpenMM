@@ -275,7 +275,7 @@ def _add_exception_offset(force, parameter, exception, charge=0.0, sigma=0.0, ep
     force.addExceptionParameterOffset(parameter, exception, charge, sigma, epsilon)
 
 
-def _softcore_expression(scale):
+def _beutler_expression(scale):
     return (
         f"4*({scale})*epsilon*(x*x-x);"
         "x=sigma^6/(r^6+SOFTCORE_ALPHA*(1-(" + scale + "))^SOFTCORE_POWER*SOFTCORE_SIGMA^6);"
@@ -283,29 +283,70 @@ def _softcore_expression(scale):
     )
 
 
-def _softcore_bond_expression(scale):
+def _beutler_bond_expression(scale):
     return (
         f"4*({scale})*epsilon*(x*x-x);"
         "x=sigma^6/(r^6+SOFTCORE_ALPHA*(1-(" + scale + "))^SOFTCORE_POWER*SOFTCORE_SIGMA^6)"
     )
 
 
+def _gapsys_energy_expression(scale, *, mixing):
+    definitions = (
+        "C6=4*epsilon*sigma^6;"
+        "C12=4*epsilon*sigma^12;"
+        "rsc=max(1e-6,GAPSYS_SCALE_LINPOINT_LJ"
+        "*((26.0/7.0)*sigmaEff^6*(1-(" + scale + ")))^(1.0/6.0));"
+        "sigmaEff=select(delta(epsilon),GAPSYS_SIGMA,sigma)"
+    )
+    if mixing:
+        definitions += ";sigma=0.5*(sigma1+sigma2);epsilon=sqrt(epsilon1*epsilon2)"
+    return (
+        f"({scale})*select(step(r-rsc),Vhard,Vlinear);"
+        "Vhard=C12/max(r,1e-6)^12-C6/max(r,1e-6)^6;"
+        "Vlinear=(78*C12/rsc^14-21*C6/rsc^8)*r^2"
+        "-(168*C12/rsc^13-48*C6/rsc^7)*r"
+        "+91*C12/rsc^12-28*C6/rsc^6;"
+        + definitions
+    )
+
+
+def _softcore_expression(scale, function):
+    if function == "gapsys":
+        return _gapsys_energy_expression(scale, mixing=True)
+    return _beutler_expression(scale)
+
+
+def _softcore_bond_expression(scale, function):
+    if function == "gapsys":
+        return _gapsys_energy_expression(scale, mixing=False)
+    return _beutler_bond_expression(scale)
+
+
 def _new_softcore_force(
     source,
     label,
     scale,
+    function,
     alpha,
     sigma_nm,
     power,
+    gapsys_scale_linpoint_lj,
+    gapsys_sigma_nm,
     *,
     use_long_range_correction,
 ):
-    force = mm.CustomNonbondedForce(_softcore_expression(scale))
+    force = mm.CustomNonbondedForce(_softcore_expression(scale, function))
     force.setName(f"CovalentSoftcoreNonbonded{label}")
     force.addGlobalParameter(scale, 0.0)
-    force.addGlobalParameter("SOFTCORE_ALPHA", float(alpha))
-    force.addGlobalParameter("SOFTCORE_SIGMA", float(sigma_nm))
-    force.addGlobalParameter("SOFTCORE_POWER", float(power))
+    if function == "gapsys":
+        force.addGlobalParameter(
+            "GAPSYS_SCALE_LINPOINT_LJ", float(gapsys_scale_linpoint_lj)
+        )
+        force.addGlobalParameter("GAPSYS_SIGMA", float(gapsys_sigma_nm))
+    else:
+        force.addGlobalParameter("SOFTCORE_ALPHA", float(alpha))
+        force.addGlobalParameter("SOFTCORE_SIGMA", float(sigma_nm))
+        force.addGlobalParameter("SOFTCORE_POWER", float(power))
     force.addPerParticleParameter("sigma")
     force.addPerParticleParameter("epsilon")
     force.setForceGroup(SOFTCORE_NONBONDED_FORCE_GROUP)
@@ -317,13 +358,28 @@ def _new_softcore_force(
     return force
 
 
-def _new_softcore_exception_force(label, scale, alpha, sigma_nm, power):
-    force = mm.CustomBondForce(_softcore_bond_expression(scale))
+def _new_softcore_exception_force(
+    label,
+    scale,
+    function,
+    alpha,
+    sigma_nm,
+    power,
+    gapsys_scale_linpoint_lj,
+    gapsys_sigma_nm,
+):
+    force = mm.CustomBondForce(_softcore_bond_expression(scale, function))
     force.setName(f"CovalentSoftcoreExceptions{label}")
     force.addGlobalParameter(scale, 0.0)
-    force.addGlobalParameter("SOFTCORE_ALPHA", float(alpha))
-    force.addGlobalParameter("SOFTCORE_SIGMA", float(sigma_nm))
-    force.addGlobalParameter("SOFTCORE_POWER", float(power))
+    if function == "gapsys":
+        force.addGlobalParameter(
+            "GAPSYS_SCALE_LINPOINT_LJ", float(gapsys_scale_linpoint_lj)
+        )
+        force.addGlobalParameter("GAPSYS_SIGMA", float(gapsys_sigma_nm))
+    else:
+        force.addGlobalParameter("SOFTCORE_ALPHA", float(alpha))
+        force.addGlobalParameter("SOFTCORE_SIGMA", float(sigma_nm))
+        force.addGlobalParameter("SOFTCORE_POWER", float(power))
     force.addPerBondParameter("sigma")
     force.addPerBondParameter("epsilon")
     force.setUsesPeriodicBoundaryConditions(True)
@@ -337,9 +393,12 @@ def _add_nonbonded_forces(
     unique_a,
     unique_b,
     *,
+    function,
     alpha,
     sigma_nm,
     power,
+    gapsys_scale_linpoint_lj,
+    gapsys_sigma_nm,
     use_long_range_correction,
 ):
     source_a = _force(endpoint_a, mm.NonbondedForce)
@@ -398,18 +457,24 @@ def _add_nonbonded_forces(
         source_a,
         "A",
         STERICS_A_PARAMETER,
+        function,
         alpha,
         sigma_nm,
         power,
+        gapsys_scale_linpoint_lj,
+        gapsys_sigma_nm,
         use_long_range_correction=use_long_range_correction,
     )
     softcore_b = _new_softcore_force(
         source_b,
         "B",
         STERICS_B_PARAMETER,
+        function,
         alpha,
         sigma_nm,
         power,
+        gapsys_scale_linpoint_lj,
+        gapsys_sigma_nm,
         use_long_range_correction=use_long_range_correction,
     )
     for particle in range(endpoint_a.getNumParticles()):
@@ -422,10 +487,24 @@ def _add_nonbonded_forces(
     if unique_b and environment:
         softcore_b.addInteractionGroup(unique_b, environment)
     exception_lj_a = _new_softcore_exception_force(
-        "A", STERICS_A_PARAMETER, alpha, sigma_nm, power
+        "A",
+        STERICS_A_PARAMETER,
+        function,
+        alpha,
+        sigma_nm,
+        power,
+        gapsys_scale_linpoint_lj,
+        gapsys_sigma_nm,
     )
     exception_lj_b = _new_softcore_exception_force(
-        "B", STERICS_B_PARAMETER, alpha, sigma_nm, power
+        "B",
+        STERICS_B_PARAMETER,
+        function,
+        alpha,
+        sigma_nm,
+        power,
+        gapsys_scale_linpoint_lj,
+        gapsys_sigma_nm,
     )
 
     for pair in sorted(exception_pairs):
@@ -673,9 +752,12 @@ def create_softcore_hamiltonian(
     unique_a,
     unique_b,
     *,
+    function: str = "beutler",
     alpha: float = 0.3,
     sigma_nm: float = 0.25,
     power: int = 1,
+    gapsys_scale_linpoint_lj: float = 0.85,
+    gapsys_sigma_nm: float = 0.30,
     charge_steps_per_stage: int = 10000,
     sterics_steps: int = 30000,
     subdivisions_per_stage: int = 1,
@@ -687,8 +769,17 @@ def create_softcore_hamiltonian(
     use_long_range_correction: bool = True,
 ) -> CovalentSoftcoreHamiltonian:
     _assert_compatible_endpoints(endpoint_a, endpoint_b)
+    function = str(function).lower()
+    if function not in {"beutler", "gapsys"}:
+        raise CovalentAlchemyError(
+            "softcore function must be 'beutler' or 'gapsys'"
+        )
     if alpha <= 0.0 or sigma_nm <= 0.0 or power < 1:
         raise CovalentAlchemyError("softcore alpha, sigma_nm, and power must be positive")
+    if gapsys_scale_linpoint_lj <= 0.0 or gapsys_sigma_nm <= 0.0:
+        raise CovalentAlchemyError(
+            "Gapsys scale linearization point and sigma must be positive"
+        )
     resolved_path = resolve_softcore_path(
         charge_steps_per_stage=int(charge_steps_per_stage),
         sterics_steps=int(sterics_steps),
@@ -707,9 +798,12 @@ def create_softcore_hamiltonian(
         endpoint_b,
         unique_a,
         unique_b,
+        function=function,
         alpha=float(alpha),
         sigma_nm=float(sigma_nm),
         power=int(power),
+        gapsys_scale_linpoint_lj=float(gapsys_scale_linpoint_lj),
+        gapsys_sigma_nm=float(gapsys_sigma_nm),
         use_long_range_correction=bool(use_long_range_correction),
     )
     _copy_other_forces(output, endpoint_a, endpoint_b)

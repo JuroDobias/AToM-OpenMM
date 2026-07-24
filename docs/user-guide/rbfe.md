@@ -631,6 +631,24 @@ The defaults (`alpha: 0.3`, `sigma_nm: 0.25`, `power: 1`) match the established
 GROMACS softcore settings used for the RHINO calculations. Endpoint total charges
 must currently be equal.
 
+The Lennard-Jones softcore function is selectable. Existing workflows default to
+the Beutler form. The Gapsys form linearly continues the short-range LJ force
+below a coupling-dependent radius and can retain a stronger restoring force when
+an appearing dummy branch overlaps its environment:
+
+```yaml
+softcore:
+  function: gapsys
+  gapsys_scale_linpoint_lj: 0.85
+  gapsys_sigma_nm: 0.30
+  long_range_correction: endpoint_correction
+```
+
+These are the standard GROMACS Gapsys LJ defaults. Gapsys is applied only to
+unique-branch/environment LJ interactions and their exceptions. Electrostatics
+continue to follow the configured staged PME charge path. `function: beutler`
+retains the `alpha`, `sigma_nm`, and `power` settings.
+
 A general path can replace the staged step settings:
 
 ```yaml
@@ -688,6 +706,24 @@ and adds the final-minus-initial difference to protocol work. Switching systems
 with a barostat are rejected in this mode. Corrected work remains in the standard
 forward/reverse CSV files; `switch_lrc_diagnostics.csv` additionally records raw
 work, endpoint corrections, their difference, and box volume.
+
+Windowed switching diagnostics can localize where protocol work accumulates
+without adding potential-energy evaluations:
+
+```yaml
+switch_work_profile:
+  enabled: true
+  interval_steps: 100
+  phases: [optimizer]
+```
+
+`phases` accepts `optimizer`, `production`, or both. The resulting
+`switch_work_profile.csv` records exact work increments, cumulative work, the
+normalized A-to-B path coordinate, and all coupling scales. The
+`delta_work_over_delta_lambda_kj_per_mol` column is a finite-window protocol-work
+derivative, not an instantaneous analytical `dU/dlambda`. Sampling introduces a
+host synchronization at each interval but does not perform an additional energy
+calculation.
 
 The softcore system evaluates common PME, protein, and solvent terms once. Unique
 A/B cross interactions remain excluded, while the existing unique-branch vacuum

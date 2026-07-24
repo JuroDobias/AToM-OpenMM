@@ -388,6 +388,56 @@ def _test_general_softcore_path_normalizes_optimizer_segments():
     assert resolved["mapped_vdw"] == [0.0, 0.5, 1.0]
 
 
+def _test_gapsys_and_work_profile_settings_are_recorded_in_protocol():
+    config = _normalized_settings(
+        {
+            "neqti": {
+                "interpolation": "softcore_linear",
+                "softcore": {
+                    "function": "gapsys",
+                    "gapsys_scale_linpoint_lj": 0.85,
+                    "gapsys_sigma_nm": 0.30,
+                },
+                "switch_work_profile": {
+                    "enabled": True,
+                    "interval_steps": 100,
+                    "phases": ["optimizer", "production"],
+                },
+            }
+        }
+    )
+
+    assert config["softcore"]["function"] == "gapsys"
+    assert config["softcore"]["gapsys_scale_linpoint_lj"] == 0.85
+    assert config["switch_work_profile"] == {
+        "enabled": True,
+        "interval_steps": 100,
+        "phases": ["optimizer", "production"],
+    }
+    protocol = _switch_protocol(config)
+    assert protocol["softcore"]["function"] == "gapsys"
+    assert protocol["switch_work_profile"]["interval_steps"] == 100
+
+
+def _test_legacy_beutler_protocol_resumes_with_new_default_fields(tmp_path):
+    config = _normalized_settings(
+        {"neqti": {"interpolation": "softcore_linear"}}
+    )
+    legacy = _switch_protocol(config)
+    legacy.pop("switch_work_profile")
+    legacy["softcore"].pop("function")
+    legacy["softcore"].pop("gapsys_scale_linpoint_lj")
+    legacy["softcore"].pop("gapsys_sigma_nm")
+    legacy["fingerprint"] = "legacy"
+    path = tmp_path / "switch_protocol.yaml"
+    path.write_text(yaml.safe_dump(legacy, sort_keys=False))
+
+    observed = _ensure_switch_protocol(tmp_path, config)
+
+    assert observed == _switch_protocol(config)
+    assert yaml.safe_load(path.read_text()) == observed
+
+
 def _test_general_softcore_resume_rejects_changed_node_values(tmp_path):
     workflow = {
         "neqti": {

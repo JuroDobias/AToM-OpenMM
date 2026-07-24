@@ -32,7 +32,13 @@ from atom_openmm.covalent_parameters import (
 )
 from atom_openmm.covalent_protein import prepare_protein_covalent_hybrid
 from atom_openmm.covalent_softcore import (
+    CHARGE_A_PARAMETER,
+    CHARGE_B_PARAMETER,
+    MAPPED_CHARGE_PARAMETER,
     SOFTCORE_NONBONDED_FORCE_GROUP,
+    STERICS_A_PARAMETER,
+    STERICS_B_PARAMETER,
+    STERICS_PARAMETER,
     create_softcore_hamiltonian,
     resolve_softcore_path,
 )
@@ -57,6 +63,14 @@ from atom_openmm.rest2_exchange import REST2ExchangeSampler
 LOGGER = logging.getLogger("atom_openmm.covalent_workflow")
 KCAL_TO_KJ = 4.184
 LRC_CORRECTION_VERSION = 2
+WORK_PROFILE_PARAMETERS = (
+    CHARGE_A_PARAMETER,
+    CHARGE_B_PARAMETER,
+    MAPPED_CHARGE_PARAMETER,
+    STERICS_A_PARAMETER,
+    STERICS_B_PARAMETER,
+    STERICS_PARAMETER,
+)
 
 
 def _softcore_path_options(settings):
@@ -310,6 +324,37 @@ def validate_covalent_workflow(path):
             "workflow.neqti.softcore.long_range_correction must be "
             "'dynamic' or 'endpoint_correction'"
         )
+    if config["softcore"]["function"] not in {"beutler", "gapsys"}:
+        raise CovalentWorkflowError(
+            "workflow.neqti.softcore.function must be 'beutler' or 'gapsys'"
+        )
+    if (
+        config["softcore"]["gapsys_scale_linpoint_lj"] <= 0.0
+        or config["softcore"]["gapsys_sigma_nm"] <= 0.0
+    ):
+        raise CovalentWorkflowError(
+            "workflow.neqti.softcore Gapsys parameters must be positive"
+        )
+    work_profile = config["switch_work_profile"]
+    if work_profile["enabled"]:
+        if config["interpolation"] != "softcore_linear":
+            raise CovalentWorkflowError(
+                "switch_work_profile currently requires interpolation: softcore_linear"
+            )
+        if work_profile["interval_steps"] < 1:
+            raise CovalentWorkflowError(
+                "switch_work_profile.interval_steps must be positive"
+            )
+        if not work_profile["phases"]:
+            raise CovalentWorkflowError(
+                "switch_work_profile.phases must not be empty"
+            )
+        invalid_phases = set(work_profile["phases"]) - {"optimizer", "production"}
+        if invalid_phases:
+            raise CovalentWorkflowError(
+                "switch_work_profile.phases may contain only 'optimizer' and "
+                "'production'"
+            )
     if any(value < 0.0 for value in config["dummy_bonded_scales"].values()):
         raise CovalentWorkflowError("workflow.setup.dummy_bonded_scales values cannot be negative")
     equilibration = config["endpoint_equilibration"]
@@ -989,17 +1034,163 @@ def _reset_softcore_context(context, integrator, parameter_values):
         context.setParameter(name, float(values[0]))
 
 
-def _run_segmented_protocol(integrator, segment_steps):
+def _parameter_values_at_step(parameter_values, segment_steps, segment, local_step):
+    fraction = float(local_step) / float(segment_steps[segment])
+    return {
+        name: float(values[segment])
+        + fraction * (float(values[segment + 1]) - float(values[segment]))
+        for name, values in parameter_values.items()
+    }
+
+
+def _run_segmented_protocol(
+    integrator,
+    segment_steps,
+    *,
+    profile_rows=None,
+    profile_interval_steps=None,
+    parameter_values=None,
+    profile_metadata=None,
+):
     segment_work = []
     previous = 0.0
-    for steps in segment_steps:
-        integrator.step(int(steps))
-        cumulative = integrator.get_protocol_work().value_in_unit(
-            unit.kilojoules_per_mole
+    total_step = 0
+    total_steps = sum(int(value) for value in segment_steps)
+    profiling = profile_rows is not None
+    if profiling and (
+        not profile_interval_steps
+        or parameter_values is None
+        or profile_metadata is None
+    ):
+        raise ValueError(
+            "profile interval, parameter values, and metadata are required"
         )
+    direction = None if profile_metadata is None else profile_metadata["direction"]
+    for segment, steps in enumerate(segment_steps):
+        steps = int(steps)
+        local_step = 0
+        cumulative = previous
+        while local_step < steps:
+            if profiling:
+                until_interval = int(profile_interval_steps) - (
+                    total_step % int(profile_interval_steps)
+                )
+                chunk = min(steps - local_step, until_interval)
+            else:
+                chunk = steps - local_step
+            window_start_step = total_step
+            window_start_work = cumulative
+            integrator.step(int(chunk))
+            local_step += chunk
+            total_step += chunk
+            cumulative = integrator.get_protocol_work().value_in_unit(
+                unit.kilojoules_per_mole
+            )
+            if profiling:
+                if direction == "forward":
+                    lambda_start = window_start_step / float(total_steps)
+                    lambda_end = total_step / float(total_steps)
+                else:
+                    lambda_start = 1.0 - window_start_step / float(total_steps)
+                    lambda_end = 1.0 - total_step / float(total_steps)
+                delta_lambda = lambda_end - lambda_start
+                window_work = float(cumulative - window_start_work)
+                values = _parameter_values_at_step(
+                    parameter_values,
+                    segment_steps,
+                    segment,
+                    local_step,
+                )
+                row = {
+                    **profile_metadata,
+                    "status": "running",
+                    "failure_message": "",
+                    "segment": segment + 1,
+                    "step_start": window_start_step,
+                    "step_end": total_step,
+                    "lambda_start": lambda_start,
+                    "lambda_end": lambda_end,
+                    "delta_lambda": delta_lambda,
+                    "window_work_kj_per_mol": window_work,
+                    "cumulative_work_kj_per_mol": float(cumulative),
+                    "delta_work_over_delta_lambda_kj_per_mol": (
+                        window_work / delta_lambda
+                    ),
+                }
+                row.update(
+                    {
+                        f"{name.lower()}_end": values[name]
+                        for name in WORK_PROFILE_PARAMETERS
+                    }
+                )
+                profile_rows.append(row)
         segment_work.append(float(cumulative - previous))
         previous = cumulative
     return float(previous), segment_work
+
+
+def _work_profile_fields():
+    return [
+        "phase",
+        "environment",
+        "direction",
+        "sample",
+        "status",
+        "failure_message",
+        "segment",
+        "step_start",
+        "step_end",
+        "lambda_start",
+        "lambda_end",
+        "delta_lambda",
+        "window_work_kj_per_mol",
+        "cumulative_work_kj_per_mol",
+        "delta_work_over_delta_lambda_kj_per_mol",
+        *[f"{name.lower()}_end" for name in WORK_PROFILE_PARAMETERS],
+    ]
+
+
+def _merge_work_profile_rows(path, rows, *, status, failure_message=""):
+    if not rows:
+        return
+    path = Path(path)
+    fields = _work_profile_fields()
+    existing = {}
+    if path.exists():
+        with path.open(newline="") as handle:
+            for row in csv.DictReader(handle):
+                key = (
+                    row["phase"],
+                    row["environment"],
+                    row["direction"],
+                    int(row["sample"]),
+                    int(row["step_end"]),
+                )
+                existing[key] = row
+    for row in rows:
+        row = dict(row)
+        row["status"] = status
+        row["failure_message"] = failure_message
+        key = (
+            row["phase"],
+            row["environment"],
+            row["direction"],
+            int(row["sample"]),
+            int(row["step_end"]),
+        )
+        existing[key] = row
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(
+            existing[key]
+            for key in sorted(
+                existing,
+                key=lambda item: (item[0], item[1], item[2], item[3], item[4]),
+            )
+        )
+    os.replace(temporary, path)
 
 
 def _optimizer_csv_fields(nsegments):
@@ -1145,6 +1336,8 @@ def _run_environment(
     }
     timing_file = workdir / "switch_timing.csv"
     lrc_diagnostics_file = workdir / "switch_lrc_diagnostics.csv"
+    work_profile_file = workdir / "switch_work_profile.csv"
+    work_profile = config["switch_work_profile"]
     forward = _read_work(files["forward"])
     reverse = _read_work(files["reverse"])
     rest2_summaries = {}
@@ -1306,9 +1499,40 @@ def _run_environment(
                 integrator.set_segment_steps(direction_steps)
                 _reset_softcore_context(context, integrator, parameter_values)
                 _apply_state(context, state)
-                raw_work, increments = _run_segmented_protocol(
-                    integrator, direction_steps
+                profile_rows = []
+                profile_enabled = (
+                    work_profile["enabled"]
+                    and "optimizer" in work_profile["phases"]
                 )
+                try:
+                    raw_work, increments = _run_segmented_protocol(
+                        integrator,
+                        direction_steps,
+                        profile_rows=profile_rows if profile_enabled else None,
+                        profile_interval_steps=work_profile["interval_steps"],
+                        parameter_values=parameter_values,
+                        profile_metadata={
+                            "phase": "optimizer",
+                            "environment": name,
+                            "direction": direction,
+                            "sample": cycle + 1,
+                        },
+                    )
+                except Exception as exc:
+                    if profile_enabled:
+                        _merge_work_profile_rows(
+                            work_profile_file,
+                            profile_rows,
+                            status="failed",
+                            failure_message=str(exc),
+                        )
+                    raise
+                if profile_enabled:
+                    _merge_work_profile_rows(
+                        work_profile_file,
+                        profile_rows,
+                        status="completed",
+                    )
                 corrected_work = raw_work
                 if lrc_corrections is not None:
                     correction = lrc_corrections[direction]
@@ -1447,6 +1671,14 @@ def _run_environment(
             initial_lrc_kj = None
             final_lrc_kj = None
             volume_nm3 = None
+            profile_rows = []
+            profile_enabled = (
+                softcore is not None
+                and work_profile["enabled"]
+                and "production" in work_profile["phases"]
+            )
+            profile_status = "failed"
+            profile_failure_message = ""
             try:
                 if softcore is None:
                     context, integrator = _switch_context(
@@ -1499,7 +1731,17 @@ def _run_environment(
                     integrator.step(int(config["switch_steps"]))
                 else:
                     raw_work_kj, _ = _run_segmented_protocol(
-                        integrator, direction_steps
+                        integrator,
+                        direction_steps,
+                        profile_rows=profile_rows if profile_enabled else None,
+                        profile_interval_steps=work_profile["interval_steps"],
+                        parameter_values=parameter_values,
+                        profile_metadata={
+                            "phase": "production",
+                            "environment": name,
+                            "direction": direction,
+                            "sample": sample + 1,
+                        },
                     )
                 switch_elapsed = time.perf_counter() - started
                 simulated_ns = config["switch_steps"] * timestep * 1.0e-6
@@ -1558,7 +1800,9 @@ def _run_environment(
                         final_lrc_kj - initial_lrc_kj,
                         work_kj,
                     )
+                profile_status = "completed"
             except Exception as exc:
+                profile_failure_message = str(exc)
                 if (
                     config["failed_switch_policy"] == "count_as_infinite"
                     and _is_numerical_switch_failure(exc)
@@ -1573,6 +1817,13 @@ def _run_environment(
                 else:
                     raise
             finally:
+                if profile_enabled:
+                    _merge_work_profile_rows(
+                        work_profile_file,
+                        profile_rows,
+                        status=profile_status,
+                        failure_message=profile_failure_message,
+                    )
                 if context is not None and not post_switch_written:
                     try:
                         final_endpoint = "b" if endpoint == "a" else "a"
@@ -1626,6 +1877,7 @@ def _normalized_settings(workflow):
     equilibration = neqti.get("endpoint_equilibration") or {}
     rest2 = neqti.get("rest2") or {}
     softcore = neqti.get("softcore") or {}
+    work_profile_raw = neqti.get("switch_work_profile") or {}
     optimization_raw = neqti.get("schedule_optimization") or {}
     path_raw = softcore.get("path")
     interpolation = str(neqti.get("interpolation", "envelope"))
@@ -1635,9 +1887,14 @@ def _normalized_settings(workflow):
         [300.0, 344.6, 395.9, 454.7, 522.3, 600.0],
     )
     softcore_settings = {
+        "function": str(softcore.get("function", "beutler")).lower(),
         "alpha": float(softcore.get("alpha", 0.3)),
         "sigma_nm": float(softcore.get("sigma_nm", 0.25)),
         "power": int(softcore.get("power", 1)),
+        "gapsys_scale_linpoint_lj": float(
+            softcore.get("gapsys_scale_linpoint_lj", 0.85)
+        ),
+        "gapsys_sigma_nm": float(softcore.get("gapsys_sigma_nm", 0.30)),
         "long_range_correction": str(
             softcore.get("long_range_correction", "dynamic")
         ),
@@ -1751,6 +2008,14 @@ def _normalized_settings(workflow):
         "interpolation": interpolation,
         "legacy_switch_steps_set": "switch_steps" in neqti,
         "softcore": softcore_settings,
+        "switch_work_profile": {
+            "enabled": bool(work_profile_raw.get("enabled", False)),
+            "interval_steps": int(work_profile_raw.get("interval_steps", 100)),
+            "phases": [
+                str(value)
+                for value in work_profile_raw.get("phases", ["optimizer"])
+            ],
+        },
         "schedule_optimization": schedule_optimization,
         "failed_switch_policy": str(
             neqti.get("failed_switch_policy", "count_as_infinite")
@@ -1975,6 +2240,7 @@ def _switch_protocol(config, mapping_settings=None):
         "interpolation": config["interpolation"],
         "timestep_fs": config["timestep_fs"],
         "total_steps": config["switch_steps"],
+        "switch_work_profile": dict(config["switch_work_profile"]),
     }
     if config["interpolation"] == "softcore_linear":
         protocol["softcore"] = dict(config["softcore"])
@@ -2025,6 +2291,26 @@ def _switch_protocol(config, mapping_settings=None):
     return protocol
 
 
+def _upgrade_legacy_switch_protocol(protocol):
+    upgraded = dict(protocol)
+    upgraded.pop("fingerprint", None)
+    upgraded.setdefault(
+        "switch_work_profile",
+        {"enabled": False, "interval_steps": 100, "phases": ["optimizer"]},
+    )
+    if "softcore" in upgraded:
+        softcore = dict(upgraded["softcore"])
+        softcore.setdefault("function", "beutler")
+        softcore.setdefault("gapsys_scale_linpoint_lj", 0.85)
+        softcore.setdefault("gapsys_sigma_nm", 0.30)
+        upgraded["softcore"] = softcore
+    serialized = yaml.safe_dump(upgraded, sort_keys=True)
+    upgraded["fingerprint"] = hashlib.sha256(
+        serialized.encode("utf-8")
+    ).hexdigest()
+    return upgraded
+
+
 def _ensure_switch_protocol(workdir, config, mapping_settings=None):
     workdir = Path(workdir)
     path = workdir / "switch_protocol.yaml"
@@ -2036,11 +2322,14 @@ def _ensure_switch_protocol(workdir, config, mapping_settings=None):
     )
     if path.exists():
         observed = yaml.safe_load(path.read_text()) or {}
+        observed = _upgrade_legacy_switch_protocol(observed)
         if observed != expected:
             raise CovalentWorkflowError(
                 "existing covalent work uses a different switching protocol; "
                 "use a new workdir or restore the original workflow settings"
             )
+        if yaml.safe_load(path.read_text()) != expected:
+            _write_yaml_atomic(path, expected)
     elif existing_work and config["interpolation"] == "softcore_linear":
         raise CovalentWorkflowError(
             "cannot resume softcore covalent work without switch_protocol.yaml; use a new workdir"
@@ -2306,6 +2595,13 @@ def run_covalent_pair(settings, pair):
     if config["softcore"]["long_range_correction"] == "endpoint_correction":
         result["artifacts"]["switch_lrc_diagnostics_csv"] = (
             "switch_lrc_diagnostics.csv"
+        )
+    if (
+        config["switch_work_profile"]["enabled"]
+        and (workdir / "switch_work_profile.csv").exists()
+    ):
+        result["artifacts"]["switch_work_profile_csv"] = (
+            "switch_work_profile.csv"
         )
     if optimizer_summary is not None:
         result["switching_protocol"]["optimized_schedules"] = {
