@@ -15,7 +15,10 @@ from openmm import app, unit
 from rdkit import Chem
 from rdkit.Chem import rdFMCS
 
-from atom_openmm.covalent_alchemy import create_endpoint_hamiltonian
+from atom_openmm.covalent_alchemy import (
+    CovalentAlchemyError,
+    create_endpoint_hamiltonian,
+)
 from atom_openmm.covalent_hybrid import (
     DummyBondedScales,
     build_covalent_hybrid_molecule,
@@ -31,6 +34,7 @@ from atom_openmm.covalent_protein import prepare_protein_covalent_hybrid
 from atom_openmm.covalent_softcore import (
     SOFTCORE_NONBONDED_FORCE_GROUP,
     create_softcore_hamiltonian,
+    resolve_softcore_path,
 )
 from atom_openmm.covalent_systems import (
     create_solvated_capped_reference,
@@ -53,6 +57,20 @@ from atom_openmm.rest2_exchange import REST2ExchangeSampler
 LOGGER = logging.getLogger("atom_openmm.covalent_workflow")
 KCAL_TO_KJ = 4.184
 LRC_CORRECTION_VERSION = 2
+
+
+def _softcore_path_options(settings):
+    keys = {
+        "charge_steps_per_stage",
+        "sterics_steps",
+        "subdivisions_per_stage",
+        "total_steps",
+        "path_nodes",
+        "vdw_a",
+        "charge_a",
+        "segments_per_interval",
+    }
+    return {key: value for key, value in settings.items() if key in keys}
 
 
 class CovalentWorkflowError(ValueError):
@@ -187,6 +205,32 @@ def validate_covalent_workflow(path):
             )
     if float(settings["dataset"].get("assay_temperature_k", 298.15)) <= 0.0:
         raise CovalentWorkflowError("dataset assay_temperature_k must be positive")
+    neqti_raw = workflow.get("neqti") or {}
+    softcore_raw = neqti_raw.get("softcore") or {}
+    optimization_raw = neqti_raw.get("schedule_optimization") or {}
+    has_general_path = "path" in softcore_raw
+    legacy_path_fields = {
+        "charge_steps_per_stage",
+        "sterics_steps",
+    } & set(softcore_raw)
+    if has_general_path and legacy_path_fields:
+        raise CovalentWorkflowError(
+            "softcore.path and softcore.total_steps cannot be combined with "
+            "charge_steps_per_stage or sterics_steps"
+        )
+    if not has_general_path and "total_steps" in softcore_raw:
+        raise CovalentWorkflowError(
+            "softcore.total_steps requires a softcore.path definition"
+        )
+    if has_general_path and "subdivisions_per_stage" in optimization_raw:
+        raise CovalentWorkflowError(
+            "general softcore paths use schedule_optimization.segments_per_interval"
+        )
+    if not has_general_path and "segments_per_interval" in optimization_raw:
+        raise CovalentWorkflowError(
+            "legacy staged softcore paths use "
+            "schedule_optimization.subdivisions_per_stage"
+        )
     config = _normalized_settings(workflow)
     if config["interpolation"] == "softcore_linear":
         for pair in settings["pairs"]:
@@ -209,8 +253,16 @@ def validate_covalent_workflow(path):
     if config["interpolation"] == "softcore_linear" and config["legacy_switch_steps_set"]:
         raise CovalentWorkflowError(
             "workflow.neqti.switch_steps cannot be combined with softcore_linear; "
-            "set softcore.charge_steps_per_stage and softcore.sterics_steps"
+            "set either the staged softcore steps or softcore.total_steps"
         )
+    resolved_path = None
+    if config["interpolation"] == "softcore_linear":
+        try:
+            resolved_path = resolve_softcore_path(
+                **_softcore_path_options(config["softcore"])
+            )
+        except CovalentAlchemyError as exc:
+            raise CovalentWorkflowError(str(exc)) from exc
     optimization = config["schedule_optimization"]
     if optimization["enabled"]:
         if config["interpolation"] != "softcore_linear":
@@ -221,19 +273,7 @@ def validate_covalent_workflow(path):
             raise CovalentWorkflowError(
                 "schedule_optimization.pilot_samples must be positive"
             )
-        subdivisions = optimization["subdivisions_per_stage"]
-        if subdivisions < 1:
-            raise CovalentWorkflowError(
-                "schedule_optimization.subdivisions_per_stage must be positive"
-            )
-        if min(
-            config["softcore"]["charge_steps_per_stage"],
-            config["softcore"]["sterics_steps"],
-        ) < subdivisions:
-            raise CovalentWorkflowError(
-                "each softcore stage must contain at least one step per subdivision"
-            )
-        nsegments = 3 * subdivisions
+        nsegments = sum(resolved_path["segments_per_interval"])
         if optimization["min_segment_steps"] * nsegments > config["switch_steps"]:
             raise CovalentWorkflowError(
                 "schedule_optimization.min_segment_steps is too large"
@@ -1166,13 +1206,13 @@ def _run_environment(
                 lrc_corrections["reverse"]["volume_nm3"],
             )
         LOGGER.info(
-            "%s softcore switching system ready: charge %d + sterics %d + charge %d "
-            "= %d steps",
+            "%s softcore switching system ready: %d intervals, %d segments, "
+            "%d total steps, path source %s",
             name,
-            config["softcore"]["charge_steps_per_stage"],
-            config["softcore"]["sterics_steps"],
-            config["softcore"]["charge_steps_per_stage"],
+            len(softcore.resolved_path["nodes"]) + 1,
+            len(softcore.segment_steps),
             softcore.total_steps,
+            softcore.resolved_path["source"],
         )
     optimization = config["schedule_optimization"]
     if optimization["enabled"]:
@@ -1587,6 +1627,7 @@ def _normalized_settings(workflow):
     rest2 = neqti.get("rest2") or {}
     softcore = neqti.get("softcore") or {}
     optimization_raw = neqti.get("schedule_optimization") or {}
+    path_raw = softcore.get("path")
     interpolation = str(neqti.get("interpolation", "envelope"))
     enabled = bool(rest2.get("enabled", True))
     temperatures = rest2.get(
@@ -1597,23 +1638,49 @@ def _normalized_settings(workflow):
         "alpha": float(softcore.get("alpha", 0.3)),
         "sigma_nm": float(softcore.get("sigma_nm", 0.25)),
         "power": int(softcore.get("power", 1)),
-        "charge_steps_per_stage": int(softcore.get("charge_steps_per_stage", 10000)),
-        "sterics_steps": int(softcore.get("sterics_steps", 30000)),
         "long_range_correction": str(
             softcore.get("long_range_correction", "dynamic")
         ),
-        "subdivisions_per_stage": int(
-            optimization_raw.get("subdivisions_per_stage", 10)
-            if optimization_raw.get("enabled", False)
-            else 1
-        ),
     }
+    optimization_enabled = bool(optimization_raw.get("enabled", False))
+    if path_raw is None:
+        softcore_settings.update(
+            {
+                "charge_steps_per_stage": int(
+                    softcore.get("charge_steps_per_stage", 10000)
+                ),
+                "sterics_steps": int(softcore.get("sterics_steps", 30000)),
+                "subdivisions_per_stage": int(
+                    optimization_raw.get("subdivisions_per_stage", 10)
+                    if optimization_enabled
+                    else 1
+                ),
+            }
+        )
+    else:
+        nodes = list(path_raw.get("nodes", []))
+        default_segments = [10] * (len(nodes) + 1) if optimization_enabled else [1] * (
+            len(nodes) + 1
+        )
+        softcore_settings.update(
+            {
+                "total_steps": int(softcore.get("total_steps", 0)),
+                "path_nodes": [float(value) for value in nodes],
+                "vdw_a": [float(value) for value in path_raw.get("vdw_a", [])],
+                "charge_a": [
+                    float(value) for value in path_raw.get("charge_a", [])
+                ],
+                "segments_per_interval": [
+                    int(value)
+                    for value in optimization_raw.get(
+                        "segments_per_interval", default_segments
+                    )
+                ],
+            }
+        )
     schedule_optimization = {
         "enabled": bool(optimization_raw.get("enabled", False)),
         "pilot_samples": int(optimization_raw.get("pilot_samples", 10)),
-        "subdivisions_per_stage": int(
-            optimization_raw.get("subdivisions_per_stage", 10)
-        ),
         "score_hysteresis_weight": float(
             optimization_raw.get("score_hysteresis_weight", 0.7)
         ),
@@ -1637,11 +1704,23 @@ def _normalized_settings(workflow):
             optimization_raw.get("max_update_factor", 2.0)
         ),
     }
-    switch_steps = (
-        2 * softcore_settings["charge_steps_per_stage"] + softcore_settings["sterics_steps"]
-        if interpolation == "softcore_linear"
-        else int(neqti.get("switch_steps", 50000))
-    )
+    if path_raw is None:
+        schedule_optimization["subdivisions_per_stage"] = int(
+            optimization_raw.get("subdivisions_per_stage", 10)
+        )
+    else:
+        schedule_optimization["segments_per_interval"] = list(
+            softcore_settings["segments_per_interval"]
+        )
+    if interpolation == "softcore_linear":
+        switch_steps = (
+            softcore_settings["total_steps"]
+            if path_raw is not None
+            else 2 * softcore_settings["charge_steps_per_stage"]
+            + softcore_settings["sterics_steps"]
+        )
+    else:
+        switch_steps = int(neqti.get("switch_steps", 50000))
     return {
         "temperature_k": float(neqti.get("temperature_k", 300.0)),
         "pressure_bar": float(neqti.get("pressure_bar", 1.0)),
@@ -1899,6 +1978,10 @@ def _switch_protocol(config, mapping_settings=None):
     }
     if config["interpolation"] == "softcore_linear":
         protocol["softcore"] = dict(config["softcore"])
+        if "path_nodes" in config["softcore"]:
+            protocol["softcore"]["resolved_path"] = resolve_softcore_path(
+                **_softcore_path_options(config["softcore"])
+            )
         protocol["schedule_optimization"] = dict(
             config["schedule_optimization"]
         )
@@ -1908,17 +1991,33 @@ def _switch_protocol(config, mapping_settings=None):
                 "evaluation_platform": "CPU",
                 "evaluation": "precomputed_per_endpoint_and_switch_volume",
             }
-        protocol["stages"] = [
-            {
-                "name": "discharge_a",
-                "steps": config["softcore"]["charge_steps_per_stage"],
-            },
-            {"name": "sterics_a_to_b", "steps": config["softcore"]["sterics_steps"]},
-            {
-                "name": "charge_b",
-                "steps": config["softcore"]["charge_steps_per_stage"],
-            },
-        ]
+        if "path_nodes" in config["softcore"]:
+            resolved = protocol["softcore"]["resolved_path"]
+            boundaries = [0.0, *resolved["nodes"], 1.0]
+            protocol["intervals"] = [
+                {
+                    "lambda_start": boundaries[index],
+                    "lambda_end": boundaries[index + 1],
+                    "initial_steps": resolved["interval_steps"][index],
+                    "segments": resolved["segments_per_interval"][index],
+                }
+                for index in range(len(boundaries) - 1)
+            ]
+        else:
+            protocol["stages"] = [
+                {
+                    "name": "discharge_a",
+                    "steps": config["softcore"]["charge_steps_per_stage"],
+                },
+                {
+                    "name": "sterics_a_to_b",
+                    "steps": config["softcore"]["sterics_steps"],
+                },
+                {
+                    "name": "charge_b",
+                    "steps": config["softcore"]["charge_steps_per_stage"],
+                },
+            ]
     if mapping_settings and mapping_settings["method"] != "dataset_core":
         protocol["covalent_mapping"] = dict(mapping_settings)
     serialized = yaml.safe_dump(protocol, sort_keys=True)

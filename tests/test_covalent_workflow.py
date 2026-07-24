@@ -357,6 +357,63 @@ def _test_covalent_schedule_optimization_settings_enable_subdivision():
     assert config["switch_steps"] == 150000
 
 
+def _test_general_softcore_path_normalizes_optimizer_segments():
+    config = _normalized_settings(
+        {
+            "neqti": {
+                "interpolation": "softcore_linear",
+                "softcore": {
+                    "total_steps": 150000,
+                    "path": {
+                        "nodes": [0.5],
+                        "vdw_a": [1.0, 1.0, 0.0],
+                        "charge_a": [1.0, 0.5, 0.0],
+                    },
+                },
+                "schedule_optimization": {
+                    "enabled": True,
+                    "pilot_samples": 10,
+                    "segments_per_interval": [15, 15],
+                },
+            }
+        }
+    )
+
+    assert config["switch_steps"] == 150000
+    assert config["softcore"]["path_nodes"] == [0.5]
+    assert config["softcore"]["segments_per_interval"] == [15, 15]
+    protocol = _switch_protocol(config)
+    resolved = protocol["softcore"]["resolved_path"]
+    assert resolved["vdw_b"] == [0.0, 1.0, 1.0]
+    assert resolved["mapped_vdw"] == [0.0, 0.5, 1.0]
+
+
+def _test_general_softcore_resume_rejects_changed_node_values(tmp_path):
+    workflow = {
+        "neqti": {
+            "interpolation": "softcore_linear",
+            "softcore": {
+                "total_steps": 100,
+                "path": {
+                    "nodes": [],
+                    "vdw_a": [1.0, 0.0],
+                    "charge_a": [1.0, 0.0],
+                },
+            },
+        }
+    }
+    _ensure_switch_protocol(tmp_path, _normalized_settings(workflow))
+    workflow["neqti"]["softcore"]["path"]["nodes"] = [0.5]
+    workflow["neqti"]["softcore"]["path"]["vdw_a"] = [1.0, 1.0, 0.0]
+    workflow["neqti"]["softcore"]["path"]["charge_a"] = [1.0, 0.5, 0.0]
+    try:
+        _ensure_switch_protocol(tmp_path, _normalized_settings(workflow))
+    except CovalentWorkflowError as exc:
+        assert "different switching protocol" in str(exc)
+    else:
+        raise AssertionError("changed general softcore path was accepted for resume")
+
+
 def test_softcore_resume_rejects_changed_protocol(tmp_path):
     first = _normalized_settings(
         {"neqti": {"interpolation": "softcore_linear", "softcore": {"sterics_steps": 30}}}

@@ -59,6 +59,14 @@ charge stage, so the configured 10000 + 30000 + 10000 steps produce a 100 ps
 switch at 2 fs. The implementation keeps PME and common protein/water forces in a
 single system rather than evaluating two complete endpoint Hamiltonians.
 
+For experimental paths, replace the two staged step settings with
+`softcore.total_steps` and `softcore.path`. An empty `nodes` list with
+`vdw_a: [1, 0]` and `charge_a: [1, 0]` transforms charge and van der Waals terms
+simultaneously. A midpoint path with `nodes: [0.5]`,
+`vdw_a: [1, 1, 0]`, and `charge_a: [1, 0.5, 0]` keeps both unique branches fully
+van der Waals coupled at the midpoint. When schedule optimization is enabled,
+`segments_per_interval` supplies one segment count for each path interval.
+
 `softcore.long_range_correction` defaults to `dynamic`, which evaluates the
 custom softcore Lennard-Jones long-range correction throughout the switch. The
 alternative `endpoint_correction` runs the fixed-volume switch without that
