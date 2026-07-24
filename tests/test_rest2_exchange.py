@@ -138,6 +138,8 @@ def _test_rest2_exchange_sampler_supports_fixed_native_hamiltonian(tmp_path):
     assert sampler.workers[0].request("parameter", "REST2_SCALE") in (0.5, 1.0)
     assert sampler.physical_state("a").getPositions() is not None
     sampler.close()
+    for checkpoint in (tmp_path / "native_rest2/a").glob("walker_*.chk"):
+        checkpoint.unlink()
 
     resumed = REST2ExchangeSampler(
         system=rest2.system,

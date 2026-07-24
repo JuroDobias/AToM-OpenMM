@@ -276,11 +276,19 @@ class REST2ExchangeSampler:
         directory = self._directory(ensemble)
         metadata = json.loads(self._metadata_path(ensemble).read_text())
         for index in range(len(self.scales)):
-            checkpoint = (directory / f"walker_{index}.chk").read_bytes()
-            if self.execution == "serial":
-                self.contexts[index].loadCheckpoint(checkpoint)
+            portable_state = directory / f"walker_{index}.xml"
+            if portable_state.exists():
+                state_xml = portable_state.read_text()
+                if self.execution == "serial":
+                    self.contexts[index].setState(mm.XmlSerializer.deserialize(state_xml))
+                else:
+                    self.workers[index].request("set_state", state_xml)
             else:
-                self.workers[index].request("load_checkpoint", checkpoint)
+                checkpoint = (directory / f"walker_{index}.chk").read_bytes()
+                if self.execution == "serial":
+                    self.contexts[index].loadCheckpoint(checkpoint)
+                else:
+                    self.workers[index].request("load_checkpoint", checkpoint)
         self.assignments = [int(value) for value in metadata["assignments"]]
         self.attempts = np.asarray(metadata["attempts"], dtype=int)
         self.accepts = np.asarray(metadata["accepts"], dtype=int)
@@ -321,6 +329,21 @@ class REST2ExchangeSampler:
             )
             temporary.write_bytes(checkpoint)
             os.replace(temporary, directory / f"walker_{index}.chk")
+            portable = directory / f"walker_{index}.xml"
+            portable_temporary = directory / f"walker_{index}.xml.tmp"
+            state_xml = (
+                mm.XmlSerializer.serialize(
+                    self.contexts[index].getState(
+                        getPositions=True,
+                        getVelocities=True,
+                        getParameters=True,
+                    )
+                )
+                if self.execution == "serial"
+                else self.workers[index].request("state")
+            )
+            portable_temporary.write_text(state_xml)
+            os.replace(portable_temporary, portable)
         payload = {
             "schema_version": 1,
             "ensemble": ensemble,

@@ -625,6 +625,85 @@ def _test_sampling_stream_resume_skips_initial_equilibration(tmp_path):
     assert worker.runs == []
 
 
+def _test_sampling_stream_prefers_portable_state_over_binary_checkpoint(tmp_path):
+    from atom_openmm.neqti import _initialize_sampling_stream, _portable_state_path
+
+    class FakeSimulation:
+        def __init__(self):
+            self.loaded = []
+
+        def loadState(self, path):
+            self.loaded.append(path)
+
+    class FakeWorker:
+        def __init__(self):
+            self.simulation = FakeSimulation()
+            self.checkpoints = []
+            self.states = []
+
+        def set_chkpt(self, checkpoint):
+            self.checkpoints.append(checkpoint)
+
+        def set_state(self, state):
+            self.states.append(state)
+
+    class FakeLogger:
+        def info(self, *args):
+            pass
+
+    checkpoint = tmp_path / "sampling.chk"
+    checkpoint.write_bytes(b"hardware-specific")
+    portable = _portable_state_path(checkpoint)
+    portable.write_text("<State/>")
+    worker = FakeWorker()
+    start_state = {"lambda1": 0.0}
+
+    _initialize_sampling_stream(
+        worker,
+        direction="forward",
+        initial_state_file="endpoint.xml",
+        start_state=start_state,
+        checkpoint_file=checkpoint,
+        completed_count=7,
+        initial_equilibration_steps=25000,
+        resume=True,
+        logger=FakeLogger(),
+    )
+
+    assert worker.simulation.loaded == [str(portable)]
+    assert worker.checkpoints == []
+    assert worker.states == [start_state]
+
+
+def _test_sampling_checkpoint_writes_portable_state(tmp_path):
+    from atom_openmm.neqti import _portable_state_path, _write_sampling_checkpoint
+
+    system = mm.System()
+    system.addParticle(12.0)
+    integrator = mm.VerletIntegrator(0.001)
+    context = mm.Context(
+        system,
+        integrator,
+        mm.Platform.getPlatformByName("Reference"),
+    )
+    context.setPositions([[0.1, 0.2, 0.3]])
+    context.setVelocities([[0.0, 0.0, 0.0]])
+
+    class Worker:
+        def __init__(self, context):
+            self.context = context
+
+        def get_chkpt(self):
+            return self.context.createCheckpoint()
+
+    checkpoint = tmp_path / "sampling.chk"
+    _write_sampling_checkpoint(checkpoint, Worker(context))
+
+    assert checkpoint.exists()
+    state = mm.XmlSerializer.deserialize(_portable_state_path(checkpoint).read_text())
+    assert state.getPositions() is not None
+
+
 def _test_legacy_resume_without_checkpoint_skips_initial_equilibration(tmp_path, monkeypatch):
     from atom_openmm import neqti
 
@@ -654,6 +733,11 @@ def _test_legacy_resume_without_checkpoint_skips_initial_equilibration(tmp_path,
             pass
 
     monkeypatch.setattr(neqti, "_write_worker_pdb_pair", lambda worker, path: None)
+    monkeypatch.setattr(
+        neqti,
+        "_write_sampling_checkpoint",
+        lambda path, worker: path.write_bytes(worker.get_chkpt()),
+    )
     worker = FakeWorker()
     checkpoint = tmp_path / "sampling.chk"
     neqti._initialize_sampling_stream(

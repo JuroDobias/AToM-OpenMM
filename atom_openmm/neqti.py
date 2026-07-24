@@ -607,6 +607,28 @@ def _write_checkpoint(path, checkpoint):
     os.replace(temporary, path)
 
 
+def _portable_state_path(checkpoint_path):
+    checkpoint_path = Path(checkpoint_path)
+    return checkpoint_path.with_suffix(checkpoint_path.suffix + ".xml")
+
+
+def _write_sampling_checkpoint(path, worker):
+    path = Path(path)
+    _write_checkpoint(path, worker.get_chkpt())
+    context = getattr(worker, "context", None)
+    if context is None:
+        return
+    state = context.getState(
+        getPositions=True,
+        getVelocities=True,
+        getParameters=True,
+    )
+    portable_path = _portable_state_path(path)
+    temporary = portable_path.with_suffix(portable_path.suffix + ".tmp")
+    temporary.write_text(mm.XmlSerializer.serialize(state))
+    os.replace(temporary, portable_path)
+
+
 def _initialize_sampling_stream(
     worker,
     *,
@@ -619,6 +641,19 @@ def _initialize_sampling_stream(
     resume,
     logger,
 ):
+    portable_state = _portable_state_path(checkpoint_file)
+    if resume and portable_state.exists():
+        worker.simulation.loadState(str(portable_state))
+        worker.set_state(start_state)
+        logger.info(
+            "Resuming NEQTI %s sampling after %d completed trajectories from portable state %s; "
+            "skipping initial equilibration",
+            direction,
+            completed_count,
+            portable_state,
+        )
+        return
+
     if resume and checkpoint_file.exists():
         try:
             worker.set_chkpt(checkpoint_file.read_bytes())
@@ -655,7 +690,7 @@ def _initialize_sampling_stream(
             f"NEQTI {direction} initial equilibration",
         )
         _write_worker_pdb_pair(worker, f"neqti_{direction}_equilibrated.pdb")
-    _write_checkpoint(checkpoint_file, worker.get_chkpt())
+    _write_sampling_checkpoint(checkpoint_file, worker)
 
 
 def _write_integrated_work(path, rows, prefix):
@@ -2138,7 +2173,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                     )
                 worker.set_chkpt(midpoint_snapshot)
                 worker.set_state(states["m"])
-                _write_checkpoint(checkpoints["m"], worker.get_chkpt())
+                _write_sampling_checkpoint(checkpoints["m"], worker)
 
                 for ensemble, switch_name in endpoint_stream_specs:
                     native_state, _native_system = native_rest2_snapshot(
@@ -2335,7 +2370,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                         worker.set_state(states["m"])
                     cycle_changed = True
                 if rest2_sampler is None:
-                    _write_checkpoint(checkpoints["m"], worker.get_chkpt())
+                    _write_sampling_checkpoint(checkpoints["m"], worker)
 
             for ensemble, switch_name in endpoint_stream_specs:
                 if not needs_attempt(switch_name, attempt):
@@ -2426,7 +2461,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                     worker.set_chkpt(snapshot)
                     worker.set_state(states[ensemble])
                     if rest2_sampler is None:
-                        _write_checkpoint(checkpoints[ensemble], worker.get_chkpt())
+                        _write_sampling_checkpoint(checkpoints[ensemble], worker)
                 cycle_changed = True
 
             if cycle_changed:
@@ -2501,7 +2536,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                     finally:
                         worker.set_chkpt(snapshot)
                         worker.set_state(states["m"])
-                _write_checkpoint(checkpoints["m"], worker.get_chkpt())
+                _write_sampling_checkpoint(checkpoints["m"], worker)
                 emit_progress()
 
         for ensemble, switch_name in endpoint_stream_specs:
@@ -2547,7 +2582,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                 finally:
                     worker.set_chkpt(snapshot)
                     worker.set_state(states[ensemble])
-                    _write_checkpoint(checkpoints[ensemble], worker.get_chkpt())
+                    _write_sampling_checkpoint(checkpoints[ensemble], worker)
                 emit_progress()
     finally:
         worker.finish()
