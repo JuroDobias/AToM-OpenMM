@@ -35,7 +35,7 @@ class DummyBondedScales:
     angle: float = 1.0
     proper_torsion: float = 1.0
     junction_angle: float = 1.0
-    junction_proper_torsion: float = 0.0
+    junction_proper_torsion: float = 1.0
 
     def __post_init__(self):
         for name, value in self.__dict__.items():

@@ -2026,7 +2026,7 @@ def _normalized_settings(workflow):
             "proper_torsion": float(dummy.get("proper_torsion", 1.0)),
             "junction_angle": float(dummy.get("junction_angle", 1.0)),
             "junction_proper_torsion": float(
-                dummy.get("junction_proper_torsion", 0.0)
+                dummy.get("junction_proper_torsion", 1.0)
             ),
         },
         "rest2": {

@@ -312,6 +312,22 @@ def test_covalent_endpoint_equilibration_defaults_and_legacy_npt_alias():
     assert configured["npt_steps"] == 250000
 
 
+def _test_dummy_bonded_scales_preserve_junction_torsions_by_default():
+    defaults = _normalized_settings({})["dummy_bonded_scales"]
+    explicit = _normalized_settings(
+        {
+            "setup": {
+                "dummy_bonded_scales": {
+                    "junction_proper_torsion": 0.0,
+                }
+            }
+        }
+    )["dummy_bonded_scales"]
+
+    assert defaults["junction_proper_torsion"] == 1.0
+    assert explicit["junction_proper_torsion"] == 0.0
+
+
 def test_softcore_settings_derive_total_switch_steps():
     config = _normalized_settings(
         {

@@ -3,9 +3,12 @@ import openmm as mm
 from openmm import unit
 from openff.toolkit import ForceField, Molecule
 from openff.units import unit as offunit
+from rdkit import Chem
 
 from atom_openmm.covalent_hybrid import (
+    DummyBondedScales,
     _add_unique_vacuum_nonbonded,
+    _inactive_scales,
     build_covalent_hybrid_molecule,
 )
 from atom_openmm.covalent_parameters import CovalentParameterBundle
@@ -57,6 +60,29 @@ def test_explicit_atom_map_does_not_expand_to_unrestricted_mcs():
     assert 2 not in hybrid.map_a_to_b
     assert 2 in hybrid.unique_a
     assert 2 in hybrid.unique_b
+
+
+def _test_junction_proper_torsions_are_preserved_by_default():
+    molecule = Chem.MolFromSmiles("CCCC")
+    _, torsion_scale = _inactive_scales(
+        molecule,
+        unique={3},
+        scales=DummyBondedScales(),
+    )
+
+    assert torsion_scale((0, 1, 2, 3)) == 1.0
+    assert torsion_scale((0, 1, 2, 3)) == DummyBondedScales().proper_torsion
+
+
+def _test_junction_proper_torsions_can_be_disabled_explicitly():
+    molecule = Chem.MolFromSmiles("CCCC")
+    _, torsion_scale = _inactive_scales(
+        molecule,
+        unique={3},
+        scales=DummyBondedScales(junction_proper_torsion=0.0),
+    )
+
+    assert torsion_scale((0, 1, 2, 3)) == 0.0
 
 
 def _test_unique_vacuum_force_exactly_replaces_internal_nonbonded_energy():
