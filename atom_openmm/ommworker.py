@@ -272,10 +272,7 @@ class OMMWorker(object):
             self.context.setTime(saved_state.getTime())
             if hasattr(self.context, "setStepCount"):
                 self.context.setStepCount(saved_state.getStepCount())
-            available_parameters = {
-                self.context.getParameterName(index)
-                for index in range(self.context.getNumParameters())
-            }
+            available_parameters = set(self.context.getParameters())
             for name, value in saved_state.getParameters().items():
                 if name in available_parameters:
                     self.context.setParameter(name, value)
