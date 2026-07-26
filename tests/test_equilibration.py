@@ -64,3 +64,49 @@ def _test_restraint_resolution_is_indexed_not_step_id(monkeypatch):
     resolved = equilibration._resolve_step_restraints(steps, topology=None, positions=None)
 
     assert resolved == [{"positional_atom_indices": [7]}, {}]
+
+
+def _test_temperature_ramp_integrator_starts_at_initial_temperature():
+    from openmm import unit
+
+    from atom_openmm.equilibration import _build_integrator
+
+    integrator = _build_integrator(
+        {
+            "type": "md",
+            "n_steps": 100,
+            "thermostat": {
+                "initial_temperature_k": 50.0,
+                "temperature_k": 310.0,
+            },
+        },
+        300.0 * unit.kelvin,
+    )
+
+    assert integrator.getTemperature().value_in_unit(
+        unit.kelvin
+    ) == pytest.approx(50.0)
+
+
+def _test_temperature_ramp_rejects_non_langevin_integrator():
+    from atom_openmm.equilibration import (
+        EquilibrationConfigError,
+        _validate_step,
+    )
+
+    with pytest.raises(
+        EquilibrationConfigError,
+        match="requires a Langevin integrator",
+    ):
+        _validate_step(
+            {
+                "type": "md",
+                "integrator": "verlet",
+                "n_steps": 100,
+                "thermostat": {
+                    "initial_temperature_k": 50.0,
+                    "temperature_k": 310.0,
+                },
+            },
+            0,
+        )

@@ -253,7 +253,14 @@ def _build_integrator(step_cfg: dict[str, Any], default_temperature):
         return mm.VerletIntegrator(timestep)
     if kind in ("langevin_middle", "langevinmiddle"):
         thermostat = step_cfg.get("thermostat") or {}
-        temperature = float(thermostat.get("temperature_k", default_temperature / kelvin)) * kelvin
+        temperature = float(
+            thermostat.get(
+                "initial_temperature_k",
+                thermostat.get(
+                    "temperature_k", default_temperature / kelvin
+                ),
+            )
+        ) * kelvin
         friction = float(thermostat.get("friction_per_ps", 1.0)) / picosecond
         return mm.LangevinMiddleIntegrator(temperature, friction, timestep)
     raise EquilibrationConfigError(f"Unsupported integrator `{kind}`")
@@ -374,6 +381,35 @@ def _validate_step(step_cfg, index):
         raise EquilibrationConfigError(f"steps[{index}].type must be 'minimization' or 'md'")
     if step_type == "md":
         int(step_cfg["n_steps"])
+        thermostat = step_cfg.get("thermostat") or {}
+        if "initial_temperature_k" in thermostat:
+            kind = str(
+                step_cfg.get("integrator", "langevin_middle")
+            ).lower()
+            if kind not in ("langevin_middle", "langevinmiddle"):
+                raise EquilibrationConfigError(
+                    f"steps[{index}].thermostat.initial_temperature_k "
+                    "requires a Langevin integrator"
+                )
+            if float(thermostat["initial_temperature_k"]) <= 0:
+                raise EquilibrationConfigError(
+                    f"steps[{index}].thermostat.initial_temperature_k "
+                    "must be positive"
+                )
+            if float(
+                thermostat.get("temperature_k", 300.0)
+            ) <= 0:
+                raise EquilibrationConfigError(
+                    f"steps[{index}].thermostat.temperature_k must be "
+                    "positive"
+                )
+            if int(
+                thermostat.get("temperature_update_interval_steps", 5000)
+            ) < 1:
+                raise EquilibrationConfigError(
+                    f"steps[{index}].thermostat."
+                    "temperature_update_interval_steps must be positive"
+                )
     if step_type == "minimization":
         float(step_cfg.get("tolerance_kj_mol_nm", 10.0))
         int(step_cfg.get("max_iterations", 0))
@@ -517,7 +553,14 @@ def run_custom_equilibration(
             )
         if step_cfg["type"] == "md" and step_cfg.get("reset_velocities", False):
             thermostat = step_cfg.get("thermostat") or {}
-            temperature = float(thermostat.get("temperature_k", default_temperature / kelvin)) * kelvin
+            temperature = float(
+                thermostat.get(
+                    "initial_temperature_k",
+                    thermostat.get(
+                        "temperature_k", default_temperature / kelvin
+                    ),
+                )
+            ) * kelvin
             simulation.context.setVelocitiesToTemperature(temperature)
 
         wall_start = time.perf_counter()
@@ -551,7 +594,43 @@ def run_custom_equilibration(
                 _step_restraint_label(step_cfg),
                 _step_barostat_label(step_cfg),
             )
-            simulation.step(completed_steps)
+            thermostat = step_cfg.get("thermostat") or {}
+            initial_temperature = thermostat.get("initial_temperature_k")
+            if initial_temperature is None:
+                simulation.step(completed_steps)
+            else:
+                initial_temperature = float(initial_temperature)
+                final_temperature = float(
+                    thermostat.get(
+                        "temperature_k", default_temperature / kelvin
+                    )
+                )
+                update_interval = int(
+                    thermostat.get("temperature_update_interval_steps", 5000)
+                )
+                if update_interval < 1:
+                    raise EquilibrationConfigError(
+                        "thermostat.temperature_update_interval_steps must "
+                        "be positive"
+                    )
+                integrated = 0
+                while integrated < completed_steps:
+                    block = min(update_interval, completed_steps - integrated)
+                    integrated += block
+                    temperature = initial_temperature + (
+                        final_temperature - initial_temperature
+                    ) * integrated / completed_steps
+                    integrator.setTemperature(temperature * kelvin)
+                    simulation.step(block)
+                logger.info(
+                    "Custom equilibration step %d/%d %s: temperature ramp "
+                    "completed from %g K to %g K",
+                    i + 1,
+                    len(steps),
+                    step_id,
+                    initial_temperature,
+                    final_temperature,
+                )
             logger.info("Custom equilibration step %d/%d %s: MD integration finished", i + 1, len(steps), step_id)
 
         step_state_path = step_dir / "final_state.xml"

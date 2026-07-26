@@ -489,7 +489,14 @@ When `resume: true`, completed work rows and three sampling checkpoints are reus
 
 `count_as_infinite` is intended for production protocols where a physical numerical instability is itself a zero-overlap outcome that must not be replaced selectively. It recognizes non-finite work, OpenMM NaN/non-finite state errors, and constraint convergence failures. Environment, CUDA/PTX, parameter-name, random-seed, I/O, and programming failures remain fatal. Counted rows use `status: counted_infinite` and `work_kcal_per_mol: inf`; ordinary failed rows from older runs remain excluded on resume. Summaries and `result.yaml` report total analyzed, finite, counted-infinite, and retryable failed counts separately. BAR returns no finite estimate when a required direction has no finite connecting sample.
 
-The wrapper can replace the default equilibration stages with inline mdflow-style steps. Amber masks require `parmed`. For `async_re`, `pre_atm` replaces the physical minimization/thermalization/NPT/NVT stage and `async_re.midpoint` can replace the final lambda-0.5 equilibration. For `neqti`, `neqti.midpoint` is applied at the shared M ensemble and `neqti.endpoint` at A and B. When `neqti.midpoint` is omitted, it reuses the endpoint steps:
+The wrapper can replace the default equilibration stages with inline
+mdflow-style steps. Amber masks require `parmed`. For `async_re`, `pre_atm`
+replaces the physical minimization/thermalization/NPT/NVT stage and
+`async_re.midpoint` can replace the final lambda-0.5 equilibration. AWH also
+uses `pre_atm`, then starts its state-space adaptation from the resulting
+physical endpoint. For `neqti`, `neqti.midpoint` is applied at the shared M
+ensemble and `neqti.endpoint` at A and B. When `neqti.midpoint` is omitted, it
+reuses the endpoint steps:
 
 ```yaml
 workflow:
@@ -522,7 +529,17 @@ workflow:
               tolerance_a: 0.25
 ```
 
-Each custom step is either `minimization` or `md`. MD steps support `NVT` and `NPT`, `langevin_middle` or `verlet` integration, optional velocity reset, and state/XTC reporters. Positional restraints use Amber mask syntax. The two ligands are named `L1` and `L2` in the prepared system; for example, `!:L1,L2` excludes both ligands from a restraint selection. A 4 fs time step generally requires appropriate hydrogen mass repartitioning through `atom_options.HMASS`; choosing `timestep_ps: 0.004` alone does not make a system stable.
+Each custom step is either `minimization` or `md`. MD steps support `NVT` and
+`NPT`, `langevin_middle` or `verlet` integration, optional velocity reset, and
+state/XTC reporters. For Langevin heating, set
+`thermostat.initial_temperature_k`, the final `temperature_k`, and optionally
+`temperature_update_interval_steps`; the thermostat temperature is changed
+linearly over the step. Positional restraints use Amber mask syntax. The two
+ligands are named `L1` and `L2` in the prepared system; for example,
+`!:L1,L2` excludes both ligands from a restraint selection. A 4 fs time step
+generally requires appropriate hydrogen mass repartitioning through
+`atom_options.HMASS`; choosing `timestep_ps: 0.004` alone does not make a
+system stable.
 
 Amber expressions can contain quoted, role-aware SMARTS leaves. Quote the complete YAML value with single quotes so `#` is not parsed as a YAML comment:
 
