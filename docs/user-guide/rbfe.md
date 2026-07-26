@@ -316,6 +316,19 @@ workflow:
       min_visits_per_state: 100
       covering_fraction: 0.8
       learning_rate_kbt: 0.1
+      refinement:
+        enabled: true
+        learning_rates_kbt: [0.1, 0.05, 0.025, 0.0125]
+        min_steps_per_stage: 500000
+        min_round_trips_per_stage: 2
+        min_visits_per_state: 20
+        covering_fraction: 1.0
+      frozen_validation:
+        min_steps: 500000
+        max_steps: 2000000
+        min_round_trips: 2
+        min_visits_per_state: 10
+        min_uniform_occupancy_overlap: 0.7
       metric_target:
         enabled: false
         min_round_trips: 2
@@ -348,19 +361,30 @@ workflow:
     resume: true
 ```
 
-The adaptive stage uses fixed-size probability-weighted updates with a uniform
-target.
-It cannot freeze merely because the bias appears stable: the configured
-minimum steps, physical A-B-A round trips, state visits, and covering fraction
-must all pass. Reaching `adaptive.max_steps` first produces a partial result.
-The subsequent fixed-bias stage records sparse complete reduced-energy
-matrices and reports UWHAM as the primary estimator. The adaptive AWH bias
-estimate remains available under `result.estimator_variants`.
+With `adaptive.refinement.enabled: true`, bias learning proceeds through the
+strictly decreasing `learning_rates_kbt` stages. Every stage must independently
+meet its step, physical A-B-A round-trip, visit, and coverage requirements.
+Fresh counters prevent a rapid global-Gibbs jump from allowing a contiguous
+unvisited block to pass merely because an earlier, more aggressive bias stage
+visited it.
 
-The adaptive bias uses a fixed dimensionless update size set by
-`adaptive.learning_rate_kbt`; it does not decay merely because time was spent
-in already explored states. This prevents an undiscovered edge from freezing
-out before schedule coverage. The bias is frozen completely for production.
+After the final refinement stage, the bias is frozen for validation.
+Production begins only after the fixed-bias trajectory passes its own
+round-trip, per-state visit, and uniform-occupancy-overlap criteria. If
+`frozen_validation.max_steps` is reached first, the workflow returns to the
+smallest learning rate and tries validation again. Reaching
+`adaptive.max_steps` before validation passes produces a partial result.
+Stage transitions and their metrics are stored in
+`awh_summary.yaml:adaptation.history`.
+
+When refinement is disabled, the legacy adaptive stage uses the fixed
+dimensionless update size set by `adaptive.learning_rate_kbt` and the original
+top-level convergence criteria. The bias is then frozen directly for
+production. In both modes, the fixed-bias production stage records sparse
+complete reduced-energy matrices and reports UWHAM as the primary estimator.
+The adaptive AWH bias estimate remains available under
+`result.estimator_variants`.
+
 `initial_error_kj_per_mol` and `diffusion_per_ps` remain accepted for
 checkpoint and input compatibility, but they do not affect this fixed-rate
 update.

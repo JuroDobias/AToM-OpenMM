@@ -113,8 +113,94 @@ def _test_awh_analysis_defaults_are_normalized():
         "min_effective_samples": 200,
     }
     assert settings["adaptive"]["learning_rate_kbt"] == pytest.approx(0.1)
+    assert settings["adaptive"]["refinement"] == {
+        "enabled": False,
+        "learning_rates_kbt": [0.1],
+        "min_steps_per_stage": 500000,
+        "min_round_trips_per_stage": 2,
+        "min_visits_per_state": 20,
+        "covering_fraction": 1.0,
+    }
     assert settings["adaptive"]["metric_target"]["enabled"] is False
     assert settings["atm_state_count"] == 4
+
+
+def _test_awh_staged_refinement_options_are_normalized():
+    from atom_openmm.awh import normalize_awh_options
+
+    settings = normalize_awh_options(
+        {
+            "awh": {
+                "adaptive": {
+                    "refinement": {
+                        "enabled": True,
+                        "learning_rates_kbt": [0.1, 0.05, 0.01],
+                        "min_steps_per_stage": 1000,
+                        "min_round_trips_per_stage": 1,
+                        "min_visits_per_state": 3,
+                        "covering_fraction": 0.9,
+                    },
+                    "frozen_validation": {
+                        "min_steps": 2000,
+                        "max_steps": 5000,
+                        "min_round_trips": 1,
+                        "min_visits_per_state": 2,
+                        "min_uniform_occupancy_overlap": 0.75,
+                    },
+                }
+            }
+        },
+        _atom_options(),
+    )
+    assert settings["adaptive"]["refinement"]["enabled"] is True
+    assert settings["adaptive"]["refinement"][
+        "learning_rates_kbt"
+    ] == pytest.approx([0.1, 0.05, 0.01])
+    assert settings["adaptive"]["frozen_validation"][
+        "min_uniform_occupancy_overlap"
+    ] == pytest.approx(0.75)
+
+
+def _test_awh_staged_refinement_rejects_non_decreasing_rates():
+    from atom_openmm.awh import AWHConfigError, normalize_awh_options
+
+    with pytest.raises(AWHConfigError, match="strictly decreasing"):
+        normalize_awh_options(
+            {
+                "awh": {
+                    "adaptive": {
+                        "refinement": {
+                            "enabled": True,
+                            "learning_rates_kbt": [0.05, 0.1],
+                        }
+                    }
+                }
+            },
+            _atom_options(),
+        )
+
+
+def _test_awh_sampling_phase_metrics_require_frozen_occupancy_overlap():
+    from atom_openmm.awh import (
+        _sampling_phase_complete,
+        _sampling_phase_metrics,
+    )
+
+    requirements = {
+        "min_steps": 1000,
+        "min_round_trips": 2,
+        "min_visits_per_state": 1,
+        "covering_fraction": 1.0,
+        "min_uniform_occupancy_overlap": 0.8,
+    }
+    skewed = _sampling_phase_metrics([97, 1, 1, 1], 1000, 2)
+    balanced = _sampling_phase_metrics([25, 25, 25, 25], 1000, 2)
+    assert not _sampling_phase_complete(
+        skewed, requirements, require_overlap=True
+    )
+    assert _sampling_phase_complete(
+        balanced, requirements, require_overlap=True
+    )
 
 
 def _test_awh_densifies_both_legs_and_preserves_midpoints():
@@ -440,6 +526,20 @@ def _test_disabled_metric_target_preserves_legacy_signature():
     current = normalize_awh_options({"awh": {}}, _atom_options())
     legacy = deepcopy(current)
     legacy["adaptive"].pop("metric_target")
+    assert _protocol_signature(_atom_options(), current) == _protocol_signature(
+        _atom_options(), legacy
+    )
+
+
+def _test_disabled_staged_refinement_preserves_legacy_signature():
+    from copy import deepcopy
+
+    from atom_openmm.awh import _protocol_signature, normalize_awh_options
+
+    current = normalize_awh_options({"awh": {}}, _atom_options())
+    legacy = deepcopy(current)
+    legacy["adaptive"].pop("refinement")
+    legacy["adaptive"].pop("frozen_validation")
     assert _protocol_signature(_atom_options(), current) == _protocol_signature(
         _atom_options(), legacy
     )

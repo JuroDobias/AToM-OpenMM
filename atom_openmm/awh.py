@@ -86,18 +86,27 @@ def normalize_awh_options(workflow, atom_options):
     friction = analysis.get("friction") or {}
     thresholds = analysis.get("thresholds") or {}
     metric_target = adaptive.get("metric_target") or {}
+    refinement = adaptive.get("refinement") or {}
+    frozen_validation = adaptive.get("frozen_validation") or {}
     state_sampling = raw.get("state_sampling") or {}
     if (
         not isinstance(trajectory, dict)
         or not isinstance(friction, dict)
         or not isinstance(thresholds, dict)
         or not isinstance(metric_target, dict)
+        or not isinstance(refinement, dict)
+        or not isinstance(frozen_validation, dict)
         or not isinstance(state_sampling, dict)
     ):
         raise AWHConfigError(
             "AWH trajectory, friction, thresholds, and metric_target settings "
             "must be mappings"
         )
+    learning_rate_kbt = float(adaptive.get("learning_rate_kbt", 0.1))
+    refinement_rates = [
+        float(value)
+        for value in refinement.get("learning_rates_kbt", [learning_rate_kbt])
+    ]
     settings = {
         "state_move_interval_steps": int(raw.get("state_move_interval_steps", 500)),
         "atm_state_count": int(raw.get("atm_state_count", len(states))),
@@ -138,8 +147,43 @@ def normalize_awh_options(workflow, atom_options):
             "min_visits_per_state": int(adaptive.get("min_visits_per_state", 100)),
             "covering_fraction": float(adaptive.get("covering_fraction", 0.8)),
             "learning_rate_kbt": float(
-                adaptive.get("learning_rate_kbt", 0.1)
+                learning_rate_kbt
             ),
+            "refinement": {
+                "enabled": bool(refinement.get("enabled", False)),
+                "learning_rates_kbt": refinement_rates,
+                "min_steps_per_stage": int(
+                    refinement.get("min_steps_per_stage", 500_000)
+                ),
+                "min_round_trips_per_stage": int(
+                    refinement.get("min_round_trips_per_stage", 2)
+                ),
+                "min_visits_per_state": int(
+                    refinement.get("min_visits_per_state", 20)
+                ),
+                "covering_fraction": float(
+                    refinement.get("covering_fraction", 1.0)
+                ),
+            },
+            "frozen_validation": {
+                "min_steps": int(
+                    frozen_validation.get("min_steps", 500_000)
+                ),
+                "max_steps": int(
+                    frozen_validation.get("max_steps", 2_000_000)
+                ),
+                "min_round_trips": int(
+                    frozen_validation.get("min_round_trips", 2)
+                ),
+                "min_visits_per_state": int(
+                    frozen_validation.get("min_visits_per_state", 10)
+                ),
+                "min_uniform_occupancy_overlap": float(
+                    frozen_validation.get(
+                        "min_uniform_occupancy_overlap", 0.7
+                    )
+                ),
+            },
             "metric_target": {
                 "enabled": bool(metric_target.get("enabled", False)),
                 "min_round_trips": int(
@@ -229,14 +273,49 @@ def normalize_awh_options(workflow, atom_options):
         settings["state_sampling"]["validation_interval_moves"],
         settings["state_sampling"]["validation_states_per_check"],
     ]
+    if settings["adaptive"]["refinement"]["enabled"]:
+        positive.extend(
+            [
+                settings["adaptive"]["refinement"]["min_steps_per_stage"],
+                settings["adaptive"]["refinement"][
+                    "min_round_trips_per_stage"
+                ],
+                settings["adaptive"]["refinement"]["min_visits_per_state"],
+                settings["adaptive"]["frozen_validation"]["min_steps"],
+                settings["adaptive"]["frozen_validation"]["max_steps"],
+                settings["adaptive"]["frozen_validation"]["min_round_trips"],
+                settings["adaptive"]["frozen_validation"][
+                    "min_visits_per_state"
+                ],
+            ]
+        )
     if any(value < 1 for value in positive):
         raise AWHConfigError("AWH step and interval settings must be positive")
     if settings["adaptive"]["min_steps"] > settings["adaptive"]["max_steps"]:
         raise AWHConfigError("workflow.awh.adaptive.min_steps cannot exceed max_steps")
+    staged_refinement = settings["adaptive"]["refinement"]["enabled"]
+    validation = settings["adaptive"]["frozen_validation"]
+    if (
+        staged_refinement
+        and validation["min_steps"] > validation["max_steps"]
+    ):
+        raise AWHConfigError(
+            "workflow.awh.adaptive.frozen_validation.min_steps cannot exceed "
+            "max_steps"
+        )
     if settings["atm_state_count"] < 4:
         raise AWHConfigError("workflow.awh.atm_state_count must be at least 4")
     if not 0 < settings["adaptive"]["covering_fraction"] <= 1:
         raise AWHConfigError("workflow.awh.adaptive.covering_fraction must be in (0, 1]")
+    if (
+        staged_refinement
+        and not 0
+        < settings["adaptive"]["refinement"]["covering_fraction"]
+        <= 1
+    ):
+        raise AWHConfigError(
+            "workflow.awh.adaptive.refinement.covering_fraction must be in (0, 1]"
+        )
     if (
         settings["initial_error_kj_per_mol"] <= 0
         or settings["diffusion_per_ps"] <= 0
@@ -244,6 +323,26 @@ def normalize_awh_options(workflow, atom_options):
         or settings["state_sampling"]["validation_tolerance_kj_per_mol"] <= 0
     ):
         raise AWHConfigError("AWH initial error and diffusion must be positive")
+    if staged_refinement and (
+        not refinement_rates
+        or any(value <= 0 for value in refinement_rates)
+        or any(
+            later >= earlier
+            for earlier, later in zip(refinement_rates, refinement_rates[1:])
+        )
+    ):
+        raise AWHConfigError(
+            "workflow.awh.adaptive.refinement.learning_rates_kbt must contain "
+            "positive, strictly decreasing values"
+        )
+    if (
+        staged_refinement
+        and not 0 < validation["min_uniform_occupancy_overlap"] <= 1
+    ):
+        raise AWHConfigError(
+            "workflow.awh.adaptive.frozen_validation."
+            "min_uniform_occupancy_overlap must be in (0, 1]"
+        )
     overflow_tolerance = settings["state_sampling"][
         "direct_overflow_probability_tolerance"
     ]
@@ -643,6 +742,10 @@ def _protocol_signature(options, settings):
     metric_target = dynamics_settings.get("adaptive", {}).get("metric_target")
     if metric_target is not None and not metric_target.get("enabled", False):
         dynamics_settings["adaptive"].pop("metric_target")
+    refinement = dynamics_settings.get("adaptive", {}).get("refinement")
+    if refinement is not None and not refinement.get("enabled", False):
+        dynamics_settings["adaptive"].pop("refinement")
+        dynamics_settings["adaptive"].pop("frozen_validation", None)
     state_sampling = dynamics_settings.get("state_sampling")
     if state_sampling is not None and state_sampling.get("method") == "legacy_local_gibbs":
         dynamics_settings.pop("state_sampling")
@@ -670,6 +773,46 @@ def _atomic_yaml(path, data):
 
 def _neighbors(index, nstates):
     return list(range(max(0, index - 1), min(nstates, index + 2)))
+
+
+def _uniform_occupancy_overlap(visits):
+    visits = np.asarray(visits, dtype=float)
+    total = float(np.sum(visits))
+    if not len(visits) or total <= 0:
+        return 0.0
+    observed = visits / total
+    uniform = np.full(len(visits), 1.0 / len(visits))
+    return float(np.minimum(observed, uniform).sum())
+
+
+def _sampling_phase_metrics(visits, steps, round_trips):
+    visits = np.asarray(visits, dtype=np.int64)
+    return {
+        "steps": int(steps),
+        "round_trips": int(round_trips),
+        "minimum_visits": int(np.min(visits)) if len(visits) else 0,
+        "covered_states": int(np.count_nonzero(visits)),
+        "covering_fraction": (
+            float(np.count_nonzero(visits) / len(visits)) if len(visits) else 0.0
+        ),
+        "uniform_occupancy_overlap": _uniform_occupancy_overlap(visits),
+    }
+
+
+def _sampling_phase_complete(metrics, requirements, *, require_overlap=False):
+    complete = (
+        metrics["steps"] >= requirements["min_steps"]
+        and metrics["round_trips"] >= requirements["min_round_trips"]
+        and metrics["minimum_visits"] >= requirements["min_visits_per_state"]
+        and metrics["covering_fraction"] >= requirements["covering_fraction"]
+    )
+    if require_overlap:
+        complete = (
+            complete
+            and metrics["uniform_occupancy_overlap"]
+            >= requirements["min_uniform_occupancy_overlap"]
+        )
+    return complete
 
 
 def _ensure_trace_schema(path, fields, initial_state):
@@ -912,6 +1055,15 @@ def run_awh(options, awh_options=None, progress_callback=None):
         settings["state_move_interval_steps"] * timestep_ps,
     )
     global_diagnostics = GlobalGibbsDiagnostics()
+    refinement_settings = settings["adaptive"]["refinement"]
+    validation_settings = settings["adaptive"]["frozen_validation"]
+    staged_refinement = refinement_settings["enabled"]
+    refinement_index = 0
+    phase_steps_completed = 0
+    phase_visits = np.zeros(len(graph), dtype=np.int64)
+    phase_round_trips_start = 0
+    validation_attempts = 0
+    adaptation_history = []
     stage = "adaptive"
     total_steps = 0
     production_steps_completed = 0
@@ -937,6 +1089,22 @@ def run_awh(options, awh_options=None, progress_callback=None):
             saved.get("transitions", transitions.tolist()), dtype=np.int64
         )
         stage = saved["stage"]
+        adaptation = saved.get("adaptation") or {}
+        refinement_index = int(adaptation.get("refinement_index", 0))
+        phase_steps_completed = int(
+            adaptation.get("phase_steps_completed", 0)
+        )
+        phase_visits = np.asarray(
+            adaptation.get("phase_visits", phase_visits.tolist()),
+            dtype=np.int64,
+        )
+        phase_round_trips_start = int(
+            adaptation.get("phase_round_trips_start", 0)
+        )
+        validation_attempts = int(
+            adaptation.get("validation_attempts", 0)
+        )
+        adaptation_history = list(adaptation.get("history") or [])
         restored_move = int(saved.get("move", saved["awh"]["updates"]))
         awh = AWHBias.from_dict(saved["awh"])
         saved_friction = saved.get("friction")
@@ -1005,6 +1173,11 @@ def run_awh(options, awh_options=None, progress_callback=None):
         "conditional_expected_jump_distance",
         "round_trips",
         "minimum_visits",
+        "refinement_stage",
+        "learning_rate_kbt",
+        "phase_steps",
+        "phase_round_trips",
+        "phase_minimum_visits",
     ]
     _ensure_trace_schema(
         trace_path,
@@ -1125,6 +1298,25 @@ def run_awh(options, awh_options=None, progress_callback=None):
                 "global_gibbs": (
                     global_diagnostics.to_dict() if global_sampling else None
                 ),
+                "adaptation": {
+                    "staged_refinement": staged_refinement,
+                    "refinement_index": refinement_index,
+                    "learning_rate_kbt": (
+                        refinement_settings["learning_rates_kbt"][
+                            refinement_index
+                        ]
+                        if staged_refinement and stage == "adaptive"
+                        else None
+                    ),
+                    "phase_steps_completed": phase_steps_completed,
+                    "phase_visits": phase_visits.tolist(),
+                    "phase_round_trips_start": phase_round_trips_start,
+                    "phase_round_trips": max(
+                        0, round_trips - phase_round_trips_start
+                    ),
+                    "validation_attempts": validation_attempts,
+                    "history": adaptation_history,
+                },
                 "rng_state": rng.bit_generator.state,
             },
         )
@@ -1159,6 +1351,28 @@ def run_awh(options, awh_options=None, progress_callback=None):
             "global_gibbs": (
                 global_diagnostics.to_dict() if global_sampling else None
             ),
+            "adaptation": {
+                "staged_refinement": staged_refinement,
+                "refinement_index": refinement_index,
+                "learning_rate_kbt": (
+                    refinement_settings["learning_rates_kbt"][
+                        refinement_index
+                    ]
+                    if staged_refinement and stage == "adaptive"
+                    else None
+                ),
+                "phase_steps_completed": phase_steps_completed,
+                "phase_round_trips": max(
+                    0, round_trips - phase_round_trips_start
+                ),
+                "phase_minimum_visits": int(np.min(phase_visits)),
+                "phase_covered_states": int(np.count_nonzero(phase_visits)),
+                "phase_uniform_occupancy_overlap": (
+                    _uniform_occupancy_overlap(phase_visits)
+                ),
+                "validation_attempts": validation_attempts,
+                "history": adaptation_history,
+            },
             "analysis": {
                 "awh_bias_ddg_kcal_per_mol": ddg,
                 "uwham_ddg_kcal_per_mol": None,
@@ -1202,6 +1416,23 @@ def run_awh(options, awh_options=None, progress_callback=None):
                     ),
                     "round_trips": round_trips,
                     "minimum_visits": int(np.min(awh.visits)),
+                    "refinement_stage": (
+                        refinement_index + 1
+                        if staged_refinement and stage == "adaptive"
+                        else ""
+                    ),
+                    "learning_rate_kbt": (
+                        refinement_settings["learning_rates_kbt"][
+                            refinement_index
+                        ]
+                        if staged_refinement and stage == "adaptive"
+                        else ""
+                    ),
+                    "phase_steps": phase_steps_completed,
+                    "phase_round_trips": max(
+                        0, round_trips - phase_round_trips_start
+                    ),
+                    "phase_minimum_visits": int(np.min(phase_visits)),
                 }
             )
 
@@ -1265,10 +1496,15 @@ def run_awh(options, awh_options=None, progress_callback=None):
                 forces=forces,
             )
         if update_bias:
+            learning_rate = settings["adaptive"]["learning_rate_kbt"]
+            if staged_refinement:
+                learning_rate = refinement_settings["learning_rates_kbt"][
+                    refinement_index
+                ]
             awh.update(
                 candidates,
                 probabilities,
-                learning_rate_kbt=settings["adaptive"]["learning_rate_kbt"],
+                learning_rate_kbt=learning_rate,
             )
             metric_target = settings["adaptive"]["metric_target"]
             if (
@@ -1300,14 +1536,53 @@ def run_awh(options, awh_options=None, progress_callback=None):
             )
         return candidates, probabilities, reduced
 
-    while stage == "adaptive":
+    def reset_phase_tracking():
+        nonlocal phase_steps_completed
+        nonlocal phase_visits
+        nonlocal phase_round_trips_start
+        nonlocal last_endpoint
+        nonlocal crossed
+        phase_steps_completed = 0
+        phase_visits = np.zeros(len(graph), dtype=np.int64)
+        phase_round_trips_start = round_trips
+        last_endpoint = current if current in (a_index, b_index) else None
+        crossed = False
+
+    def current_phase_metrics():
+        return _sampling_phase_metrics(
+            phase_visits,
+            phase_steps_completed,
+            max(0, round_trips - phase_round_trips_start),
+        )
+
+    def record_adaptation_event(event, metrics, **values):
+        adaptation_history.append(
+            {
+                "event": event,
+                "move": move,
+                "total_steps": total_steps,
+                "refinement_index": refinement_index,
+                "learning_rate_kbt": (
+                    refinement_settings["learning_rates_kbt"][refinement_index]
+                    if staged_refinement
+                    else settings["adaptive"]["learning_rate_kbt"]
+                ),
+                **metrics,
+                **values,
+            }
+        )
+
+    while stage in {"adaptive", "validation"}:
         md_started = time.perf_counter()
         worker.run(settings["state_move_interval_steps"])
         if global_sampling:
             global_diagnostics.md_seconds += time.perf_counter() - md_started
         total_steps += settings["state_move_interval_steps"]
+        phase_steps_completed += settings["state_move_interval_steps"]
         previous = current
-        candidates, probabilities, reduced = evaluate_state_move(True)
+        candidates, probabilities, reduced = evaluate_state_move(
+            stage == "adaptive"
+        )
         current = int(rng.choice(candidates, p=probabilities))
         expected_jump = None
         if global_sampling:
@@ -1316,6 +1591,7 @@ def run_awh(options, awh_options=None, progress_callback=None):
             )
         transitions[previous, current] += 1
         awh.visits[current] += 1
+        phase_visits[current] += 1
         apply_node(current)
         if current in (a_index, b_index) and current != last_endpoint:
             if last_endpoint is not None:
@@ -1332,17 +1608,128 @@ def run_awh(options, awh_options=None, progress_callback=None):
             expected_jump,
         )
         adaptive = settings["adaptive"]
-        covered = np.count_nonzero(awh.visits) / len(graph) >= adaptive["covering_fraction"]
-        converged = (
-            total_steps >= adaptive["min_steps"]
-            and round_trips >= adaptive["min_round_trips"]
-            and int(np.min(awh.visits)) >= adaptive["min_visits_per_state"]
-            and covered
-        )
-        if converged:
-            stage = "production"
-            logger.info("AWH adaptive stage converged after %d steps and %d round trips", total_steps, round_trips)
-        if move % settings["checkpoint_interval_moves"] == 0 or converged:
+        transitioned = False
+        metrics = current_phase_metrics()
+        if stage == "adaptive" and staged_refinement:
+            requirements = {
+                "min_steps": refinement_settings["min_steps_per_stage"],
+                "min_round_trips": refinement_settings[
+                    "min_round_trips_per_stage"
+                ],
+                "min_visits_per_state": refinement_settings[
+                    "min_visits_per_state"
+                ],
+                "covering_fraction": refinement_settings[
+                    "covering_fraction"
+                ],
+            }
+            if _sampling_phase_complete(metrics, requirements):
+                if (
+                    refinement_index + 1
+                    < len(refinement_settings["learning_rates_kbt"])
+                ):
+                    record_adaptation_event(
+                        "refinement_stage_complete", metrics
+                    )
+                    refinement_index += 1
+                    logger.info(
+                        "AWH refinement advanced to stage %d/%d at %.6g kBT "
+                        "after %d total steps",
+                        refinement_index + 1,
+                        len(refinement_settings["learning_rates_kbt"]),
+                        refinement_settings["learning_rates_kbt"][
+                            refinement_index
+                        ],
+                        total_steps,
+                    )
+                    reset_phase_tracking()
+                    transitioned = True
+                elif total_steps >= adaptive["min_steps"]:
+                    record_adaptation_event(
+                        "refinement_stage_complete", metrics
+                    )
+                    stage = "validation"
+                    logger.info(
+                        "AWH refinement complete after %d steps; starting "
+                        "frozen-bias validation",
+                        total_steps,
+                    )
+                    reset_phase_tracking()
+                    transitioned = True
+        elif stage == "adaptive":
+            requirements = {
+                "min_steps": adaptive["min_steps"],
+                "min_round_trips": adaptive["min_round_trips"],
+                "min_visits_per_state": adaptive["min_visits_per_state"],
+                "covering_fraction": adaptive["covering_fraction"],
+            }
+            legacy_metrics = _sampling_phase_metrics(
+                awh.visits, total_steps, round_trips
+            )
+            if _sampling_phase_complete(legacy_metrics, requirements):
+                stage = "production"
+                logger.info(
+                    "AWH adaptive stage converged after %d steps and %d "
+                    "round trips",
+                    total_steps,
+                    round_trips,
+                )
+                transitioned = True
+        else:
+            requirements = {
+                "min_steps": validation_settings["min_steps"],
+                "min_round_trips": validation_settings["min_round_trips"],
+                "min_visits_per_state": validation_settings[
+                    "min_visits_per_state"
+                ],
+                "covering_fraction": 1.0,
+                "min_uniform_occupancy_overlap": validation_settings[
+                    "min_uniform_occupancy_overlap"
+                ],
+            }
+            if _sampling_phase_complete(
+                metrics, requirements, require_overlap=True
+            ):
+                record_adaptation_event("frozen_validation_passed", metrics)
+                stage = "production"
+                logger.info(
+                    "AWH frozen-bias validation passed after %d steps, %d "
+                    "round trips, and %.3f uniform occupancy overlap",
+                    metrics["steps"],
+                    metrics["round_trips"],
+                    metrics["uniform_occupancy_overlap"],
+                )
+                transitioned = True
+            elif phase_steps_completed >= validation_settings["max_steps"]:
+                validation_attempts += 1
+                record_adaptation_event(
+                    "frozen_validation_failed",
+                    metrics,
+                    validation_attempt=validation_attempts,
+                )
+                stage = "adaptive"
+                refinement_index = (
+                    len(refinement_settings["learning_rates_kbt"]) - 1
+                )
+                logger.warning(
+                    "AWH frozen-bias validation attempt %d failed after %d "
+                    "steps: %d round trips, minimum visits %d, occupancy "
+                    "overlap %.3f; resuming refinement at %.6g kBT",
+                    validation_attempts,
+                    metrics["steps"],
+                    metrics["round_trips"],
+                    metrics["minimum_visits"],
+                    metrics["uniform_occupancy_overlap"],
+                    refinement_settings["learning_rates_kbt"][
+                        refinement_index
+                    ],
+                )
+                reset_phase_tracking()
+                transitioned = True
+        if (
+            move % settings["checkpoint_interval_moves"] == 0
+            or transitioned
+        ):
             with bias_path.open("a", newline="") as handle:
                 writer = csv.writer(handle)
                 if handle.tell() == 0:
@@ -1354,11 +1741,20 @@ def run_awh(options, awh_options=None, progress_callback=None):
             live_summary = summary()
             if progress_callback:
                 progress_callback(live_summary)
-        if total_steps >= adaptive["max_steps"] and not converged:
+        if (
+            total_steps >= adaptive["max_steps"]
+            and stage != "production"
+        ):
             checkpoint()
             result = summary("partial")
+            warning = (
+                "AWH adaptation reached max_steps before frozen-bias "
+                "validation passed"
+                if staged_refinement
+                else "AWH adaptive stage reached max_steps before convergence"
+            )
             result["warnings"] = [
-                "AWH adaptive stage reached max_steps before convergence",
+                warning,
                 *result["diagnostics"]["warnings"],
             ]
             plot_awh_diagnostics(
@@ -1561,6 +1957,8 @@ def analyze_existing_awh(options, awh_options):
         "overlap_score": quality["uwham"]["minimum_adjacent_overlap"],
         "rest2": quality["rest2"],
         "diagnostics": quality,
+        "global_gibbs": checkpoint.get("global_gibbs"),
+        "adaptation": checkpoint.get("adaptation"),
         "analysis": {
             "awh_bias_ddg_kcal_per_mol": bias_ddg,
             "uwham_ddg_kcal_per_mol": None,
