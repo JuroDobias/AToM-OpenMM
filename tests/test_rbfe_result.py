@@ -223,6 +223,37 @@ def _test_neqti_progress_handles_staged_two_leg_counts(tmp_path):
     assert result["progress"]["target_snapshot_cycles"] == 40
 
 
+def _test_awh_result_uses_fixed_bias_uwham_and_tracks_progress(tmp_path):
+    writer = _writer(tmp_path, method="awh", requested_samples=None)
+    writer.workdir.mkdir(parents=True)
+    (writer.workdir / "awh_summary.yaml").write_text("status: completed\n")
+    (writer.workdir / "awh_state_trace.csv").write_text("state\n")
+    writer.update(
+        "completed",
+        analysis={
+            "stage": "production",
+            "total_steps": 6000000,
+            "round_trips": 12,
+            "minimum_visits": 105,
+            "state_visits": [105, 120, 118],
+            "analysis": {
+                "awh_bias_ddg_kcal_per_mol": 1.3,
+                "uwham_ddg_kcal_per_mol": 1.2,
+                "uwham_bootstrap_std_kcal_per_mol": 0.2,
+            },
+        },
+    )
+    result = _read(writer)
+    assert result["method"] == "awh"
+    assert result["result"]["estimator"] == "UWHAM"
+    assert result["result"]["ddg_kcal_per_mol"] == pytest.approx(1.2)
+    assert result["result"]["estimator_variants"]["awh_bias"]["ddg_kcal_per_mol"] == 1.3
+    assert result["progress"]["current_awh_stage"] == "production"
+    assert result["progress"]["round_trips"] == 12
+    assert result["artifacts"]["awh_summary"] == "awh_summary.yaml"
+    assert result["artifacts"]["awh_state_trace"] == "awh_state_trace.csv"
+
+
 def _test_failed_result_has_structured_error(tmp_path):
     writer = _writer(tmp_path, method="neqti")
     writer.update(

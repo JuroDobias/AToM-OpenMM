@@ -638,6 +638,42 @@ def _test_run_production_routes_neqti(monkeypatch):
     assert rbfe_workflow.run_production(options, workflow)["analysis"]["bar_dg_kcal_per_mol"] == 1.0
 
 
+def _test_run_production_routes_awh(monkeypatch):
+    from atom_openmm import awh, rbfe_workflow
+
+    options = {
+        "BASENAME": "edge",
+        "TEMPERATURES": [300.0],
+        "LAMBDAS": [0.0, 0.5, 0.5, 1.0],
+        "DIRECTION": [1, 1, -1, -1],
+        "INTERMEDIATE": [0, 1, 1, 0],
+        "LAMBDA1": [0.0, 0.5, 0.5, 0.0],
+        "LAMBDA2": [0.0, 0.5, 0.5, 0.0],
+        "ALPHA": [0.1] * 4,
+        "U0": [110.0] * 4,
+        "W0COEFF": [0.0] * 4,
+        "UMAX": 200.0,
+        "UBCORE": 100.0,
+        "ACORE": 0.0625,
+    }
+    workflow = {
+        "production_method": "awh",
+        "awh": {
+            "adaptive": {"min_steps": 500, "max_steps": 1000},
+            "production": {"steps": 500},
+        },
+    }
+
+    def fake_run_awh(received_options, received_settings):
+        assert received_options is options
+        assert received_settings["adaptive"]["max_steps"] == 1000
+        return {"status": "completed", "analysis": {"uwham_ddg_kcal_per_mol": 0.5}}
+
+    monkeypatch.setattr(awh, "run_awh", fake_run_awh)
+    result = rbfe_workflow.run_production(options, workflow)
+    assert result["analysis"]["uwham_ddg_kcal_per_mol"] == 0.5
+
+
 def _test_neqti_workflow_uses_physical_only_structprep(tmp_path, monkeypatch):
     from atom_openmm import rbfe_workflow
 

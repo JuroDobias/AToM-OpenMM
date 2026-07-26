@@ -121,6 +121,12 @@ class RBFEResultWriter:
             "neqti_convergence": None,
             "async_re_log": None,
             "async_re_replica_output_pattern": None,
+            "awh_summary": None,
+            "awh_protocol": None,
+            "awh_state_trace": None,
+            "awh_bias_history": None,
+            "awh_reduced_energies": None,
+            "awh_checkpoint": None,
             "plot": None,
         }
 
@@ -157,6 +163,12 @@ class RBFEResultWriter:
                 "neqti_convergence": self._relative_if_exists("neqti_convergence.yaml"),
                 "async_re_log": self._relative_if_exists(f"{job}.log"),
                 "async_re_replica_output_pattern": f"r*/{job}.out" if any(self.workdir.glob(f"r*/{job}.out")) else None,
+                "awh_summary": self._relative_if_exists("awh_summary.yaml"),
+                "awh_protocol": self._relative_if_exists("awh_protocol.yaml"),
+                "awh_state_trace": self._relative_if_exists("awh_state_trace.csv"),
+                "awh_bias_history": self._relative_if_exists("awh_bias_history.csv"),
+                "awh_reduced_energies": self._relative_if_exists("awh_reduced_energies.csv"),
+                "awh_checkpoint": self._relative_if_exists("awh_checkpoint.yaml"),
                 "plot": self._relative_if_exists(f"{job}.png"),
             }
         )
@@ -204,6 +216,40 @@ class RBFEResultWriter:
                 (analysis or {}).get("schedule_optimization")
             )
             self.data["termination_reason"] = (analysis or {}).get("termination_reason")
+        elif self.method == "awh":
+            values = (analysis or {}).get("analysis") or {}
+            result["ddg_kcal_per_mol"] = values.get("uwham_ddg_kcal_per_mol")
+            result["ddg_error_kcal_per_mol"] = values.get(
+                "uwham_bootstrap_std_kcal_per_mol"
+            )
+            result["estimator_variants"] = {
+                "awh_bias": {
+                    "ddg_kcal_per_mol": values.get("awh_bias_ddg_kcal_per_mol"),
+                    "ddg_error_kcal_per_mol": None,
+                    "ddg_kj_per_mol": None
+                    if values.get("awh_bias_ddg_kcal_per_mol") is None
+                    else float(values["awh_bias_ddg_kcal_per_mol"]) * KCAL_TO_KJ,
+                    "ddg_error_kj_per_mol": None,
+                },
+                "fixed_bias_uwham": {
+                    "ddg_kcal_per_mol": values.get("uwham_ddg_kcal_per_mol"),
+                    "ddg_error_kcal_per_mol": values.get(
+                        "uwham_bootstrap_std_kcal_per_mol"
+                    ),
+                    "ddg_kj_per_mol": None
+                    if values.get("uwham_ddg_kcal_per_mol") is None
+                    else float(values["uwham_ddg_kcal_per_mol"]) * KCAL_TO_KJ,
+                    "ddg_error_kj_per_mol": None
+                    if values.get("uwham_bootstrap_std_kcal_per_mol") is None
+                    else float(values["uwham_bootstrap_std_kcal_per_mol"]) * KCAL_TO_KJ,
+                },
+            }
+            self.data["quality"]["convergence"] = {
+                "stage": (analysis or {}).get("stage"),
+                "round_trips": (analysis or {}).get("round_trips"),
+                "minimum_visits": (analysis or {}).get("minimum_visits"),
+                "state_visits": (analysis or {}).get("state_visits"),
+            }
         else:
             result["ddg_kcal_per_mol"] = (analysis or {}).get("ddg")
             result["ddg_error_kcal_per_mol"] = (analysis or {}).get("ddg_std")
@@ -258,6 +304,22 @@ class RBFEResultWriter:
                 )
                 if all(value is not None for value in sample_counts.values()):
                     progress["completed_snapshot_cycles"] = min(sample_counts.values())
+        elif self.method == "awh":
+            progress.update(
+                {
+                    "md_steps": None,
+                    "current_awh_stage": None,
+                    "round_trips": None,
+                    "minimum_state_visits": None,
+                }
+            )
+            if analysis:
+                progress["md_steps"] = int((analysis or {}).get("total_steps", 0))
+                progress["current_awh_stage"] = (analysis or {}).get("stage")
+                progress["round_trips"] = int((analysis or {}).get("round_trips", 0))
+                progress["minimum_state_visits"] = int(
+                    (analysis or {}).get("minimum_visits", 0)
+                )
         elif analysis:
             samples = (analysis or {}).get("samples")
             progress["forward_samples"] = None if samples is None else int(samples)

@@ -634,6 +634,30 @@ class OMMSystemRBFE(OMMSystem):
                 "ATM REST2 currently requires LIGAND1_VAR_ATOMS/LIGAND2_VAR_ATOMS; "
                 "the legacy ATM 1-4 separation path is not REST2-safe"
             )
+        awh_regions = self.keywords.get("AWH_REST2_REGIONS")
+        if awh_regions:
+            from atom_openmm.equilibration import AmberMaskResolver
+            from atom_openmm.rest2 import create_multi_rest2_system
+
+            resolved = {}
+            for name, region in awh_regions.items():
+                resolver = AmberMaskResolver(
+                    self.topology,
+                    self.positions,
+                    keywords=self.keywords,
+                    endpoint=region["endpoint"],
+                    base_dir=self.keywords.get("WORKDIR", "."),
+                )
+                resolved[name] = resolver.resolve(
+                    region["selection"], f"workflow.awh.rest2.endpoint_{name}_solute"
+                )
+            self.rest2_system = create_multi_rest2_system(self.system, resolved)
+            self.system = self.rest2_system.system
+            self.logger.info(
+                "Enabled endpoint REST2 regions: %s",
+                ", ".join(f"{name}={len(atoms)} atoms" for name, atoms in resolved.items()),
+            )
+            return
         selection = self.keywords.get("REST2_SOLUTE", '#ligand:"*"')
         if selection == '#ligand:"*"' and not self.keywords.get("SELECTION_METADATA"):
             solute_atoms = sorted(set(self.lig1_atoms) | set(self.lig2_atoms))

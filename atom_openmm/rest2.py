@@ -7,6 +7,7 @@ import math
 from typing import Iterable, Optional
 
 import openmm as mm
+from openmm import unit
 
 
 class REST2Error(ValueError):
@@ -19,6 +20,13 @@ class REST2System:
     solute_atoms: tuple[int, ...]
     scale_parameter: str
     sqrt_scale_parameter: str
+
+
+@dataclass(frozen=True)
+class MultiREST2System:
+    system: mm.System
+    regions: dict[str, tuple[int, ...]]
+    parameters: dict[str, tuple[str, str]]
 
 
 def _copy_force_metadata(source, target):
@@ -216,3 +224,199 @@ def set_rest2_scale(
     sqrt_parameter = rest2_system.sqrt_scale_parameter if rest2_system else "REST2_SQRT_SCALE"
     context.setParameter(scale_parameter, scale)
     context.setParameter(sqrt_parameter, math.sqrt(scale))
+
+
+def create_multi_rest2_system(
+    system: mm.System,
+    regions: dict[str, Iterable[int]],
+) -> MultiREST2System:
+    """Create independently scalable REST2 regions.
+
+    Regions must be disjoint. Terms touching two regions are rejected because
+    no such terms are expected between the two ligand copies in an ATM system.
+    """
+    normalized = {
+        str(name): tuple(sorted(set(int(index) for index in atoms)))
+        for name, atoms in regions.items()
+    }
+    if not normalized or any(not atoms for atoms in normalized.values()):
+        raise REST2Error("multi-region REST2 requires non-empty regions")
+    owners = {}
+    for name, atoms in normalized.items():
+        for atom in atoms:
+            if atom < 0 or atom >= system.getNumParticles():
+                raise REST2Error("REST2 solute atom index is outside the System particle range")
+            if atom in owners:
+                raise REST2Error(
+                    f"REST2 regions {owners[atom]!r} and {name!r} overlap at atom {atom}"
+                )
+            owners[atom] = name
+    parameters = {
+        name: (f"AWH_REST2_{name.upper()}_SCALE", f"AWH_REST2_{name.upper()}_SQRT_SCALE")
+        for name in normalized
+    }
+    transformed = mm.XmlSerializer.deserialize(mm.XmlSerializer.serialize(system))
+
+    def term_region(atom_indices):
+        touched = {owners[index] for index in atom_indices if index in owners}
+        if len(touched) > 1:
+            raise REST2Error(
+                f"bonded term {tuple(atom_indices)} touches multiple REST2 regions"
+            )
+        if not touched:
+            return None, False
+        name = next(iter(touched))
+        return name, all(index in normalized[name] for index in atom_indices)
+
+    replacements = []
+    nonbonded_count = 0
+    for force_index in range(transformed.getNumForces()):
+        force = transformed.getForce(force_index)
+        if isinstance(force, mm.HarmonicBondForce):
+            expression = "unscaled"
+            for name, (scale, sqrt_scale) in parameters.items():
+                expression += f"+full_{name}*{scale}+mixed_{name}*{sqrt_scale}"
+            custom = mm.CustomBondForce(f"({expression})*0.5*k*(r-r0)^2")
+            for scale, sqrt_scale in parameters.values():
+                custom.addGlobalParameter(scale, 1.0)
+                custom.addGlobalParameter(sqrt_scale, 1.0)
+            for parameter in ("r0", "k", "unscaled"):
+                custom.addPerBondParameter(parameter)
+            for name in normalized:
+                custom.addPerBondParameter(f"full_{name}")
+                custom.addPerBondParameter(f"mixed_{name}")
+            for index in range(force.getNumBonds()):
+                a, b, r0, k = force.getBondParameters(index)
+                name, complete = term_region((a, b))
+                weights = [1.0 if name is None else 0.0]
+                for region in normalized:
+                    weights.extend([
+                        1.0 if name == region and complete else 0.0,
+                        1.0 if name == region and not complete else 0.0,
+                    ])
+                custom.addBond(a, b, [r0, k, *weights])
+            _copy_force_metadata(force, custom)
+            replacements.append((force_index, custom))
+        elif isinstance(force, mm.HarmonicAngleForce):
+            expression = "unscaled"
+            for name, (scale, sqrt_scale) in parameters.items():
+                expression += f"+full_{name}*{scale}+mixed_{name}*{sqrt_scale}"
+            custom = mm.CustomAngleForce(f"({expression})*0.5*k*(theta-theta0)^2")
+            for scale, sqrt_scale in parameters.values():
+                custom.addGlobalParameter(scale, 1.0)
+                custom.addGlobalParameter(sqrt_scale, 1.0)
+            for parameter in ("theta0", "k", "unscaled"):
+                custom.addPerAngleParameter(parameter)
+            for name in normalized:
+                custom.addPerAngleParameter(f"full_{name}")
+                custom.addPerAngleParameter(f"mixed_{name}")
+            for index in range(force.getNumAngles()):
+                a, b, c, theta0, k = force.getAngleParameters(index)
+                name, complete = term_region((a, b, c))
+                weights = [1.0 if name is None else 0.0]
+                for region in normalized:
+                    weights.extend([
+                        1.0 if name == region and complete else 0.0,
+                        1.0 if name == region and not complete else 0.0,
+                    ])
+                custom.addAngle(a, b, c, [theta0, k, *weights])
+            _copy_force_metadata(force, custom)
+            replacements.append((force_index, custom))
+        elif isinstance(force, mm.PeriodicTorsionForce):
+            expression = "unscaled"
+            for name, (scale, sqrt_scale) in parameters.items():
+                expression += f"+full_{name}*{scale}+mixed_{name}*{sqrt_scale}"
+            custom = mm.CustomTorsionForce(
+                f"({expression})*k*(1+cos(periodicity*theta-phase))"
+            )
+            for scale, sqrt_scale in parameters.values():
+                custom.addGlobalParameter(scale, 1.0)
+                custom.addGlobalParameter(sqrt_scale, 1.0)
+            for parameter in ("periodicity", "phase", "k", "unscaled"):
+                custom.addPerTorsionParameter(parameter)
+            for name in normalized:
+                custom.addPerTorsionParameter(f"full_{name}")
+                custom.addPerTorsionParameter(f"mixed_{name}")
+            for index in range(force.getNumTorsions()):
+                a, b, c, d, periodicity, phase, k = force.getTorsionParameters(index)
+                name, complete = term_region((a, b, c, d))
+                weights = [1.0 if name is None else 0.0]
+                for region in normalized:
+                    weights.extend([
+                        1.0 if name == region and complete else 0.0,
+                        1.0 if name == region and not complete else 0.0,
+                    ])
+                custom.addTorsion(a, b, c, d, [periodicity, phase, k, *weights])
+            _copy_force_metadata(force, custom)
+            replacements.append((force_index, custom))
+        elif isinstance(force, mm.NonbondedForce):
+            for scale, sqrt_scale in parameters.values():
+                force.addGlobalParameter(scale, 1.0)
+                force.addGlobalParameter(sqrt_scale, 1.0)
+            for atom, name in sorted(owners.items()):
+                charge, sigma, epsilon = force.getParticleParameters(atom)
+                force.setParticleParameters(atom, 0.0 * charge, sigma, 0.0 * epsilon)
+                scale, sqrt_scale = parameters[name]
+                force.addParticleParameterOffset(
+                    sqrt_scale, atom, charge, 0.0 * sigma, 0.0 * epsilon
+                )
+                force.addParticleParameterOffset(
+                    scale, atom, 0.0 * charge, 0.0 * sigma, epsilon
+                )
+            for index in range(force.getNumExceptions()):
+                a, b, charge_product, sigma, epsilon = force.getExceptionParameters(index)
+                region_a = owners.get(int(a))
+                region_b = owners.get(int(b))
+                if region_a and region_b and region_a != region_b:
+                    charge_value = charge_product.value_in_unit(
+                        unit.elementary_charge**2
+                    )
+                    epsilon_value = epsilon.value_in_unit(
+                        unit.kilojoule_per_mole
+                    )
+                    if abs(charge_value) > 0 or abs(epsilon_value) > 0:
+                        raise REST2Error("nonzero exception connects two REST2 regions")
+                    continue
+                name = region_a or region_b
+                if name is None:
+                    continue
+                parameter = parameters[name][0 if region_a == region_b else 1]
+                force.setExceptionParameters(
+                    index, a, b, 0.0 * charge_product, sigma, 0.0 * epsilon
+                )
+                force.addExceptionParameterOffset(
+                    parameter, index, charge_product, 0.0 * sigma, epsilon
+                )
+            nonbonded_count += 1
+        elif isinstance(force, mm.CMAPTorsionForce):
+            for index in range(force.getNumTorsions()):
+                atoms = [int(value) for value in force.getTorsionParameters(index)[1:]]
+                if any(atom in owners for atom in atoms):
+                    raise REST2Error("CMAP terms touching REST2 atoms are unsupported")
+        elif isinstance(force, (mm.CMMotionRemover, mm.MonteCarloBarostat, mm.CustomExternalForce)):
+            continue
+        else:
+            raise REST2Error(
+                f"unsupported force for multi-region REST2: {force.__class__.__name__}"
+            )
+    if nonbonded_count != 1:
+        raise REST2Error(
+            f"multi-region REST2 requires exactly one NonbondedForce; found {nonbonded_count}"
+        )
+    for index, replacement in reversed(replacements):
+        transformed.removeForce(index)
+        transformed.addForce(replacement)
+    return MultiREST2System(transformed, normalized, parameters)
+
+
+def set_multi_rest2_scales(
+    context: mm.Context,
+    scales: dict[str, float],
+    rest2_system: MultiREST2System,
+):
+    for name, (scale_parameter, sqrt_parameter) in rest2_system.parameters.items():
+        scale = float(scales.get(name, 1.0))
+        if not math.isfinite(scale) or not 0.0 < scale <= 1.0:
+            raise REST2Error("REST2 scale must be finite and in the interval (0, 1]")
+        context.setParameter(scale_parameter, scale)
+        context.setParameter(sqrt_parameter, math.sqrt(scale))

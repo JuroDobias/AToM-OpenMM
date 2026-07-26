@@ -276,6 +276,75 @@ With convergence stopping enabled, BAR is recomputed after each complete product
 
 Four half-path switches have approximately the same total integration length as two complete A↔B switches. Logs report effective ns/day for equilibration, decorrelation, and switching segments.
 
+## ATM-AWH with endpoint REST2
+
+Set `workflow.production_method: awh` to run one expanded-ensemble walker over
+the complete ATM schedule. Endpoint REST2 states extend the linear graph:
+
+```text
+A_hot ... A_physical - ATM states ... M+ - M- ... B_physical ... B_hot
+```
+
+The thermostat remains at the physical temperature. Effective REST2
+temperatures define Hamiltonian scales, and the desired result is the free
+energy difference between `A_physical` and `B_physical`. REST2 endpoint
+selectors use the existing role-aware syntax. The default `#unbound:"*"`
+therefore selects ligand B on the A branch and ligand A on the B branch.
+
+```yaml
+workflow:
+  production_method: awh
+  awh:
+    state_move_interval_steps: 500
+    start_state: a
+    start_annealing_steps_per_state: 10000
+    initial_error_kj_per_mol: 50.0
+    diffusion_per_ps: 0.005
+    target_distribution: uniform
+    adaptive:
+      min_steps: 1000000
+      max_steps: 20000000
+      min_round_trips: 10
+      min_visits_per_state: 100
+      covering_fraction: 0.8
+    production:
+      steps: 5000000
+      reduced_energy_interval_moves: 10
+      bootstrap_samples: 500
+    rest2:
+      enabled: true
+      effective_temperatures_k: [300, 344.6, 395.9, 454.7, 522.3, 600]
+      endpoint_a_solute: '#unbound:"*"'
+      endpoint_b_solute: '#unbound:"*"'
+    resume: true
+```
+
+The adaptive stage uses AWH reference-histogram updates with a uniform target.
+It cannot freeze merely because the bias appears stable: the configured
+minimum steps, physical A-B-A round trips, state visits, and covering fraction
+must all pass. Reaching `adaptive.max_steps` first produces a partial result.
+The subsequent fixed-bias stage records sparse complete reduced-energy
+matrices and reports UWHAM as the primary estimator. The adaptive AWH bias
+estimate remains available under `result.estimator_variants`.
+
+`awh_protocol.yaml` fingerprints the ATM schedule, REST2 selections, ladder,
+and AWH settings. Resume restores coordinates, velocities, RNG state, current
+node, free-energy estimate, reference histogram, visits, transitions, and
+round trips. Incompatible artifacts are rejected.
+
+For an independent B-start pilot, set `start_state: b`. Unless
+`initial_state_file` points to an already equilibrated B state, the workflow
+prepares B by traversing the configured ATM schedule with
+`start_annealing_steps_per_state` MD steps at each node. The resulting state is
+saved as `awh_start_B.xml`. This preparation is outside AWH statistics.
+
+Important artifacts are `awh_state_trace.csv`, `awh_bias_history.csv`,
+`awh_reduced_energies.csv`, `awh_checkpoint.yaml`, and `awh_summary.yaml`.
+Version 1 is a single walker with a uniform target. Metric-optimized targets,
+shared-bias multiple walkers, and overlapping endpoint REST2 regions are not
+implemented. Independent A-start and B-start calculations should agree before
+using the method for a benchmark series.
+
 The custom switching path uses a dedicated BAOAB-style Langevin `CustomIntegrator` with the ATM parameter update centered in each timestep (`V R H O R V`). Endpoint equilibration and snapshot decorrelation continue to use the existing ATM MTS integrator. A `CompoundIntegrator` keeps both modes in one OpenMM context. The custom path executes one Python call per schedule segment rather than one call per integration step.
 
 `work_sample_intervals` adds diagnostic left-point quadrature estimates without changing the switching trajectory or removing the exact per-step energy evaluations. Interval 1 must match exact work. Each configured interval gets its own two-leg BAR estimate in `neqti_summary.yaml` and `result.result.estimator_variants`, including the DDG difference from exact and a paired-bootstrap uncertainty for that difference. These diagnostics do not improve switching speed.

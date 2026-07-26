@@ -1,0 +1,70 @@
+workflow:
+  type: rbfe
+  mode: small_molecule
+  workdir: awh_pilot
+  receptor: receptor/cdk2.pdb
+  ligands_dir: ligands
+  pairs:
+    - [H1Q, OIY]
+  alignment:
+    method: smarts
+    smarts: "Nc(nc1O)nc2c1ncn2"
+    smarts_atom_ids: [7, 1, 5]
+  forcefield_cache: ff.json
+  production_method: awh
+  awh:
+    state_move_interval_steps: 500
+    random_seed: 2026
+    target_distribution: uniform
+    initial_error_kj_per_mol: 50.0
+    diffusion_per_ps: 0.005
+    adaptive:
+      min_steps: 1000000
+      max_steps: 20000000
+      min_round_trips: 10
+      min_visits_per_state: 100
+      covering_fraction: 0.8
+    production:
+      steps: 5000000
+      reduced_energy_interval_moves: 10
+      bootstrap_samples: 500
+    rest2:
+      enabled: true
+      effective_temperatures_k: [310.0, 356.2, 409.1, 469.9, 539.8, 620.0]
+      endpoint_a_solute: '#unbound:"*"'
+      endpoint_b_solute: '#unbound:"*"'
+    resume: true
+  setup:
+    protein_forcefield: [amber14-all.xml]
+    solvent_forcefield: [amber14/tip3p.xml]
+    ligand_forcefield: espaloma-0.3.2
+    ligand_charge_model: nn
+
+atom_options:
+  TEMPERATURES: [310.0]
+  LAMBDAS: [0.00, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00]
+  DIRECTION: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
+  INTERMEDIATE: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  LAMBDA1: [0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.10, 0.20, 0.30, 0.40, 0.50, 0.50, 0.40, 0.30, 0.20, 0.10, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00]
+  LAMBDA2: [0.00, 0.10, 0.20, 0.30, 0.40, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.40, 0.30, 0.20, 0.10, 0.00]
+  ALPHA: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10]
+  U0: [110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0]
+  W0COEFF: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  PRNT_FREQUENCY: 10000
+  TRJ_FREQUENCY: 20000
+  CM_KF: 25.0
+  CM_TOL: 5
+  POSRE_FORCE_CONSTANT: 0.0
+  POSRE_TOLERANCE: 3.5
+  ALIGN_KF_SEP: 0.0
+  ALIGN_K_THETA: 25.0
+  ALIGN_K_PSI: 25.0
+  UMAX: 200.0
+  ACORE: 0.0625
+  UBCORE: 100.0
+  FRICTION_COEFF: 0.5
+  HMASS: 1.5
+  TIME_STEP: 0.002
+  PRODUCTION_STEPS: 10000
+  MAX_SAMPLES: 1
+  VERBOSE: false

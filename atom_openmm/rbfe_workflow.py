@@ -1037,7 +1037,16 @@ def run_production(options, workflow, progress_callback=None):
         if progress_callback is None:
             return run_neqti(options, neqti_options)
         return run_neqti(options, neqti_options, progress_callback=progress_callback)
-    raise WorkflowConfigError("workflow.production_method must be 'async_re' or 'neqti'")
+    if production_method == "awh":
+        from atom_openmm.awh import normalize_awh_options, run_awh
+
+        awh_options = normalize_awh_options(workflow, options)
+        if progress_callback is None:
+            return run_awh(options, awh_options)
+        return run_awh(options, awh_options, progress_callback=progress_callback)
+    raise WorkflowConfigError(
+        "workflow.production_method must be 'async_re', 'neqti', or 'awh'"
+    )
 
 
 def run_production_with_restarts(options, workflow, result_writer, stage, progress_callback=None):
@@ -1086,7 +1095,7 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
     requested_samples = (
         (workflow.get("neqti") or {}).get("n_snapshots", atom_options.get("MAX_SAMPLES", 1))
         if production_method == "neqti"
-        else atom_options.get("MAX_SAMPLES")
+        else None if production_method == "awh" else atom_options.get("MAX_SAMPLES")
     )
     result_writer = RBFEResultWriter(
         pair_plan=pair_plan,
@@ -1100,7 +1109,7 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
     stage = "setup"
     result_writer.update("running", stage=stage)
     try:
-        if production_method == "neqti":
+        if production_method in ("neqti", "awh"):
             options["STRUCTPREP_MODE"] = "physical_only"
             options["NEQTI_INITIAL_STATE_FILE"] = options["BASENAME"] + "_equil.xml"
         else:
@@ -1166,7 +1175,9 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
                 return {"jobname": options["BASENAME"], "status": "prepared", "workdir": options["WORKDIR"]}
 
             stage = "preparation"
-            prep_state = options["BASENAME"] + ("_equil.xml" if production_method == "neqti" else "_0.xml")
+            prep_state = options["BASENAME"] + (
+                "_equil.xml" if production_method in ("neqti", "awh") else "_0.xml"
+            )
             if not Path(prep_state).exists():
                 result_writer.update("running", stage=stage)
                 rbfe_structprep(config_file=None, options=deepcopy(options))
@@ -1175,7 +1186,7 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
             stage = "production"
             result_writer.update("running", stage=stage)
 
-            def record_neqti_progress(summary):
+            def record_production_progress(summary):
                 result_writer.update("partial", analysis=summary, stage=stage)
 
             production_result = run_production_with_restarts(
@@ -1183,11 +1194,16 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
                 workflow,
                 result_writer,
                 stage,
-                progress_callback=record_neqti_progress,
+                progress_callback=record_production_progress,
             )
             if production_result is not None:
                 final_status = production_result.get("status", "completed")
-                warning = None if production_result.get("analysis") else "No finite NEQTI estimate is available."
+                method_label = "AWH" if production_method == "awh" else "NEQTI"
+                warning = (
+                    None
+                    if production_result.get("analysis")
+                    else f"No finite {method_label} estimate is available."
+                )
                 result_writer.update(final_status, analysis=production_result, warning=warning, stage=stage)
                 return {"workdir": options["WORKDIR"], **production_result}
 
@@ -1288,12 +1304,19 @@ def analyze_neqti_existing(options, workflow):
     return analyze_existing_neqti(options, neqti_options)
 
 
+def analyze_awh_existing(options, workflow):
+    from atom_openmm.awh import analyze_existing_awh, normalize_awh_options
+
+    awh_options = normalize_awh_options(workflow, options)
+    return analyze_existing_awh(options, awh_options)
+
+
 def analyze_pair_existing(pair_plan, workflow, atom_options, receptor_file, workflow_yaml=None):
     production_method = workflow.get("production_method", "async_re")
     requested_samples = (
         (workflow.get("neqti") or {}).get("n_snapshots", atom_options.get("MAX_SAMPLES", 1))
         if production_method == "neqti"
-        else atom_options.get("MAX_SAMPLES")
+        else None if production_method == "awh" else atom_options.get("MAX_SAMPLES")
     )
     result_writer = RBFEResultWriter(
         pair_plan=pair_plan,
@@ -1311,6 +1334,11 @@ def analyze_pair_existing(pair_plan, workflow, atom_options, receptor_file, work
             options = _load_pair_options(pair_plan)
             if production_method == "neqti":
                 analysis = analyze_neqti_existing(options, workflow)
+                status = analysis.get("status", "completed")
+                result_writer.update(status, analysis=analysis, stage=stage)
+                return {"workdir": options["WORKDIR"], **analysis}
+            if production_method == "awh":
+                analysis = analyze_awh_existing(options, workflow)
                 status = analysis.get("status", "completed")
                 result_writer.update(status, analysis=analysis, stage=stage)
                 return {"workdir": options["WORKDIR"], **analysis}

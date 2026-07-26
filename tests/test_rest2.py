@@ -85,6 +85,44 @@ def _test_rest2_nonbonded_scaling_matches_solute_classification():
     assert mixed == pytest.approx(math.sqrt(scale) * physical, rel=1e-6)
 
 
+def _test_multi_rest2_regions_scale_independently():
+    from atom_openmm.rest2 import create_multi_rest2_system, set_multi_rest2_scales
+
+    system = mm.System()
+    for _ in range(3):
+        system.addParticle(12.0)
+    force = mm.NonbondedForce()
+    force.setNonbondedMethod(mm.NonbondedForce.NoCutoff)
+    for charge in (0.5, -0.4, 0.3):
+        force.addParticle(charge, 0.3, 0.2)
+    system.addForce(force)
+    transformed = create_multi_rest2_system(system, {"a": [0], "b": [2]})
+    context = mm.Context(
+        transformed.system,
+        mm.VerletIntegrator(0.001),
+        mm.Platform.getPlatformByName("Reference"),
+    )
+    context.setPositions([[0, 0, 0], [0.5, 0, 0], [1.0, 0, 0]])
+    physical = context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(
+        unit.kilojoule_per_mole
+    )
+    set_multi_rest2_scales(context, {"a": 0.25, "b": 1.0}, transformed)
+    a_hot = context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(
+        unit.kilojoule_per_mole
+    )
+    set_multi_rest2_scales(context, {"a": 1.0, "b": 0.25}, transformed)
+    b_hot = context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(
+        unit.kilojoule_per_mole
+    )
+    assert a_hot != pytest.approx(physical)
+    assert b_hot != pytest.approx(physical)
+    set_multi_rest2_scales(context, {"a": 1.0, "b": 1.0}, transformed)
+    restored = context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(
+        unit.kilojoule_per_mole
+    )
+    assert restored == pytest.approx(physical, abs=1e-6)
+
+
 def _test_rest2_bond_scaling_and_context_validation():
     from atom_openmm.rest2 import REST2Error, create_rest2_system, set_rest2_scale
 

@@ -5,7 +5,7 @@ AToM-OpenMM v8.5
 
 The Alchemical Transfer Method for OpenMM (AToM-OpenMM) is an extensible Python package for estimating absolute and relative binding free energies of molecular complexes. It implements the [Alchemical Transfer Method (ATM)](https://pubs.acs.org/doi/10.1021/acs.jcim.1c01129) with [OpenMM](https://github.com/openmm) and can run on GPU workstations or cluster nodes.
 
-This fork adds a single-YAML RBFE workflow on top of the original AToM-OpenMM implementation. The wrapper can prepare and run complete ligand-pair calculations, select setup force fields and ligand charges, define custom equilibration protocols with Amber masks, and use either asynchronous replica exchange or an experimental nonequilibrium switching (NEQTI) protocol. An experimental `workflow.mode: covalent` path supports congeneric cysteine-aldehyde inhibitors through explicit thiohemiacetal product models.
+This fork adds a single-YAML RBFE workflow on top of the original AToM-OpenMM implementation. The wrapper can prepare and run complete ligand-pair calculations, select setup force fields and ligand charges, define custom equilibration protocols with Amber masks, and use asynchronous replica exchange, experimental nonequilibrium switching (NEQTI), or experimental ATM-AWH with endpoint REST2. An experimental `workflow.mode: covalent` path supports congeneric cysteine-aldehyde inhibitors through explicit thiohemiacetal product models.
 
 This version of AToM-OpenMM has been tested with OpenMM 8.5 and 8.4; it uses [ATMForce](https://github.com/openmm/openmm/pull/4110) in the 8.4.0 or later versions of [OpenMM](https://github.com/openmm/openmm).
 
@@ -131,6 +131,14 @@ workflow:
 ```
 
 NEQTI reuses the async-RE ATM soft-core schedule as two bidirectional half paths that meet at one shared midpoint ensemble, A<->M and B<->M. It estimates both legs with BAR and combines them as `DG(A->M) - DG(B->M)`.
+
+Experimental ATM-AWH instead uses one expanded-ensemble walker over the complete
+ATM schedule. Optional role-aware REST2 branches extend the physical A and B
+endpoints without heating the ATM interior. AWH first adapts a uniform-target
+bias, requires physical A-B-A round trips and state coverage, then freezes the
+bias for production. Fixed-bias UWHAM is the primary reported estimator. See
+[`examples/RBFE/cdk2/workflow.awh.yaml`](examples/RBFE/cdk2/workflow.awh.yaml)
+and the [RBFE guide](docs/user-guide/rbfe.md#atm-awh-with-endpoint-rest2).
 
 For production sampling, `failed_switch_policy: count_as_infinite` preserves recognized numerical switching failures as `+inf` protocol-work observations instead of selectively replacing them. CUDA/environment and programming failures still stop the run. Use `retry` for the previous replacement behavior or `abort` to stop at the first failed switch.
 
