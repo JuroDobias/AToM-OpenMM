@@ -1205,7 +1205,11 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
                     else f"No finite {method_label} estimate is available."
                 )
                 result_writer.update(final_status, analysis=production_result, warning=warning, stage=stage)
-                return {"workdir": options["WORKDIR"], **production_result}
+                return {
+                    **production_result,
+                    "jobname": options["BASENAME"],
+                    "workdir": options["WORKDIR"],
+                }
 
             if production_method == "async_re" and workflow.get("analyze", True):
                 stage = "analysis"
@@ -1341,7 +1345,11 @@ def analyze_pair_existing(pair_plan, workflow, atom_options, receptor_file, work
                 analysis = analyze_awh_existing(options, workflow)
                 status = analysis.get("status", "completed")
                 result_writer.update(status, analysis=analysis, stage=stage)
-                return {"workdir": options["WORKDIR"], **analysis}
+                return {
+                    **analysis,
+                    "jobname": options["BASENAME"],
+                    "workdir": options["WORKDIR"],
+                }
             analysis = analyze_pair(options, workflow)
             if analysis is None:
                 raise WorkflowConfigError("No async-RE production samples are available for analysis")

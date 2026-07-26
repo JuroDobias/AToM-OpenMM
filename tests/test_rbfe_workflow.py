@@ -761,7 +761,7 @@ def _test_neqti_workflow_uses_physical_only_structprep(tmp_path, monkeypatch):
     def fake_run_production(options, workflow, progress_callback=None):
         received["production_initial"] = options["NEQTI_INITIAL_STATE_FILE"]
         received["production_time_step"] = options["TIME_STEP"]
-        return {"jobname": options["BASENAME"], "status": "completed"}
+        return {"status": "completed"}
 
     monkeypatch.setattr(rbfe_workflow, "rbfe_structprep", fake_structprep)
     monkeypatch.setattr(rbfe_workflow, "run_production", fake_run_production)
@@ -769,6 +769,7 @@ def _test_neqti_workflow_uses_physical_only_structprep(tmp_path, monkeypatch):
     results = rbfe_workflow.run_rbfe_workflow(config_file)
 
     assert results[0]["status"] == "completed"
+    assert results[0]["jobname"] == "cdk2-H1Q-H1R"
     assert received["structprep_mode"] == "physical_only"
     assert received["initial"] == "cdk2-H1Q-H1R_equil.xml"
     assert received["production_initial"] == "cdk2-H1Q-H1R_equil.xml"
