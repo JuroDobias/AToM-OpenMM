@@ -367,6 +367,69 @@ def _test_rest2_scan_integrator_preserves_coordinates_and_time():
     assert after.getTime().value_in_unit(unit.picosecond) == pytest.approx(0.0)
 
 
+def _test_portable_state_load_omits_incompatible_integrator_metadata(tmp_path):
+    import openmm as mm
+    from openmm import unit
+    from openmm.app import Simulation, Topology
+
+    from atom_openmm.ommworker import OMMWorker
+
+    system = mm.System()
+    system.addParticle(1.0)
+    force = mm.CustomExternalForce("state_parameter")
+    force.addGlobalParameter("state_parameter", 0.0)
+    force.addParticle(0, [])
+    system.addForce(force)
+    topology = Topology()
+    chain = topology.addChain()
+    residue = topology.addResidue("MOL", chain)
+    topology.addAtom("X", None, residue)
+
+    source_integrator = mm.CustomIntegrator(0.001)
+    source_integrator.addGlobalVariable("source_only", 3.0)
+    source = Simulation(
+        topology,
+        system,
+        source_integrator,
+        mm.Platform.getPlatformByName("Reference"),
+    )
+    source.context.setPositions([[0.25, 0.0, 0.0]])
+    source.context.setVelocities([[0.5, 0.0, 0.0]])
+    source.context.setParameter("state_parameter", 7.0)
+    source.context.setTime(2.5)
+    source.context.setStepCount(17)
+    state_path = tmp_path / "source.xml"
+    source.saveState(str(state_path))
+
+    compound = mm.CompoundIntegrator()
+    compound.addIntegrator(mm.VerletIntegrator(0.001))
+    compound.addIntegrator(mm.CustomIntegrator(0.0))
+    target = Simulation(
+        topology,
+        system,
+        compound,
+        mm.Platform.getPlatformByName("Reference"),
+    )
+    worker = object.__new__(OMMWorker)
+    worker.context = target.context
+    worker.simulation = target
+    worker.load_state(state_path, ignore_integrator_parameters=True)
+    restored = target.context.getState(getPositions=True, getVelocities=True)
+    assert np.allclose(
+        restored.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+        [[0.25, 0.0, 0.0]],
+    )
+    assert np.allclose(
+        restored.getVelocities(asNumpy=True).value_in_unit(
+            unit.nanometer / unit.picosecond
+        ),
+        [[0.5, 0.0, 0.0]],
+    )
+    assert target.context.getParameter("state_parameter") == pytest.approx(7.0)
+    assert target.context.getTime().value_in_unit(unit.picosecond) == pytest.approx(2.5)
+    assert target.context.getStepCount() == 17
+
+
 def _test_disabled_metric_target_preserves_legacy_signature():
     from copy import deepcopy
 
