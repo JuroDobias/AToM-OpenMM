@@ -861,7 +861,10 @@ def run_awh(options, awh_options=None, progress_callback=None):
     if settings["resume"] and state_path.exists() and xml_path.exists():
         with state_path.open() as handle:
             saved = yaml.safe_load(handle) or {}
-        worker.simulation.loadState(str(xml_path))
+        worker.load_state(
+            xml_path,
+            ignore_integrator_parameters=global_sampling,
+        )
         current = int(saved["current_state"])
         total_steps = int(saved["total_steps"])
         production_steps_completed = int(saved.get("production_steps_completed", 0))
@@ -894,7 +897,10 @@ def run_awh(options, awh_options=None, progress_callback=None):
         rng.bit_generator.state = saved["rng_state"]
         logger.info("Resumed AWH %s at %d steps in state %s", stage, total_steps, graph[current]["name"])
     else:
-        worker.simulation.loadState(str(initial_file))
+        worker.load_state(
+            initial_file,
+            ignore_integrator_parameters=global_sampling,
+        )
         if settings["start_state"] == "b" and settings["initial_state_file"] is None:
             logger.info(
                 "Preparing independent AWH B start with %d MD steps per ATM state",
