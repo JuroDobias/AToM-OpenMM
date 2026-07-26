@@ -809,18 +809,36 @@ def run_awh(options, awh_options=None, progress_callback=None):
         for index in indices:
             direct.append(energy(index))
         apply_node(current)
-        errors = np.abs(np.asarray(direct) - np.asarray(analytical)[indices])
+        direct_values = np.asarray(direct, dtype=float)
+        reconstructed_values = np.asarray(analytical, dtype=float)[indices]
+        matching_infinities = (
+            np.isinf(direct_values)
+            & np.isinf(reconstructed_values)
+            & (np.signbit(direct_values) == np.signbit(reconstructed_values))
+        )
+        finite_pairs = np.isfinite(direct_values) & np.isfinite(
+            reconstructed_values
+        )
+        errors = np.full(len(indices), np.inf)
+        errors[matching_infinities] = 0.0
+        errors[finite_pairs] = np.abs(
+            direct_values[finite_pairs] - reconstructed_values[finite_pairs]
+        )
         maximum = float(np.max(errors)) if len(errors) else 0.0
         global_diagnostics.record_validation(maximum)
         tolerance = settings["state_sampling"][
             "validation_tolerance_kj_per_mol"
         ]
         if maximum > tolerance:
-            worst = int(indices[int(np.argmax(errors))])
+            worst_offset = int(np.argmax(errors))
+            worst = int(indices[worst_offset])
+            decomposition = getattr(worker, "last_energy_decomposition", {})
             raise AWHConfigError(
                 "hybrid global-Gibbs energy validation failed for "
                 f"{graph[worst]['name']}: error {maximum:.6g} kJ/mol exceeds "
-                f"{tolerance:.6g} kJ/mol"
+                f"{tolerance:.6g} kJ/mol; direct={direct[worst_offset]!r}, "
+                f"reconstructed={float(np.asarray(analytical)[worst])!r}, "
+                f"decomposition={decomposition!r}"
             )
 
     beta = 1.0 / (R_KJ_MOL_K * float(options["TEMPERATURES"][0]))
