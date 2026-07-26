@@ -193,6 +193,9 @@ def _test_awh_state_sampling_defaults_preserve_legacy_signature():
         _atom_options(),
     )
     assert omitted["state_sampling"]["method"] == "legacy_local_gibbs"
+    assert omitted["state_sampling"][
+        "direct_overflow_probability_tolerance"
+    ] == pytest.approx(1.0e-12)
     assert _protocol_signature(_atom_options(), omitted) == _protocol_signature(
         _atom_options(), explicit
     )

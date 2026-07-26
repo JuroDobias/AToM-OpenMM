@@ -125,6 +125,11 @@ def normalize_awh_options(workflow, atom_options):
             "validation_tolerance_kj_per_mol": float(
                 state_sampling.get("validation_tolerance_kj_per_mol", 0.05)
             ),
+            "direct_overflow_probability_tolerance": float(
+                state_sampling.get(
+                    "direct_overflow_probability_tolerance", 1.0e-12
+                )
+            ),
         },
         "adaptive": {
             "min_steps": int(adaptive.get("min_steps", 1_000_000)),
@@ -239,6 +244,14 @@ def normalize_awh_options(workflow, atom_options):
         or settings["state_sampling"]["validation_tolerance_kj_per_mol"] <= 0
     ):
         raise AWHConfigError("AWH initial error and diffusion must be positive")
+    overflow_tolerance = settings["state_sampling"][
+        "direct_overflow_probability_tolerance"
+    ]
+    if not 0.0 < overflow_tolerance < 1.0:
+        raise AWHConfigError(
+            "workflow.awh.state_sampling.direct_overflow_probability_tolerance "
+            "must be in (0, 1)"
+        )
     metric_target = settings["adaptive"]["metric_target"]
     if (
         metric_target["min_round_trips"] < 0
@@ -453,6 +466,7 @@ class GlobalGibbsDiagnostics:
         self.energy_seconds = 0.0
         self.selection_seconds = 0.0
         self.validation_checks = 0
+        self.direct_overflow_validations = 0
         self.maximum_validation_error_kj_per_mol = 0.0
 
     def update(self, previous, selected, probabilities):
@@ -473,8 +487,9 @@ class GlobalGibbsDiagnostics:
             self.radius_mass_999[radius] += int(mass >= 0.999)
         return expected
 
-    def record_validation(self, maximum_error):
+    def record_validation(self, maximum_error, direct_overflows=0):
         self.validation_checks += 1
+        self.direct_overflow_validations += int(direct_overflows)
         self.maximum_validation_error_kj_per_mol = max(
             self.maximum_validation_error_kj_per_mol,
             float(maximum_error),
@@ -523,6 +538,7 @@ class GlobalGibbsDiagnostics:
             },
             "validation": {
                 "checks": self.validation_checks,
+                "accepted_direct_overflows": self.direct_overflow_validations,
                 "maximum_error_kj_per_mol": self.maximum_validation_error_kj_per_mol,
             },
         }
@@ -560,6 +576,9 @@ class GlobalGibbsDiagnostics:
         value.selection_seconds = float(timing.get("selection", 0.0))
         validation = data.get("validation", {})
         value.validation_checks = int(validation.get("checks", 0))
+        value.direct_overflow_validations = int(
+            validation.get("accepted_direct_overflows", 0)
+        )
         value.maximum_validation_error_kj_per_mol = float(
             validation.get("maximum_error_kj_per_mol", 0.0)
         )
@@ -819,13 +838,38 @@ def run_awh(options, awh_options=None, progress_callback=None):
         finite_pairs = np.isfinite(direct_values) & np.isfinite(
             reconstructed_values
         )
+        reconstructed_probabilities = awh.probabilities(
+            beta * np.asarray(analytical, dtype=float),
+            list(range(len(graph))),
+        )
+        acceptable_direct_overflows = (
+            np.isposinf(direct_values)
+            & np.isfinite(reconstructed_values)
+            & (
+                reconstructed_probabilities[np.asarray(indices, dtype=int)]
+                <= settings["state_sampling"][
+                    "direct_overflow_probability_tolerance"
+                ]
+            )
+        )
         errors = np.full(len(indices), np.inf)
         errors[matching_infinities] = 0.0
+        errors[acceptable_direct_overflows] = 0.0
         errors[finite_pairs] = np.abs(
             direct_values[finite_pairs] - reconstructed_values[finite_pairs]
         )
         maximum = float(np.max(errors)) if len(errors) else 0.0
-        global_diagnostics.record_validation(maximum)
+        overflow_count = int(np.count_nonzero(acceptable_direct_overflows))
+        global_diagnostics.record_validation(maximum, overflow_count)
+        if overflow_count:
+            logger.info(
+                "Accepted %d direct ATM energy overflows for states with "
+                "reconstructed Gibbs probability <= %.3g",
+                overflow_count,
+                settings["state_sampling"][
+                    "direct_overflow_probability_tolerance"
+                ],
+            )
         tolerance = settings["state_sampling"][
             "validation_tolerance_kj_per_mol"
         ]

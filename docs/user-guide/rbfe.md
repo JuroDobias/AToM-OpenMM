@@ -301,6 +301,7 @@ workflow:
       validation_interval_moves: 1000
       validation_states_per_check: 4
       validation_tolerance_kj_per_mol: 0.05
+      direct_overflow_probability_tolerance: 1.0e-12
     # Optional interpolation of the original 22-state schedule.
     # atm_state_count: 100
     start_state: a
@@ -388,6 +389,14 @@ validation error. These data show whether a cheaper truncated Gibbs scan would
 be justified on a later implementation. For approximately 100 ATM states,
 consider a shorter interval such as `state_move_interval_steps: 100` and retain
 enough adaptive steps for the configured round trips.
+
+For configurations that are grossly incompatible with a remote ATM state, the
+direct plugin expression can overflow while the stable analytical softplus
+still returns a finite energy. Validation accepts this only when the
+reconstructed global-Gibbs probability is no greater than
+`direct_overflow_probability_tolerance`. Such a state cannot be selected at
+that configuration. A nonfinite direct energy for a state with appreciable
+probability remains fatal.
 
 `awh_protocol.yaml` fingerprints the ATM schedule, REST2 selections, ladder,
 and AWH settings. Resume restores coordinates, velocities, RNG state, current
