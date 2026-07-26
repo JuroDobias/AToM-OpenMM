@@ -775,6 +775,8 @@ def run_awh(options, awh_options=None, progress_callback=None):
     global_sampling = (
         settings["state_sampling"]["method"] == "hybrid_global_gibbs"
     )
+    if global_sampling:
+        system_options["IGNORE_INITIAL_INTEGRATOR_PARAMETERS"] = True
     worker_class = OMMWorkerAWHGlobalGibbs if global_sampling else OMMWorkerATMSync
     worker_kwargs = {}
     if global_sampling:

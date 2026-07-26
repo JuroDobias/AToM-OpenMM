@@ -263,7 +263,24 @@ class OMMWorker(object):
 
         #load initial state/coordinates
         initial_state_file = self.keywords.get("INITIAL_STATE_FILE", self.basename + "_0.xml")
-        self.simulation.loadState(initial_state_file)
+        if self.keywords.get("IGNORE_INITIAL_INTEGRATOR_PARAMETERS", False):
+            with open(initial_state_file) as handle:
+                saved_state = XmlSerializer.deserialize(handle.read())
+            self.context.setPositions(saved_state.getPositions())
+            self.context.setVelocities(saved_state.getVelocities())
+            self.context.setPeriodicBoxVectors(*saved_state.getPeriodicBoxVectors())
+            self.context.setTime(saved_state.getTime())
+            if hasattr(self.context, "setStepCount"):
+                self.context.setStepCount(saved_state.getStepCount())
+            available_parameters = {
+                self.context.getParameterName(index)
+                for index in range(self.context.getNumParameters())
+            }
+            for name, value in saved_state.getParameters().items():
+                if name in available_parameters:
+                    self.context.setParameter(name, value)
+        else:
+            self.simulation.loadState(initial_state_file)
 
         #replace parameters loaded from the initial xml file with the values in the system
         for param_name in self.ommsystem.cparams:
