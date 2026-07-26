@@ -214,14 +214,13 @@ def _test_atm_energy_reconstructs_both_directions():
     energies = reconstruct_atm_energies(
         states,
         reference_total_energy=103.0,
-        reference_bias_energy=3.0,
-        reference_direction=1,
+        reference_atm_energy=20.0,
         u0=20.0,
         u1=25.0,
     )
     assert energies.shape == (4,)
-    assert energies[0] == pytest.approx(100.0)
-    assert energies[-1] == pytest.approx(105.0)
+    assert energies[0] == pytest.approx(103.0)
+    assert energies[-1] == pytest.approx(108.0)
     assert np.isfinite(energies).all()
     assert states[0]["uoffset"].value_in_unit(unit.kilojoule_per_mole) == 0.0
 

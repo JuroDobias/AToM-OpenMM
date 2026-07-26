@@ -111,7 +111,7 @@ class OMMWorkerAWHGlobalGibbs(OMMWorkerATMSync):
         u1, u0, bias = self.ommsystem.atmforce.getPerturbationEnergy(self.context)
         self.last_energy_decomposition = {
             "reference_energy_kj_per_mol": self.scan_integrator.reference_energy(),
-            "bias_energy_kj_per_mol": _energy_value(bias),
+            "reference_atm_energy_kj_per_mol": _energy_value(bias),
             "u0_kj_per_mol": _energy_value(u0),
             "u1_kj_per_mol": _energy_value(u1),
         }
@@ -120,10 +120,9 @@ class OMMWorkerAWHGlobalGibbs(OMMWorkerATMSync):
             reference_total_energy=self.last_energy_decomposition[
                 "reference_energy_kj_per_mol"
             ],
-            reference_bias_energy=self.last_energy_decomposition[
-                "bias_energy_kj_per_mol"
+            reference_atm_energy=self.last_energy_decomposition[
+                "reference_atm_energy_kj_per_mol"
             ],
-            reference_direction=self._awh_atm_states[0]["atmdirection"],
             u0=self.last_energy_decomposition["u0_kj_per_mol"],
             u1=self.last_energy_decomposition["u1_kj_per_mol"],
             multisoftplus=self.ommsystem.multisoftplus,

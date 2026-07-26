@@ -136,17 +136,13 @@ def reconstruct_atm_energies(
     states,
     *,
     reference_total_energy,
-    reference_bias_energy,
-    reference_direction,
+    reference_atm_energy,
     u0,
     u1,
     multisoftplus=False,
 ):
     """Reconstruct all physical ATM energies from one physical-state query."""
-    reference_base = u0 if float(reference_direction) >= 0.0 else u1
-    environment = float(reference_total_energy) - float(reference_bias_energy) - float(
-        reference_base
-    )
+    environment = float(reference_total_energy) - float(reference_atm_energy)
     return np.asarray(
         [
             atm_state_energy(
