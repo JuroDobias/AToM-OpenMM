@@ -139,6 +139,13 @@ bias, requires physical A-B-A round trips and state coverage, then freezes the
 bias for production. Fixed-bias UWHAM is the primary reported estimator. See
 [`examples/RBFE/cdk2/workflow.awh.yaml`](examples/RBFE/cdk2/workflow.awh.yaml)
 and the [RBFE guide](docs/user-guide/rbfe.md#atm-awh-with-endpoint-rest2).
+Automatic diagnostics report neighboring UWHAM overlap, endpoint effective
+samples, REST2 hot-state returns, and state occupancy. A state-tagged,
+solute-only trajectory supports structural analysis of every AWH and REST2
+node.
+The adaptive learning rate remains fixed until freezing, and
+`workflow.awh.atm_state_count` can densify both ATM half paths without changing
+the user-supplied async-RE schedule.
 
 For production sampling, `failed_switch_policy: count_as_infinite` preserves recognized numerical switching failures as `+inf` protocol-work observations instead of selectively replacing them. CUDA/environment and programming failures still stop the run. Use `retry` for the previous replacement behavior or `abort` to stop at the first failed switch.
 

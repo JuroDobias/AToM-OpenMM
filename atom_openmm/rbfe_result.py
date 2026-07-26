@@ -127,6 +127,11 @@ class RBFEResultWriter:
             "awh_bias_history": None,
             "awh_reduced_energies": None,
             "awh_checkpoint": None,
+            "awh_diagnostics": None,
+            "awh_diagnostics_plot": None,
+            "awh_trajectory": None,
+            "awh_trajectory_topology": None,
+            "awh_trajectory_frames": None,
             "plot": None,
         }
 
@@ -169,6 +174,15 @@ class RBFEResultWriter:
                 "awh_bias_history": self._relative_if_exists("awh_bias_history.csv"),
                 "awh_reduced_energies": self._relative_if_exists("awh_reduced_energies.csv"),
                 "awh_checkpoint": self._relative_if_exists("awh_checkpoint.yaml"),
+                "awh_diagnostics": self._relative_if_exists("awh_diagnostics.yaml"),
+                "awh_diagnostics_plot": self._relative_if_exists("awh_diagnostics.png"),
+                "awh_trajectory": self._relative_if_exists("awh_trajectory.xtc"),
+                "awh_trajectory_topology": self._relative_if_exists(
+                    "awh_trajectory_topology.pdb"
+                ),
+                "awh_trajectory_frames": self._relative_if_exists(
+                    "awh_trajectory_frames.csv"
+                ),
                 "plot": self._relative_if_exists(f"{job}.png"),
             }
         )
@@ -218,6 +232,7 @@ class RBFEResultWriter:
             self.data["termination_reason"] = (analysis or {}).get("termination_reason")
         elif self.method == "awh":
             values = (analysis or {}).get("analysis") or {}
+            diagnostics = (analysis or {}).get("diagnostics") or {}
             result["ddg_kcal_per_mol"] = values.get("uwham_ddg_kcal_per_mol")
             result["ddg_error_kcal_per_mol"] = values.get(
                 "uwham_bootstrap_std_kcal_per_mol"
@@ -249,7 +264,16 @@ class RBFEResultWriter:
                 "round_trips": (analysis or {}).get("round_trips"),
                 "minimum_visits": (analysis or {}).get("minimum_visits"),
                 "state_visits": (analysis or {}).get("state_visits"),
+                "production": diagnostics.get("production"),
+                "endpoint_effective_samples": (
+                    diagnostics.get("uwham") or {}
+                ).get("endpoint_effective_samples"),
+                "bias_stability": diagnostics.get("bias_stability"),
             }
+            self.data["quality"]["overlap_score"] = (analysis or {}).get(
+                "overlap_score"
+            )
+            self.data["quality"]["rest2"] = (analysis or {}).get("rest2")
         else:
             result["ddg_kcal_per_mol"] = (analysis or {}).get("ddg")
             result["ddg_error_kcal_per_mol"] = (analysis or {}).get("ddg_std")

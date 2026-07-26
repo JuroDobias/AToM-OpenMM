@@ -14,6 +14,8 @@ workflow:
   production_method: awh
   awh:
     state_move_interval_steps: 500
+    # Set to 100 with state_move_interval_steps: 100 for a dense ATM pilot.
+    atm_state_count: 22
     random_seed: 2026
     target_distribution: uniform
     initial_error_kj_per_mol: 50.0
@@ -24,6 +26,7 @@ workflow:
       min_round_trips: 10
       min_visits_per_state: 100
       covering_fraction: 0.8
+      learning_rate_kbt: 0.1
     production:
       steps: 5000000
       reduced_energy_interval_moves: 10
@@ -33,6 +36,16 @@ workflow:
       effective_temperatures_k: [310.0, 356.2, 409.1, 469.9, 539.8, 620.0]
       endpoint_a_solute: '#unbound:"*"'
       endpoint_b_solute: '#unbound:"*"'
+    analysis:
+      trajectory:
+        enabled: true
+        interval_moves: 10
+        atom_selection: '!:HOH,WAT,NA,CL,K,CA'
+      thresholds:
+        min_adjacent_overlap: 0.03
+        min_endpoint_effective_samples: 50
+        min_rest2_hot_returns: 5
+        min_uniform_occupancy_overlap: 0.8
     resume: true
   setup:
     protein_forcefield: [amber14-all.xml]

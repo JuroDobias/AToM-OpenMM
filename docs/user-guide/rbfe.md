@@ -296,6 +296,8 @@ workflow:
   production_method: awh
   awh:
     state_move_interval_steps: 500
+    # Optional interpolation of the original 22-state schedule.
+    # atm_state_count: 100
     start_state: a
     start_annealing_steps_per_state: 10000
     initial_error_kj_per_mol: 50.0
@@ -307,6 +309,7 @@ workflow:
       min_round_trips: 10
       min_visits_per_state: 100
       covering_fraction: 0.8
+      learning_rate_kbt: 0.1
     production:
       steps: 5000000
       reduced_energy_interval_moves: 10
@@ -316,6 +319,16 @@ workflow:
       effective_temperatures_k: [300, 344.6, 395.9, 454.7, 522.3, 600]
       endpoint_a_solute: '#unbound:"*"'
       endpoint_b_solute: '#unbound:"*"'
+    analysis:
+      trajectory:
+        enabled: true
+        interval_moves: 10
+        atom_selection: '!:HOH,WAT,NA,CL,K,CA'
+      thresholds:
+        min_adjacent_overlap: 0.03
+        min_endpoint_effective_samples: 50
+        min_rest2_hot_returns: 5
+        min_uniform_occupancy_overlap: 0.8
     resume: true
 ```
 
@@ -326,6 +339,21 @@ must all pass. Reaching `adaptive.max_steps` first produces a partial result.
 The subsequent fixed-bias stage records sparse complete reduced-energy
 matrices and reports UWHAM as the primary estimator. The adaptive AWH bias
 estimate remains available under `result.estimator_variants`.
+
+The adaptive bias uses a fixed dimensionless update size set by
+`adaptive.learning_rate_kbt`; it does not decay merely because time was spent
+in already explored states. This prevents an undiscovered edge from freezing
+out before schedule coverage. The bias is frozen completely for production.
+
+`atm_state_count` can interpolate the two original ATM half paths while
+preserving separate M+ and M- nodes. Local state proposals still evaluate only
+the current and neighboring Hamiltonians, so their force-evaluation cost does
+not increase with the total state count. A nearest-neighbor random walk does,
+however, require approximately the square of the number of nodes to traverse
+the graph, and complete reduced-energy rows scale linearly with state count.
+For approximately 100 ATM states, use a shorter state interval such as
+`state_move_interval_steps: 100` and retain enough adaptive steps for the
+configured round trips.
 
 `awh_protocol.yaml` fingerprints the ATM schedule, REST2 selections, ladder,
 and AWH settings. Resume restores coordinates, velocities, RNG state, current
@@ -344,6 +372,28 @@ Version 1 is a single walker with a uniform target. Metric-optimized targets,
 shared-bias multiple walkers, and overlapping endpoint REST2 regions are not
 implemented. Independent A-start and B-start calculations should agree before
 using the method for a benchmark series.
+
+`awh_diagnostics.yaml` reports adaptive and fixed-bias occupancy, observed and
+expected neighboring transition probabilities, complete REST2
+physical-hottest-physical returns, UWHAM overlap, and effective sample counts.
+`awh_diagnostics.png` visualizes state visits, transition traffic, neighboring
+overlap, and effective samples. Failure of a configured quality threshold marks
+the result `partial` and adds a specific warning to `result.yaml`.
+
+When trajectory output is enabled, `awh_trajectory.xtc` contains the selected
+atoms and `awh_trajectory_topology.pdb` is its matching topology.
+`awh_trajectory_frames.csv` identifies the AWH stage, ATM state, REST2 region,
+scale, and effective temperature for every frame. A frame is tagged with the
+Hamiltonian that propagated it, before the following state draw. Adaptive
+frames are useful for diagnosing state-space traversal but must not be used as
+fixed-bias equilibrium populations. With the default 500-step state interval
+and 2 fs timestep, `interval_moves: 10` saves one frame every 10 ps.
+
+`atom-rbfe --analyze-only workflow.yaml` rebuilds the AWH summary and
+diagnostics from the trace, reduced-energy matrix, bias history, and
+checkpoint. Legacy runs without the extended trace or trajectory remain
+analyzable, but unavailable stage-specific or structural diagnostics are
+reported rather than reconstructed.
 
 The custom switching path uses a dedicated BAOAB-style Langevin `CustomIntegrator` with the ATM parameter update centered in each timestep (`V R H O R V`). Endpoint equilibration and snapshot decorrelation continue to use the existing ATM MTS integrator. A `CompoundIntegrator` keeps both modes in one OpenMM context. The custom path executes one Python call per schedule segment rather than one call per integration step.
 

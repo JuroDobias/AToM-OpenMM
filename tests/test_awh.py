@@ -52,6 +52,17 @@ def _test_awh_bias_moves_free_energy_against_oversampling():
     assert np.isfinite(bias.bias).all()
 
 
+def _test_awh_fixed_learning_rate_does_not_decay():
+    from atom_openmm.awh import AWHBias
+
+    bias = AWHBias(3, initial_histogram_size=10)
+    bias.update([0, 1], np.array([0.9, 0.1]), learning_rate_kbt=0.1)
+    first_change = bias.free_energy[1] - bias.free_energy[0]
+    bias.update([0, 1], np.array([0.9, 0.1]), learning_rate_kbt=0.1)
+    second_change = bias.free_energy[1] - bias.free_energy[0]
+    assert second_change - first_change == pytest.approx(first_change)
+
+
 def _test_awh_bias_roundtrip_serialization():
     from atom_openmm.awh import AWHBias
 
@@ -84,3 +95,306 @@ def _test_awh_rejects_nonuniform_target_for_v1():
             {"awh": {"target_distribution": "metric"}},
             _atom_options(),
         )
+
+
+def _test_awh_analysis_defaults_are_normalized():
+    from atom_openmm.awh import normalize_awh_options
+
+    settings = normalize_awh_options({"awh": {}}, _atom_options())
+    assert settings["analysis"]["trajectory"] == {
+        "enabled": True,
+        "interval_moves": 10,
+        "atom_selection": "!:HOH,WAT,NA,CL,K,CA",
+    }
+    assert settings["analysis"]["thresholds"]["min_adjacent_overlap"] == 0.03
+    assert settings["adaptive"]["learning_rate_kbt"] == pytest.approx(0.1)
+    assert settings["atm_state_count"] == 4
+
+
+def _test_awh_densifies_both_legs_and_preserves_midpoints():
+    from atom_openmm.awh import densify_atm_states
+    from atom_openmm.neqti import build_atm_state_parameters, split_two_leg_paths
+
+    original = build_atm_state_parameters(_atom_options())
+    dense = densify_atm_states(original, 20)
+    paths = split_two_leg_paths(dense)
+    assert len(dense) == 20
+    assert dense[0]["lambda2"] == pytest.approx(original[0]["lambda2"])
+    assert dense[-1]["lambda2"] == pytest.approx(original[-1]["lambda2"])
+    assert dense[paths["leg_a_forward"][-1]]["atmdirection"] == 1
+    assert dense[paths["leg_b_reverse"][0]]["atmdirection"] == -1
+    original_delta = max(
+        abs(b["lambda2"] - a["lambda2"]) for a, b in zip(original, original[1:])
+    )
+    dense_delta = max(
+        abs(b["lambda2"] - a["lambda2"]) for a, b in zip(dense, dense[1:])
+    )
+    assert dense_delta < original_delta
+
+
+def _test_awh_analysis_output_settings_do_not_change_dynamics_signature():
+    from atom_openmm.awh import _protocol_signature, normalize_awh_options
+
+    first = normalize_awh_options({"awh": {}}, _atom_options())
+    second = normalize_awh_options(
+        {
+            "awh": {
+                "analysis": {
+                    "trajectory": {"enabled": False, "interval_moves": 50},
+                    "thresholds": {"min_adjacent_overlap": 0.1},
+                }
+            }
+        },
+        _atom_options(),
+    )
+    assert _protocol_signature(_atom_options(), first) == _protocol_signature(
+        _atom_options(), second
+    )
+
+
+def _test_awh_diagnostics_report_rest2_returns_overlap_and_ess():
+    from atom_openmm.awh import (
+        build_awh_state_graph,
+        estimate_mbar,
+        normalize_awh_options,
+    )
+    from atom_openmm.awh_analysis import analyze_awh_diagnostics
+    from atom_openmm.neqti import build_atm_state_parameters
+
+    settings = normalize_awh_options(
+        {"awh": {"rest2": {"effective_temperatures_k": [300, 450, 600]}}},
+        _atom_options(),
+    )
+    graph = build_awh_state_graph(
+        build_atm_state_parameters(_atom_options()), settings
+    )
+    path = [2, 1, 0, 1, 2, 3, 4, 5, 6, 7, 6, 5]
+    rows = []
+    previous = 2
+    for move, state in enumerate(path, 1):
+        rows.append(
+            {
+                "move": move,
+                "stage": "production",
+                "previous_state": previous,
+                "state": state,
+                "left_probability": 0.2,
+                "stay_probability": 0.6,
+                "right_probability": 0.2,
+            }
+        )
+        previous = state
+    sampled_states = np.repeat(np.arange(len(graph)), 5)
+    matrix = np.zeros((len(sampled_states), len(graph)))
+    free = estimate_mbar(matrix, sampled_states, len(graph))
+    result = analyze_awh_diagnostics(
+        graph,
+        trace_rows=rows,
+        sampled_states=sampled_states,
+        reduced_energies=matrix,
+        free_energies=free,
+        thresholds={
+            "min_adjacent_overlap": 0.01,
+            "min_endpoint_effective_samples": 1,
+            "min_rest2_hot_returns": 1,
+            "min_uniform_occupancy_overlap": 0.1,
+        },
+    )
+    assert result["uwham"]["minimum_adjacent_overlap"] == pytest.approx(1 / 8)
+    assert result["uwham"]["endpoint_effective_samples"]["a_physical"] == pytest.approx(40)
+    assert (
+        result["rest2"]["endpoint_a"]["production"][
+            "complete_physical_hottest_physical_returns"
+        ]
+        == 1
+    )
+    assert (
+        result["rest2"]["endpoint_b"]["production"][
+            "complete_physical_hottest_physical_returns"
+        ]
+        == 1
+    )
+    assert result["edges"][2]["expected_left_to_right_probability"] == pytest.approx(0.2)
+    assert result["quality_passed"]
+
+
+def _test_state_tagged_trajectory_writes_frame_metadata(tmp_path, monkeypatch):
+    from atom_openmm import awh_trajectory
+
+    reports = []
+
+    class FakeXTCReporter:
+        def __init__(self, *args, **kwargs):
+            reports.append((args, kwargs))
+
+        def describeNextReport(self, simulation):
+            return {"steps": 1}
+
+        def report(self, simulation, state):
+            reports.append(("report", simulation.currentStep))
+
+    monkeypatch.setattr(awh_trajectory.app, "XTCReporter", FakeXTCReporter)
+    reporter = awh_trajectory.StateTaggedXTCReporter(
+        tmp_path / "trajectory.xtc",
+        tmp_path / "frames.csv",
+        5000,
+        [1, 2, 3],
+        lambda: {
+            "move": 10,
+            "stage": "adaptive",
+            "state": 4,
+            "state_name": "a_physical",
+            "kind": "physical",
+            "atm_state": 0,
+            "rest2_region": None,
+            "rest2_scale": 1.0,
+            "effective_temperature_k": 310.0,
+        },
+        origin_simulation_step=450000,
+        origin_awh_steps=5000,
+    )
+
+    class FakeSimulation:
+        currentStep = 455000
+
+    reporter.report(FakeSimulation(), object())
+    rows = list(__import__("csv").DictReader((tmp_path / "frames.csv").open()))
+    assert rows[0]["awh_steps"] == "10000"
+    assert rows[0]["state_name"] == "a_physical"
+    assert reports[-1] == ("report", 455000)
+
+
+def _test_state_tagged_xtc_trajectory_resumes(tmp_path):
+    import csv
+    import openmm as mm
+    from openmm import app
+
+    from atom_openmm.awh_trajectory import StateTaggedXTCReporter
+
+    topology = app.Topology()
+    chain = topology.addChain()
+    residue = topology.addResidue("MOL", chain)
+    topology.addAtom("C1", app.element.carbon, residue)
+    topology.addAtom("C2", app.element.carbon, residue)
+    system = mm.System()
+    system.addParticle(12.0)
+    system.addParticle(12.0)
+    metadata = lambda: {
+        "move": 1,
+        "stage": "adaptive",
+        "state": 0,
+        "state_name": "a_physical",
+        "kind": "physical",
+        "atm_state": 0,
+        "rest2_region": None,
+        "rest2_scale": 1.0,
+        "effective_temperature_k": 300.0,
+    }
+    trajectory = tmp_path / "trajectory.xtc"
+    frames = tmp_path / "frames.csv"
+
+    first = app.Simulation(topology, system, mm.VerletIntegrator(0.001))
+    first.context.setPositions([[0, 0, 0], [0.1, 0, 0]])
+    first.reporters.append(
+        StateTaggedXTCReporter(
+            trajectory, frames, 1, [0, 1], metadata
+        )
+    )
+    first.step(2)
+
+    second = app.Simulation(topology, system, mm.VerletIntegrator(0.001))
+    second.context.setPositions([[0, 0, 0], [0.1, 0, 0]])
+    second.currentStep = 2
+    second.reporters.append(
+        StateTaggedXTCReporter(
+            trajectory, frames, 1, [0, 1], metadata, append=True
+        )
+    )
+    second.step(1)
+
+    with frames.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [int(row["frame"]) for row in rows] == [0, 1, 2]
+
+
+def _test_analyze_existing_awh_rebuilds_summary_from_raw_artifacts(
+    tmp_path, monkeypatch
+):
+    import csv
+    import yaml
+
+    from atom_openmm import awh
+    from atom_openmm.neqti import build_atm_state_parameters
+
+    settings = awh.normalize_awh_options(
+        {
+            "awh": {
+                "production": {"steps": 100, "bootstrap_samples": 0},
+                "rest2": {"effective_temperatures_k": [300, 450, 600]},
+                "analysis": {
+                    "trajectory": {"enabled": False},
+                    "thresholds": {
+                        "min_adjacent_overlap": 0.01,
+                        "min_endpoint_effective_samples": 1,
+                        "min_rest2_hot_returns": 0,
+                        "min_uniform_occupancy_overlap": 0.1,
+                    },
+                },
+            }
+        },
+        _atom_options(),
+    )
+    graph = awh.build_awh_state_graph(
+        build_atm_state_parameters(_atom_options()), settings
+    )
+    (tmp_path / "awh_protocol.yaml").write_text(
+        yaml.safe_dump({"graph": graph, "settings": settings})
+    )
+    (tmp_path / "awh_checkpoint.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "stage": "production",
+                "total_steps": 1100,
+                "production_steps_completed": 100,
+                "round_trips": 1,
+                "current_state": 2,
+                "transitions": np.zeros(
+                    (len(graph), len(graph)), dtype=int
+                ).tolist(),
+                "awh": {
+                    "free_energy": [0.0] * len(graph),
+                    "visits": [10] * len(graph),
+                },
+            }
+        )
+    )
+    with (tmp_path / "awh_state_trace.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["move", "stage", "previous_state", "state"],
+        )
+        writer.writeheader()
+        previous = 0
+        for move, state in enumerate(range(len(graph)), 1):
+            writer.writerow(
+                {
+                    "move": move,
+                    "stage": "production",
+                    "previous_state": previous,
+                    "state": state,
+                }
+            )
+            previous = state
+    with (tmp_path / "awh_reduced_energies.csv").open(
+        "w", newline=""
+    ) as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["sampled_state", *[node["name"] for node in graph]])
+        for state in np.repeat(np.arange(len(graph)), 5):
+            writer.writerow([state, *([0.0] * len(graph))])
+    monkeypatch.chdir(tmp_path)
+    result = awh.analyze_existing_awh(_atom_options(), settings)
+    assert result["status"] == "completed"
+    assert result["overlap_score"] == pytest.approx(1 / len(graph))
+    assert (tmp_path / "awh_summary.yaml").exists()
+    assert (tmp_path / "awh_diagnostics.yaml").exists()
