@@ -145,7 +145,10 @@ solute-only trajectory supports structural analysis of every AWH and REST2
 node.
 The adaptive learning rate remains fixed until freezing, and
 `workflow.awh.atm_state_count` can densify both ATM half paths without changing
-the user-supplied async-RE schedule.
+the user-supplied async-RE schedule. Optional generalized-force friction
+diagnostics identify slow graph regions and suggest a square-root-friction
+target. Applying that target remains disabled by default and requires a fresh
+dynamics checkpoint.
 
 For production sampling, `failed_switch_policy: count_as_infinite` preserves recognized numerical switching failures as `+inf` protocol-work observations instead of selectively replacing them. CUDA/environment and programming failures still stop the run. Use `retry` for the previous replacement behavior or `abort` to stop at the first failed switch.
 

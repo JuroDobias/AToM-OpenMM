@@ -132,6 +132,8 @@ class RBFEResultWriter:
             "awh_trajectory": None,
             "awh_trajectory_topology": None,
             "awh_trajectory_frames": None,
+            "awh_friction": None,
+            "awh_friction_samples": None,
             "plot": None,
         }
 
@@ -182,6 +184,10 @@ class RBFEResultWriter:
                 ),
                 "awh_trajectory_frames": self._relative_if_exists(
                     "awh_trajectory_frames.csv"
+                ),
+                "awh_friction": self._relative_if_exists("awh_friction.yaml"),
+                "awh_friction_samples": self._relative_if_exists(
+                    "awh_friction_samples.csv"
                 ),
                 "plot": self._relative_if_exists(f"{job}.png"),
             }

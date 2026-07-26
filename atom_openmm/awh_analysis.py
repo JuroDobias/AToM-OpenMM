@@ -146,10 +146,14 @@ def _selection_statistics(rows, nstates):
     return records
 
 
-def _state_records(graph, sequences, selection_statistics):
+def _state_records(graph, sequences, selection_statistics, target=None):
     nstates = len(graph)
     records = []
-    target = 1.0 / nstates
+    target = (
+        np.full(nstates, 1.0 / nstates)
+        if target is None
+        else np.asarray(target, dtype=float)
+    )
     totals = {stage: len(values) for stage, values in sequences.items()}
     for index, node in enumerate(graph):
         record = {
@@ -160,7 +164,7 @@ def _state_records(graph, sequences, selection_statistics):
             "rest2": {key: float(value) for key, value in node["rest2"].items()},
             "adaptive_visits": int(sequences["adaptive"].count(index)),
             "production_visits": int(sequences["production"].count(index)),
-            "target_probability": target,
+            "target_probability": float(target[index]),
         }
         for stage in ("adaptive", "production"):
             record[f"{stage}_occupancy"] = (
@@ -186,12 +190,16 @@ def _state_records(graph, sequences, selection_statistics):
     return records
 
 
-def _occupancy_overlap(sequence, nstates):
+def _occupancy_overlap(sequence, nstates, target=None):
     if not sequence:
         return None
     counts = np.bincount(sequence, minlength=nstates).astype(float)
     observed = counts / counts.sum()
-    target = np.full(nstates, 1.0 / nstates)
+    target = (
+        np.full(nstates, 1.0 / nstates)
+        if target is None
+        else np.asarray(target, dtype=float)
+    )
     return float(np.minimum(observed, target).sum())
 
 
@@ -366,15 +374,21 @@ def analyze_awh_diagnostics(
     fallback_transitions=None,
     bias_history=None,
     thresholds=None,
+    friction=None,
 ):
     thresholds = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
     nstates = len(graph)
+    active_target = None if friction is None else friction.get("active_target")
+    if active_target is not None and len(active_target) != nstates:
+        active_target = None
     sequences = _stage_sequences(trace_rows, nstates)
     selection_statistics = _selection_statistics(trace_rows, nstates)
     transition_matrices = _transition_counts(
         trace_rows, nstates, fallback=fallback_transitions
     )
-    state_records = _state_records(graph, sequences, selection_statistics)
+    state_records = _state_records(
+        graph, sequences, selection_statistics, target=active_target
+    )
     overlap = None
     effective_samples = None
     if free_energies is not None:
@@ -413,6 +427,12 @@ def analyze_awh_diagnostics(
         sequences["production"], nstates
     )
     adaptive_occupancy_overlap = _occupancy_overlap(sequences["adaptive"], nstates)
+    production_target_overlap = _occupancy_overlap(
+        sequences["production"], nstates, active_target
+    )
+    adaptive_target_overlap = _occupancy_overlap(
+        sequences["adaptive"], nstates, active_target
+    )
     rest2 = _rest2_diagnostics(graph, sequences)
     warnings = []
     if minimum_overlap is not None and minimum_overlap < thresholds["min_adjacent_overlap"]:
@@ -428,12 +448,12 @@ def analyze_awh_diagnostics(
                     f"{thresholds['min_endpoint_effective_samples']:.1f}"
                 )
     if (
-        production_occupancy_overlap is not None
-        and production_occupancy_overlap < thresholds["min_uniform_occupancy_overlap"]
+        production_target_overlap is not None
+        and production_target_overlap < thresholds["min_uniform_occupancy_overlap"]
     ):
         warnings.append(
-            f"production occupancy overlap with the uniform target "
-            f"{production_occupancy_overlap:.3f} is below "
+            f"production occupancy overlap with the configured target "
+            f"{production_target_overlap:.3f} is below "
             f"{thresholds['min_uniform_occupancy_overlap']:.3f}"
         )
     for label, branch in rest2.items():
@@ -453,11 +473,13 @@ def analyze_awh_diagnostics(
         "adaptive": {
             "moves": len(sequences["adaptive"]),
             "uniform_occupancy_overlap": adaptive_occupancy_overlap,
+            "target_occupancy_overlap": adaptive_target_overlap,
         },
         "production": {
             "moves": len(sequences["production"]),
             "reduced_energy_samples": len(sampled_states),
             "uniform_occupancy_overlap": production_occupancy_overlap,
+            "target_occupancy_overlap": production_target_overlap,
         },
         "uwham": {
             "overlap_matrix": None if overlap is None else overlap.tolist(),
@@ -465,6 +487,7 @@ def analyze_awh_diagnostics(
             "endpoint_effective_samples": endpoint_ess,
         },
         "rest2": rest2,
+        "friction": friction,
         "bias_stability": _bias_stability(bias_history or [], graph),
         "thresholds": thresholds,
         "quality_passed": not warnings,
@@ -494,7 +517,7 @@ def plot_awh_diagnostics(diagnostics, path, trace_rows=None):
     edge_traffic = [
         edge["left_to_right_count"] + edge["right_to_left_count"] for edge in edges
     ]
-    figure, axes = plt.subplots(2, 3, figsize=(17, 8), constrained_layout=True)
+    figure, axes = plt.subplots(2, 4, figsize=(21, 8), constrained_layout=True)
     trace_rows = trace_rows or []
     trace_moves = []
     trace_states = []
@@ -514,6 +537,14 @@ def plot_awh_diagnostics(diagnostics, path, trace_rows=None):
     axes[0, 1].legend()
     axes[0, 2].bar(edge_x, edge_traffic)
     axes[0, 2].set_title("Adjacent transition traffic")
+    friction = diagnostics.get("friction") or {}
+    friction_states = friction.get("states") or []
+    friction_values = [
+        record.get("friction_kbt2_ps_per_state2", np.nan)
+        for record in friction_states
+    ]
+    axes[0, 3].plot(x[: len(friction_values)], friction_values, marker="o")
+    axes[0, 3].set_title("Generalized-force friction")
     axes[1, 0].plot(edge_x, edge_overlap, marker="o")
     axes[1, 0].axhline(
         diagnostics["thresholds"]["min_adjacent_overlap"],
@@ -536,6 +567,15 @@ def plot_awh_diagnostics(diagnostics, path, trace_rows=None):
     axes[1, 2].plot(x, expected_stay, label="expected", marker=".")
     axes[1, 2].set_title("State stay probability")
     axes[1, 2].legend()
+    suggested = friction.get("suggested_target")
+    active = friction.get("active_target")
+    if suggested is not None:
+        axes[1, 3].plot(x, suggested, label="suggested", marker="o")
+    if active is not None:
+        axes[1, 3].plot(x, active, label="active", marker=".")
+    axes[1, 3].set_title("AWH target distribution")
+    if suggested is not None or active is not None:
+        axes[1, 3].legend()
     for axis in list(axes.flat)[1:]:
         axis.set_xlabel("AWH state index")
         axis.grid(alpha=0.2)

@@ -310,6 +310,12 @@ workflow:
       min_visits_per_state: 100
       covering_fraction: 0.8
       learning_rate_kbt: 0.1
+      metric_target:
+        enabled: false
+        min_round_trips: 2
+        update_interval_moves: 1000
+        smoothing: 0.2
+        max_relative_weight: 5.0
     production:
       steps: 5000000
       reduced_energy_interval_moves: 10
@@ -324,6 +330,10 @@ workflow:
         enabled: true
         interval_moves: 10
         atom_selection: '!:HOH,WAT,NA,CL,K,CA'
+      friction:
+        enabled: true
+        max_correlation_lag_moves: 50
+        min_effective_samples: 200
       thresholds:
         min_adjacent_overlap: 0.03
         min_endpoint_effective_samples: 50
@@ -332,7 +342,8 @@ workflow:
     resume: true
 ```
 
-The adaptive stage uses AWH reference-histogram updates with a uniform target.
+The adaptive stage uses fixed-size probability-weighted updates with a uniform
+target.
 It cannot freeze merely because the bias appears stable: the configured
 minimum steps, physical A-B-A round trips, state visits, and covering fraction
 must all pass. Reaching `adaptive.max_steps` first produces a partial result.
@@ -344,6 +355,9 @@ The adaptive bias uses a fixed dimensionless update size set by
 `adaptive.learning_rate_kbt`; it does not decay merely because time was spent
 in already explored states. This prevents an undiscovered edge from freezing
 out before schedule coverage. The bias is frozen completely for production.
+`initial_error_kj_per_mol` and `diffusion_per_ps` remain accepted for
+checkpoint and input compatibility, but they do not affect this fixed-rate
+update.
 
 `atm_state_count` can interpolate the two original ATM half paths while
 preserving separate M+ and M- nodes. Local state proposals still evaluate only
@@ -368,17 +382,34 @@ saved as `awh_start_B.xml`. This preparation is outside AWH statistics.
 
 Important artifacts are `awh_state_trace.csv`, `awh_bias_history.csv`,
 `awh_reduced_energies.csv`, `awh_checkpoint.yaml`, and `awh_summary.yaml`.
-Version 1 is a single walker with a uniform target. Metric-optimized targets,
-shared-bias multiple walkers, and overlapping endpoint REST2 regions are not
-implemented. Independent A-start and B-start calculations should agree before
-using the method for a benchmark series.
+Version 1 is a single walker. Shared-bias multiple walkers and overlapping
+endpoint REST2 regions are not implemented. Independent A-start and B-start
+calculations should agree before using the method for a benchmark series.
+
+Friction analysis estimates the generalized force along the ordered state
+graph using centered finite differences of neighboring reduced energies. It
+accumulates probability-weighted force variance and autocorrelation statistics
+for the complete endpoint-REST2 and ATM graph. `awh_friction_samples.csv`
+contains the raw observations and `awh_friction.yaml` reports effective sample
+counts, integrated autocorrelation times, friction, and a suggested target
+proportional to the square root of friction. The units refer to graph-index
+spacing rather than a Cartesian coordinate or the original ATM lambda.
+
+Friction collection is analysis-only and can be enabled on a compatible
+checkpoint. Setting `adaptive.metric_target.enabled: true` changes the dynamics
+signature and requires a fresh run. Once every state reaches
+`friction.min_effective_samples` and the configured round trips have completed,
+the target is periodically moved toward the friction suggestion. Smoothing and
+`max_relative_weight` limit noisy early changes. Keep this disabled until a
+system's friction profile is reproducible.
 
 `awh_diagnostics.yaml` reports adaptive and fixed-bias occupancy, observed and
 expected neighboring transition probabilities, complete REST2
 physical-hottest-physical returns, UWHAM overlap, and effective sample counts.
 `awh_diagnostics.png` visualizes state visits, transition traffic, neighboring
-overlap, and effective samples. Failure of a configured quality threshold marks
-the result `partial` and adds a specific warning to `result.yaml`.
+overlap, effective samples, generalized-force friction, and active and
+suggested targets. Failure of a configured quality threshold marks the result
+`partial` and adds a specific warning to `result.yaml`.
 
 When trajectory output is enabled, `awh_trajectory.xtc` contains the selected
 atoms and `awh_trajectory_topology.pdb` is its matching topology.

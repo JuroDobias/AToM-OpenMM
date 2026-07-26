@@ -25,6 +25,14 @@ from atom_openmm.awh_analysis import (
     read_reduced_energies,
     read_state_trace,
 )
+from atom_openmm.awh_friction import (
+    FrictionAccumulator,
+    append_friction_samples,
+    friction_summary,
+    friction_target,
+    generalized_forces,
+    reconcile_friction_samples,
+)
 from atom_openmm.awh_trajectory import StateTaggedXTCReporter, write_subset_topology
 from atom_openmm.equilibration import AmberMaskResolver
 from atom_openmm.neqti import build_atm_state_parameters, split_two_leg_paths
@@ -73,10 +81,18 @@ def normalize_awh_options(workflow, atom_options):
     if not isinstance(analysis, dict):
         raise AWHConfigError("workflow.awh.analysis must be a mapping")
     trajectory = analysis.get("trajectory") or {}
+    friction = analysis.get("friction") or {}
     thresholds = analysis.get("thresholds") or {}
-    if not isinstance(trajectory, dict) or not isinstance(thresholds, dict):
+    metric_target = adaptive.get("metric_target") or {}
+    if (
+        not isinstance(trajectory, dict)
+        or not isinstance(friction, dict)
+        or not isinstance(thresholds, dict)
+        or not isinstance(metric_target, dict)
+    ):
         raise AWHConfigError(
-            "workflow.awh.analysis.trajectory and thresholds must be mappings"
+            "AWH trajectory, friction, thresholds, and metric_target settings "
+            "must be mappings"
         )
     settings = {
         "state_move_interval_steps": int(raw.get("state_move_interval_steps", 500)),
@@ -101,6 +117,19 @@ def normalize_awh_options(workflow, atom_options):
             "learning_rate_kbt": float(
                 adaptive.get("learning_rate_kbt", 0.1)
             ),
+            "metric_target": {
+                "enabled": bool(metric_target.get("enabled", False)),
+                "min_round_trips": int(
+                    metric_target.get("min_round_trips", 2)
+                ),
+                "update_interval_moves": int(
+                    metric_target.get("update_interval_moves", 1000)
+                ),
+                "smoothing": float(metric_target.get("smoothing", 0.2)),
+                "max_relative_weight": float(
+                    metric_target.get("max_relative_weight", 5.0)
+                ),
+            },
         },
         "production": {
             "steps": int(production.get("steps", 5_000_000)),
@@ -129,6 +158,15 @@ def normalize_awh_options(workflow, atom_options):
                     )
                 ),
             },
+            "friction": {
+                "enabled": bool(friction.get("enabled", False)),
+                "max_correlation_lag_moves": int(
+                    friction.get("max_correlation_lag_moves", 50)
+                ),
+                "min_effective_samples": int(
+                    friction.get("min_effective_samples", 200)
+                ),
+            },
             "thresholds": {
                 key: (
                     int(thresholds.get(key, value))
@@ -154,6 +192,9 @@ def normalize_awh_options(workflow, atom_options):
         settings["production"]["steps"],
         settings["production"]["reduced_energy_interval_moves"],
         settings["analysis"]["trajectory"]["interval_moves"],
+        settings["analysis"]["friction"]["max_correlation_lag_moves"],
+        settings["analysis"]["friction"]["min_effective_samples"],
+        settings["adaptive"]["metric_target"]["update_interval_moves"],
     ]
     if any(value < 1 for value in positive):
         raise AWHConfigError("AWH step and interval settings must be positive")
@@ -169,6 +210,17 @@ def normalize_awh_options(workflow, atom_options):
         or settings["adaptive"]["learning_rate_kbt"] <= 0
     ):
         raise AWHConfigError("AWH initial error and diffusion must be positive")
+    metric_target = settings["adaptive"]["metric_target"]
+    if (
+        metric_target["min_round_trips"] < 0
+        or not 0 < metric_target["smoothing"] <= 1
+        or metric_target["max_relative_weight"] < 1
+    ):
+        raise AWHConfigError("workflow.awh.adaptive.metric_target settings are invalid")
+    if metric_target["enabled"] and not settings["analysis"]["friction"]["enabled"]:
+        raise AWHConfigError(
+            "friction analysis must be enabled when metric target scaling is enabled"
+        )
     quality = settings["analysis"]["thresholds"]
     if (
         quality["min_adjacent_overlap"] <= 0
@@ -285,7 +337,7 @@ def build_awh_state_graph(atm_states, settings):
 
 
 class AWHBias:
-    """AWH free-energy/reference-histogram update for a discrete state graph."""
+    """Free-energy bias estimate for the discrete AWH state graph."""
 
     def __init__(self, nstates, initial_histogram_size, target=None):
         self.target = np.full(nstates, 1.0 / nstates) if target is None else np.asarray(target)
@@ -325,6 +377,7 @@ class AWHBias:
 
     def to_dict(self):
         return {
+            "target": self.target.tolist(),
             "free_energy": self.free_energy.tolist(),
             "reference": self.reference.tolist(),
             "covering": self.covering.tolist(),
@@ -334,7 +387,17 @@ class AWHBias:
 
     @classmethod
     def from_dict(cls, data):
-        obj = cls(len(data["free_energy"]), 1.0)
+        obj = cls(
+            len(data["free_energy"]),
+            1.0,
+            target=np.asarray(
+                data.get(
+                    "target",
+                    np.full(len(data["free_energy"]), 1.0 / len(data["free_energy"])),
+                ),
+                dtype=float,
+            ),
+        )
         obj.free_energy = np.asarray(data["free_energy"], dtype=float)
         obj.reference = np.asarray(data["reference"], dtype=float)
         obj.covering = np.asarray(data["covering"], dtype=float)
@@ -395,9 +458,12 @@ def _protocol_signature(options, settings):
         raw = getattr(value, "_value", value)
         return float(raw)
 
-    dynamics_settings = {
-        key: value for key, value in settings.items() if key != "analysis"
-    }
+    dynamics_settings = deepcopy(
+        {key: value for key, value in settings.items() if key != "analysis"}
+    )
+    metric_target = dynamics_settings.get("adaptive", {}).get("metric_target")
+    if metric_target is not None and not metric_target.get("enabled", False):
+        dynamics_settings["adaptive"].pop("metric_target")
     payload = {
         "schema_version": 1,
         "schedule": [
@@ -473,6 +539,8 @@ def run_awh(options, awh_options=None, progress_callback=None):
     trajectory_path = Path("awh_trajectory.xtc")
     trajectory_topology_path = Path("awh_trajectory_topology.pdb")
     trajectory_frames_path = Path("awh_trajectory_frames.csv")
+    friction_samples_path = Path("awh_friction_samples.csv")
+    friction_path = Path("awh_friction.yaml")
     existing = state_path.exists() or xml_path.exists() or trace_path.exists()
     if settings["resume"] and existing:
         if not manifest_path.exists():
@@ -492,6 +560,8 @@ def run_awh(options, awh_options=None, progress_callback=None):
             trajectory_path,
             trajectory_topology_path,
             trajectory_frames_path,
+            friction_samples_path,
+            friction_path,
         ):
             path.unlink(missing_ok=True)
     _atomic_yaml(
@@ -573,6 +643,12 @@ def run_awh(options, awh_options=None, progress_callback=None):
     current = a_index if settings["start_state"] == "a" else b_index
     rng = np.random.default_rng(settings["random_seed"])
     awh = AWHBias(len(graph), initial_histogram)
+    friction_settings = settings["analysis"]["friction"]
+    friction_accumulator = FrictionAccumulator(
+        len(graph),
+        friction_settings["max_correlation_lag_moves"],
+        settings["state_move_interval_steps"] * timestep_ps,
+    )
     stage = "adaptive"
     total_steps = 0
     production_steps_completed = 0
@@ -595,6 +671,19 @@ def run_awh(options, awh_options=None, progress_callback=None):
         )
         stage = saved["stage"]
         awh = AWHBias.from_dict(saved["awh"])
+        saved_friction = saved.get("friction")
+        if friction_settings["enabled"] and saved_friction:
+            restored_friction = FrictionAccumulator.from_dict(saved_friction)
+            if (
+                restored_friction.nstates == len(graph)
+                and restored_friction.maximum_lag
+                == friction_settings["max_correlation_lag_moves"]
+            ):
+                friction_accumulator = restored_friction
+            else:
+                logger.warning(
+                    "AWH friction settings changed; restarting friction statistics"
+                )
         rng.bit_generator.state = saved["rng_state"]
         logger.info("Resumed AWH %s at %d steps in state %s", stage, total_steps, graph[current]["name"])
     else:
@@ -638,6 +727,8 @@ def run_awh(options, awh_options=None, progress_callback=None):
         a_index if settings["start_state"] == "a" else b_index,
     )
     move = awh.updates
+    if friction_settings["enabled"]:
+        reconcile_friction_samples(friction_samples_path, move)
 
     trajectory_settings = settings["analysis"]["trajectory"]
     if trajectory_settings["enabled"]:
@@ -698,6 +789,18 @@ def run_awh(options, awh_options=None, progress_callback=None):
         sampled_states, matrices = read_reduced_energies(matrix_path)
         if free_energies is None:
             free_energies = estimate_mbar(matrices, sampled_states, len(graph))
+        friction = None
+        if friction_settings["enabled"]:
+            friction = friction_summary(
+                friction_accumulator,
+                graph,
+                friction_settings["min_effective_samples"],
+                target=awh.target,
+                maximum_relative_weight=settings["adaptive"]["metric_target"][
+                    "max_relative_weight"
+                ],
+            )
+            _atomic_yaml(friction_path, friction)
         value = analyze_awh_diagnostics(
             graph,
             trace_rows=read_state_trace(trace_path),
@@ -707,6 +810,7 @@ def run_awh(options, awh_options=None, progress_callback=None):
             fallback_transitions=transitions,
             bias_history=read_bias_history(bias_path),
             thresholds=settings["analysis"]["thresholds"],
+            friction=friction,
         )
         _atomic_yaml(diagnostics_path, value)
         return value
@@ -727,6 +831,11 @@ def run_awh(options, awh_options=None, progress_callback=None):
                 "crossed": crossed,
                 "transitions": transitions.tolist(),
                 "awh": awh.to_dict(),
+                "friction": (
+                    friction_accumulator.to_dict()
+                    if friction_settings["enabled"]
+                    else None
+                ),
                 "rng_state": rng.bit_generator.state,
             },
         )
@@ -791,18 +900,77 @@ def run_awh(options, awh_options=None, progress_callback=None):
                 }
             )
 
+    def evaluate_state_move(update_bias):
+        candidates = _neighbors(current, len(graph))
+        evaluation_radius = 2 if friction_settings["enabled"] else 1
+        evaluation_states = list(
+            range(
+                max(0, current - evaluation_radius),
+                min(len(graph), current + evaluation_radius + 1),
+            )
+        )
+        reduced_by_state = {
+            index: beta * energy(index) for index in evaluation_states
+        }
+        reduced = [reduced_by_state[index] for index in candidates]
+        probabilities = awh.probabilities(reduced, candidates)
+        if friction_settings["enabled"]:
+            probability_by_state = dict(zip(candidates, probabilities))
+            forces = generalized_forces(
+                reduced_by_state, candidates, len(graph)
+            )
+            friction_accumulator.update(
+                {
+                    state: (probability_by_state[state], forces[state])
+                    for state in candidates
+                }
+            )
+            append_friction_samples(
+                friction_samples_path,
+                move=move + 1,
+                steps=total_steps,
+                stage=stage,
+                graph=graph,
+                probabilities=probability_by_state,
+                forces=forces,
+            )
+        if update_bias:
+            awh.update(
+                candidates,
+                probabilities,
+                learning_rate_kbt=settings["adaptive"]["learning_rate_kbt"],
+            )
+            metric_target = settings["adaptive"]["metric_target"]
+            if (
+                metric_target["enabled"]
+                and round_trips >= metric_target["min_round_trips"]
+                and (move + 1) % metric_target["update_interval_moves"] == 0
+            ):
+                records = friction_accumulator.records(
+                    graph,
+                    minimum_effective_samples=friction_settings[
+                        "min_effective_samples"
+                    ],
+                )
+                target = friction_target(
+                    records,
+                    maximum_relative_weight=metric_target[
+                        "max_relative_weight"
+                    ],
+                )
+                if target is not None:
+                    smoothing = metric_target["smoothing"]
+                    awh.target = (
+                        (1.0 - smoothing) * awh.target + smoothing * target
+                    )
+                    awh.target /= awh.target.sum()
+        return candidates, probabilities, reduced
+
     while stage == "adaptive":
         worker.run(settings["state_move_interval_steps"])
         total_steps += settings["state_move_interval_steps"]
-        candidates = _neighbors(current, len(graph))
         previous = current
-        reduced = [beta * energy(index) for index in candidates]
-        probabilities = awh.probabilities(reduced, candidates)
-        awh.update(
-            candidates,
-            probabilities,
-            learning_rate_kbt=settings["adaptive"]["learning_rate_kbt"],
-        )
+        candidates, probabilities, reduced = evaluate_state_move(True)
         current = int(rng.choice(candidates, p=probabilities))
         transitions[previous, current] += 1
         awh.visits[current] += 1
@@ -859,10 +1027,8 @@ def run_awh(options, awh_options=None, progress_callback=None):
         worker.run(settings["state_move_interval_steps"])
         total_steps += settings["state_move_interval_steps"]
         production_steps_completed += settings["state_move_interval_steps"]
-        candidates = _neighbors(current, len(graph))
         previous = current
-        reduced = [beta * energy(index) for index in candidates]
-        probabilities = awh.probabilities(reduced, candidates)
+        candidates, probabilities, reduced = evaluate_state_move(False)
         current = int(rng.choice(candidates, p=probabilities))
         transitions[previous, current] += 1
         awh.visits[current] += 1
@@ -968,6 +1134,20 @@ def analyze_existing_awh(options, awh_options):
         (checkpoint.get("awh") or {}).get("free_energy", np.zeros(len(graph))),
         dtype=float,
     )
+    friction = None
+    friction_data = checkpoint.get("friction")
+    friction_settings = settings["analysis"]["friction"]
+    if friction_settings["enabled"] and friction_data:
+        friction = friction_summary(
+            FrictionAccumulator.from_dict(friction_data),
+            graph,
+            friction_settings["min_effective_samples"],
+            target=(checkpoint.get("awh") or {}).get("target"),
+            maximum_relative_weight=settings["adaptive"]["metric_target"][
+                "max_relative_weight"
+            ],
+        )
+        _atomic_yaml(Path("awh_friction.yaml"), friction)
     bias_ddg = float(
         (free_energy[b_index] - free_energy[a_index]) / beta / 4.184
     )
@@ -980,6 +1160,7 @@ def analyze_existing_awh(options, awh_options):
         fallback_transitions=checkpoint.get("transitions"),
         bias_history=read_bias_history(Path("awh_bias_history.csv")),
         thresholds=settings["analysis"]["thresholds"],
+        friction=friction,
     )
     _atomic_yaml(Path("awh_diagnostics.yaml"), quality)
     plot_awh_diagnostics(

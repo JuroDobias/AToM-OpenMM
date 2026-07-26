@@ -232,6 +232,8 @@ def _test_awh_result_uses_fixed_bias_uwham_and_tracks_progress(tmp_path):
     (writer.workdir / "awh_trajectory.xtc").write_bytes(b"xtc")
     (writer.workdir / "awh_trajectory_topology.pdb").write_text("END\n")
     (writer.workdir / "awh_trajectory_frames.csv").write_text("frame,state\n")
+    (writer.workdir / "awh_friction.yaml").write_text("ready: false\n")
+    (writer.workdir / "awh_friction_samples.csv").write_text("move,state\n")
     writer.update(
         "completed",
         analysis={
@@ -283,6 +285,11 @@ def _test_awh_result_uses_fixed_bias_uwham_and_tracks_progress(tmp_path):
     assert result["artifacts"]["awh_state_trace"] == "awh_state_trace.csv"
     assert result["artifacts"]["awh_diagnostics"] == "awh_diagnostics.yaml"
     assert result["artifacts"]["awh_trajectory"] == "awh_trajectory.xtc"
+    assert result["artifacts"]["awh_friction"] == "awh_friction.yaml"
+    assert (
+        result["artifacts"]["awh_friction_samples"]
+        == "awh_friction_samples.csv"
+    )
 
 
 def _test_failed_result_has_structured_error(tmp_path):

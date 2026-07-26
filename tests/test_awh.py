@@ -107,7 +107,13 @@ def _test_awh_analysis_defaults_are_normalized():
         "atom_selection": "!:HOH,WAT,NA,CL,K,CA",
     }
     assert settings["analysis"]["thresholds"]["min_adjacent_overlap"] == 0.03
+    assert settings["analysis"]["friction"] == {
+        "enabled": False,
+        "max_correlation_lag_moves": 50,
+        "min_effective_samples": 200,
+    }
     assert settings["adaptive"]["learning_rate_kbt"] == pytest.approx(0.1)
+    assert settings["adaptive"]["metric_target"]["enabled"] is False
     assert settings["atm_state_count"] == 4
 
 
@@ -141,6 +147,10 @@ def _test_awh_analysis_output_settings_do_not_change_dynamics_signature():
             "awh": {
                 "analysis": {
                     "trajectory": {"enabled": False, "interval_moves": 50},
+                    "friction": {
+                        "enabled": True,
+                        "max_correlation_lag_moves": 20,
+                    },
                     "thresholds": {"min_adjacent_overlap": 0.1},
                 }
             }
@@ -150,6 +160,125 @@ def _test_awh_analysis_output_settings_do_not_change_dynamics_signature():
     assert _protocol_signature(_atom_options(), first) == _protocol_signature(
         _atom_options(), second
     )
+
+
+def _test_awh_metric_target_changes_dynamics_signature():
+    from atom_openmm.awh import _protocol_signature, normalize_awh_options
+
+    first = normalize_awh_options({"awh": {}}, _atom_options())
+    second = normalize_awh_options(
+        {
+            "awh": {
+                "analysis": {"friction": {"enabled": True}},
+                "adaptive": {"metric_target": {"enabled": True}},
+            }
+        },
+        _atom_options(),
+    )
+    assert _protocol_signature(_atom_options(), first) != _protocol_signature(
+        _atom_options(), second
+    )
+
+
+def _test_disabled_metric_target_preserves_legacy_signature():
+    from copy import deepcopy
+
+    from atom_openmm.awh import _protocol_signature, normalize_awh_options
+
+    current = normalize_awh_options({"awh": {}}, _atom_options())
+    legacy = deepcopy(current)
+    legacy["adaptive"].pop("metric_target")
+    assert _protocol_signature(_atom_options(), current) == _protocol_signature(
+        _atom_options(), legacy
+    )
+
+
+def _test_generalized_force_uses_centered_and_endpoint_differences():
+    from atom_openmm.awh_friction import generalized_forces
+
+    values = {0: 0.0, 1: 1.0, 2: 4.0, 3: 9.0}
+    result = generalized_forces(values, [0, 1, 2, 3], 4)
+    assert result == pytest.approx({0: 1.0, 1: 2.0, 2: 4.0, 3: 5.0})
+
+
+def _test_correlated_force_has_larger_friction_than_white_noise():
+    from atom_openmm.awh_friction import FrictionAccumulator
+
+    rng = np.random.default_rng(11)
+    white = FrictionAccumulator(1, maximum_lag=40, sample_interval_ps=0.2)
+    correlated = FrictionAccumulator(1, maximum_lag=40, sample_interval_ps=0.2)
+    value = 0.0
+    for _ in range(5000):
+        white.update({0: (1.0, rng.normal())})
+        value = 0.9 * value + np.sqrt(1.0 - 0.9**2) * rng.normal()
+        correlated.update({0: (1.0, value)})
+    white_metric = white.records(minimum_effective_samples=200)[0]
+    correlated_metric = correlated.records(minimum_effective_samples=200)[0]
+    assert correlated_metric["friction_kbt2_ps_per_state2"] > (
+        5 * white_metric["friction_kbt2_ps_per_state2"]
+    )
+
+
+def _test_friction_checkpoint_and_summary_are_yaml_serializable():
+    import yaml
+
+    from atom_openmm.awh_friction import FrictionAccumulator, friction_summary
+
+    accumulator = FrictionAccumulator(2, maximum_lag=2, sample_interval_ps=0.2)
+    for value in (0.0, 1.0, -1.0, 0.5):
+        accumulator.update({0: (0.8, value), 1: (0.2, -value)})
+    restored = FrictionAccumulator.from_dict(accumulator.to_dict())
+    summary = friction_summary(restored, [{"name": "a"}, {"name": "b"}], 1)
+    yaml.safe_dump(summary)
+
+
+def _test_friction_target_is_uniform_or_capped():
+    from atom_openmm.awh_friction import friction_target
+
+    uniform = [
+        {"friction_kbt2_ps_per_state2": 4.0},
+        {"friction_kbt2_ps_per_state2": 4.0},
+        {"friction_kbt2_ps_per_state2": 4.0},
+    ]
+    assert friction_target(uniform) == pytest.approx([1 / 3] * 3)
+    uneven = [
+        {"friction_kbt2_ps_per_state2": 1.0},
+        {"friction_kbt2_ps_per_state2": 10000.0},
+        {"friction_kbt2_ps_per_state2": 1.0},
+    ]
+    target = friction_target(uneven, maximum_relative_weight=2.0)
+    assert target[1] > target[0]
+    assert target[1] / target[0] <= 4.0 + 1e-12
+
+
+def _test_friction_samples_reconcile_to_checkpoint(tmp_path):
+    import csv
+
+    from atom_openmm.awh_friction import (
+        FRICTION_SAMPLE_FIELDS,
+        reconcile_friction_samples,
+    )
+
+    path = tmp_path / "friction.csv"
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=FRICTION_SAMPLE_FIELDS)
+        writer.writeheader()
+        for move in (1, 2, 3):
+            writer.writerow(
+                {
+                    "move": move,
+                    "steps": move * 100,
+                    "stage": "adaptive",
+                    "state": 0,
+                    "state_name": "a",
+                    "probability": 1.0,
+                    "force_kbt_per_state": 0.0,
+                }
+            )
+    reconcile_friction_samples(path, 2)
+    with path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [int(row["move"]) for row in rows] == [1, 2]
 
 
 def _test_awh_diagnostics_report_rest2_returns_overlap_and_ess():

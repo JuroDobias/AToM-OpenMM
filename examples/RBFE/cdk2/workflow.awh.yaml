@@ -27,6 +27,12 @@ workflow:
       min_visits_per_state: 100
       covering_fraction: 0.8
       learning_rate_kbt: 0.1
+      metric_target:
+        enabled: false
+        min_round_trips: 2
+        update_interval_moves: 1000
+        smoothing: 0.2
+        max_relative_weight: 5.0
     production:
       steps: 5000000
       reduced_energy_interval_moves: 10
@@ -41,6 +47,10 @@ workflow:
         enabled: true
         interval_moves: 10
         atom_selection: '!:HOH,WAT,NA,CL,K,CA'
+      friction:
+        enabled: false
+        max_correlation_lag_moves: 50
+        min_effective_samples: 200
       thresholds:
         min_adjacent_overlap: 0.03
         min_endpoint_effective_samples: 50
