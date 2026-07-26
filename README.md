@@ -149,6 +149,11 @@ the user-supplied async-RE schedule. Optional generalized-force friction
 diagnostics identify slow graph regions and suggest a square-root-friction
 target. Applying that target remains disabled by default and requires a fresh
 dynamics checkpoint.
+Experimental `workflow.awh.state_sampling.method: hybrid_global_gibbs`
+reconstructs every physical ATM energy from one ATM decomposition, scans the
+REST2 endpoint states on-device, and draws from the complete graph. Direct
+energy validation is mandatory, and the full energy vector is reused for
+fixed-bias UWHAM/MBAR output.
 
 For production sampling, `failed_switch_policy: count_as_infinite` preserves recognized numerical switching failures as `+inf` protocol-work observations instead of selectively replacing them. CUDA/environment and programming failures still stop the run. Use `retry` for the previous replacement behavior or `abort` to stop at the first failed switch.
 

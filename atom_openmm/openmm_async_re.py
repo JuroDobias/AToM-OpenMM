@@ -17,6 +17,7 @@ from atom_openmm.local_openmm_transport import *
 from atom_openmm.ommreplica import *
 from atom_openmm.ommsystem import *
 from atom_openmm.ommworker import *
+from atom_openmm.atm_energy import multi_softplus_energy, softplus_energy
 
 class openmm_job(JobManager):
     def __init__(self, command_file, options):
@@ -347,21 +348,29 @@ class openmm_job_ATM(openmm_job):
 
     #evaluates the softplus function
     def _softplus(self, lambda1, lambda2, alpha, uh, w0, uf):
-        ee = 1.0 + math.exp(-alpha*(uf-uh))
-        softplusf = lambda2 * uf + w0
-        if alpha._value > 0.:
-            softplusf += ((lambda2 - lambda1)/alpha) * math.log(ee)
-        return softplusf
+        kj = kilojoules_per_mole
+        return softplus_energy(
+            lambda1,
+            lambda2,
+            alpha.value_in_unit(kj**-1),
+            uh.value_in_unit(kj),
+            w0.value_in_unit(kj),
+            uf.value_in_unit(kj),
+        ) * kj
 
     #evaluates the softplus function
     def _multi_softplus(self, lambda1, lambda2, lambda3, alpha, uh0, uh1, w0, uf):
-        f3 = lambda3*uf + w0
-        if alpha._value > 0.:
-            f2 = lambda2*uf + w0 + (lambda3 - lambda2)*uh1
-            f1 = lambda1*uf + w0 + (lambda3 - lambda2)*uh1 + (lambda2 - lambda1)*uh0
-            return math.log( (math.exp(alpha*f1) + math.exp(alpha*f2) + math.exp(alpha*f3))/3.0)/alpha
-        else:
-            return f3
+        kj = kilojoules_per_mole
+        return multi_softplus_energy(
+            lambda1,
+            lambda2,
+            lambda3,
+            alpha.value_in_unit(kj**-1),
+            uh0.value_in_unit(kj),
+            uh1.value_in_unit(kj),
+            w0.value_in_unit(kj),
+            uf.value_in_unit(kj),
+        ) * kj
 
     #customized getPot to return the unperturbed potential energy
     #of the replica U0 = U - W_lambda(u)
@@ -498,4 +507,3 @@ class openmm_job_RBFE(openmm_job_ATM):
         for node in self.compute_nodes:
             ommsys = OMMSystemRBFE(self.basename, self.keywords, pdbtopfile, systemfile, self.logger) 
             self.openmm_workers.append(ommworkercls(self.basename, ommsys, self.keywords, node_info = node, compute = True, logger = self.logger))
-

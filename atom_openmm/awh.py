@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import time
 from copy import deepcopy
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from atom_openmm.awh_friction import (
     generalized_forces,
     reconcile_friction_samples,
 )
+from atom_openmm.awh_global_gibbs import OMMWorkerAWHGlobalGibbs
 from atom_openmm.awh_trajectory import StateTaggedXTCReporter, write_subset_topology
 from atom_openmm.equilibration import AmberMaskResolver
 from atom_openmm.neqti import build_atm_state_parameters, split_two_leg_paths
@@ -84,11 +86,13 @@ def normalize_awh_options(workflow, atom_options):
     friction = analysis.get("friction") or {}
     thresholds = analysis.get("thresholds") or {}
     metric_target = adaptive.get("metric_target") or {}
+    state_sampling = raw.get("state_sampling") or {}
     if (
         not isinstance(trajectory, dict)
         or not isinstance(friction, dict)
         or not isinstance(thresholds, dict)
         or not isinstance(metric_target, dict)
+        or not isinstance(state_sampling, dict)
     ):
         raise AWHConfigError(
             "AWH trajectory, friction, thresholds, and metric_target settings "
@@ -108,6 +112,20 @@ def normalize_awh_options(workflow, atom_options):
         ),
         "initial_state_file": raw.get("initial_state_file"),
         "checkpoint_interval_moves": int(raw.get("checkpoint_interval_moves", 100)),
+        "state_sampling": {
+            "method": str(
+                state_sampling.get("method", "legacy_local_gibbs")
+            ).lower(),
+            "validation_interval_moves": int(
+                state_sampling.get("validation_interval_moves", 1000)
+            ),
+            "validation_states_per_check": int(
+                state_sampling.get("validation_states_per_check", 4)
+            ),
+            "validation_tolerance_kj_per_mol": float(
+                state_sampling.get("validation_tolerance_kj_per_mol", 0.05)
+            ),
+        },
         "adaptive": {
             "min_steps": int(adaptive.get("min_steps", 1_000_000)),
             "max_steps": int(adaptive.get("max_steps", 20_000_000)),
@@ -182,6 +200,14 @@ def normalize_awh_options(workflow, atom_options):
         raise AWHConfigError("workflow.awh.target_distribution currently must be 'uniform'")
     if settings["start_state"] not in {"a", "b"}:
         raise AWHConfigError("workflow.awh.start_state must be 'a' or 'b'")
+    if settings["state_sampling"]["method"] not in {
+        "legacy_local_gibbs",
+        "hybrid_global_gibbs",
+    }:
+        raise AWHConfigError(
+            "workflow.awh.state_sampling.method must be "
+            "'legacy_local_gibbs' or 'hybrid_global_gibbs'"
+        )
     positive = [
         settings["state_move_interval_steps"],
         settings["atm_state_count"],
@@ -195,6 +221,8 @@ def normalize_awh_options(workflow, atom_options):
         settings["analysis"]["friction"]["max_correlation_lag_moves"],
         settings["analysis"]["friction"]["min_effective_samples"],
         settings["adaptive"]["metric_target"]["update_interval_moves"],
+        settings["state_sampling"]["validation_interval_moves"],
+        settings["state_sampling"]["validation_states_per_check"],
     ]
     if any(value < 1 for value in positive):
         raise AWHConfigError("AWH step and interval settings must be positive")
@@ -208,6 +236,7 @@ def normalize_awh_options(workflow, atom_options):
         settings["initial_error_kj_per_mol"] <= 0
         or settings["diffusion_per_ps"] <= 0
         or settings["adaptive"]["learning_rate_kbt"] <= 0
+        or settings["state_sampling"]["validation_tolerance_kj_per_mol"] <= 0
     ):
         raise AWHConfigError("AWH initial error and diffusion must be positive")
     metric_target = settings["adaptive"]["metric_target"]
@@ -406,6 +435,137 @@ class AWHBias:
         return obj
 
 
+class GlobalGibbsDiagnostics:
+    """Online diagnostics for deciding whether truncated Gibbs would suffice."""
+
+    RADII = (1, 2, 4, 8, 16)
+
+    def __init__(self):
+        self.moves = 0
+        self.jump_counts = {}
+        self.jump_distance_sum = 0.0
+        self.jump_distance_squared_sum = 0.0
+        self.expected_jump_distance_sum = 0.0
+        self.radius_mass_sum = {radius: 0.0 for radius in self.RADII}
+        self.radius_mass_99 = {radius: 0 for radius in self.RADII}
+        self.radius_mass_999 = {radius: 0 for radius in self.RADII}
+        self.md_seconds = 0.0
+        self.energy_seconds = 0.0
+        self.selection_seconds = 0.0
+        self.validation_checks = 0
+        self.maximum_validation_error_kj_per_mol = 0.0
+
+    def update(self, previous, selected, probabilities):
+        probabilities = np.asarray(probabilities, dtype=float)
+        indices = np.arange(len(probabilities))
+        distances = np.abs(indices - int(previous))
+        jump = abs(int(selected) - int(previous))
+        self.moves += 1
+        self.jump_counts[jump] = self.jump_counts.get(jump, 0) + 1
+        self.jump_distance_sum += jump
+        self.jump_distance_squared_sum += jump * jump
+        expected = float(np.dot(probabilities, distances))
+        self.expected_jump_distance_sum += expected
+        for radius in self.RADII:
+            mass = float(probabilities[distances <= radius].sum())
+            self.radius_mass_sum[radius] += mass
+            self.radius_mass_99[radius] += int(mass >= 0.99)
+            self.radius_mass_999[radius] += int(mass >= 0.999)
+        return expected
+
+    def record_validation(self, maximum_error):
+        self.validation_checks += 1
+        self.maximum_validation_error_kj_per_mol = max(
+            self.maximum_validation_error_kj_per_mol,
+            float(maximum_error),
+        )
+
+    def to_dict(self):
+        moves = max(1, self.moves)
+        mean = self.jump_distance_sum / moves
+        variance = max(
+            0.0,
+            self.jump_distance_squared_sum / moves - mean * mean,
+        )
+        return {
+            "schema_version": 1,
+            "moves": self.moves,
+            "jump_distance_histogram": {
+                str(key): value for key, value in sorted(self.jump_counts.items())
+            },
+            "mean_jump_distance": mean if self.moves else None,
+            "jump_distance_std": math.sqrt(variance) if self.moves else None,
+            "mean_conditional_expected_jump_distance": (
+                self.expected_jump_distance_sum / moves if self.moves else None
+            ),
+            "truncated_probability_mass": {
+                str(radius): {
+                    "mean": self.radius_mass_sum[radius] / moves,
+                    "fraction_at_least_0.99": self.radius_mass_99[radius] / moves,
+                    "fraction_at_least_0.999": self.radius_mass_999[radius] / moves,
+                }
+                for radius in self.RADII
+            },
+            "timing_seconds": {
+                "md": self.md_seconds,
+                "energy_scan": self.energy_seconds,
+                "selection": self.selection_seconds,
+                "total_per_move": (
+                    (
+                        self.md_seconds
+                        + self.energy_seconds
+                        + self.selection_seconds
+                    )
+                    / moves
+                    if self.moves
+                    else None
+                ),
+            },
+            "validation": {
+                "checks": self.validation_checks,
+                "maximum_error_kj_per_mol": self.maximum_validation_error_kj_per_mol,
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        value = cls()
+        value.moves = int(data.get("moves", 0))
+        value.jump_counts = {
+            int(key): int(count)
+            for key, count in data.get("jump_distance_histogram", {}).items()
+        }
+        mean = data.get("mean_jump_distance")
+        std = data.get("jump_distance_std")
+        if mean is not None:
+            value.jump_distance_sum = float(mean) * value.moves
+            value.jump_distance_squared_sum = (
+                float(std or 0.0) ** 2 + float(mean) ** 2
+            ) * value.moves
+        expected = data.get("mean_conditional_expected_jump_distance")
+        if expected is not None:
+            value.expected_jump_distance_sum = float(expected) * value.moves
+        for radius in value.RADII:
+            row = data.get("truncated_probability_mass", {}).get(str(radius), {})
+            value.radius_mass_sum[radius] = float(row.get("mean", 0.0)) * value.moves
+            value.radius_mass_99[radius] = round(
+                float(row.get("fraction_at_least_0.99", 0.0)) * value.moves
+            )
+            value.radius_mass_999[radius] = round(
+                float(row.get("fraction_at_least_0.999", 0.0)) * value.moves
+            )
+        timing = data.get("timing_seconds", {})
+        value.md_seconds = float(timing.get("md", 0.0))
+        value.energy_seconds = float(timing.get("energy_scan", 0.0))
+        value.selection_seconds = float(timing.get("selection", 0.0))
+        validation = data.get("validation", {})
+        value.validation_checks = int(validation.get("checks", 0))
+        value.maximum_validation_error_kj_per_mol = float(
+            validation.get("maximum_error_kj_per_mol", 0.0)
+        )
+        return value
+
+
 def estimate_mbar(reduced_energies, sampled_states, nstates, max_iterations=10000):
     u_nk = np.asarray(reduced_energies, dtype=float)
     sampled_states = np.asarray(sampled_states, dtype=int)
@@ -464,6 +624,9 @@ def _protocol_signature(options, settings):
     metric_target = dynamics_settings.get("adaptive", {}).get("metric_target")
     if metric_target is not None and not metric_target.get("enabled", False):
         dynamics_settings["adaptive"].pop("metric_target")
+    state_sampling = dynamics_settings.get("state_sampling")
+    if state_sampling is not None and state_sampling.get("method") == "legacy_local_gibbs":
+        dynamics_settings.pop("state_sampling")
     payload = {
         "schema_version": 1,
         "schedule": [
@@ -609,8 +772,21 @@ def run_awh(options, awh_options=None, progress_callback=None):
         "slot_number": "0:0",
         "threads_number": "1",
     }
-    worker = OMMWorkerATMSync(
-        basename, ommsystem, system_options, node_info=node_info, compute=False, logger=logger
+    global_sampling = (
+        settings["state_sampling"]["method"] == "hybrid_global_gibbs"
+    )
+    worker_class = OMMWorkerAWHGlobalGibbs if global_sampling else OMMWorkerATMSync
+    worker_kwargs = {}
+    if global_sampling:
+        worker_kwargs.update(atm_states=atm_states, graph=graph)
+    worker = worker_class(
+        basename,
+        ommsystem,
+        system_options,
+        node_info=node_info,
+        compute=False,
+        logger=logger,
+        **worker_kwargs,
     )
     worker.platform = platform
     worker.platform_properties = platform_properties
@@ -626,8 +802,30 @@ def run_awh(options, awh_options=None, progress_callback=None):
         value = worker.context.getState(getEnergy=True).getPotentialEnergy()
         return value.value_in_unit(unit.kilojoule_per_mole)
 
+    def validate_global_energies(analytical, indices):
+        direct = []
+        for index in indices:
+            direct.append(energy(index))
+        apply_node(current)
+        errors = np.abs(np.asarray(direct) - np.asarray(analytical)[indices])
+        maximum = float(np.max(errors)) if len(errors) else 0.0
+        global_diagnostics.record_validation(maximum)
+        tolerance = settings["state_sampling"][
+            "validation_tolerance_kj_per_mol"
+        ]
+        if maximum > tolerance:
+            worst = int(indices[int(np.argmax(errors))])
+            raise AWHConfigError(
+                "hybrid global-Gibbs energy validation failed for "
+                f"{graph[worst]['name']}: error {maximum:.6g} kJ/mol exceeds "
+                f"{tolerance:.6g} kJ/mol"
+            )
+
     beta = 1.0 / (R_KJ_MOL_K * float(options["TEMPERATURES"][0]))
-    timestep_ps = worker.integrator.getStepSize().value_in_unit(unit.picosecond)
+    dynamics_integrator = (
+        worker.equilibrium_integrator if global_sampling else worker.integrator
+    )
+    timestep_ps = dynamics_integrator.getStepSize().value_in_unit(unit.picosecond)
     initial_histogram = max(
         1.0,
         1.0
@@ -649,6 +847,7 @@ def run_awh(options, awh_options=None, progress_callback=None):
         friction_settings["max_correlation_lag_moves"],
         settings["state_move_interval_steps"] * timestep_ps,
     )
+    global_diagnostics = GlobalGibbsDiagnostics()
     stage = "adaptive"
     total_steps = 0
     production_steps_completed = 0
@@ -656,6 +855,7 @@ def run_awh(options, awh_options=None, progress_callback=None):
     last_endpoint = current if current in (a_index, b_index) else None
     crossed = False
     transitions = np.zeros((len(graph), len(graph)), dtype=np.int64)
+    restored_move = None
     if settings["resume"] and state_path.exists() and xml_path.exists():
         with state_path.open() as handle:
             saved = yaml.safe_load(handle) or {}
@@ -670,8 +870,13 @@ def run_awh(options, awh_options=None, progress_callback=None):
             saved.get("transitions", transitions.tolist()), dtype=np.int64
         )
         stage = saved["stage"]
+        restored_move = int(saved.get("move", saved["awh"]["updates"]))
         awh = AWHBias.from_dict(saved["awh"])
         saved_friction = saved.get("friction")
+        if global_sampling and saved.get("global_gibbs"):
+            global_diagnostics = GlobalGibbsDiagnostics.from_dict(
+                saved["global_gibbs"]
+            )
         if friction_settings["enabled"] and saved_friction:
             restored_friction = FrictionAccumulator.from_dict(saved_friction)
             if (
@@ -703,6 +908,13 @@ def run_awh(options, awh_options=None, progress_callback=None):
             worker.simulation.saveState("awh_start_B.xml")
             logger.info("Completed independent AWH B-start preparation")
     apply_node(current)
+    if global_sampling and global_diagnostics.validation_checks == 0:
+        initial_energies = worker.all_graph_energies()
+        validate_global_energies(initial_energies, list(range(len(graph))))
+        logger.info(
+            "Hybrid global-Gibbs initial energy validation passed for %d states",
+            len(graph),
+        )
 
     trace_fields = [
         "move",
@@ -718,6 +930,9 @@ def run_awh(options, awh_options=None, progress_callback=None):
         "stay_probability",
         "right_state",
         "right_probability",
+        "selected_probability",
+        "jump_distance",
+        "conditional_expected_jump_distance",
         "round_trips",
         "minimum_visits",
     ]
@@ -726,7 +941,7 @@ def run_awh(options, awh_options=None, progress_callback=None):
         trace_fields,
         a_index if settings["start_state"] == "a" else b_index,
     )
-    move = awh.updates
+    move = awh.updates if restored_move is None else restored_move
     if friction_settings["enabled"]:
         reconcile_friction_samples(friction_samples_path, move)
 
@@ -823,6 +1038,7 @@ def run_awh(options, awh_options=None, progress_callback=None):
                 "schema_version": 1,
                 "signature": signature,
                 "stage": stage,
+                "move": move,
                 "current_state": current,
                 "total_steps": total_steps,
                 "production_steps_completed": production_steps_completed,
@@ -835,6 +1051,9 @@ def run_awh(options, awh_options=None, progress_callback=None):
                     friction_accumulator.to_dict()
                     if friction_settings["enabled"]
                     else None
+                ),
+                "global_gibbs": (
+                    global_diagnostics.to_dict() if global_sampling else None
                 ),
                 "rng_state": rng.bit_generator.state,
             },
@@ -867,6 +1086,9 @@ def run_awh(options, awh_options=None, progress_callback=None):
             "overlap_score": quality["uwham"]["minimum_adjacent_overlap"],
             "rest2": quality["rest2"],
             "diagnostics": quality,
+            "global_gibbs": (
+                global_diagnostics.to_dict() if global_sampling else None
+            ),
             "analysis": {
                 "awh_bias_ddg_kcal_per_mol": ddg,
                 "uwham_ddg_kcal_per_mol": None,
@@ -874,7 +1096,13 @@ def run_awh(options, awh_options=None, progress_callback=None):
             },
         }
 
-    def append_trace(previous, candidates, probabilities, reduced):
+    def append_trace(
+        previous,
+        candidates,
+        probabilities,
+        reduced,
+        conditional_expected_jump_distance=None,
+    ):
         probability_by_state = dict(zip(candidates, probabilities))
         energy_by_state = dict(zip(candidates, reduced))
         with trace_path.open("a", newline="") as handle:
@@ -895,24 +1123,56 @@ def run_awh(options, awh_options=None, progress_callback=None):
                         previous + 1 if previous + 1 < len(graph) else ""
                     ),
                     "right_probability": probability_by_state.get(previous + 1, ""),
+                    "selected_probability": probability_by_state.get(current, ""),
+                    "jump_distance": abs(current - previous),
+                    "conditional_expected_jump_distance": (
+                        ""
+                        if conditional_expected_jump_distance is None
+                        else conditional_expected_jump_distance
+                    ),
                     "round_trips": round_trips,
                     "minimum_visits": int(np.min(awh.visits)),
                 }
             )
 
     def evaluate_state_move(update_bias):
-        candidates = _neighbors(current, len(graph))
-        evaluation_radius = 2 if friction_settings["enabled"] else 1
-        evaluation_states = list(
-            range(
-                max(0, current - evaluation_radius),
-                min(len(graph), current + evaluation_radius + 1),
+        energy_started = time.perf_counter()
+        if global_sampling:
+            candidates = list(range(len(graph)))
+            all_energies = worker.all_graph_energies()
+            reduced_by_state = {
+                index: beta * value for index, value in enumerate(all_energies)
+            }
+            global_diagnostics.energy_seconds += time.perf_counter() - energy_started
+            validation = settings["state_sampling"]
+            if (
+                (move + 1) % validation["validation_interval_moves"] == 0
+            ):
+                physical = [
+                    index
+                    for index, node in enumerate(graph)
+                    if not node["kind"].startswith("rest2_")
+                ]
+                count = min(validation["validation_states_per_check"], len(physical))
+                selected = sorted(
+                    int(value)
+                    for value in rng.choice(physical, size=count, replace=False)
+                )
+                validate_global_energies(all_energies, selected)
+        else:
+            candidates = _neighbors(current, len(graph))
+            evaluation_radius = 2 if friction_settings["enabled"] else 1
+            evaluation_states = list(
+                range(
+                    max(0, current - evaluation_radius),
+                    min(len(graph), current + evaluation_radius + 1),
+                )
             )
-        )
-        reduced_by_state = {
-            index: beta * energy(index) for index in evaluation_states
-        }
+            reduced_by_state = {
+                index: beta * energy(index) for index in evaluation_states
+            }
         reduced = [reduced_by_state[index] for index in candidates]
+        selection_started = time.perf_counter()
         probabilities = awh.probabilities(reduced, candidates)
         if friction_settings["enabled"]:
             probability_by_state = dict(zip(candidates, probabilities))
@@ -964,14 +1224,26 @@ def run_awh(options, awh_options=None, progress_callback=None):
                         (1.0 - smoothing) * awh.target + smoothing * target
                     )
                     awh.target /= awh.target.sum()
+        if global_sampling:
+            global_diagnostics.selection_seconds += (
+                time.perf_counter() - selection_started
+            )
         return candidates, probabilities, reduced
 
     while stage == "adaptive":
+        md_started = time.perf_counter()
         worker.run(settings["state_move_interval_steps"])
+        if global_sampling:
+            global_diagnostics.md_seconds += time.perf_counter() - md_started
         total_steps += settings["state_move_interval_steps"]
         previous = current
         candidates, probabilities, reduced = evaluate_state_move(True)
         current = int(rng.choice(candidates, p=probabilities))
+        expected_jump = None
+        if global_sampling:
+            expected_jump = global_diagnostics.update(
+                previous, current, probabilities
+            )
         transitions[previous, current] += 1
         awh.visits[current] += 1
         apply_node(current)
@@ -982,7 +1254,13 @@ def run_awh(options, awh_options=None, progress_callback=None):
                     round_trips += 1
             last_endpoint = current
         move += 1
-        append_trace(previous, candidates, probabilities, reduced)
+        append_trace(
+            previous,
+            candidates,
+            probabilities,
+            reduced,
+            expected_jump,
+        )
         adaptive = settings["adaptive"]
         covered = np.count_nonzero(awh.visits) / len(graph) >= adaptive["covering_fraction"]
         converged = (
@@ -1024,12 +1302,20 @@ def run_awh(options, awh_options=None, progress_callback=None):
     sampled_states = []
     matrices = []
     while production_steps_completed < settings["production"]["steps"]:
+        md_started = time.perf_counter()
         worker.run(settings["state_move_interval_steps"])
+        if global_sampling:
+            global_diagnostics.md_seconds += time.perf_counter() - md_started
         total_steps += settings["state_move_interval_steps"]
         production_steps_completed += settings["state_move_interval_steps"]
         previous = current
         candidates, probabilities, reduced = evaluate_state_move(False)
         current = int(rng.choice(candidates, p=probabilities))
+        expected_jump = None
+        if global_sampling:
+            expected_jump = global_diagnostics.update(
+                previous, current, probabilities
+            )
         transitions[previous, current] += 1
         awh.visits[current] += 1
         apply_node(current)
@@ -1040,17 +1326,28 @@ def run_awh(options, awh_options=None, progress_callback=None):
                     round_trips += 1
             last_endpoint = current
         move += 1
-        append_trace(previous, candidates, probabilities, reduced)
+        append_trace(
+            previous,
+            candidates,
+            probabilities,
+            reduced,
+            expected_jump,
+        )
         if move % settings["production"]["reduced_energy_interval_moves"] == 0:
-            row = [beta * energy(index) for index in range(len(graph))]
-            apply_node(current)
+            if global_sampling:
+                row = list(reduced)
+                sampled_state = previous
+            else:
+                row = [beta * energy(index) for index in range(len(graph))]
+                apply_node(current)
+                sampled_state = current
             matrices.append(row)
-            sampled_states.append(current)
+            sampled_states.append(sampled_state)
             with matrix_path.open("a", newline="") as handle:
                 writer = csv.writer(handle)
                 if handle.tell() == 0:
                     writer.writerow(["sampled_state", *[node["name"] for node in graph]])
-                writer.writerow([current, *row])
+                writer.writerow([sampled_state, *row])
         if move % settings["checkpoint_interval_moves"] == 0:
             checkpoint()
             live_summary = summary()

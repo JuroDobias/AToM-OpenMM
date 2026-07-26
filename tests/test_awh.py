@@ -180,6 +180,193 @@ def _test_awh_metric_target_changes_dynamics_signature():
     )
 
 
+def _test_awh_state_sampling_defaults_preserve_legacy_signature():
+    from atom_openmm.awh import _protocol_signature, normalize_awh_options
+
+    omitted = normalize_awh_options({"awh": {}}, _atom_options())
+    explicit = normalize_awh_options(
+        {"awh": {"state_sampling": {"method": "legacy_local_gibbs"}}},
+        _atom_options(),
+    )
+    global_gibbs = normalize_awh_options(
+        {"awh": {"state_sampling": {"method": "hybrid_global_gibbs"}}},
+        _atom_options(),
+    )
+    assert omitted["state_sampling"]["method"] == "legacy_local_gibbs"
+    assert _protocol_signature(_atom_options(), omitted) == _protocol_signature(
+        _atom_options(), explicit
+    )
+    assert _protocol_signature(_atom_options(), omitted) != _protocol_signature(
+        _atom_options(), global_gibbs
+    )
+
+
+def _test_atm_energy_reconstructs_both_directions():
+    from openmm import unit
+
+    from atom_openmm.atm_energy import reconstruct_atm_energies
+    from atom_openmm.neqti import build_atm_state_parameters
+
+    states = build_atm_state_parameters(_atom_options())
+    energies = reconstruct_atm_energies(
+        states,
+        reference_total_energy=103.0,
+        reference_bias_energy=3.0,
+        reference_direction=1,
+        u0=20.0,
+        u1=25.0,
+    )
+    assert energies.shape == (4,)
+    assert energies[0] == pytest.approx(100.0)
+    assert energies[-1] == pytest.approx(105.0)
+    assert np.isfinite(energies).all()
+    assert states[0]["uoffset"].value_in_unit(unit.kilojoule_per_mole) == 0.0
+
+
+def _test_atm_softcore_matches_reference_expression():
+    from atom_openmm.atm_energy import softcore_perturbation_energy
+
+    energy = 150.0
+    maximum = 200.0
+    core = 100.0
+    exponent = 0.0625
+    reduced = (energy - core) / (exponent * (maximum - core))
+    zeta = 1.0 + 2.0 * reduced * (reduced + 1.0)
+    expected = (
+        (maximum - core)
+        * (zeta**exponent - 1.0)
+        / (zeta**exponent + 1.0)
+        + core
+    )
+    assert softcore_perturbation_energy(
+        energy, maximum, core, exponent
+    ) == pytest.approx(expected)
+
+
+def _test_global_gibbs_diagnostics_reports_truncated_mass():
+    from atom_openmm.awh import GlobalGibbsDiagnostics
+
+    diagnostics = GlobalGibbsDiagnostics()
+    expected = diagnostics.update(
+        previous=3,
+        selected=5,
+        probabilities=np.asarray([0.0, 0.0, 0.1, 0.7, 0.1, 0.1, 0.0]),
+    )
+    result = diagnostics.to_dict()
+    assert expected == pytest.approx(0.4)
+    assert result["jump_distance_histogram"] == {"2": 1}
+    assert result["truncated_probability_mass"]["1"]["mean"] == pytest.approx(0.9)
+
+
+def _test_rest2_scan_integrator_preserves_coordinates_and_time():
+    import openmm as mm
+    from openmm import unit
+
+    from atom_openmm.awh_global_gibbs import AWHREST2EnergyScanIntegrator
+    from atom_openmm.neqti import build_atm_state_parameters
+
+    class _ATMForceNames:
+        @staticmethod
+        def Lambda1():
+            return "Lambda1"
+
+        @staticmethod
+        def Lambda2():
+            return "Lambda2"
+
+        @staticmethod
+        def Alpha():
+            return "Alpha"
+
+        @staticmethod
+        def Uh():
+            return "Uh"
+
+        @staticmethod
+        def W0():
+            return "W0"
+
+        @staticmethod
+        def Direction():
+            return "Direction"
+
+        @staticmethod
+        def Umax():
+            return "Umax"
+
+        @staticmethod
+        def Ubcore():
+            return "Ubcore"
+
+        @staticmethod
+        def Acore():
+            return "Acore"
+
+    class _REST2:
+        parameters = {"a": ("REST_A", "REST_A_SQRT")}
+
+    class _OMMSystem:
+        atmforce = _ATMForceNames()
+        multisoftplus = False
+        rest2_system = _REST2()
+
+    system = mm.System()
+    system.addParticle(1.0)
+    force = mm.CustomExternalForce("Lambda2 + REST_A + REST_A_SQRT")
+    for name in (
+        "Lambda1",
+        "Lambda2",
+        "Alpha",
+        "Uh",
+        "W0",
+        "Direction",
+        "Umax",
+        "Ubcore",
+        "Acore",
+        "UOffset",
+        "REST_A",
+        "REST_A_SQRT",
+    ):
+        force.addGlobalParameter(name, 0.0)
+    force.addParticle(0, [])
+    system.addForce(force)
+    states = build_atm_state_parameters(_atom_options())
+    graph = [
+        {
+            "kind": "rest2_a",
+            "atm_state": 0,
+            "rest2": {"a": 0.25},
+        },
+        {
+            "kind": "physical",
+            "atm_state": 0,
+            "rest2": {"a": 1.0},
+        },
+    ]
+    integrator = AWHREST2EnergyScanIntegrator(_OMMSystem(), states, graph)
+    context = mm.Context(system, integrator, mm.Platform.getPlatformByName("Reference"))
+    context.setPositions([[0.25, 0.0, 0.0]])
+    context.setVelocities([[0.5, 0.0, 0.0]])
+    before = context.getState(getPositions=True, getVelocities=True)
+    integrator.step(1)
+    after = context.getState(getPositions=True, getVelocities=True)
+    assert integrator.scanned_energies()[0] == pytest.approx(0.75)
+    assert integrator.reference_energy() == pytest.approx(2.0)
+    assert np.allclose(
+        before.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+        after.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+    )
+    assert np.allclose(
+        before.getVelocities(asNumpy=True).value_in_unit(
+            unit.nanometer / unit.picosecond
+        ),
+        after.getVelocities(asNumpy=True).value_in_unit(
+            unit.nanometer / unit.picosecond
+        ),
+    )
+    assert after.getTime().value_in_unit(unit.picosecond) == pytest.approx(0.0)
+
+
 def _test_disabled_metric_target_preserves_legacy_signature():
     from copy import deepcopy
 

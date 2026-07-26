@@ -296,6 +296,11 @@ workflow:
   production_method: awh
   awh:
     state_move_interval_steps: 500
+    state_sampling:
+      method: hybrid_global_gibbs
+      validation_interval_moves: 1000
+      validation_states_per_check: 4
+      validation_tolerance_kj_per_mol: 0.05
     # Optional interpolation of the original 22-state schedule.
     # atm_state_count: 100
     start_state: a
@@ -360,14 +365,29 @@ checkpoint and input compatibility, but they do not affect this fixed-rate
 update.
 
 `atm_state_count` can interpolate the two original ATM half paths while
-preserving separate M+ and M- nodes. Local state proposals still evaluate only
-the current and neighboring Hamiltonians, so their force-evaluation cost does
-not increase with the total state count. A nearest-neighbor random walk does,
-however, require approximately the square of the number of nodes to traverse
-the graph, and complete reduced-energy rows scale linearly with state count.
-For approximately 100 ATM states, use a shorter state interval such as
-`state_move_interval_steps: 100` and retain enough adaptive steps for the
-configured round trips.
+preserving separate M+ and M- nodes. The default
+`state_sampling.method: legacy_local_gibbs` evaluates the current and
+neighboring Hamiltonians and preserves existing checkpoints. A nearest-neighbor
+random walk requires approximately the square of the number of nodes to
+traverse the graph.
+
+The experimental `hybrid_global_gibbs` method instead samples once from all
+graph states after every MD block. It obtains one physical ATM decomposition,
+reconstructs all physical ATM energies analytically, and scans only the REST2
+hot endpoint states with a device-side OpenMM integrator. The resulting full
+probability vector updates the adaptive bias and is reused directly for
+production UWHAM/MBAR rows. This avoids one host-driven force evaluation per
+ATM state. An initial exhaustive comparison and periodic random direct checks
+must remain within `validation_tolerance_kj_per_mol`; a mismatch stops the run
+rather than silently using approximate energies.
+
+Hybrid global-Gibbs diagnostics in `awh_summary.yaml` include selected jump
+distances, conditional expected jump distance, probability mass captured by
+local radii 1, 2, 4, 8, and 16, energy-scan and MD timing, and the largest
+validation error. These data show whether a cheaper truncated Gibbs scan would
+be justified on a later implementation. For approximately 100 ATM states,
+consider a shorter interval such as `state_move_interval_steps: 100` and retain
+enough adaptive steps for the configured round trips.
 
 `awh_protocol.yaml` fingerprints the ATM schedule, REST2 selections, ladder,
 and AWH settings. Resume restores coordinates, velocities, RNG state, current
