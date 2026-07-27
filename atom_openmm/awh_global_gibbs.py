@@ -35,6 +35,16 @@ class AWHREST2EnergyScanIntegrator(mm.CustomIntegrator):
     def __init__(self, ommsystem, atm_states, graph, reference_atm_state=0):
         super().__init__(0.0)
         self._energy_variables = {}
+        environment_groups = sorted(
+            {
+                int(ommsystem.system.getForce(index).getForceGroup())
+                for index in range(ommsystem.system.getNumForces())
+                if int(ommsystem.system.getForce(index).getForceGroup())
+                != int(ommsystem.atmforcegroup)
+            }
+        )
+        if not environment_groups:
+            raise ValueError("AWH global Gibbs found no non-ATM force groups")
         reference_node = {
             "atm_state": int(reference_atm_state),
             "rest2": {"a": 1.0, "b": 1.0},
@@ -58,6 +68,11 @@ class AWHREST2EnergyScanIntegrator(mm.CustomIntegrator):
             self.addComputeGlobal(name, f"{float(value):.17g}")
         self.addGlobalVariable("awh_reference_energy", 0.0)
         self.addComputeGlobal("awh_reference_energy", "energy")
+        self.addGlobalVariable("awh_environment_energy", 0.0)
+        self.addComputeGlobal(
+            "awh_environment_energy",
+            "+".join(f"energy{group}" for group in environment_groups),
+        )
 
     def scanned_energies(self):
         return {
@@ -67,6 +82,9 @@ class AWHREST2EnergyScanIntegrator(mm.CustomIntegrator):
 
     def reference_energy(self):
         return self.getGlobalVariableByName("awh_reference_energy")
+
+    def environment_energy(self):
+        return self.getGlobalVariableByName("awh_environment_energy")
 
 
 class OMMWorkerAWHGlobalGibbs(OMMWorkerATMSync):
@@ -112,16 +130,16 @@ class OMMWorkerAWHGlobalGibbs(OMMWorkerATMSync):
         self.last_energy_decomposition = {
             "reference_energy_kj_per_mol": self.scan_integrator.reference_energy(),
             "reference_atm_energy_kj_per_mol": _energy_value(bias),
+            "environment_energy_kj_per_mol": (
+                self.scan_integrator.environment_energy()
+            ),
             "u0_kj_per_mol": _energy_value(u0),
             "u1_kj_per_mol": _energy_value(u1),
         }
         physical = reconstruct_atm_energies(
             self._awh_atm_states,
-            reference_total_energy=self.last_energy_decomposition[
-                "reference_energy_kj_per_mol"
-            ],
-            reference_atm_energy=self.last_energy_decomposition[
-                "reference_atm_energy_kj_per_mol"
+            environment_energy=self.last_energy_decomposition[
+                "environment_energy_kj_per_mol"
             ],
             u0=self.last_energy_decomposition["u0_kj_per_mol"],
             u1=self.last_energy_decomposition["u1_kj_per_mol"],

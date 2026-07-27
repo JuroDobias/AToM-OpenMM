@@ -311,6 +311,22 @@ def _test_atm_energy_reconstructs_both_directions():
     assert states[0]["uoffset"].value_in_unit(unit.kilojoule_per_mole) == 0.0
 
 
+def _test_atm_energy_uses_direct_environment_without_large_subtraction():
+    from atom_openmm.atm_energy import reconstruct_atm_energies
+    from atom_openmm.neqti import build_atm_state_parameters
+
+    states = build_atm_state_parameters(_atom_options())
+    energies = reconstruct_atm_energies(
+        states,
+        environment_energy=-615522.0,
+        u0=1.2933610693463407e20,
+        u1=-615502.0,
+    )
+
+    assert np.isfinite(energies).all()
+    assert energies[-1] == pytest.approx(-1231024.0)
+
+
 def _test_atm_softcore_matches_reference_expression():
     from atom_openmm.atm_energy import softcore_perturbation_energy
 
@@ -417,7 +433,12 @@ def _test_rest2_scan_integrator_preserves_coordinates_and_time():
     ):
         force.addGlobalParameter(name, 0.0)
     force.addParticle(0, [])
+    force.setForceGroup(1)
     system.addForce(force)
+    environment_force = mm.CustomExternalForce("7")
+    environment_force.addParticle(0, [])
+    environment_force.setForceGroup(0)
+    system.addForce(environment_force)
     states = build_atm_state_parameters(_atom_options())
     graph = [
         {
@@ -431,15 +452,19 @@ def _test_rest2_scan_integrator_preserves_coordinates_and_time():
             "rest2": {"a": 1.0},
         },
     ]
-    integrator = AWHREST2EnergyScanIntegrator(_OMMSystem(), states, graph)
+    ommsystem = _OMMSystem()
+    ommsystem.system = system
+    ommsystem.atmforcegroup = 1
+    integrator = AWHREST2EnergyScanIntegrator(ommsystem, states, graph)
     context = mm.Context(system, integrator, mm.Platform.getPlatformByName("Reference"))
     context.setPositions([[0.25, 0.0, 0.0]])
     context.setVelocities([[0.5, 0.0, 0.0]])
     before = context.getState(getPositions=True, getVelocities=True)
     integrator.step(1)
     after = context.getState(getPositions=True, getVelocities=True)
-    assert integrator.scanned_energies()[0] == pytest.approx(0.75)
-    assert integrator.reference_energy() == pytest.approx(2.0)
+    assert integrator.scanned_energies()[0] == pytest.approx(7.75)
+    assert integrator.reference_energy() == pytest.approx(9.0)
+    assert integrator.environment_energy() == pytest.approx(7.0)
     assert np.allclose(
         before.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
         after.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
@@ -628,6 +653,25 @@ def _test_friction_samples_reconcile_to_checkpoint(tmp_path):
                 }
             )
     reconcile_friction_samples(path, 2)
+    with path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [int(row["move"]) for row in rows] == [1, 2]
+
+
+def _test_awh_trace_reconciles_to_checkpoint_move(tmp_path):
+    import csv
+
+    from atom_openmm.awh import _reconcile_move_csv
+
+    path = tmp_path / "trace.csv"
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["move", "state"])
+        writer.writeheader()
+        for move in (1, 2, 3):
+            writer.writerow({"move": move, "state": move})
+
+    _reconcile_move_csv(path, 2)
+
     with path.open(newline="") as handle:
         rows = list(csv.DictReader(handle))
     assert [int(row["move"]) for row in rows] == [1, 2]

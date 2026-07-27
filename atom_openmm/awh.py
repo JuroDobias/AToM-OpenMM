@@ -842,6 +842,29 @@ def _ensure_trace_schema(path, fields, initial_state):
     os.replace(temporary, path)
 
 
+def _reconcile_move_csv(path, checkpoint_move):
+    if not path.exists():
+        return
+    with path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        fields = reader.fieldnames or []
+        if "move" not in fields:
+            return
+        rows = []
+        for row in reader:
+            try:
+                if int(row["move"]) <= int(checkpoint_move):
+                    rows.append(row)
+            except (KeyError, TypeError, ValueError):
+                continue
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(temporary, path)
+
+
 def run_awh(options, awh_options=None, progress_callback=None):
     settings = awh_options or normalize_awh_options({"awh": {}}, options)
     logger = logging.getLogger("atom_openmm.awh")
@@ -1185,6 +1208,9 @@ def run_awh(options, awh_options=None, progress_callback=None):
         a_index if settings["start_state"] == "a" else b_index,
     )
     move = awh.updates if restored_move is None else restored_move
+    if restored_move is not None:
+        _reconcile_move_csv(trace_path, restored_move)
+        _reconcile_move_csv(bias_path, restored_move)
     if friction_settings["enabled"]:
         reconcile_friction_samples(friction_samples_path, move)
 
