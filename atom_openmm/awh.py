@@ -109,6 +109,55 @@ def normalize_awh_options(workflow, atom_options):
         float(value)
         for value in refinement.get("learning_rates_kbt", [learning_rate_kbt])
     ]
+    refinement_settings = {
+        "enabled": bool(refinement.get("enabled", False)),
+        "learning_rates_kbt": refinement_rates,
+        "min_steps_per_stage": int(
+            refinement.get("min_steps_per_stage", 500_000)
+        ),
+        "min_round_trips_per_stage": int(
+            refinement.get("min_round_trips_per_stage", 2)
+        ),
+        "min_visits_per_state": int(
+            refinement.get("min_visits_per_state", 20)
+        ),
+        "covering_fraction": float(
+            refinement.get("covering_fraction", 1.0)
+        ),
+    }
+    for key, converter in (
+        ("min_target_occupancy_overlap", float),
+        ("rest2_hot_fraction_tolerance", float),
+        ("occupancy_half_life_moves", int),
+    ):
+        if key in refinement:
+            refinement_settings[key] = converter(refinement[key])
+    frozen_validation_settings = {
+        "min_steps": int(
+            frozen_validation.get("min_steps", 500_000)
+        ),
+        "max_steps": int(
+            frozen_validation.get("max_steps", 2_000_000)
+        ),
+        "min_round_trips": int(
+            frozen_validation.get("min_round_trips", 2)
+        ),
+        "min_visits_per_state": int(
+            frozen_validation.get("min_visits_per_state", 10)
+        ),
+        "min_uniform_occupancy_overlap": float(
+            frozen_validation.get(
+                "min_target_occupancy_overlap",
+                frozen_validation.get(
+                    "min_uniform_occupancy_overlap", 0.7
+                ),
+            )
+        ),
+    }
+    if "rest2_hot_fraction_tolerance" in frozen_validation:
+        frozen_validation_settings["rest2_hot_fraction_tolerance"] = float(
+            frozen_validation["rest2_hot_fraction_tolerance"]
+        )
     settings = {
         "state_move_interval_steps": int(raw.get("state_move_interval_steps", 500)),
         "atm_state_count": int(raw.get("atm_state_count", len(states))),
@@ -151,44 +200,8 @@ def normalize_awh_options(workflow, atom_options):
             "learning_rate_kbt": float(
                 learning_rate_kbt
             ),
-            "refinement": {
-                "enabled": bool(refinement.get("enabled", False)),
-                "learning_rates_kbt": refinement_rates,
-                "min_steps_per_stage": int(
-                    refinement.get("min_steps_per_stage", 500_000)
-                ),
-                "min_round_trips_per_stage": int(
-                    refinement.get("min_round_trips_per_stage", 2)
-                ),
-                "min_visits_per_state": int(
-                    refinement.get("min_visits_per_state", 20)
-                ),
-                "covering_fraction": float(
-                    refinement.get("covering_fraction", 1.0)
-                ),
-            },
-            "frozen_validation": {
-                "min_steps": int(
-                    frozen_validation.get("min_steps", 500_000)
-                ),
-                "max_steps": int(
-                    frozen_validation.get("max_steps", 2_000_000)
-                ),
-                "min_round_trips": int(
-                    frozen_validation.get("min_round_trips", 2)
-                ),
-                "min_visits_per_state": int(
-                    frozen_validation.get("min_visits_per_state", 10)
-                ),
-                "min_uniform_occupancy_overlap": float(
-                    frozen_validation.get(
-                        "min_target_occupancy_overlap",
-                        frozen_validation.get(
-                            "min_uniform_occupancy_overlap", 0.7
-                        ),
-                    )
-                ),
-            },
+            "refinement": refinement_settings,
+            "frozen_validation": frozen_validation_settings,
             "metric_target": {
                 "enabled": bool(metric_target.get("enabled", False)),
                 "min_round_trips": int(
@@ -329,6 +342,39 @@ def normalize_awh_options(workflow, atom_options):
         raise AWHConfigError(
             "workflow.awh.adaptive.refinement.covering_fraction must be in (0, 1]"
         )
+    if staged_refinement and (
+        "min_target_occupancy_overlap" in refinement_settings
+        and not 0
+        < refinement_settings["min_target_occupancy_overlap"]
+        <= 1
+    ):
+        raise AWHConfigError(
+            "workflow.awh.adaptive.refinement.min_target_occupancy_overlap "
+            "must be in (0, 1]"
+        )
+    if staged_refinement and (
+        "occupancy_half_life_moves" in refinement_settings
+        and refinement_settings["occupancy_half_life_moves"] < 1
+    ):
+        raise AWHConfigError(
+            "workflow.awh.adaptive.refinement.occupancy_half_life_moves "
+            "must be positive"
+        )
+    for section, values in (
+        ("refinement", refinement_settings),
+        ("frozen_validation", frozen_validation_settings),
+    ):
+        tolerance = values.get("rest2_hot_fraction_tolerance")
+        if tolerance is not None and not 0 <= tolerance <= 1:
+            raise AWHConfigError(
+                "workflow.awh.adaptive."
+                f"{section}.rest2_hot_fraction_tolerance must be in [0, 1]"
+            )
+        if tolerance is not None and settings["target_distribution"] != "grouped":
+            raise AWHConfigError(
+                "REST2 hot-fraction occupancy gates require "
+                "workflow.awh.target_distribution: grouped"
+            )
     if (
         settings["initial_error_kj_per_mol"] <= 0
         or settings["diffusion_per_ps"] <= 0
@@ -857,9 +903,24 @@ def _uniform_occupancy_overlap(visits):
     return _occupancy_overlap(visits)
 
 
-def _sampling_phase_metrics(visits, steps, round_trips, target=None):
+def _occupancy_fraction(visits, indices):
+    visits = np.asarray(visits, dtype=float)
+    total = float(np.sum(visits))
+    if total <= 0 or not indices:
+        return None
+    return float(np.sum(visits[np.asarray(indices, dtype=int)]) / total)
+
+
+def _sampling_phase_metrics(
+    visits,
+    steps,
+    round_trips,
+    target=None,
+    rest2_hot_indices=None,
+    recent_visits=None,
+):
     visits = np.asarray(visits, dtype=np.int64)
-    return {
+    metrics = {
         "steps": int(steps),
         "round_trips": int(round_trips),
         "minimum_visits": int(np.min(visits)) if len(visits) else 0,
@@ -870,6 +931,22 @@ def _sampling_phase_metrics(visits, steps, round_trips, target=None):
         "uniform_occupancy_overlap": _uniform_occupancy_overlap(visits),
         "target_occupancy_overlap": _occupancy_overlap(visits, target),
     }
+    if rest2_hot_indices:
+        metrics["rest2_hot_fraction"] = _occupancy_fraction(
+            visits, rest2_hot_indices
+        )
+        metrics["target_rest2_hot_fraction"] = float(
+            np.sum(np.asarray(target, dtype=float)[rest2_hot_indices])
+        )
+    if recent_visits is not None:
+        metrics["recent_target_occupancy_overlap"] = _occupancy_overlap(
+            recent_visits, target
+        )
+        if rest2_hot_indices:
+            metrics["recent_rest2_hot_fraction"] = _occupancy_fraction(
+                recent_visits, rest2_hot_indices
+            )
+    return metrics
 
 
 def _sampling_phase_complete(metrics, requirements, *, require_overlap=False):
@@ -879,12 +956,37 @@ def _sampling_phase_complete(metrics, requirements, *, require_overlap=False):
         and metrics["minimum_visits"] >= requirements["min_visits_per_state"]
         and metrics["covering_fraction"] >= requirements["covering_fraction"]
     )
+    overlap_threshold = requirements.get("min_target_occupancy_overlap")
     if require_overlap:
+        overlap_threshold = requirements["min_uniform_occupancy_overlap"]
+    if overlap_threshold is not None:
         complete = (
             complete
             and metrics["target_occupancy_overlap"]
-            >= requirements["min_uniform_occupancy_overlap"]
+            >= overlap_threshold
         )
+        if "recent_target_occupancy_overlap" in metrics:
+            complete = (
+                complete
+                and metrics["recent_target_occupancy_overlap"]
+                >= overlap_threshold
+            )
+    tolerance = requirements.get("rest2_hot_fraction_tolerance")
+    if tolerance is not None:
+        target = metrics.get("target_rest2_hot_fraction")
+        observed = metrics.get("rest2_hot_fraction")
+        complete = (
+            complete
+            and target is not None
+            and observed is not None
+            and abs(observed - target) <= tolerance
+        )
+        if "recent_rest2_hot_fraction" in metrics:
+            complete = (
+                complete
+                and abs(metrics["recent_rest2_hot_fraction"] - target)
+                <= tolerance
+            )
     return complete
 
 
@@ -949,6 +1051,11 @@ def run_awh(options, awh_options=None, progress_callback=None):
     )
     graph = build_awh_state_graph(atm_states, settings)
     target = build_awh_target(graph, settings)
+    rest2_hot_indices = [
+        index
+        for index, node in enumerate(graph)
+        if node["kind"] in {"rest2_a", "rest2_b"}
+    ]
     signature = _protocol_signature(options, settings)
     manifest_path = Path("awh_protocol.yaml")
     state_path = Path("awh_checkpoint.yaml")
@@ -1155,9 +1262,18 @@ def run_awh(options, awh_options=None, progress_callback=None):
     refinement_settings = settings["adaptive"]["refinement"]
     validation_settings = settings["adaptive"]["frozen_validation"]
     staged_refinement = refinement_settings["enabled"]
+    occupancy_half_life_moves = refinement_settings.get(
+        "occupancy_half_life_moves"
+    )
+    occupancy_decay = (
+        0.5 ** (1.0 / occupancy_half_life_moves)
+        if occupancy_half_life_moves is not None
+        else None
+    )
     refinement_index = 0
     phase_steps_completed = 0
     phase_visits = np.zeros(len(graph), dtype=np.int64)
+    recent_visits = np.zeros(len(graph), dtype=float)
     phase_round_trips_start = 0
     validation_attempts = 0
     adaptation_history = []
@@ -1194,6 +1310,10 @@ def run_awh(options, awh_options=None, progress_callback=None):
         phase_visits = np.asarray(
             adaptation.get("phase_visits", phase_visits.tolist()),
             dtype=np.int64,
+        )
+        recent_visits = np.asarray(
+            adaptation.get("recent_visits", recent_visits.tolist()),
+            dtype=float,
         )
         phase_round_trips_start = int(
             adaptation.get("phase_round_trips_start", 0)
@@ -1276,6 +1396,15 @@ def run_awh(options, awh_options=None, progress_callback=None):
         "phase_round_trips",
         "phase_minimum_visits",
     ]
+    if occupancy_half_life_moves is not None:
+        trace_fields.extend(
+            [
+                "phase_target_occupancy_overlap",
+                "phase_rest2_hot_fraction",
+                "recent_target_occupancy_overlap",
+                "recent_rest2_hot_fraction",
+            ]
+        )
     _ensure_trace_schema(
         trace_path,
         trace_fields,
@@ -1411,6 +1540,11 @@ def run_awh(options, awh_options=None, progress_callback=None):
                     ),
                     "phase_steps_completed": phase_steps_completed,
                     "phase_visits": phase_visits.tolist(),
+                    **(
+                        {"recent_visits": recent_visits.tolist()}
+                        if occupancy_half_life_moves is not None
+                        else {}
+                    ),
                     "phase_round_trips_start": phase_round_trips_start,
                     "phase_round_trips": max(
                         0, round_trips - phase_round_trips_start
@@ -1474,6 +1608,22 @@ def run_awh(options, awh_options=None, progress_callback=None):
                 "phase_target_occupancy_overlap": (
                     _occupancy_overlap(phase_visits, awh.target)
                 ),
+                **(
+                    {
+                        "phase_rest2_hot_fraction": _occupancy_fraction(
+                            phase_visits, rest2_hot_indices
+                        ),
+                        "recent_target_occupancy_overlap": _occupancy_overlap(
+                            recent_visits, awh.target
+                        ),
+                        "recent_rest2_hot_fraction": _occupancy_fraction(
+                            recent_visits, rest2_hot_indices
+                        ),
+                        "occupancy_half_life_moves": occupancy_half_life_moves,
+                    }
+                    if occupancy_half_life_moves is not None
+                    else {}
+                ),
                 "validation_attempts": validation_attempts,
                 "history": adaptation_history,
             },
@@ -1493,6 +1643,7 @@ def run_awh(options, awh_options=None, progress_callback=None):
     ):
         probability_by_state = dict(zip(candidates, probabilities))
         energy_by_state = dict(zip(candidates, reduced))
+        phase_metrics = current_phase_metrics()
         with trace_path.open("a", newline="") as handle:
             csv.DictWriter(handle, fieldnames=trace_fields).writerow(
                 {
@@ -1537,6 +1688,24 @@ def run_awh(options, awh_options=None, progress_callback=None):
                         0, round_trips - phase_round_trips_start
                     ),
                     "phase_minimum_visits": int(np.min(phase_visits)),
+                    **(
+                        {
+                            "phase_target_occupancy_overlap": phase_metrics[
+                                "target_occupancy_overlap"
+                            ],
+                            "phase_rest2_hot_fraction": phase_metrics[
+                                "rest2_hot_fraction"
+                            ],
+                            "recent_target_occupancy_overlap": phase_metrics[
+                                "recent_target_occupancy_overlap"
+                            ],
+                            "recent_rest2_hot_fraction": phase_metrics[
+                                "recent_rest2_hot_fraction"
+                            ],
+                        }
+                        if occupancy_half_life_moves is not None
+                        else {}
+                    ),
                 }
             )
 
@@ -1643,11 +1812,13 @@ def run_awh(options, awh_options=None, progress_callback=None):
     def reset_phase_tracking():
         nonlocal phase_steps_completed
         nonlocal phase_visits
+        nonlocal recent_visits
         nonlocal phase_round_trips_start
         nonlocal last_endpoint
         nonlocal crossed
         phase_steps_completed = 0
         phase_visits = np.zeros(len(graph), dtype=np.int64)
+        recent_visits = np.zeros(len(graph), dtype=float)
         phase_round_trips_start = round_trips
         last_endpoint = current if current in (a_index, b_index) else None
         crossed = False
@@ -1658,6 +1829,12 @@ def run_awh(options, awh_options=None, progress_callback=None):
             phase_steps_completed,
             max(0, round_trips - phase_round_trips_start),
             target=awh.target,
+            rest2_hot_indices=rest2_hot_indices,
+            recent_visits=(
+                recent_visits
+                if occupancy_half_life_moves is not None
+                else None
+            ),
         )
 
     def record_adaptation_event(event, metrics, **values):
@@ -1697,6 +1874,9 @@ def run_awh(options, awh_options=None, progress_callback=None):
         transitions[previous, current] += 1
         awh.visits[current] += 1
         phase_visits[current] += 1
+        if occupancy_decay is not None:
+            recent_visits *= occupancy_decay
+            recent_visits[current] += 1.0
         apply_node(current)
         if current in (a_index, b_index) and current != last_endpoint:
             if last_endpoint is not None:
@@ -1727,6 +1907,24 @@ def run_awh(options, awh_options=None, progress_callback=None):
                 "covering_fraction": refinement_settings[
                     "covering_fraction"
                 ],
+                **(
+                    {
+                        "min_target_occupancy_overlap": refinement_settings[
+                            "min_target_occupancy_overlap"
+                        ]
+                    }
+                    if "min_target_occupancy_overlap" in refinement_settings
+                    else {}
+                ),
+                **(
+                    {
+                        "rest2_hot_fraction_tolerance": refinement_settings[
+                            "rest2_hot_fraction_tolerance"
+                        ]
+                    }
+                    if "rest2_hot_fraction_tolerance" in refinement_settings
+                    else {}
+                ),
             }
             if _sampling_phase_complete(metrics, requirements):
                 if (
@@ -1791,6 +1989,15 @@ def run_awh(options, awh_options=None, progress_callback=None):
                 "min_uniform_occupancy_overlap": validation_settings[
                     "min_uniform_occupancy_overlap"
                 ],
+                **(
+                    {
+                        "rest2_hot_fraction_tolerance": validation_settings[
+                            "rest2_hot_fraction_tolerance"
+                        ]
+                    }
+                    if "rest2_hot_fraction_tolerance" in validation_settings
+                    else {}
+                ),
             }
             if _sampling_phase_complete(
                 metrics, requirements, require_overlap=True

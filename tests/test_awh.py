@@ -149,6 +149,9 @@ def _test_awh_staged_refinement_options_are_normalized():
                         "min_round_trips_per_stage": 1,
                         "min_visits_per_state": 3,
                         "covering_fraction": 0.9,
+                        "min_target_occupancy_overlap": 0.8,
+                        "rest2_hot_fraction_tolerance": 0.05,
+                        "occupancy_half_life_moves": 5000,
                     },
                     "frozen_validation": {
                         "min_steps": 2000,
@@ -156,8 +159,11 @@ def _test_awh_staged_refinement_options_are_normalized():
                         "min_round_trips": 1,
                         "min_visits_per_state": 2,
                         "min_uniform_occupancy_overlap": 0.75,
+                        "rest2_hot_fraction_tolerance": 0.05,
                     },
-                }
+                },
+                "target_distribution": "grouped",
+                "target": {"rest2_hot_fraction": 1.0 / 6.0},
             }
         },
         _atom_options(),
@@ -169,6 +175,15 @@ def _test_awh_staged_refinement_options_are_normalized():
     assert settings["adaptive"]["frozen_validation"][
         "min_uniform_occupancy_overlap"
     ] == pytest.approx(0.75)
+    assert settings["adaptive"]["refinement"][
+        "min_target_occupancy_overlap"
+    ] == pytest.approx(0.8)
+    assert settings["adaptive"]["refinement"][
+        "rest2_hot_fraction_tolerance"
+    ] == pytest.approx(0.05)
+    assert settings["adaptive"]["refinement"][
+        "occupancy_half_life_moves"
+    ] == 5000
 
 
 def _test_awh_staged_refinement_rejects_non_decreasing_rates():
@@ -267,6 +282,46 @@ def _test_awh_grouped_target_preserves_rest2_mass_and_drives_validation():
     assert _sampling_phase_complete(
         metrics, requirements, require_overlap=True
     )
+
+
+def _test_awh_refinement_requires_phase_and_recent_grouped_occupancy():
+    from atom_openmm.awh import (
+        _sampling_phase_complete,
+        _sampling_phase_metrics,
+    )
+
+    target = np.array([1 / 12, 1 / 12, 5 / 12, 5 / 12])
+    requirements = {
+        "min_steps": 1000,
+        "min_round_trips": 4,
+        "min_visits_per_state": 1,
+        "covering_fraction": 1.0,
+        "min_target_occupancy_overlap": 0.8,
+        "rest2_hot_fraction_tolerance": 0.05,
+    }
+    phase = np.array([10, 10, 50, 50])
+    recent_balanced = np.array([5.0, 5.0, 25.0, 25.0])
+    recent_path_heavy = np.array([0.5, 0.5, 29.5, 29.5])
+    balanced = _sampling_phase_metrics(
+        phase,
+        1000,
+        4,
+        target=target,
+        rest2_hot_indices=[0, 1],
+        recent_visits=recent_balanced,
+    )
+    stale = _sampling_phase_metrics(
+        phase,
+        1000,
+        4,
+        target=target,
+        rest2_hot_indices=[0, 1],
+        recent_visits=recent_path_heavy,
+    )
+    assert _sampling_phase_complete(balanced, requirements)
+    assert not _sampling_phase_complete(stale, requirements)
+    assert stale["target_occupancy_overlap"] == pytest.approx(1.0)
+    assert stale["recent_rest2_hot_fraction"] == pytest.approx(1 / 60)
 
 
 def _test_awh_grouped_target_changes_dynamics_signature():
