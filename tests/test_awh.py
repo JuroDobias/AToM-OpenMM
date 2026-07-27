@@ -851,6 +851,33 @@ def _test_awh_trace_reconciles_to_checkpoint_move(tmp_path):
     assert [int(row["move"]) for row in rows] == [1, 2]
 
 
+def _test_awh_reduced_energies_reconcile_to_production_checkpoint(tmp_path):
+    import csv
+
+    from atom_openmm.awh import _reconcile_reduced_energy_csv
+
+    path = tmp_path / "awh_reduced_energies.csv"
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["sampled_state", "a", "b"])
+        for index in range(7):
+            writer.writerow([index % 2, index, index + 1])
+
+    _reconcile_reduced_energy_csv(
+        path,
+        checkpoint_move=100,
+        production_steps_completed=350,
+        state_move_interval_steps=10,
+        reduced_energy_interval_moves=10,
+    )
+
+    with path.open(newline="") as handle:
+        rows = list(csv.reader(handle))
+    # Production began after move 65, so samples at moves 70, 80, 90, and 100 remain.
+    assert len(rows) == 5
+    assert rows[-1] == ["1", "3", "4"]
+
+
 def _test_awh_diagnostics_report_rest2_returns_overlap_and_ess():
     from atom_openmm.awh import (
         build_awh_state_graph,

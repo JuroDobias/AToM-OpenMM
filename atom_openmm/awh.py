@@ -1089,6 +1089,34 @@ def _reconcile_move_csv(path, checkpoint_move):
     os.replace(temporary, path)
 
 
+def _reconcile_reduced_energy_csv(
+    path,
+    checkpoint_move,
+    production_steps_completed,
+    state_move_interval_steps,
+    reduced_energy_interval_moves,
+):
+    if not path.exists():
+        return
+    production_moves = (
+        int(production_steps_completed) // int(state_move_interval_steps)
+    )
+    production_start_move = int(checkpoint_move) - production_moves
+    expected_rows = (
+        int(checkpoint_move) // int(reduced_energy_interval_moves)
+        - production_start_move // int(reduced_energy_interval_moves)
+    )
+    with path.open(newline="") as handle:
+        rows = list(csv.reader(handle))
+    if not rows or len(rows) - 1 <= expected_rows:
+        return
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerows(rows[: expected_rows + 1])
+    os.replace(temporary, path)
+
+
 def run_awh(options, awh_options=None, progress_callback=None):
     settings = awh_options or normalize_awh_options({"awh": {}}, options)
     logger = logging.getLogger("atom_openmm.awh")
@@ -1460,6 +1488,13 @@ def run_awh(options, awh_options=None, progress_callback=None):
     if restored_move is not None:
         _reconcile_move_csv(trace_path, restored_move)
         _reconcile_move_csv(bias_path, restored_move)
+        _reconcile_reduced_energy_csv(
+            matrix_path,
+            restored_move,
+            production_steps_completed,
+            settings["state_move_interval_steps"],
+            settings["production"]["reduced_energy_interval_moves"],
+        )
     if friction_settings["enabled"]:
         reconcile_friction_samples(friction_samples_path, move)
 
