@@ -85,6 +85,7 @@ def normalize_awh_options(workflow, atom_options):
     trajectory = analysis.get("trajectory") or {}
     friction = analysis.get("friction") or {}
     thresholds = analysis.get("thresholds") or {}
+    target = raw.get("target") or {}
     metric_target = adaptive.get("metric_target") or {}
     refinement = adaptive.get("refinement") or {}
     frozen_validation = adaptive.get("frozen_validation") or {}
@@ -93,6 +94,7 @@ def normalize_awh_options(workflow, atom_options):
         not isinstance(trajectory, dict)
         or not isinstance(friction, dict)
         or not isinstance(thresholds, dict)
+        or not isinstance(target, dict)
         or not isinstance(metric_target, dict)
         or not isinstance(refinement, dict)
         or not isinstance(frozen_validation, dict)
@@ -180,7 +182,10 @@ def normalize_awh_options(workflow, atom_options):
                 ),
                 "min_uniform_occupancy_overlap": float(
                     frozen_validation.get(
-                        "min_uniform_occupancy_overlap", 0.7
+                        "min_target_occupancy_overlap",
+                        frozen_validation.get(
+                            "min_uniform_occupancy_overlap", 0.7
+                        ),
                     )
                 ),
             },
@@ -245,8 +250,16 @@ def normalize_awh_options(workflow, atom_options):
         },
         "platform": raw.get("platform"),
     }
-    if settings["target_distribution"] != "uniform":
-        raise AWHConfigError("workflow.awh.target_distribution currently must be 'uniform'")
+    if settings["target_distribution"] not in {"uniform", "grouped"}:
+        raise AWHConfigError(
+            "workflow.awh.target_distribution must be 'uniform' or 'grouped'"
+        )
+    if settings["target_distribution"] == "grouped":
+        settings["target"] = {
+            "rest2_hot_fraction": float(
+                target.get("rest2_hot_fraction", 1.0 / 6.0)
+            )
+        }
     if settings["start_state"] not in {"a", "b"}:
         raise AWHConfigError("workflow.awh.start_state must be 'a' or 'b'")
     if settings["state_sampling"]["method"] not in {
@@ -362,6 +375,23 @@ def normalize_awh_options(workflow, atom_options):
         raise AWHConfigError(
             "friction analysis must be enabled when metric target scaling is enabled"
         )
+    if (
+        settings["target_distribution"] == "grouped"
+        and metric_target["enabled"]
+    ):
+        raise AWHConfigError(
+            "grouped targets cannot yet be combined with metric target scaling"
+        )
+    if settings["target_distribution"] == "grouped":
+        rest2_hot_fraction = settings["target"]["rest2_hot_fraction"]
+        if not settings["rest2"]["enabled"]:
+            raise AWHConfigError(
+                "grouped targets require endpoint REST2 to be enabled"
+            )
+        if not 0.0 < rest2_hot_fraction < 1.0:
+            raise AWHConfigError(
+                "workflow.awh.target.rest2_hot_fraction must be in (0, 1)"
+            )
     quality = settings["analysis"]["thresholds"]
     if (
         quality["min_adjacent_overlap"] <= 0
@@ -475,6 +505,38 @@ def build_awh_state_graph(atm_states, settings):
                 }
             )
     return graph
+
+
+def build_awh_target(graph, settings):
+    """Build state probabilities without coupling REST2 mass to ATM resolution."""
+    nstates = len(graph)
+    if settings["target_distribution"] == "uniform":
+        return np.full(nstates, 1.0 / nstates)
+    hot = np.asarray(
+        [
+            index
+            for index, node in enumerate(graph)
+            if node["kind"] in {"rest2_a", "rest2_b"}
+        ],
+        dtype=int,
+    )
+    path = np.asarray(
+        [
+            index
+            for index, node in enumerate(graph)
+            if node["kind"] not in {"rest2_a", "rest2_b"}
+        ],
+        dtype=int,
+    )
+    if not len(hot) or not len(path):
+        raise AWHConfigError(
+            "grouped targets require both hot REST2 and physical ATM states"
+        )
+    hot_fraction = settings["target"]["rest2_hot_fraction"]
+    target = np.zeros(nstates, dtype=float)
+    target[hot] = hot_fraction / len(hot)
+    target[path] = (1.0 - hot_fraction) / len(path)
+    return target
 
 
 class AWHBias:
@@ -775,17 +837,27 @@ def _neighbors(index, nstates):
     return list(range(max(0, index - 1), min(nstates, index + 2)))
 
 
-def _uniform_occupancy_overlap(visits):
+def _occupancy_overlap(visits, target=None):
     visits = np.asarray(visits, dtype=float)
     total = float(np.sum(visits))
     if not len(visits) or total <= 0:
         return 0.0
     observed = visits / total
-    uniform = np.full(len(visits), 1.0 / len(visits))
-    return float(np.minimum(observed, uniform).sum())
+    expected = (
+        np.full(len(visits), 1.0 / len(visits))
+        if target is None
+        else np.asarray(target, dtype=float)
+    )
+    if expected.shape != observed.shape or not np.isclose(expected.sum(), 1.0):
+        raise AWHConfigError("AWH occupancy target is invalid")
+    return float(np.minimum(observed, expected).sum())
 
 
-def _sampling_phase_metrics(visits, steps, round_trips):
+def _uniform_occupancy_overlap(visits):
+    return _occupancy_overlap(visits)
+
+
+def _sampling_phase_metrics(visits, steps, round_trips, target=None):
     visits = np.asarray(visits, dtype=np.int64)
     return {
         "steps": int(steps),
@@ -796,6 +868,7 @@ def _sampling_phase_metrics(visits, steps, round_trips):
             float(np.count_nonzero(visits) / len(visits)) if len(visits) else 0.0
         ),
         "uniform_occupancy_overlap": _uniform_occupancy_overlap(visits),
+        "target_occupancy_overlap": _occupancy_overlap(visits, target),
     }
 
 
@@ -809,7 +882,7 @@ def _sampling_phase_complete(metrics, requirements, *, require_overlap=False):
     if require_overlap:
         complete = (
             complete
-            and metrics["uniform_occupancy_overlap"]
+            and metrics["target_occupancy_overlap"]
             >= requirements["min_uniform_occupancy_overlap"]
         )
     return complete
@@ -875,6 +948,7 @@ def run_awh(options, awh_options=None, progress_callback=None):
         build_atm_state_parameters(options), settings["atm_state_count"]
     )
     graph = build_awh_state_graph(atm_states, settings)
+    target = build_awh_target(graph, settings)
     signature = _protocol_signature(options, settings)
     manifest_path = Path("awh_protocol.yaml")
     state_path = Path("awh_checkpoint.yaml")
@@ -1070,7 +1144,7 @@ def run_awh(options, awh_options=None, progress_callback=None):
     b_index = next(i for i, node in enumerate(graph) if node["name"] == "b_physical")
     current = a_index if settings["start_state"] == "a" else b_index
     rng = np.random.default_rng(settings["random_seed"])
-    awh = AWHBias(len(graph), initial_histogram)
+    awh = AWHBias(len(graph), initial_histogram, target=target)
     friction_settings = settings["analysis"]["friction"]
     friction_accumulator = FrictionAccumulator(
         len(graph),
@@ -1295,6 +1369,7 @@ def run_awh(options, awh_options=None, progress_callback=None):
             bias_history=read_bias_history(bias_path),
             thresholds=settings["analysis"]["thresholds"],
             friction=friction,
+            target=awh.target,
         )
         _atomic_yaml(diagnostics_path, value)
         return value
@@ -1395,6 +1470,9 @@ def run_awh(options, awh_options=None, progress_callback=None):
                 "phase_covered_states": int(np.count_nonzero(phase_visits)),
                 "phase_uniform_occupancy_overlap": (
                     _uniform_occupancy_overlap(phase_visits)
+                ),
+                "phase_target_occupancy_overlap": (
+                    _occupancy_overlap(phase_visits, awh.target)
                 ),
                 "validation_attempts": validation_attempts,
                 "history": adaptation_history,
@@ -1579,6 +1657,7 @@ def run_awh(options, awh_options=None, progress_callback=None):
             phase_visits,
             phase_steps_completed,
             max(0, round_trips - phase_round_trips_start),
+            target=awh.target,
         )
 
     def record_adaptation_event(event, metrics, **values):
@@ -1720,10 +1799,10 @@ def run_awh(options, awh_options=None, progress_callback=None):
                 stage = "production"
                 logger.info(
                     "AWH frozen-bias validation passed after %d steps, %d "
-                    "round trips, and %.3f uniform occupancy overlap",
+                    "round trips, and %.3f target occupancy overlap",
                     metrics["steps"],
                     metrics["round_trips"],
-                    metrics["uniform_occupancy_overlap"],
+                    metrics["target_occupancy_overlap"],
                 )
                 transitioned = True
             elif phase_steps_completed >= validation_settings["max_steps"]:
@@ -1745,7 +1824,7 @@ def run_awh(options, awh_options=None, progress_callback=None):
                     metrics["steps"],
                     metrics["round_trips"],
                     metrics["minimum_visits"],
-                    metrics["uniform_occupancy_overlap"],
+                    metrics["target_occupancy_overlap"],
                     refinement_settings["learning_rates_kbt"][
                         refinement_index
                     ],
@@ -1950,6 +2029,7 @@ def analyze_existing_awh(options, awh_options):
         bias_history=read_bias_history(Path("awh_bias_history.csv")),
         thresholds=settings["analysis"]["thresholds"],
         friction=friction,
+        target=(checkpoint.get("awh") or {}).get("target"),
     )
     _atomic_yaml(Path("awh_diagnostics.yaml"), quality)
     plot_awh_diagnostics(

@@ -456,6 +456,26 @@ the target is periodically moved toward the friction suggestion. Smoothing and
 `max_relative_weight` limit noisy early changes. Keep this disabled until a
 system's friction profile is reproducible.
 
+By default, every expanded AWH state has equal target probability. This means
+that reducing `atm_state_count` increases the aggregate probability assigned to
+the fixed-size endpoint REST2 ladders. Use a grouped target to keep the total
+hot-REST2 probability independent of ATM path resolution:
+
+```yaml
+awh:
+  target_distribution: grouped
+  target:
+    rest2_hot_fraction: 0.1666666667
+```
+
+The configured fraction is divided equally over all auxiliary hot REST2 states;
+the remainder is divided over the physical ATM path, including both physical
+endpoints. Frozen validation then compares observed occupancy with this
+configured target. `frozen_validation.min_target_occupancy_overlap` is the
+preferred spelling for its threshold; the legacy
+`min_uniform_occupancy_overlap` spelling remains accepted. Grouped targets
+cannot currently be combined with friction-driven metric target adaptation.
+
 `awh_diagnostics.yaml` reports adaptive and fixed-bias occupancy, observed and
 expected neighboring transition probabilities, complete REST2
 physical-hottest-physical returns, UWHAM overlap, and effective sample counts.

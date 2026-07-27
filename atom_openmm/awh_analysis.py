@@ -375,10 +375,13 @@ def analyze_awh_diagnostics(
     bias_history=None,
     thresholds=None,
     friction=None,
+    target=None,
 ):
     thresholds = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
     nstates = len(graph)
-    active_target = None if friction is None else friction.get("active_target")
+    active_target = target
+    if active_target is None and friction is not None:
+        active_target = friction.get("active_target")
     if active_target is not None and len(active_target) != nstates:
         active_target = None
     sequences = _stage_sequences(trace_rows, nstates)

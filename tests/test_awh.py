@@ -87,9 +87,19 @@ def _test_mbar_recovers_sampled_two_state_offset():
     assert estimate[1] == pytest.approx(1.25, abs=0.08)
 
 
-def _test_awh_rejects_nonuniform_target_for_v1():
+def _test_awh_accepts_grouped_target_and_rejects_unknown_target():
     from atom_openmm.awh import AWHConfigError, normalize_awh_options
 
+    grouped = normalize_awh_options(
+        {
+            "awh": {
+                "target_distribution": "grouped",
+                "target": {"rest2_hot_fraction": 0.2},
+            }
+        },
+        _atom_options(),
+    )
+    assert grouped["target"] == {"rest2_hot_fraction": pytest.approx(0.2)}
     with pytest.raises(AWHConfigError, match="uniform"):
         normalize_awh_options(
             {"awh": {"target_distribution": "metric"}},
@@ -201,6 +211,81 @@ def _test_awh_sampling_phase_metrics_require_frozen_occupancy_overlap():
     assert _sampling_phase_complete(
         balanced, requirements, require_overlap=True
     )
+
+
+def _test_awh_grouped_target_preserves_rest2_mass_and_drives_validation():
+    from atom_openmm.awh import (
+        _sampling_phase_complete,
+        _sampling_phase_metrics,
+        build_awh_state_graph,
+        build_awh_target,
+        densify_atm_states,
+        normalize_awh_options,
+    )
+    from atom_openmm.neqti import build_atm_state_parameters
+
+    settings = normalize_awh_options(
+        {
+            "awh": {
+                "atm_state_count": 25,
+                "target_distribution": "grouped",
+                "target": {"rest2_hot_fraction": 1.0 / 6.0},
+            }
+        },
+        _atom_options(),
+    )
+    states = densify_atm_states(
+        build_atm_state_parameters(_atom_options()), 25
+    )
+    graph = build_awh_state_graph(states, settings)
+    target = build_awh_target(graph, settings)
+    hot = [
+        index
+        for index, node in enumerate(graph)
+        if node["kind"] in {"rest2_a", "rest2_b"}
+    ]
+    path = [index for index in range(len(graph)) if index not in hot]
+    assert len(graph) == 35
+    assert target[hot].sum() == pytest.approx(1.0 / 6.0)
+    assert target[path].sum() == pytest.approx(5.0 / 6.0)
+    assert len(set(target[hot])) == 1
+    assert len(set(target[path])) == 1
+
+    visits = np.rint(target * 6000).astype(int)
+    requirements = {
+        "min_steps": 1000,
+        "min_round_trips": 2,
+        "min_visits_per_state": 1,
+        "covering_fraction": 1.0,
+        "min_uniform_occupancy_overlap": 0.99,
+    }
+    metrics = _sampling_phase_metrics(
+        visits, 1000, 2, target=target
+    )
+    assert metrics["target_occupancy_overlap"] == pytest.approx(1.0)
+    assert metrics["uniform_occupancy_overlap"] < 0.9
+    assert _sampling_phase_complete(
+        metrics, requirements, require_overlap=True
+    )
+
+
+def _test_awh_grouped_target_changes_dynamics_signature():
+    from atom_openmm.awh import _protocol_signature, normalize_awh_options
+
+    uniform = normalize_awh_options({"awh": {}}, _atom_options())
+    grouped = normalize_awh_options(
+        {
+            "awh": {
+                "target_distribution": "grouped",
+                "target": {"rest2_hot_fraction": 1.0 / 6.0},
+            }
+        },
+        _atom_options(),
+    )
+    assert "target" not in uniform
+    assert _protocol_signature(
+        _atom_options(), uniform
+    ) != _protocol_signature(_atom_options(), grouped)
 
 
 def _test_awh_densifies_both_legs_and_preserves_midpoints():
