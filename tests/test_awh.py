@@ -502,6 +502,40 @@ def _test_global_gibbs_diagnostics_reports_truncated_mass():
     assert result["truncated_probability_mass"]["1"]["mean"] == pytest.approx(0.9)
 
 
+def _test_global_energy_validation_ignores_negligible_finite_candidates():
+    from atom_openmm.awh import _global_energy_validation_errors
+
+    direct = np.array([1.4078891309013990e15, -616000.0])
+    reconstructed = np.array([1.4078891309013992e15, -616000.2])
+    errors, overflows, finite = _global_energy_validation_errors(
+        direct,
+        reconstructed,
+        reconstructed_probabilities=np.array([0.0, 0.25]),
+        negligible_probability_tolerance=1.0e-12,
+    )
+
+    assert errors.tolist() == pytest.approx([0.0, 0.2])
+    assert not overflows.any()
+    assert finite.tolist() == [True, False]
+
+
+def _test_global_energy_validation_keeps_relevant_and_nan_failures():
+    from atom_openmm.awh import _global_energy_validation_errors
+
+    errors, overflows, finite = _global_energy_validation_errors(
+        direct=np.array([np.inf, np.inf, np.nan]),
+        reconstructed=np.array([1.0e20, 1.0e20, 1.0e20]),
+        reconstructed_probabilities=np.array([0.0, 0.5, 0.0]),
+        negligible_probability_tolerance=1.0e-12,
+    )
+
+    assert errors[0] == 0.0
+    assert np.isinf(errors[1])
+    assert np.isinf(errors[2])
+    assert overflows.tolist() == [True, False, False]
+    assert not finite.any()
+
+
 def _test_rest2_scan_integrator_preserves_coordinates_and_time():
     import openmm as mm
     from openmm import unit

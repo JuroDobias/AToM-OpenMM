@@ -674,6 +674,7 @@ class GlobalGibbsDiagnostics:
         self.selection_seconds = 0.0
         self.validation_checks = 0
         self.direct_overflow_validations = 0
+        self.negligible_probability_validations = 0
         self.maximum_validation_error_kj_per_mol = 0.0
 
     def update(self, previous, selected, probabilities):
@@ -694,9 +695,17 @@ class GlobalGibbsDiagnostics:
             self.radius_mass_999[radius] += int(mass >= 0.999)
         return expected
 
-    def record_validation(self, maximum_error, direct_overflows=0):
+    def record_validation(
+        self,
+        maximum_error,
+        direct_overflows=0,
+        negligible_probability_states=0,
+    ):
         self.validation_checks += 1
         self.direct_overflow_validations += int(direct_overflows)
+        self.negligible_probability_validations += int(
+            negligible_probability_states
+        )
         self.maximum_validation_error_kj_per_mol = max(
             self.maximum_validation_error_kj_per_mol,
             float(maximum_error),
@@ -746,6 +755,9 @@ class GlobalGibbsDiagnostics:
             "validation": {
                 "checks": self.validation_checks,
                 "accepted_direct_overflows": self.direct_overflow_validations,
+                "accepted_negligible_probability_states": (
+                    self.negligible_probability_validations
+                ),
                 "maximum_error_kj_per_mol": self.maximum_validation_error_kj_per_mol,
             },
         }
@@ -785,6 +797,9 @@ class GlobalGibbsDiagnostics:
         value.validation_checks = int(validation.get("checks", 0))
         value.direct_overflow_validations = int(
             validation.get("accepted_direct_overflows", 0)
+        )
+        value.negligible_probability_validations = int(
+            validation.get("accepted_negligible_probability_states", 0)
         )
         value.maximum_validation_error_kj_per_mol = float(
             validation.get("maximum_error_kj_per_mol", 0.0)
@@ -990,6 +1005,40 @@ def _sampling_phase_complete(metrics, requirements, *, require_overlap=False):
     return complete
 
 
+def _global_energy_validation_errors(
+    direct,
+    reconstructed,
+    reconstructed_probabilities,
+    negligible_probability_tolerance,
+):
+    direct = np.asarray(direct, dtype=float)
+    reconstructed = np.asarray(reconstructed, dtype=float)
+    probabilities = np.asarray(reconstructed_probabilities, dtype=float)
+    matching_infinities = (
+        np.isinf(direct)
+        & np.isinf(reconstructed)
+        & (np.signbit(direct) == np.signbit(reconstructed))
+    )
+    finite_pairs = np.isfinite(direct) & np.isfinite(reconstructed)
+    negligible = (
+        np.isfinite(probabilities)
+        & (probabilities <= negligible_probability_tolerance)
+    )
+    accepted_overflows = (
+        np.isposinf(direct)
+        & np.isfinite(reconstructed)
+        & negligible
+    )
+    accepted_finite = finite_pairs & negligible
+    errors = np.full(len(direct), np.inf)
+    errors[matching_infinities] = 0.0
+    errors[finite_pairs] = np.abs(
+        direct[finite_pairs] - reconstructed[finite_pairs]
+    )
+    errors[accepted_overflows | accepted_finite] = 0.0
+    return errors, accepted_overflows, accepted_finite
+
+
 def _ensure_trace_schema(path, fields, initial_state):
     if not path.exists():
         with path.open("w", newline="") as handle:
@@ -1177,45 +1226,42 @@ def run_awh(options, awh_options=None, progress_callback=None):
         apply_node(current)
         direct_values = np.asarray(direct, dtype=float)
         reconstructed_values = np.asarray(analytical, dtype=float)[indices]
-        matching_infinities = (
-            np.isinf(direct_values)
-            & np.isinf(reconstructed_values)
-            & (np.signbit(direct_values) == np.signbit(reconstructed_values))
-        )
-        finite_pairs = np.isfinite(direct_values) & np.isfinite(
-            reconstructed_values
-        )
         reconstructed_probabilities = awh.probabilities(
             beta * np.asarray(analytical, dtype=float),
             list(range(len(graph))),
         )
-        acceptable_direct_overflows = (
-            np.isposinf(direct_values)
-            & np.isfinite(reconstructed_values)
-            & (
-                reconstructed_probabilities[np.asarray(indices, dtype=int)]
-                <= settings["state_sampling"][
-                    "direct_overflow_probability_tolerance"
-                ]
+        probability_tolerance = settings["state_sampling"][
+            "direct_overflow_probability_tolerance"
+        ]
+        errors, acceptable_direct_overflows, acceptable_finite = (
+            _global_energy_validation_errors(
+                direct_values,
+                reconstructed_values,
+                reconstructed_probabilities[np.asarray(indices, dtype=int)],
+                probability_tolerance,
             )
-        )
-        errors = np.full(len(indices), np.inf)
-        errors[matching_infinities] = 0.0
-        errors[acceptable_direct_overflows] = 0.0
-        errors[finite_pairs] = np.abs(
-            direct_values[finite_pairs] - reconstructed_values[finite_pairs]
         )
         maximum = float(np.max(errors)) if len(errors) else 0.0
         overflow_count = int(np.count_nonzero(acceptable_direct_overflows))
-        global_diagnostics.record_validation(maximum, overflow_count)
+        finite_count = int(np.count_nonzero(acceptable_finite))
+        global_diagnostics.record_validation(
+            maximum,
+            overflow_count,
+            negligible_probability_states=finite_count,
+        )
         if overflow_count:
             logger.info(
                 "Accepted %d direct ATM energy overflows for states with "
                 "reconstructed Gibbs probability <= %.3g",
                 overflow_count,
-                settings["state_sampling"][
-                    "direct_overflow_probability_tolerance"
-                ],
+                probability_tolerance,
+            )
+        if finite_count:
+            logger.info(
+                "Skipped %d finite direct ATM energy comparisons for states "
+                "with reconstructed Gibbs probability <= %.3g",
+                finite_count,
+                probability_tolerance,
             )
         tolerance = settings["state_sampling"][
             "validation_tolerance_kj_per_mol"
