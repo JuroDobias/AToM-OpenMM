@@ -601,9 +601,16 @@ class AWHBias:
         return self.free_energy + np.log(self.target)
 
     def probabilities(self, reduced_energies, indices):
+        reduced = np.asarray(reduced_energies, dtype=float)
+        if np.any(np.isnan(reduced)) or np.any(np.isneginf(reduced)):
+            raise AWHConfigError(
+                "AWH state energies contain NaN or negative infinity"
+            )
         log_weights = np.asarray(
             [self.bias[index] - energy for index, energy in zip(indices, reduced_energies)]
         )
+        if not np.any(np.isfinite(log_weights)):
+            raise AWHConfigError("AWH has no finite-probability candidate state")
         return np.exp(log_weights - logsumexp(log_weights))
 
     def update(self, indices, probabilities, learning_rate_kbt=None):
@@ -1037,6 +1044,28 @@ def _global_energy_validation_errors(
     )
     errors[accepted_overflows | accepted_finite] = 0.0
     return errors, accepted_overflows, accepted_finite
+
+
+def _repair_global_energies(energies, current, direct_energy):
+    """Replace failed analytical energies with direct OpenMM evaluations."""
+    repaired = np.asarray(energies, dtype=float).copy()
+    nonfinite = np.flatnonzero(~np.isfinite(repaired))
+    directly_repaired = []
+    excluded = []
+    for index in nonfinite:
+        direct = float(direct_energy(int(index)))
+        if np.isfinite(direct):
+            repaired[index] = direct
+            directly_repaired.append(int(index))
+        else:
+            repaired[index] = np.inf
+            excluded.append(int(index))
+    if not np.isfinite(repaired[int(current)]):
+        raise AWHConfigError(
+            "current AWH state has non-finite potential energy after direct "
+            f"re-evaluation: state {int(current)}"
+        )
+    return repaired, directly_repaired, excluded
 
 
 def _ensure_trace_schema(path, fields, initial_state):
@@ -1795,6 +1824,20 @@ def run_awh(options, awh_options=None, progress_callback=None):
         if global_sampling:
             candidates = list(range(len(graph)))
             all_energies = worker.all_graph_energies()
+            all_energies, directly_repaired, excluded = _repair_global_energies(
+                all_energies,
+                current,
+                energy,
+            )
+            if directly_repaired or excluded:
+                apply_node(current)
+                logger.warning(
+                    "Global-Gibbs analytical scan had %d non-finite states; "
+                    "%d recovered by direct evaluation and %d excluded",
+                    len(directly_repaired) + len(excluded),
+                    len(directly_repaired),
+                    len(excluded),
+                )
             reduced_by_state = {
                 index: beta * value for index, value in enumerate(all_energies)
             }
@@ -1829,7 +1872,9 @@ def run_awh(options, awh_options=None, progress_callback=None):
         reduced = [reduced_by_state[index] for index in candidates]
         selection_started = time.perf_counter()
         probabilities = awh.probabilities(reduced, candidates)
-        if friction_settings["enabled"]:
+        if friction_settings["enabled"] and not (
+            global_sampling and excluded
+        ):
             probability_by_state = dict(zip(candidates, probabilities))
             forces = generalized_forces(
                 reduced_by_state, candidates, len(graph)

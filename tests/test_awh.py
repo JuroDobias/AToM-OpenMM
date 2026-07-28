@@ -536,6 +536,44 @@ def _test_global_energy_validation_keeps_relevant_and_nan_failures():
     assert not finite.any()
 
 
+def _test_global_energies_repair_nonfinite_candidates():
+    from atom_openmm.awh import _repair_global_energies
+
+    direct = {1: 11.0, 2: np.inf}
+    repaired, recovered, excluded = _repair_global_energies(
+        [3.0, np.nan, np.inf],
+        current=0,
+        direct_energy=direct.__getitem__,
+    )
+
+    assert repaired[0] == 3.0
+    assert repaired[1] == 11.0
+    assert np.isposinf(repaired[2])
+    assert recovered == [1]
+    assert excluded == [2]
+
+
+def _test_global_energies_reject_nonfinite_current_state():
+    from atom_openmm.awh import AWHConfigError, _repair_global_energies
+
+    with pytest.raises(AWHConfigError, match="current AWH state"):
+        _repair_global_energies(
+            [np.nan, 2.0],
+            current=0,
+            direct_energy=lambda _index: np.inf,
+        )
+
+
+def _test_awh_probabilities_assign_zero_to_positive_infinite_energy():
+    from atom_openmm.awh import AWHBias
+
+    awh = AWHBias(3, 1.0)
+    probabilities = awh.probabilities([1.0, np.inf, 2.0], [0, 1, 2])
+
+    assert probabilities.sum() == pytest.approx(1.0)
+    assert probabilities[1] == 0.0
+
+
 def _test_rest2_scan_integrator_preserves_coordinates_and_time():
     import openmm as mm
     from openmm import unit
