@@ -318,17 +318,23 @@ workflow:
       learning_rate_kbt: 0.1
       refinement:
         enabled: true
-        learning_rates_kbt: [0.1, 0.05, 0.025, 0.0125]
-        min_steps_per_stage: 500000
-        min_round_trips_per_stage: 2
-        min_visits_per_state: 20
-        covering_fraction: 1.0
+        occupancy_half_life_moves: 5000
+        stages:
+          - {learning_rate_kbt: 0.1, min_steps: 500000, min_round_trips: 2, min_visits_per_state: 10}
+          - {learning_rate_kbt: 0.05, min_steps: 500000, min_round_trips: 2, min_visits_per_state: 20, min_recent_target_overlap: 0.60, rest2_hot_fraction_tolerance: 0.10}
+          - {learning_rate_kbt: 0.025, min_steps: 500000, min_round_trips: 3, min_visits_per_state: 30, min_recent_target_overlap: 0.70, rest2_hot_fraction_tolerance: 0.08}
+          - {learning_rate_kbt: 0.0125, min_steps: 500000, min_round_trips: 3, min_visits_per_state: 50, min_recent_target_overlap: 0.75, rest2_hot_fraction_tolerance: 0.06}
+          - {learning_rate_kbt: 0.005, min_steps: 500000, min_round_trips: 4, min_visits_per_state: 75, min_recent_target_overlap: 0.80, rest2_hot_fraction_tolerance: 0.05, min_endpoint_target_fraction: 0.5}
+          - {learning_rate_kbt: 0.002, min_steps: 500000, min_round_trips: 4, min_visits_per_state: 100, min_recent_target_overlap: 0.80, rest2_hot_fraction_tolerance: 0.04, min_endpoint_target_fraction: 0.5}
       frozen_validation:
-        min_steps: 500000
-        max_steps: 2000000
-        min_round_trips: 2
-        min_visits_per_state: 10
-        min_uniform_occupancy_overlap: 0.7
+        min_steps: 2000000
+        max_steps: 5000000
+        burn_in_steps: 500000
+        min_round_trips: 4
+        min_visits_per_state: 100
+        min_target_occupancy_overlap: 0.8
+        rest2_hot_fraction_tolerance: 0.04
+        min_endpoint_target_fraction: 0.5
       metric_target:
         enabled: false
         min_round_trips: 2
@@ -362,11 +368,11 @@ workflow:
 ```
 
 With `adaptive.refinement.enabled: true`, bias learning proceeds through the
-strictly decreasing `learning_rates_kbt` stages. Every stage must independently
-meet its step, physical A-B-A round-trip, visit, and coverage requirements.
-Fresh counters prevent a rapid global-Gibbs jump from allowing a contiguous
-unvisited block to pass merely because an earlier, more aggressive bias stage
-visited it.
+strictly decreasing learning rates in `refinement.stages`. Each stage has
+independent criteria, allowing aggressive early discovery and progressively
+stricter recent-occupancy, REST2-group, and physical-endpoint checks. The
+legacy `learning_rates_kbt` form with shared criteria remains supported, but it
+cannot be mixed with `stages`.
 
 After the final refinement stage, the bias is frozen for validation.
 Production begins only after the fixed-bias trajectory passes its own
@@ -376,6 +382,13 @@ smallest learning rate and tries validation again. Reaching
 `adaptive.max_steps` before validation passes produces a partial result.
 Stage transitions and their metrics are stored in
 `awh_summary.yaml:adaptation.history`.
+
+Frozen validation records a separate reduced-energy matrix after
+`burn_in_steps`. A failed validation attempt discards that matrix. When
+validation passes, its post-burn-in rows are combined with production for the
+primary UWHAM estimate. The summary also reports validation-only and
+production-only estimates so drift between the two fixed-bias phases remains
+visible.
 
 When refinement is disabled, the legacy adaptive stage uses the fixed
 dimensionless update size set by `adaptive.learning_rate_kbt` and the original
@@ -434,7 +447,8 @@ prepares B by traversing the configured ATM schedule with
 saved as `awh_start_B.xml`. This preparation is outside AWH statistics.
 
 Important artifacts are `awh_state_trace.csv`, `awh_bias_history.csv`,
-`awh_reduced_energies.csv`, `awh_checkpoint.yaml`, and `awh_summary.yaml`.
+`awh_validation_reduced_energies.csv`, `awh_reduced_energies.csv`,
+`awh_checkpoint.yaml`, and `awh_summary.yaml`.
 Version 1 is a single walker. Shared-bias multiple walkers and overlapping
 endpoint REST2 regions are not implemented. Independent A-start and B-start
 calculations should agree before using the method for a benchmark series.

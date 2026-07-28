@@ -228,6 +228,9 @@ def _test_awh_result_uses_fixed_bias_uwham_and_tracks_progress(tmp_path):
     writer.workdir.mkdir(parents=True)
     (writer.workdir / "awh_summary.yaml").write_text("status: completed\n")
     (writer.workdir / "awh_state_trace.csv").write_text("state\n")
+    (writer.workdir / "awh_validation_reduced_energies.csv").write_text(
+        "move,sampled_state,a,b\n"
+    )
     (writer.workdir / "awh_diagnostics.yaml").write_text("quality_passed: true\n")
     (writer.workdir / "awh_trajectory.xtc").write_bytes(b"xtc")
     (writer.workdir / "awh_trajectory_topology.pdb").write_text("END\n")
@@ -264,6 +267,18 @@ def _test_awh_result_uses_fixed_bias_uwham_and_tracks_progress(tmp_path):
                 "awh_bias_ddg_kcal_per_mol": 1.3,
                 "uwham_ddg_kcal_per_mol": 1.2,
                 "uwham_bootstrap_std_kcal_per_mol": 0.2,
+                "uwham_estimators": {
+                    "combined": {
+                        "ddg_kcal_per_mol": 1.2,
+                        "bootstrap_std_kcal_per_mol": 0.2,
+                        "samples": 500,
+                    },
+                    "validation_only": {
+                        "ddg_kcal_per_mol": 1.1,
+                        "bootstrap_std_kcal_per_mol": 0.3,
+                        "samples": 100,
+                    },
+                },
             },
         },
     )
@@ -272,6 +287,9 @@ def _test_awh_result_uses_fixed_bias_uwham_and_tracks_progress(tmp_path):
     assert result["result"]["estimator"] == "UWHAM"
     assert result["result"]["ddg_kcal_per_mol"] == pytest.approx(1.2)
     assert result["result"]["estimator_variants"]["awh_bias"]["ddg_kcal_per_mol"] == 1.3
+    assert result["result"]["estimator_variants"][
+        "fixed_bias_uwham_validation_only"
+    ]["samples"] == 100
     assert result["progress"]["current_awh_stage"] == "production"
     assert result["progress"]["round_trips"] == 12
     assert result["quality"]["overlap_score"] == pytest.approx(0.08)
@@ -283,6 +301,10 @@ def _test_awh_result_uses_fixed_bias_uwham_and_tracks_progress(tmp_path):
     ] == 80
     assert result["artifacts"]["awh_summary"] == "awh_summary.yaml"
     assert result["artifacts"]["awh_state_trace"] == "awh_state_trace.csv"
+    assert (
+        result["artifacts"]["awh_validation_reduced_energies"]
+        == "awh_validation_reduced_energies.csv"
+    )
     assert result["artifacts"]["awh_diagnostics"] == "awh_diagnostics.yaml"
     assert result["artifacts"]["awh_trajectory"] == "awh_trajectory.xtc"
     assert result["artifacts"]["awh_friction"] == "awh_friction.yaml"

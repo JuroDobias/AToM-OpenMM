@@ -175,6 +175,9 @@ class RBFEResultWriter:
                 "awh_state_trace": self._relative_if_exists("awh_state_trace.csv"),
                 "awh_bias_history": self._relative_if_exists("awh_bias_history.csv"),
                 "awh_reduced_energies": self._relative_if_exists("awh_reduced_energies.csv"),
+                "awh_validation_reduced_energies": self._relative_if_exists(
+                    "awh_validation_reduced_energies.csv"
+                ),
                 "awh_checkpoint": self._relative_if_exists("awh_checkpoint.yaml"),
                 "awh_diagnostics": self._relative_if_exists("awh_diagnostics.yaml"),
                 "awh_diagnostics_plot": self._relative_if_exists("awh_diagnostics.png"),
@@ -265,6 +268,22 @@ class RBFEResultWriter:
                     else float(values["uwham_bootstrap_std_kcal_per_mol"]) * KCAL_TO_KJ,
                 },
             }
+            for name, variant in (
+                values.get("uwham_estimators") or {}
+            ).items():
+                ddg = variant.get("ddg_kcal_per_mol")
+                error = variant.get("bootstrap_std_kcal_per_mol")
+                result["estimator_variants"][f"fixed_bias_uwham_{name}"] = {
+                    "ddg_kcal_per_mol": ddg,
+                    "ddg_error_kcal_per_mol": error,
+                    "ddg_kj_per_mol": (
+                        None if ddg is None else float(ddg) * KCAL_TO_KJ
+                    ),
+                    "ddg_error_kj_per_mol": (
+                        None if error is None else float(error) * KCAL_TO_KJ
+                    ),
+                    "samples": variant.get("samples"),
+                }
             self.data["quality"]["convergence"] = {
                 "stage": (analysis or {}).get("stage"),
                 "round_trips": (analysis or {}).get("round_trips"),

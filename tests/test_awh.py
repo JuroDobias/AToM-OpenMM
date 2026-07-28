@@ -126,10 +126,21 @@ def _test_awh_analysis_defaults_are_normalized():
     assert settings["adaptive"]["refinement"] == {
         "enabled": False,
         "learning_rates_kbt": [0.1],
-        "min_steps_per_stage": 500000,
-        "min_round_trips_per_stage": 2,
-        "min_visits_per_state": 20,
-        "covering_fraction": 1.0,
+        "stages": [
+            {
+                "learning_rate_kbt": 0.1,
+                "min_steps": 500000,
+                "min_round_trips": 2,
+                "min_visits_per_state": 20,
+                "covering_fraction": 1.0,
+            }
+        ],
+        "_legacy_shared": {
+            "min_steps_per_stage": 500000,
+            "min_round_trips_per_stage": 2,
+            "min_visits_per_state": 20,
+            "covering_fraction": 1.0,
+        },
     }
     assert settings["adaptive"]["metric_target"]["enabled"] is False
     assert settings["atm_state_count"] == 4
@@ -175,15 +186,90 @@ def _test_awh_staged_refinement_options_are_normalized():
     assert settings["adaptive"]["frozen_validation"][
         "min_uniform_occupancy_overlap"
     ] == pytest.approx(0.75)
-    assert settings["adaptive"]["refinement"][
+    assert settings["adaptive"]["refinement"]["stages"][0][
         "min_target_occupancy_overlap"
     ] == pytest.approx(0.8)
-    assert settings["adaptive"]["refinement"][
+    assert settings["adaptive"]["refinement"]["stages"][0][
         "rest2_hot_fraction_tolerance"
     ] == pytest.approx(0.05)
     assert settings["adaptive"]["refinement"][
         "occupancy_half_life_moves"
     ] == 5000
+
+
+def _test_awh_stage_specific_refinement_options_are_normalized():
+    from atom_openmm.awh import normalize_awh_options
+
+    stages = [
+        {
+            "learning_rate_kbt": rate,
+            "min_round_trips": trips,
+            "min_visits_per_state": 10 * (index + 1),
+            **(
+                {"min_recent_target_overlap": 0.8}
+                if index >= 4
+                else {}
+            ),
+            **(
+                {"min_endpoint_target_fraction": 0.5}
+                if index >= 4
+                else {}
+            ),
+        }
+        for index, (rate, trips) in enumerate(
+            zip([0.1, 0.05, 0.025, 0.0125, 0.005, 0.002], [2, 2, 3, 3, 4, 4])
+        )
+    ]
+    settings = normalize_awh_options(
+        {
+            "awh": {
+                "target_distribution": "grouped",
+                "adaptive": {
+                    "refinement": {
+                        "enabled": True,
+                        "occupancy_half_life_moves": 5000,
+                        "stages": stages,
+                    },
+                    "frozen_validation": {
+                        "min_steps": 2000000,
+                        "max_steps": 5000000,
+                        "burn_in_steps": 500000,
+                        "min_round_trips": 4,
+                        "min_visits_per_state": 100,
+                        "min_target_occupancy_overlap": 0.8,
+                        "min_endpoint_target_fraction": 0.5,
+                    },
+                },
+            }
+        },
+        _atom_options(),
+    )
+
+    normalized = settings["adaptive"]["refinement"]["stages"]
+    assert [stage["min_round_trips"] for stage in normalized] == [2, 2, 3, 3, 4, 4]
+    assert normalized[-1]["learning_rate_kbt"] == pytest.approx(0.002)
+    assert normalized[-1]["min_endpoint_target_fraction"] == pytest.approx(0.5)
+    assert settings["adaptive"]["frozen_validation"]["burn_in_steps"] == 500000
+
+
+def _test_awh_stage_specific_and_legacy_refinement_options_conflict():
+    from atom_openmm.awh import AWHConfigError, normalize_awh_options
+
+    with pytest.raises(AWHConfigError, match="cannot be combined"):
+        normalize_awh_options(
+            {
+                "awh": {
+                    "adaptive": {
+                        "refinement": {
+                            "enabled": True,
+                            "learning_rates_kbt": [0.1],
+                            "stages": [{"learning_rate_kbt": 0.1}],
+                        }
+                    }
+                }
+            },
+            _atom_options(),
+        )
 
 
 def _test_awh_staged_refinement_rejects_non_decreasing_rates():
@@ -322,6 +408,36 @@ def _test_awh_refinement_requires_phase_and_recent_grouped_occupancy():
     assert not _sampling_phase_complete(stale, requirements)
     assert stale["target_occupancy_overlap"] == pytest.approx(1.0)
     assert stale["recent_rest2_hot_fraction"] == pytest.approx(1 / 60)
+
+
+def _test_awh_refinement_requires_recent_endpoint_occupancy():
+    from atom_openmm.awh import (
+        _sampling_phase_complete,
+        _sampling_phase_metrics,
+    )
+
+    target = np.full(4, 0.25)
+    requirements = {
+        "min_steps": 1000,
+        "min_round_trips": 4,
+        "min_visits_per_state": 1,
+        "covering_fraction": 1.0,
+        "min_recent_target_overlap": 0.8,
+        "min_endpoint_target_fraction": 0.5,
+    }
+    phase = np.array([25, 25, 25, 25])
+    recent = np.array([5.0, 45.0, 45.0, 5.0])
+    metrics = _sampling_phase_metrics(
+        phase,
+        1000,
+        4,
+        target=target,
+        recent_visits=recent,
+        endpoint_indices=[0, 3],
+    )
+
+    assert metrics["recent_target_occupancy_overlap"] == pytest.approx(0.6)
+    assert not _sampling_phase_complete(metrics, requirements)
 
 
 def _test_awh_grouped_target_changes_dynamics_signature():
@@ -914,6 +1030,30 @@ def _test_awh_reduced_energies_reconcile_to_production_checkpoint(tmp_path):
     # Production began after move 65, so samples at moves 70, 80, 90, and 100 remain.
     assert len(rows) == 5
     assert rows[-1] == ["1", "3", "4"]
+
+
+def _test_awh_validation_energies_round_trip_and_combine(tmp_path):
+    from atom_openmm.awh import (
+        _append_reduced_energy,
+        _combined_reduced_energies,
+        _read_validation_reduced_energies,
+    )
+
+    graph = [{"name": "a"}, {"name": "b"}]
+    validation = tmp_path / "validation.csv"
+    production = tmp_path / "production.csv"
+    _append_reduced_energy(validation, graph, 0, [1.0, 2.0], move=10)
+    _append_reduced_energy(validation, graph, 1, [3.0, 4.0], move=20)
+    _append_reduced_energy(production, graph, 0, [5.0, 6.0])
+
+    states, rows = _read_validation_reduced_energies(validation)
+    assert states == [0, 1]
+    assert rows == [[1.0, 2.0], [3.0, 4.0]]
+    combined_states, combined_rows = _combined_reduced_energies(
+        production, validation
+    )
+    assert combined_states == [0, 1, 0]
+    assert combined_rows[-1] == [5.0, 6.0]
 
 
 def _test_awh_diagnostics_report_rest2_returns_overlap_and_ess():

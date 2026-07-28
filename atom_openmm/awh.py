@@ -105,33 +105,107 @@ def normalize_awh_options(workflow, atom_options):
             "must be mappings"
         )
     learning_rate_kbt = float(adaptive.get("learning_rate_kbt", 0.1))
+    legacy_refinement_keys = {
+        "learning_rates_kbt",
+        "min_steps_per_stage",
+        "min_round_trips_per_stage",
+        "min_visits_per_state",
+        "covering_fraction",
+        "min_target_occupancy_overlap",
+        "rest2_hot_fraction_tolerance",
+    }
+    raw_stages = refinement.get("stages")
+    if raw_stages is not None and any(
+        key in refinement for key in legacy_refinement_keys
+    ):
+        raise AWHConfigError(
+            "workflow.awh.adaptive.refinement.stages cannot be combined with "
+            "legacy shared refinement criteria"
+        )
+    if raw_stages is not None:
+        legacy_refinement = None
+        if not isinstance(raw_stages, list) or not raw_stages:
+            raise AWHConfigError(
+                "workflow.awh.adaptive.refinement.stages must be a non-empty list"
+            )
+        refinement_stages = []
+        for index, raw_stage in enumerate(raw_stages):
+            if not isinstance(raw_stage, dict):
+                raise AWHConfigError(
+                    "workflow.awh.adaptive.refinement.stages entries must be mappings"
+                )
+            stage = {
+                "learning_rate_kbt": float(raw_stage["learning_rate_kbt"]),
+                "min_steps": int(raw_stage.get("min_steps", 500_000)),
+                "min_round_trips": int(raw_stage.get("min_round_trips", 2)),
+                "min_visits_per_state": int(
+                    raw_stage.get("min_visits_per_state", 20)
+                ),
+                "covering_fraction": float(
+                    raw_stage.get("covering_fraction", 1.0)
+                ),
+            }
+            for key in (
+                "min_target_occupancy_overlap",
+                "min_recent_target_overlap",
+                "rest2_hot_fraction_tolerance",
+                "min_endpoint_target_fraction",
+            ):
+                if key in raw_stage:
+                    stage[key] = float(raw_stage[key])
+            refinement_stages.append(stage)
+    else:
+        refinement_rates = [
+            float(value)
+            for value in refinement.get("learning_rates_kbt", [learning_rate_kbt])
+        ]
+        shared = {
+            "min_steps": int(refinement.get("min_steps_per_stage", 500_000)),
+            "min_round_trips": int(
+                refinement.get("min_round_trips_per_stage", 2)
+            ),
+            "min_visits_per_state": int(
+                refinement.get("min_visits_per_state", 20)
+            ),
+            "covering_fraction": float(
+                refinement.get("covering_fraction", 1.0)
+            ),
+        }
+        for key in (
+            "min_target_occupancy_overlap",
+            "rest2_hot_fraction_tolerance",
+        ):
+            if key in refinement:
+                shared[key] = float(refinement[key])
+        refinement_stages = [
+            {"learning_rate_kbt": rate, **shared} for rate in refinement_rates
+        ]
+        legacy_refinement = {
+            "min_steps_per_stage": shared["min_steps"],
+            "min_round_trips_per_stage": shared["min_round_trips"],
+            "min_visits_per_state": shared["min_visits_per_state"],
+            "covering_fraction": shared["covering_fraction"],
+        }
+        for key in (
+            "min_target_occupancy_overlap",
+            "rest2_hot_fraction_tolerance",
+        ):
+            if key in shared:
+                legacy_refinement[key] = shared[key]
     refinement_rates = [
-        float(value)
-        for value in refinement.get("learning_rates_kbt", [learning_rate_kbt])
+        stage["learning_rate_kbt"] for stage in refinement_stages
     ]
     refinement_settings = {
         "enabled": bool(refinement.get("enabled", False)),
         "learning_rates_kbt": refinement_rates,
-        "min_steps_per_stage": int(
-            refinement.get("min_steps_per_stage", 500_000)
-        ),
-        "min_round_trips_per_stage": int(
-            refinement.get("min_round_trips_per_stage", 2)
-        ),
-        "min_visits_per_state": int(
-            refinement.get("min_visits_per_state", 20)
-        ),
-        "covering_fraction": float(
-            refinement.get("covering_fraction", 1.0)
-        ),
+        "stages": refinement_stages,
     }
-    for key, converter in (
-        ("min_target_occupancy_overlap", float),
-        ("rest2_hot_fraction_tolerance", float),
-        ("occupancy_half_life_moves", int),
-    ):
-        if key in refinement:
-            refinement_settings[key] = converter(refinement[key])
+    if "occupancy_half_life_moves" in refinement:
+        refinement_settings["occupancy_half_life_moves"] = int(
+            refinement["occupancy_half_life_moves"]
+        )
+    if legacy_refinement is not None:
+        refinement_settings["_legacy_shared"] = legacy_refinement
     frozen_validation_settings = {
         "min_steps": int(
             frozen_validation.get("min_steps", 500_000)
@@ -153,11 +227,16 @@ def normalize_awh_options(workflow, atom_options):
                 ),
             )
         ),
+        "burn_in_steps": int(
+            frozen_validation.get("burn_in_steps", 0)
+        ),
     }
-    if "rest2_hot_fraction_tolerance" in frozen_validation:
-        frozen_validation_settings["rest2_hot_fraction_tolerance"] = float(
-            frozen_validation["rest2_hot_fraction_tolerance"]
-        )
+    for key in (
+        "rest2_hot_fraction_tolerance",
+        "min_endpoint_target_fraction",
+    ):
+        if key in frozen_validation:
+            frozen_validation_settings[key] = float(frozen_validation[key])
     settings = {
         "state_move_interval_steps": int(raw.get("state_move_interval_steps", 500)),
         "atm_state_count": int(raw.get("atm_state_count", len(states))),
@@ -300,13 +379,16 @@ def normalize_awh_options(workflow, atom_options):
         settings["state_sampling"]["validation_states_per_check"],
     ]
     if settings["adaptive"]["refinement"]["enabled"]:
+        for stage in settings["adaptive"]["refinement"]["stages"]:
+            positive.extend(
+                [
+                    stage["min_steps"],
+                    stage["min_round_trips"],
+                    stage["min_visits_per_state"],
+                ]
+            )
         positive.extend(
             [
-                settings["adaptive"]["refinement"]["min_steps_per_stage"],
-                settings["adaptive"]["refinement"][
-                    "min_round_trips_per_stage"
-                ],
-                settings["adaptive"]["refinement"]["min_visits_per_state"],
                 settings["adaptive"]["frozen_validation"]["min_steps"],
                 settings["adaptive"]["frozen_validation"]["max_steps"],
                 settings["adaptive"]["frozen_validation"]["min_round_trips"],
@@ -335,22 +417,14 @@ def normalize_awh_options(workflow, atom_options):
         raise AWHConfigError("workflow.awh.adaptive.covering_fraction must be in (0, 1]")
     if (
         staged_refinement
-        and not 0
-        < settings["adaptive"]["refinement"]["covering_fraction"]
-        <= 1
-    ):
-        raise AWHConfigError(
-            "workflow.awh.adaptive.refinement.covering_fraction must be in (0, 1]"
+        and any(
+            not 0 < stage["covering_fraction"] <= 1
+            for stage in refinement_settings["stages"]
         )
-    if staged_refinement and (
-        "min_target_occupancy_overlap" in refinement_settings
-        and not 0
-        < refinement_settings["min_target_occupancy_overlap"]
-        <= 1
     ):
         raise AWHConfigError(
-            "workflow.awh.adaptive.refinement.min_target_occupancy_overlap "
-            "must be in (0, 1]"
+            "workflow.awh.adaptive.refinement stage covering_fraction must be "
+            "in (0, 1]"
         )
     if staged_refinement and (
         "occupancy_half_life_moves" in refinement_settings
@@ -360,10 +434,22 @@ def normalize_awh_options(workflow, atom_options):
             "workflow.awh.adaptive.refinement.occupancy_half_life_moves "
             "must be positive"
         )
-    for section, values in (
-        ("refinement", refinement_settings),
-        ("frozen_validation", frozen_validation_settings),
-    ):
+    occupancy_sections = [
+        (f"refinement.stages[{index}]", stage)
+        for index, stage in enumerate(refinement_settings["stages"])
+    ]
+    occupancy_sections.append(("frozen_validation", frozen_validation_settings))
+    for section, values in occupancy_sections:
+        for key in (
+            "min_target_occupancy_overlap",
+            "min_recent_target_overlap",
+            "min_endpoint_target_fraction",
+        ):
+            threshold = values.get(key)
+            if threshold is not None and not 0 < threshold <= 1:
+                raise AWHConfigError(
+                    f"workflow.awh.adaptive.{section}.{key} must be in (0, 1]"
+                )
         tolerance = values.get("rest2_hot_fraction_tolerance")
         if tolerance is not None and not 0 <= tolerance <= 1:
             raise AWHConfigError(
@@ -375,6 +461,15 @@ def normalize_awh_options(workflow, atom_options):
                 "REST2 hot-fraction occupancy gates require "
                 "workflow.awh.target_distribution: grouped"
             )
+    if validation["burn_in_steps"] < 0:
+        raise AWHConfigError(
+            "workflow.awh.adaptive.frozen_validation.burn_in_steps cannot be negative"
+        )
+    if validation["burn_in_steps"] >= validation["max_steps"]:
+        raise AWHConfigError(
+            "workflow.awh.adaptive.frozen_validation.burn_in_steps must be "
+            "less than max_steps"
+        )
     if (
         settings["initial_error_kj_per_mol"] <= 0
         or settings["diffusion_per_ps"] <= 0
@@ -876,6 +971,20 @@ def _protocol_signature(options, settings):
     if refinement is not None and not refinement.get("enabled", False):
         dynamics_settings["adaptive"].pop("refinement")
         dynamics_settings["adaptive"].pop("frozen_validation", None)
+    elif refinement is not None and "_legacy_shared" in refinement:
+        legacy = {
+            "enabled": refinement["enabled"],
+            "learning_rates_kbt": refinement["learning_rates_kbt"],
+            **refinement["_legacy_shared"],
+        }
+        if "occupancy_half_life_moves" in refinement:
+            legacy["occupancy_half_life_moves"] = refinement[
+                "occupancy_half_life_moves"
+            ]
+        dynamics_settings["adaptive"]["refinement"] = legacy
+    validation = dynamics_settings.get("adaptive", {}).get("frozen_validation")
+    if validation is not None and validation.get("burn_in_steps") == 0:
+        validation.pop("burn_in_steps")
     state_sampling = dynamics_settings.get("state_sampling")
     if state_sampling is not None and state_sampling.get("method") == "legacy_local_gibbs":
         dynamics_settings.pop("state_sampling")
@@ -940,6 +1049,7 @@ def _sampling_phase_metrics(
     target=None,
     rest2_hot_indices=None,
     recent_visits=None,
+    endpoint_indices=None,
 ):
     visits = np.asarray(visits, dtype=np.int64)
     metrics = {
@@ -968,6 +1078,21 @@ def _sampling_phase_metrics(
             metrics["recent_rest2_hot_fraction"] = _occupancy_fraction(
                 recent_visits, rest2_hot_indices
             )
+    if endpoint_indices is not None and target is not None:
+        endpoint_indices = [int(index) for index in endpoint_indices]
+        observed = visits / max(float(np.sum(visits)), 1.0)
+        expected = np.asarray(target, dtype=float)
+        metrics["endpoint_target_fractions"] = {
+            str(index): float(observed[index] / expected[index])
+            for index in endpoint_indices
+        }
+        if recent_visits is not None:
+            recent = np.asarray(recent_visits, dtype=float)
+            recent /= max(float(np.sum(recent)), 1.0)
+            metrics["recent_endpoint_target_fractions"] = {
+                str(index): float(recent[index] / expected[index])
+                for index in endpoint_indices
+            }
     return metrics
 
 
@@ -993,6 +1118,13 @@ def _sampling_phase_complete(metrics, requirements, *, require_overlap=False):
                 and metrics["recent_target_occupancy_overlap"]
                 >= overlap_threshold
             )
+    recent_overlap = requirements.get("min_recent_target_overlap")
+    if recent_overlap is not None:
+        complete = (
+            complete
+            and metrics.get("recent_target_occupancy_overlap", 0.0)
+            >= recent_overlap
+        )
     tolerance = requirements.get("rest2_hot_fraction_tolerance")
     if tolerance is not None:
         target = metrics.get("target_rest2_hot_fraction")
@@ -1009,6 +1141,17 @@ def _sampling_phase_complete(metrics, requirements, *, require_overlap=False):
                 and abs(metrics["recent_rest2_hot_fraction"] - target)
                 <= tolerance
             )
+    endpoint_fraction = requirements.get("min_endpoint_target_fraction")
+    if endpoint_fraction is not None:
+        phase = metrics.get("endpoint_target_fractions") or {}
+        recent = metrics.get("recent_endpoint_target_fractions") or {}
+        complete = (
+            complete
+            and bool(phase)
+            and min(phase.values()) >= endpoint_fraction
+        )
+        if recent:
+            complete = complete and min(recent.values()) >= endpoint_fraction
     return complete
 
 
@@ -1146,6 +1289,76 @@ def _reconcile_reduced_energy_csv(
     os.replace(temporary, path)
 
 
+def _read_validation_reduced_energies(path):
+    if not path.exists():
+        return [], []
+    with path.open(newline="") as handle:
+        reader = csv.reader(handle)
+        header = next(reader, [])
+        if header[:2] != ["move", "sampled_state"]:
+            raise AWHConfigError(f"invalid validation energy matrix: {path}")
+        rows = list(reader)
+    return (
+        [int(row[1]) for row in rows],
+        [[float(value) for value in row[2:]] for row in rows],
+    )
+
+
+def _append_reduced_energy(path, graph, sampled_state, row, move=None):
+    with path.open("a", newline="") as handle:
+        writer = csv.writer(handle)
+        if handle.tell() == 0:
+            prefix = ["sampled_state"] if move is None else ["move", "sampled_state"]
+            writer.writerow([*prefix, *[node["name"] for node in graph]])
+        prefix = [sampled_state] if move is None else [move, sampled_state]
+        writer.writerow([*prefix, *row])
+
+
+def _combined_reduced_energies(production_path, validation_path):
+    production_states, production_rows = read_reduced_energies(production_path)
+    validation_states, validation_rows = _read_validation_reduced_energies(
+        validation_path
+    )
+    return (
+        [*validation_states, *production_states],
+        [*validation_rows, *production_rows],
+    )
+
+
+def _uwham_variant(
+    reduced_energies,
+    sampled_states,
+    nstates,
+    a_index,
+    b_index,
+    beta,
+    bootstrap_samples,
+    rng,
+):
+    estimate = estimate_mbar(reduced_energies, sampled_states, nstates)
+    result = {
+        "ddg_kcal_per_mol": None,
+        "bootstrap_std_kcal_per_mol": None,
+        "samples": len(sampled_states),
+    }
+    if estimate is None:
+        return result, None
+    result["ddg_kcal_per_mol"] = float(
+        (estimate[b_index] - estimate[a_index]) / beta / 4.184
+    )
+    result["bootstrap_std_kcal_per_mol"] = bootstrap_mbar_ddg(
+        reduced_energies,
+        sampled_states,
+        nstates,
+        a_index,
+        b_index,
+        beta,
+        bootstrap_samples,
+        rng,
+    )
+    return result, estimate
+
+
 def run_awh(options, awh_options=None, progress_callback=None):
     settings = awh_options or normalize_awh_options({"awh": {}}, options)
     logger = logging.getLogger("atom_openmm.awh")
@@ -1168,6 +1381,7 @@ def run_awh(options, awh_options=None, progress_callback=None):
     xml_path = Path("awh_checkpoint.xml")
     trace_path = Path("awh_state_trace.csv")
     matrix_path = Path("awh_reduced_energies.csv")
+    validation_matrix_path = Path("awh_validation_reduced_energies.csv")
     bias_path = Path("awh_bias_history.csv")
     diagnostics_path = Path("awh_diagnostics.yaml")
     diagnostics_plot_path = Path("awh_diagnostics.png")
@@ -1176,7 +1390,12 @@ def run_awh(options, awh_options=None, progress_callback=None):
     trajectory_frames_path = Path("awh_trajectory_frames.csv")
     friction_samples_path = Path("awh_friction_samples.csv")
     friction_path = Path("awh_friction.yaml")
-    existing = state_path.exists() or xml_path.exists() or trace_path.exists()
+    existing = (
+        state_path.exists()
+        or xml_path.exists()
+        or trace_path.exists()
+        or validation_matrix_path.exists()
+    )
     if settings["resume"] and existing:
         if not manifest_path.exists():
             raise AWHConfigError("AWH resume artifacts exist without awh_protocol.yaml")
@@ -1189,6 +1408,7 @@ def run_awh(options, awh_options=None, progress_callback=None):
             xml_path,
             trace_path,
             matrix_path,
+            validation_matrix_path,
             bias_path,
             diagnostics_path,
             diagnostics_plot_path,
@@ -1517,6 +1737,7 @@ def run_awh(options, awh_options=None, progress_callback=None):
     if restored_move is not None:
         _reconcile_move_csv(trace_path, restored_move)
         _reconcile_move_csv(bias_path, restored_move)
+        _reconcile_move_csv(validation_matrix_path, restored_move)
         _reconcile_reduced_energy_csv(
             matrix_path,
             restored_move,
@@ -1583,7 +1804,9 @@ def run_awh(options, awh_options=None, progress_callback=None):
         )
 
     def diagnostics(free_energies=None):
-        sampled_states, matrices = read_reduced_energies(matrix_path)
+        sampled_states, matrices = _combined_reduced_energies(
+            matrix_path, validation_matrix_path
+        )
         if free_energies is None:
             free_energies = estimate_mbar(matrices, sampled_states, len(graph))
         friction = None
@@ -1642,8 +1865,8 @@ def run_awh(options, awh_options=None, progress_callback=None):
                     "staged_refinement": staged_refinement,
                     "refinement_index": refinement_index,
                     "learning_rate_kbt": (
-                        refinement_settings["learning_rates_kbt"][
-                            refinement_index
+                        refinement_settings["stages"][refinement_index][
+                            "learning_rate_kbt"
                         ]
                         if staged_refinement and stage == "adaptive"
                         else None
@@ -1700,8 +1923,8 @@ def run_awh(options, awh_options=None, progress_callback=None):
                 "staged_refinement": staged_refinement,
                 "refinement_index": refinement_index,
                 "learning_rate_kbt": (
-                    refinement_settings["learning_rates_kbt"][
-                        refinement_index
+                    refinement_settings["stages"][refinement_index][
+                        "learning_rate_kbt"
                     ]
                     if staged_refinement and stage == "adaptive"
                     else None
@@ -1787,8 +2010,8 @@ def run_awh(options, awh_options=None, progress_callback=None):
                         else ""
                     ),
                     "learning_rate_kbt": (
-                        refinement_settings["learning_rates_kbt"][
-                            refinement_index
+                        refinement_settings["stages"][refinement_index][
+                            "learning_rate_kbt"
                         ]
                         if staged_refinement and stage == "adaptive"
                         else ""
@@ -1897,9 +2120,9 @@ def run_awh(options, awh_options=None, progress_callback=None):
         if update_bias:
             learning_rate = settings["adaptive"]["learning_rate_kbt"]
             if staged_refinement:
-                learning_rate = refinement_settings["learning_rates_kbt"][
+                learning_rate = refinement_settings["stages"][
                     refinement_index
-                ]
+                ]["learning_rate_kbt"]
             awh.update(
                 candidates,
                 probabilities,
@@ -1935,6 +2158,13 @@ def run_awh(options, awh_options=None, progress_callback=None):
             )
         return candidates, probabilities, reduced
 
+    def complete_reduced_energy_row(reduced):
+        if global_sampling:
+            return list(reduced)
+        row = [beta * energy(index) for index in range(len(graph))]
+        apply_node(current)
+        return row
+
     def reset_phase_tracking():
         nonlocal phase_steps_completed
         nonlocal phase_visits
@@ -1961,6 +2191,7 @@ def run_awh(options, awh_options=None, progress_callback=None):
                 if occupancy_half_life_moves is not None
                 else None
             ),
+            endpoint_indices=(a_index, b_index),
         )
 
     def record_adaptation_event(event, metrics, **values):
@@ -1971,7 +2202,9 @@ def run_awh(options, awh_options=None, progress_callback=None):
                 "total_steps": total_steps,
                 "refinement_index": refinement_index,
                 "learning_rate_kbt": (
-                    refinement_settings["learning_rates_kbt"][refinement_index]
+                    refinement_settings["stages"][refinement_index][
+                        "learning_rate_kbt"
+                    ]
                     if staged_refinement
                     else settings["adaptive"]["learning_rate_kbt"]
                 ),
@@ -2018,44 +2251,29 @@ def run_awh(options, awh_options=None, progress_callback=None):
             reduced,
             expected_jump,
         )
+        if (
+            stage == "validation"
+            and phase_steps_completed > validation_settings["burn_in_steps"]
+            and move
+            % settings["production"]["reduced_energy_interval_moves"]
+            == 0
+        ):
+            _append_reduced_energy(
+                validation_matrix_path,
+                graph,
+                previous,
+                complete_reduced_energy_row(reduced),
+                move=move,
+            )
         adaptive = settings["adaptive"]
         transitioned = False
         metrics = current_phase_metrics()
         if stage == "adaptive" and staged_refinement:
-            requirements = {
-                "min_steps": refinement_settings["min_steps_per_stage"],
-                "min_round_trips": refinement_settings[
-                    "min_round_trips_per_stage"
-                ],
-                "min_visits_per_state": refinement_settings[
-                    "min_visits_per_state"
-                ],
-                "covering_fraction": refinement_settings[
-                    "covering_fraction"
-                ],
-                **(
-                    {
-                        "min_target_occupancy_overlap": refinement_settings[
-                            "min_target_occupancy_overlap"
-                        ]
-                    }
-                    if "min_target_occupancy_overlap" in refinement_settings
-                    else {}
-                ),
-                **(
-                    {
-                        "rest2_hot_fraction_tolerance": refinement_settings[
-                            "rest2_hot_fraction_tolerance"
-                        ]
-                    }
-                    if "rest2_hot_fraction_tolerance" in refinement_settings
-                    else {}
-                ),
-            }
+            requirements = refinement_settings["stages"][refinement_index]
             if _sampling_phase_complete(metrics, requirements):
                 if (
                     refinement_index + 1
-                    < len(refinement_settings["learning_rates_kbt"])
+                    < len(refinement_settings["stages"])
                 ):
                     record_adaptation_event(
                         "refinement_stage_complete", metrics
@@ -2065,9 +2283,9 @@ def run_awh(options, awh_options=None, progress_callback=None):
                         "AWH refinement advanced to stage %d/%d at %.6g kBT "
                         "after %d total steps",
                         refinement_index + 1,
-                        len(refinement_settings["learning_rates_kbt"]),
-                        refinement_settings["learning_rates_kbt"][
-                            refinement_index
+                        len(refinement_settings["stages"]),
+                        refinement_settings["stages"][refinement_index][
+                            "learning_rate_kbt"
                         ],
                         total_steps,
                     )
@@ -2083,6 +2301,7 @@ def run_awh(options, awh_options=None, progress_callback=None):
                         "frozen-bias validation",
                         total_steps,
                     )
+                    validation_matrix_path.unlink(missing_ok=True)
                     reset_phase_tracking()
                     transitioned = True
         elif stage == "adaptive":
@@ -2115,16 +2334,13 @@ def run_awh(options, awh_options=None, progress_callback=None):
                 "min_uniform_occupancy_overlap": validation_settings[
                     "min_uniform_occupancy_overlap"
                 ],
-                **(
-                    {
-                        "rest2_hot_fraction_tolerance": validation_settings[
-                            "rest2_hot_fraction_tolerance"
-                        ]
-                    }
-                    if "rest2_hot_fraction_tolerance" in validation_settings
-                    else {}
-                ),
             }
+            for key in (
+                "rest2_hot_fraction_tolerance",
+                "min_endpoint_target_fraction",
+            ):
+                if key in validation_settings:
+                    requirements[key] = validation_settings[key]
             if _sampling_phase_complete(
                 metrics, requirements, require_overlap=True
             ):
@@ -2146,8 +2362,9 @@ def run_awh(options, awh_options=None, progress_callback=None):
                     validation_attempt=validation_attempts,
                 )
                 stage = "adaptive"
+                validation_matrix_path.unlink(missing_ok=True)
                 refinement_index = (
-                    len(refinement_settings["learning_rates_kbt"]) - 1
+                    len(refinement_settings["stages"]) - 1
                 )
                 logger.warning(
                     "AWH frozen-bias validation attempt %d failed after %d "
@@ -2158,8 +2375,8 @@ def run_awh(options, awh_options=None, progress_callback=None):
                     metrics["round_trips"],
                     metrics["minimum_visits"],
                     metrics["target_occupancy_overlap"],
-                    refinement_settings["learning_rates_kbt"][
-                        refinement_index
+                    refinement_settings["stages"][refinement_index][
+                        "learning_rate_kbt"
                     ],
                 )
                 reset_phase_tracking()
@@ -2238,46 +2455,67 @@ def run_awh(options, awh_options=None, progress_callback=None):
             expected_jump,
         )
         if move % settings["production"]["reduced_energy_interval_moves"] == 0:
-            if global_sampling:
-                row = list(reduced)
-                sampled_state = previous
-            else:
-                row = [beta * energy(index) for index in range(len(graph))]
-                apply_node(current)
-                sampled_state = current
+            row = complete_reduced_energy_row(reduced)
+            sampled_state = previous
             matrices.append(row)
             sampled_states.append(sampled_state)
-            with matrix_path.open("a", newline="") as handle:
-                writer = csv.writer(handle)
-                if handle.tell() == 0:
-                    writer.writerow(["sampled_state", *[node["name"] for node in graph]])
-                writer.writerow([sampled_state, *row])
+            _append_reduced_energy(
+                matrix_path, graph, sampled_state, row
+            )
         if move % settings["checkpoint_interval_moves"] == 0:
             checkpoint()
             live_summary = summary()
             if progress_callback:
                 progress_callback(live_summary)
     checkpoint()
-    if matrix_path.exists():
-        with matrix_path.open() as handle:
-            rows = list(csv.reader(handle))
-        sampled_states = [int(row[0]) for row in rows[1:]]
-        matrices = [[float(value) for value in row[1:]] for row in rows[1:]]
-    mbar = estimate_mbar(matrices, sampled_states, len(graph))
+    production_states, production_matrices = read_reduced_energies(matrix_path)
+    validation_states, validation_matrices = _read_validation_reduced_energies(
+        validation_matrix_path
+    )
+    sampled_states = [*validation_states, *production_states]
+    matrices = [*validation_matrices, *production_matrices]
+    combined_variant, mbar = _uwham_variant(
+        matrices,
+        sampled_states,
+        len(graph),
+        a_index,
+        b_index,
+        beta,
+        settings["production"]["bootstrap_samples"],
+        rng,
+    )
     result = summary("completed", free_energies=mbar)
+    production_variant, _ = _uwham_variant(
+        production_matrices,
+        production_states,
+        len(graph),
+        a_index,
+        b_index,
+        beta,
+        settings["production"]["bootstrap_samples"],
+        rng,
+    )
+    validation_variant, _ = _uwham_variant(
+        validation_matrices,
+        validation_states,
+        len(graph),
+        a_index,
+        b_index,
+        beta,
+        settings["production"]["bootstrap_samples"],
+        rng,
+    )
+    result["analysis"]["uwham_estimators"] = {
+        "combined": combined_variant,
+        "production_only": production_variant,
+        "validation_only": validation_variant,
+    }
     if mbar is not None:
-        result["analysis"]["uwham_ddg_kcal_per_mol"] = float(
-            (mbar[b_index] - mbar[a_index]) / beta / 4.184
-        )
-        result["analysis"]["uwham_bootstrap_std_kcal_per_mol"] = bootstrap_mbar_ddg(
-            matrices,
-            sampled_states,
-            len(graph),
-            a_index,
-            b_index,
-            beta,
-            settings["production"]["bootstrap_samples"],
-            rng,
+        result["analysis"]["uwham_ddg_kcal_per_mol"] = combined_variant[
+            "ddg_kcal_per_mol"
+        ]
+        result["analysis"]["uwham_bootstrap_std_kcal_per_mol"] = (
+            combined_variant["bootstrap_std_kcal_per_mol"]
         )
         difference = abs(
             result["analysis"]["uwham_ddg_kcal_per_mol"]
@@ -2324,9 +2562,14 @@ def analyze_existing_awh(options, awh_options):
         raise AWHConfigError("awh_protocol.yaml has no state graph")
     settings = deepcopy(manifest.get("settings") or awh_options)
     settings["analysis"] = deepcopy(awh_options["analysis"])
-    sampled_states, matrices = read_reduced_energies(
+    production_states, production_matrices = read_reduced_energies(
         Path("awh_reduced_energies.csv")
     )
+    validation_states, validation_matrices = _read_validation_reduced_energies(
+        Path("awh_validation_reduced_energies.csv")
+    )
+    sampled_states = [*validation_states, *production_states]
+    matrices = [*validation_matrices, *production_matrices]
     mbar = estimate_mbar(matrices, sampled_states, len(graph))
     beta = 1.0 / (R_KJ_MOL_K * float(options["TEMPERATURES"][0]))
     a_index = next(i for i, node in enumerate(graph) if node["name"] == "a_physical")
@@ -2405,23 +2648,50 @@ def analyze_existing_awh(options, awh_options):
         },
         "warnings": list(quality["warnings"]),
     }
+    rng = np.random.default_rng(settings["random_seed"])
+    combined_variant, mbar = _uwham_variant(
+        matrices,
+        sampled_states,
+        len(graph),
+        a_index,
+        b_index,
+        beta,
+        settings["production"]["bootstrap_samples"],
+        rng,
+    )
+    production_variant, _ = _uwham_variant(
+        production_matrices,
+        production_states,
+        len(graph),
+        a_index,
+        b_index,
+        beta,
+        settings["production"]["bootstrap_samples"],
+        rng,
+    )
+    validation_variant, _ = _uwham_variant(
+        validation_matrices,
+        validation_states,
+        len(graph),
+        a_index,
+        b_index,
+        beta,
+        settings["production"]["bootstrap_samples"],
+        rng,
+    )
+    result["analysis"]["uwham_estimators"] = {
+        "combined": combined_variant,
+        "production_only": production_variant,
+        "validation_only": validation_variant,
+    }
     if mbar is None:
         result["status"] = "partial"
         result["warnings"].append(
             "fixed-bias samples did not visit every state; UWHAM is unavailable"
         )
     else:
-        uwham_ddg = float((mbar[b_index] - mbar[a_index]) / beta / 4.184)
-        uncertainty = bootstrap_mbar_ddg(
-            matrices,
-            sampled_states,
-            len(graph),
-            a_index,
-            b_index,
-            beta,
-            settings["production"]["bootstrap_samples"],
-            np.random.default_rng(settings["random_seed"]),
-        )
+        uwham_ddg = combined_variant["ddg_kcal_per_mol"]
+        uncertainty = combined_variant["bootstrap_std_kcal_per_mol"]
         difference = abs(uwham_ddg - bias_ddg)
         tolerance = max(0.5, 2.0 * uncertainty) if uncertainty is not None else 0.5
         result["analysis"].update(
