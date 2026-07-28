@@ -1087,7 +1087,7 @@ def _sampling_phase_metrics(
             for index in endpoint_indices
         }
         if recent_visits is not None:
-            recent = np.asarray(recent_visits, dtype=float)
+            recent = np.array(recent_visits, dtype=float, copy=True)
             recent /= max(float(np.sum(recent)), 1.0)
             metrics["recent_endpoint_target_fractions"] = {
                 str(index): float(recent[index] / expected[index])

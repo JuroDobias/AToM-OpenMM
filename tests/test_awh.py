@@ -427,6 +427,7 @@ def _test_awh_refinement_requires_recent_endpoint_occupancy():
     }
     phase = np.array([25, 25, 25, 25])
     recent = np.array([5.0, 45.0, 45.0, 5.0])
+    original_recent = recent.copy()
     metrics = _sampling_phase_metrics(
         phase,
         1000,
@@ -437,6 +438,7 @@ def _test_awh_refinement_requires_recent_endpoint_occupancy():
     )
 
     assert metrics["recent_target_occupancy_overlap"] == pytest.approx(0.6)
+    assert recent == pytest.approx(original_recent)
     assert not _sampling_phase_complete(metrics, requirements)
 
 
