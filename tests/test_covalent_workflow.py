@@ -435,6 +435,16 @@ def _test_gapsys_and_work_profile_settings_are_recorded_in_protocol():
     assert protocol["switch_work_profile"]["interval_steps"] == 100
 
 
+def test_switch_pdb_output_can_be_disabled():
+    default = _normalized_settings({"neqti": {}})
+    disabled = _normalized_settings(
+        {"neqti": {"write_switch_pdbs": False}}
+    )
+
+    assert default["write_switch_pdbs"] is False
+    assert disabled["write_switch_pdbs"] is False
+
+
 def _test_legacy_beutler_protocol_resumes_with_new_default_fields(tmp_path):
     config = _normalized_settings(
         {"neqti": {"interpolation": "softcore_linear"}}

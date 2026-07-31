@@ -1656,15 +1656,16 @@ def _run_environment(
             post_switch_path = workdir / (
                 f"{name}_{direction}_sample_{sample + 1:03d}_post_switch.pdb"
             )
-            _write_switch_pdb(
-                pre_switch_path,
-                prepared.topology,
-                state,
-                endpoint=endpoint,
-                dummy_atom_indices=_dummy_particles(prepared, endpoint),
-            )
+            if config["write_switch_pdbs"]:
+                _write_switch_pdb(
+                    pre_switch_path,
+                    prepared.topology,
+                    state,
+                    endpoint=endpoint,
+                    dummy_atom_indices=_dummy_particles(prepared, endpoint),
+                )
             context = None
-            post_switch_written = False
+            post_switch_written = not config["write_switch_pdbs"]
             switch_elapsed = None
             switch_ns_per_day = None
             raw_work_kj = None
@@ -1759,14 +1760,15 @@ def _run_environment(
                 post_switch_state = context.getState(
                     getPositions=True, enforcePeriodicBox=True
                 )
-                _write_switch_pdb(
-                    post_switch_path,
-                    prepared.topology,
-                    post_switch_state,
-                    endpoint=final_endpoint,
-                    dummy_atom_indices=_dummy_particles(prepared, final_endpoint),
-                )
-                post_switch_written = True
+                if config["write_switch_pdbs"]:
+                    _write_switch_pdb(
+                        post_switch_path,
+                        prepared.topology,
+                        post_switch_state,
+                        endpoint=final_endpoint,
+                        dummy_atom_indices=_dummy_particles(prepared, final_endpoint),
+                    )
+                    post_switch_written = True
                 if raw_work_kj is None:
                     raw_work_kj = integrator.get_protocol_work().value_in_unit(
                         unit.kilojoules_per_mole
@@ -2003,6 +2005,7 @@ def _normalized_settings(workflow):
         "decorrelation_steps": int(neqti.get("decorrelation_steps", 100000)),
         "switch_steps": switch_steps,
         "n_snapshots": int(neqti.get("n_snapshots", 10)),
+        "write_switch_pdbs": bool(neqti.get("write_switch_pdbs", False)),
         "bootstrap_samples": int(neqti.get("bootstrap_samples", 500)),
         "random_seed": int(neqti.get("random_seed", 2026)),
         "interpolation": interpolation,
