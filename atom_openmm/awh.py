@@ -2026,15 +2026,15 @@ def run_awh(options, awh_options=None, progress_callback=None):
                             "phase_target_occupancy_overlap": phase_metrics[
                                 "target_occupancy_overlap"
                             ],
-                            "phase_rest2_hot_fraction": phase_metrics[
+                            "phase_rest2_hot_fraction": phase_metrics.get(
                                 "rest2_hot_fraction"
-                            ],
+                            ),
                             "recent_target_occupancy_overlap": phase_metrics[
                                 "recent_target_occupancy_overlap"
                             ],
-                            "recent_rest2_hot_fraction": phase_metrics[
+                            "recent_rest2_hot_fraction": phase_metrics.get(
                                 "recent_rest2_hot_fraction"
-                            ],
+                            ),
                         }
                         if occupancy_half_life_moves is not None
                         else {}

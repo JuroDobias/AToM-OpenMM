@@ -442,6 +442,24 @@ def _test_awh_refinement_requires_recent_endpoint_occupancy():
     assert not _sampling_phase_complete(metrics, requirements)
 
 
+def _test_awh_phase_metrics_omit_rest2_values_when_rest2_is_disabled():
+    from atom_openmm.awh import _sampling_phase_metrics
+
+    metrics = _sampling_phase_metrics(
+        [25, 25, 25, 25],
+        1000,
+        4,
+        target=np.full(4, 0.25),
+        recent_visits=[10, 10, 10, 10],
+        rest2_hot_indices=[],
+    )
+
+    assert metrics["target_occupancy_overlap"] == pytest.approx(1.0)
+    assert metrics["recent_target_occupancy_overlap"] == pytest.approx(1.0)
+    assert "rest2_hot_fraction" not in metrics
+    assert "recent_rest2_hot_fraction" not in metrics
+
+
 def _test_awh_grouped_target_changes_dynamics_signature():
     from atom_openmm.awh import _protocol_signature, normalize_awh_options
 
