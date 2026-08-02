@@ -237,7 +237,8 @@ def _test_awh_stage_specific_refinement_options_are_normalized():
                         "min_round_trips": 4,
                         "min_visits_per_state": 100,
                         "min_target_occupancy_overlap": 0.8,
-                        "min_endpoint_target_fraction": 0.5,
+                        "min_endpoint_target_fraction": 0.4,
+                        "min_recent_endpoint_target_fraction": 0.5,
                     },
                 },
             }
@@ -249,7 +250,10 @@ def _test_awh_stage_specific_refinement_options_are_normalized():
     assert [stage["min_round_trips"] for stage in normalized] == [2, 2, 3, 3, 4, 4]
     assert normalized[-1]["learning_rate_kbt"] == pytest.approx(0.002)
     assert normalized[-1]["min_endpoint_target_fraction"] == pytest.approx(0.5)
-    assert settings["adaptive"]["frozen_validation"]["burn_in_steps"] == 500000
+    validation = settings["adaptive"]["frozen_validation"]
+    assert validation["burn_in_steps"] == 500000
+    assert validation["min_endpoint_target_fraction"] == pytest.approx(0.4)
+    assert validation["min_recent_endpoint_target_fraction"] == pytest.approx(0.5)
 
 
 def _test_awh_stage_specific_and_legacy_refinement_options_conflict():
@@ -440,6 +444,46 @@ def _test_awh_refinement_requires_recent_endpoint_occupancy():
     assert metrics["recent_target_occupancy_overlap"] == pytest.approx(0.6)
     assert recent == pytest.approx(original_recent)
     assert not _sampling_phase_complete(metrics, requirements)
+
+
+def _test_awh_phase_and_recent_endpoint_thresholds_are_independent():
+    from atom_openmm.awh import (
+        _sampling_phase_complete,
+        _sampling_phase_metrics,
+    )
+
+    target = np.full(4, 0.25)
+    requirements = {
+        "min_steps": 1000,
+        "min_round_trips": 4,
+        "min_visits_per_state": 1,
+        "covering_fraction": 1.0,
+        "min_endpoint_target_fraction": 0.4,
+        "min_recent_endpoint_target_fraction": 0.5,
+    }
+    phase = np.array([11.0, 39.0, 39.0, 11.0])
+    recent_balanced = np.array([13.0, 37.0, 37.0, 13.0])
+    recent_endpoint_poor = np.array([10.0, 40.0, 40.0, 10.0])
+
+    accepted = _sampling_phase_metrics(
+        phase,
+        1000,
+        4,
+        target=target,
+        recent_visits=recent_balanced,
+        endpoint_indices=[0, 3],
+    )
+    rejected = _sampling_phase_metrics(
+        phase,
+        1000,
+        4,
+        target=target,
+        recent_visits=recent_endpoint_poor,
+        endpoint_indices=[0, 3],
+    )
+
+    assert _sampling_phase_complete(accepted, requirements)
+    assert not _sampling_phase_complete(rejected, requirements)
 
 
 def _test_awh_phase_metrics_omit_rest2_values_when_rest2_is_disabled():

@@ -150,6 +150,7 @@ def normalize_awh_options(workflow, atom_options):
                 "min_recent_target_overlap",
                 "rest2_hot_fraction_tolerance",
                 "min_endpoint_target_fraction",
+                "min_recent_endpoint_target_fraction",
             ):
                 if key in raw_stage:
                     stage[key] = float(raw_stage[key])
@@ -234,6 +235,7 @@ def normalize_awh_options(workflow, atom_options):
     for key in (
         "rest2_hot_fraction_tolerance",
         "min_endpoint_target_fraction",
+        "min_recent_endpoint_target_fraction",
     ):
         if key in frozen_validation:
             frozen_validation_settings[key] = float(frozen_validation[key])
@@ -444,6 +446,7 @@ def normalize_awh_options(workflow, atom_options):
             "min_target_occupancy_overlap",
             "min_recent_target_overlap",
             "min_endpoint_target_fraction",
+            "min_recent_endpoint_target_fraction",
         ):
             threshold = values.get(key)
             if threshold is not None and not 0 < threshold <= 1:
@@ -1142,16 +1145,25 @@ def _sampling_phase_complete(metrics, requirements, *, require_overlap=False):
                 <= tolerance
             )
     endpoint_fraction = requirements.get("min_endpoint_target_fraction")
+    recent_endpoint_fraction = requirements.get(
+        "min_recent_endpoint_target_fraction"
+    )
     if endpoint_fraction is not None:
         phase = metrics.get("endpoint_target_fractions") or {}
-        recent = metrics.get("recent_endpoint_target_fractions") or {}
         complete = (
             complete
             and bool(phase)
             and min(phase.values()) >= endpoint_fraction
         )
-        if recent:
-            complete = complete and min(recent.values()) >= endpoint_fraction
+    recent = metrics.get("recent_endpoint_target_fractions") or {}
+    if recent_endpoint_fraction is None and recent:
+        recent_endpoint_fraction = endpoint_fraction
+    if recent_endpoint_fraction is not None:
+        complete = (
+            complete
+            and bool(recent)
+            and min(recent.values()) >= recent_endpoint_fraction
+        )
     return complete
 
 
