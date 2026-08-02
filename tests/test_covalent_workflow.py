@@ -83,12 +83,12 @@ def test_apply_state_accepts_positions_without_velocities():
     assert observed[0].x == positions_only.getPositions(asNumpy=True)[0].x
 
 
-def _prepared_fixture():
+def _prepared_fixture(atom_names=("C1", "C2")):
     topology = app.Topology()
     chain = topology.addChain("A")
     residue = topology.addResidue("MOL", chain, "1")
-    first = topology.addAtom("C1", app.Element.getBySymbol("C"), residue)
-    second = topology.addAtom("C2", app.Element.getBySymbol("C"), residue)
+    first = topology.addAtom(atom_names[0], app.Element.getBySymbol("C"), residue)
+    second = topology.addAtom(atom_names[1], app.Element.getBySymbol("C"), residue)
     topology.addBond(first, second)
     systems = []
     for distance in (0.15, 0.16):
@@ -139,6 +139,27 @@ def _test_prepared_pair_bundle_round_trips_and_rejects_changed_fingerprint(tmp_p
         assert "fingerprint differs" in str(exc)
     else:
         raise AssertionError("changed preparation fingerprint was accepted")
+
+
+def _test_prepared_pair_bundle_preserves_duplicate_atom_names(tmp_path):
+    prepared = _prepared_fixture(atom_names=("BCl3", "BCl3"))
+    manifest = _write_prepared_pair_bundle(
+        tmp_path,
+        prepared,
+        prepared,
+        fingerprint="expected",
+        fingerprint_inputs={},
+        mapping_payload={},
+        parameterization={},
+    )
+
+    protein, _, _ = _load_prepared_pair_bundle(tmp_path, "expected")
+
+    assert manifest["environments"]["protein"]["artifacts"]["topology"][
+        "file"
+    ].endswith(".cif")
+    assert protein.topology.getNumAtoms() == 2
+    assert [atom.name for atom in protein.topology.atoms()] == ["BCl3", "BCl3"]
 
 
 def _test_prepared_pair_bundle_rejects_corrupt_artifact(tmp_path):
