@@ -568,6 +568,52 @@ def _test_awh_analysis_output_settings_do_not_change_dynamics_signature():
     )
 
 
+def _test_awh_production_length_can_extend_legacy_checkpoint():
+    from atom_openmm.awh import (
+        _protocol_signature,
+        _resume_protocol_is_compatible,
+        normalize_awh_options,
+    )
+
+    previous = normalize_awh_options(
+        {"awh": {"production": {"steps": 5_000_000}}},
+        _atom_options(),
+    )
+    extended = normalize_awh_options(
+        {"awh": {"production": {"steps": 10_000_000}}},
+        _atom_options(),
+    )
+    manifest = {
+        "signature": _protocol_signature(
+            _atom_options(), previous, include_production_steps=True
+        ),
+        "settings": previous,
+    }
+    assert _protocol_signature(_atom_options(), previous) == _protocol_signature(
+        _atom_options(), extended
+    )
+    assert _resume_protocol_is_compatible(
+        manifest,
+        _atom_options(),
+        extended,
+    )
+
+    changed = normalize_awh_options(
+        {
+            "awh": {
+                "production": {"steps": 10_000_000},
+                "state_move_interval_steps": 200,
+            }
+        },
+        _atom_options(),
+    )
+    assert not _resume_protocol_is_compatible(
+        manifest,
+        _atom_options(),
+        changed,
+    )
+
+
 def _test_awh_metric_target_changes_dynamics_signature():
     from atom_openmm.awh import _protocol_signature, normalize_awh_options
 

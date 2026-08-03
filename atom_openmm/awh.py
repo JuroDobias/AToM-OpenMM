@@ -980,7 +980,7 @@ def bootstrap_mbar_ddg(
     return None if len(estimates) < 2 else float(np.std(estimates, ddof=1))
 
 
-def _protocol_signature(options, settings):
+def _protocol_signature(options, settings, include_production_steps=False):
     def scalar(value):
         raw = getattr(value, "_value", value)
         return float(raw)
@@ -988,6 +988,8 @@ def _protocol_signature(options, settings):
     dynamics_settings = deepcopy(
         {key: value for key, value in settings.items() if key != "analysis"}
     )
+    if not include_production_steps:
+        dynamics_settings["production"].pop("steps", None)
     metric_target = dynamics_settings.get("adaptive", {}).get("metric_target")
     if metric_target is not None and not metric_target.get("enabled", False):
         dynamics_settings["adaptive"].pop("metric_target")
@@ -1023,6 +1025,25 @@ def _protocol_signature(options, settings):
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def _resume_protocol_is_compatible(manifest, options, settings):
+    """Accept current signatures and legacy signatures differing only in run length."""
+    signature = _protocol_signature(options, settings)
+    if manifest.get("signature") == signature:
+        return True
+    previous_settings = manifest.get("settings")
+    if not isinstance(previous_settings, dict):
+        return False
+    previous_legacy_signature = _protocol_signature(
+        options,
+        previous_settings,
+        include_production_steps=True,
+    )
+    return (
+        manifest.get("signature") == previous_legacy_signature
+        and _protocol_signature(options, previous_settings) == signature
+    )
 
 
 def _atomic_yaml(path, data):
@@ -1433,7 +1454,12 @@ def run_awh(options, awh_options=None, progress_callback=None):
         if not manifest_path.exists():
             raise AWHConfigError("AWH resume artifacts exist without awh_protocol.yaml")
         with manifest_path.open() as handle:
-            if (yaml.safe_load(handle) or {}).get("signature") != signature:
+            manifest = yaml.safe_load(handle) or {}
+            if not _resume_protocol_is_compatible(
+                manifest,
+                options,
+                settings,
+            ):
                 raise AWHConfigError("existing AWH artifacts use a different protocol")
     elif not settings["resume"] and existing:
         for path in (
