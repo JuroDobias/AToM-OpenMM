@@ -780,6 +780,8 @@ class GlobalGibbsDiagnostics:
         self.validation_checks = 0
         self.direct_overflow_validations = 0
         self.negligible_probability_validations = 0
+        self.saturated_inner_energy_scans = 0
+        self.saturated_inner_energy_counts = {"u0": 0, "u1": 0}
         self.maximum_validation_error_kj_per_mol = 0.0
 
     def update(self, previous, selected, probabilities):
@@ -815,6 +817,15 @@ class GlobalGibbsDiagnostics:
             self.maximum_validation_error_kj_per_mol,
             float(maximum_error),
         )
+
+    def record_saturated_inner_energies(self, states):
+        if not states:
+            return
+        self.saturated_inner_energy_scans += 1
+        for state in states:
+            self.saturated_inner_energy_counts[state] = (
+                self.saturated_inner_energy_counts.get(state, 0) + 1
+            )
 
     def to_dict(self):
         moves = max(1, self.moves)
@@ -865,6 +876,10 @@ class GlobalGibbsDiagnostics:
                 ),
                 "maximum_error_kj_per_mol": self.maximum_validation_error_kj_per_mol,
             },
+            "inactive_inner_energy_saturation": {
+                "scans": self.saturated_inner_energy_scans,
+                "counts": dict(self.saturated_inner_energy_counts),
+            },
         }
 
     @classmethod
@@ -909,6 +924,12 @@ class GlobalGibbsDiagnostics:
         value.maximum_validation_error_kj_per_mol = float(
             validation.get("maximum_error_kj_per_mol", 0.0)
         )
+        saturation = data.get("inactive_inner_energy_saturation", {})
+        value.saturated_inner_energy_scans = int(saturation.get("scans", 0))
+        value.saturated_inner_energy_counts = {
+            "u0": int(saturation.get("counts", {}).get("u0", 0)),
+            "u1": int(saturation.get("counts", {}).get("u1", 0)),
+        }
         return value
 
 
@@ -2059,6 +2080,18 @@ def run_awh(options, awh_options=None, progress_callback=None):
         if global_sampling:
             candidates = list(range(len(graph)))
             all_energies = worker.all_graph_energies()
+            saturated = worker.last_energy_decomposition.get(
+                "saturated_inner_states", []
+            )
+            global_diagnostics.record_saturated_inner_energies(saturated)
+            saturation_scans = global_diagnostics.saturated_inner_energy_scans
+            if saturated and (saturation_scans == 1 or saturation_scans % 1000 == 0):
+                logger.warning(
+                    "ATM inactive inner energy saturated for %s in %d global "
+                    "energy scans; using the bounded inactive-energy sentinel",
+                    ", ".join(saturated),
+                    saturation_scans,
+                )
             all_energies, directly_repaired, excluded = _repair_global_energies(
                 all_energies,
                 current,

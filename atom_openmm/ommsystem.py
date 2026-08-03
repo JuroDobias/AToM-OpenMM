@@ -137,6 +137,23 @@ class OMMSystem(object):
                        'The maximum number (32) of the force groups is already used.')
         return max(freeGroups)
 
+    def configure_atm_endpoint_evaluation(self):
+        """Skip the inactive ATM inner context at exact physical endpoints."""
+        setter0 = getattr(self.atmforce, "setState0EvaluationExpression", None)
+        setter1 = getattr(self.atmforce, "setState1EvaluationExpression", None)
+        if setter0 is None or setter1 is None:
+            self.logger.info(
+                "OpenMM does not support inactive ATM endpoint-context skipping"
+            )
+            return False
+        lambdas = "Lambda1^2+Lambda2^2"
+        if self.multisoftplus:
+            lambdas += "+Lambda3^2"
+        setter0(f"select({lambdas}, 1, step(Direction))")
+        setter1(f"select({lambdas}, 1, step(-Direction))")
+        self.logger.info("Enabled inactive ATM endpoint-context skipping")
+        return True
+
     def set_positional_restraints(self):
         #indexes of the atoms whose position is restrained near the initial positions
         #by a flat-bottom harmonic potential. 
@@ -539,6 +556,7 @@ class OMMSystemABFE(OMMSystem):
         self.atmforce.addGlobalParameter("Acore", acore);
         self.atmforce.addGlobalParameter("Direction", direction);
         self.atmforce.addGlobalParameter("UOffset", uoffset/kilojoules_per_mole);
+        self.configure_atm_endpoint_evaluation()
 
         #assign a group to ATMForce for multiple time-steps
         self.atmforcegroup = self.free_force_group()
@@ -1016,6 +1034,7 @@ class OMMSystemRBFE(OMMSystem):
         self.atmforce.addGlobalParameter("Acore", acore);
         self.atmforce.addGlobalParameter("Direction", direction);
         self.atmforce.addGlobalParameter("UOffset", uoffset/kilojoules_per_mole);
+        self.configure_atm_endpoint_evaluation()
         
         #assign a group to ATMForce for multiple time-steps
         self.atmforcegroup = self.free_force_group()

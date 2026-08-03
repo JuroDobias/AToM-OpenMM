@@ -136,6 +136,15 @@ class OMMWorkerAWHGlobalGibbs(OMMWorkerATMSync):
             "u0_kj_per_mol": _energy_value(u0),
             "u1_kj_per_mol": _energy_value(u1),
         }
+        saturation_limit = 0.5 * np.finfo(np.float32).max
+        self.last_energy_decomposition["saturated_inner_states"] = [
+            name
+            for name, value in (
+                ("u0", self.last_energy_decomposition["u0_kj_per_mol"]),
+                ("u1", self.last_energy_decomposition["u1_kj_per_mol"]),
+            )
+            if not np.isfinite(value) or abs(value) >= saturation_limit
+        ]
         physical = reconstruct_atm_energies(
             self._awh_atm_states,
             environment_energy=self.last_energy_decomposition[
