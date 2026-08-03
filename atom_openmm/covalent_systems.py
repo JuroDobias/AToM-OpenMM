@@ -88,12 +88,14 @@ def write_prepared_hybrid_bundle(prepared, directory, name):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     paths = {
-        "topology": directory / f"{name}_topology.pdb",
+        "topology": directory / f"{name}_topology.cif",
         "endpoint_a": directory / f"{name}_endpoint_a.xml",
         "endpoint_b": directory / f"{name}_endpoint_b.xml",
     }
     with paths["topology"].open("w") as handle:
-        app.PDBFile.writeFile(prepared.topology, prepared.positions, handle, keepIds=True)
+        app.PDBxFile.writeFile(
+            prepared.topology, prepared.positions, handle, keepIds=True
+        )
     paths["endpoint_a"].write_text(mm.XmlSerializer.serialize(prepared.endpoint_a))
     paths["endpoint_b"].write_text(mm.XmlSerializer.serialize(prepared.endpoint_b))
     particle_count = prepared.endpoint_a.getNumParticles()
@@ -126,12 +128,16 @@ def load_prepared_hybrid_bundle(directory, payload):
         if _sha256(path) != artifact["sha256"]:
             raise CovalentParameterError(f"prepared artifact checksum differs: {path}")
         paths[key] = path
-    pdb = app.PDBFile(str(paths["topology"]))
+    topology_file = (
+        app.PDBxFile(str(paths["topology"]))
+        if paths["topology"].suffix.lower() in {".cif", ".mmcif"}
+        else app.PDBFile(str(paths["topology"]))
+    )
     endpoint_a = mm.XmlSerializer.deserialize(paths["endpoint_a"].read_text())
     endpoint_b = mm.XmlSerializer.deserialize(paths["endpoint_b"].read_text())
     expected = int(payload["particle_count"])
     observed = {
-        "topology": pdb.topology.getNumAtoms(),
+        "topology": topology_file.topology.getNumAtoms(),
         "endpoint_a": endpoint_a.getNumParticles(),
         "endpoint_b": endpoint_b.getNumParticles(),
     }
@@ -140,8 +146,8 @@ def load_prepared_hybrid_bundle(directory, payload):
             f"prepared particle counts differ from manifest {expected}: {observed}"
         )
     return PreparedCovalentHybrid(
-        pdb.topology,
-        pdb.positions,
+        topology_file.topology,
+        topology_file.positions,
         endpoint_a,
         endpoint_b,
         int(payload["solute_atom_count"]),
