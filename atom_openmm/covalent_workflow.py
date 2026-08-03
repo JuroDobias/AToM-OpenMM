@@ -58,6 +58,7 @@ from atom_openmm.neqti import (
 from atom_openmm.neqti_integrator import ATMNonequilibriumLangevinIntegrator
 from atom_openmm.rest2 import create_rest2_system
 from atom_openmm.rest2_exchange import REST2ExchangeSampler
+from atom_openmm.workflow_schema import WorkflowAxesError, normalize_workflow_axes
 
 
 LOGGER = logging.getLogger("atom_openmm.covalent_workflow")
@@ -104,10 +105,11 @@ def _resolve(path, base):
 
 
 def _mapping_settings(workflow, pair):
-    default = workflow.get("mapping")
+    alchemy = workflow.get("alchemy") or {}
+    default = alchemy.get("mapping")
     override = pair.get("mapping")
     if default is not None and not isinstance(default, dict):
-        raise CovalentWorkflowError("workflow.mapping must be a mapping")
+        raise CovalentWorkflowError("workflow.alchemy.mapping must be a mapping")
     if override is not None and not isinstance(override, dict):
         raise CovalentWorkflowError("workflow.pairs[].mapping must be a mapping")
     settings = dict(default or {})
@@ -139,8 +141,14 @@ def load_covalent_workflow(path):
         raise CovalentWorkflowError(f"workflow does not exist: {workflow_path}")
     config = yaml.safe_load(workflow_path.read_text()) or {}
     workflow = config.get("workflow") or {}
-    if workflow.get("type") != "rbfe" or workflow.get("mode") != "covalent":
-        raise CovalentWorkflowError("covalent workflow requires workflow.type='rbfe' and mode='covalent'")
+    if workflow.get("type") != "rbfe":
+        raise CovalentWorkflowError("covalent workflow requires workflow.type='rbfe'")
+    try:
+        axes = normalize_workflow_axes(workflow)
+    except WorkflowAxesError as exc:
+        raise CovalentWorkflowError(str(exc)) from exc
+    if axes.chemistry != "covalent":
+        raise CovalentWorkflowError("covalent workflow requires workflow.chemistry='covalent'")
     if not workflow.get("dataset"):
         raise CovalentWorkflowError("workflow.dataset is required for covalent mode")
     dataset_path = _resolve(workflow["dataset"], workflow_path.parent)
@@ -166,7 +174,10 @@ def plan_covalent_workflow(path):
     workflow = settings["workflow"]
     workdir = _resolve(workflow.get("workdir", "run"), settings["config_path"].parent)
     return {
-        "mode": "covalent",
+        "chemistry": "covalent",
+        "alchemy_model": "hybrid_topology",
+        "thermodynamic_cycle": "complex_solvent",
+        "sampling_method": "neqti",
         "dataset": str(settings["dataset_path"]),
         "receptor": str(settings["dataset_root"] / settings["dataset"]["receptor"]),
         "workdir": str(workdir),
@@ -2237,7 +2248,7 @@ def _validate_softcore_endpoint_charge(config, parameters_a, parameters_b):
         )
 
 
-def _switch_protocol(config, mapping_settings=None):
+def _switch_protocol(config, mapping_settings=None, mapping_label="covalent_mapping"):
     protocol = {
         "schema_version": 1,
         "interpolation": config["interpolation"],
@@ -2288,7 +2299,7 @@ def _switch_protocol(config, mapping_settings=None):
                 },
             ]
     if mapping_settings and mapping_settings["method"] != "dataset_core":
-        protocol["covalent_mapping"] = dict(mapping_settings)
+        protocol[mapping_label] = dict(mapping_settings)
     serialized = yaml.safe_dump(protocol, sort_keys=True)
     protocol["fingerprint"] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
     return protocol
@@ -2314,13 +2325,20 @@ def _upgrade_legacy_switch_protocol(protocol):
     return upgraded
 
 
-def _ensure_switch_protocol(workdir, config, mapping_settings=None):
+def _ensure_switch_protocol(
+    workdir,
+    config,
+    mapping_settings=None,
+    *,
+    environments=("protein", "reference"),
+    mapping_label="covalent_mapping",
+):
     workdir = Path(workdir)
     path = workdir / "switch_protocol.yaml"
-    expected = _switch_protocol(config, mapping_settings)
+    expected = _switch_protocol(config, mapping_settings, mapping_label)
     existing_work = any(
         (workdir / f"{environment}_{direction}.csv").exists()
-        for environment in ("protein", "reference")
+        for environment in environments
         for direction in ("forward", "reverse")
     )
     if path.exists():
@@ -2328,14 +2346,14 @@ def _ensure_switch_protocol(workdir, config, mapping_settings=None):
         observed = _upgrade_legacy_switch_protocol(observed)
         if observed != expected:
             raise CovalentWorkflowError(
-                "existing covalent work uses a different switching protocol; "
+                "existing hybrid work uses a different switching protocol; "
                 "use a new workdir or restore the original workflow settings"
             )
         if yaml.safe_load(path.read_text()) != expected:
             _write_yaml_atomic(path, expected)
     elif existing_work and config["interpolation"] == "softcore_linear":
         raise CovalentWorkflowError(
-            "cannot resume softcore covalent work without switch_protocol.yaml; use a new workdir"
+            "cannot resume softcore hybrid work without switch_protocol.yaml; use a new workdir"
         )
     else:
         if existing_work:
@@ -2368,7 +2386,9 @@ def run_covalent_pair(settings, pair):
             "jobname": jobname,
             "status": "running",
             "method": "neqti",
-            "system_mode": "covalent",
+            "chemistry": "covalent",
+            "alchemy_model": "hybrid_topology",
+            "thermodynamic_cycle": "complex_solvent",
             "ligand_a": pair["ligand_a"],
             "ligand_b": pair["ligand_b"],
             "workdir": str(workdir.resolve()),
@@ -2521,7 +2541,9 @@ def run_covalent_pair(settings, pair):
         "jobname": jobname,
         "status": "completed" if analysis is not None else "partial",
         "method": "neqti",
-        "system_mode": "covalent",
+        "chemistry": "covalent",
+        "alchemy_model": "hybrid_topology",
+        "thermodynamic_cycle": "complex_solvent",
         "ligand_a": pair["ligand_a"],
         "ligand_b": pair["ligand_b"],
         "workdir": str(workdir.resolve()),
@@ -2660,7 +2682,9 @@ def run_covalent_workflow(path):
                     "jobname": jobname,
                     "status": "failed",
                     "method": "neqti",
-                    "system_mode": "covalent",
+                    "chemistry": "covalent",
+                    "alchemy_model": "hybrid_topology",
+                    "thermodynamic_cycle": "complex_solvent",
                     "ligand_a": pair["ligand_a"],
                     "ligand_b": pair["ligand_b"],
                     "workdir": str(workdir.resolve()),

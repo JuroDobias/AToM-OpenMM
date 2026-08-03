@@ -204,9 +204,11 @@ def _test_state_compatibility_reports_particle_count_mismatch():
 
 def test_covalent_mapping_settings_support_default_and_pair_override():
     workflow = {
-        "mapping": {
-            "method": "mcs_core_smarts",
-            "smarts": "c1ccccc1",
+        "alchemy": {
+            "mapping": {
+                "method": "mcs_core_smarts",
+                "smarts": "c1ccccc1",
+            },
         }
     }
 
@@ -596,7 +598,9 @@ def _write_fixture(tmp_path, *, decorrelation_steps=1000):
     workflow = {
         "workflow": {
             "type": "rbfe",
-            "mode": "covalent",
+            "chemistry": "covalent",
+            "alchemy": {"model": "hybrid_topology", "cycle": "complex_solvent"},
+            "sampling": {"method": "neqti"},
             "dataset": "dataset.yaml",
             "workdir": "run",
             "pairs": [{"ligand_a": "A", "ligand_b": "B"}],
@@ -622,7 +626,7 @@ def _test_covalent_mode_routes_through_atom_rbfe(tmp_path):
     direct = plan_covalent_workflow(path)
     routed = plan_workflow(path)
     assert routed == direct
-    assert routed["mode"] == "covalent"
+    assert routed["chemistry"] == "covalent"
     assert routed["pairs"][0]["ligand_a"] == "A"
 
 

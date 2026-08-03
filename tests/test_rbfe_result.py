@@ -46,6 +46,9 @@ def _test_async_result_schema_and_unit_conversion(tmp_path):
     assert result["tool"] == "atom_openmm_rbfe"
     assert result["status"] == "completed"
     assert result["method"] == "async_re"
+    assert result["chemistry"] == "noncovalent"
+    assert result["alchemy_model"] == "atm"
+    assert result["thermodynamic_cycle"] == "transfer"
     assert result["convention"]["edge_direction"] == "ligand_a_to_ligand_b"
     assert result["convention"]["ddg_definition"] == "G(ligand_b) - G(ligand_a)"
     assert result["external_metadata"] == {"edge_id": 44}
@@ -355,7 +358,11 @@ def _test_run_pair_records_setup_failure_and_reraises(tmp_path):
     with pytest.raises(WorkflowConfigError, match="missing alignment atoms"):
         run_pair(
             pair_plan,
-            {"production_method": "async_re"},
+            {
+                "chemistry": "noncovalent",
+                "alchemy": {"model": "atm", "cycle": "transfer"},
+                "sampling": {"method": "async_re"},
+            },
             {"MAX_SAMPLES": 10},
             {"ligandforcefield": "gaff-2.2.20"},
             receptor,

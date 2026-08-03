@@ -639,3 +639,10 @@ def build_covalent_hybrid_molecule(
         attachment_pairs,
         scales,
     )
+
+
+# Generic names for noncovalent and covalent dual-topology preparation.  The
+# covalent names remain available for existing internal callers.
+HybridMolecule = CovalentHybridMolecule
+HybridBondedScales = DummyBondedScales
+build_hybrid_molecule = build_covalent_hybrid_molecule

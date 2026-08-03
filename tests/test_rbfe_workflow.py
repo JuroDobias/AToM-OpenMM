@@ -36,7 +36,9 @@ def _write_minimal_workflow(tmp_path):
     workflow = {
         "workflow": {
             "type": "rbfe",
-            "mode": "small_molecule",
+            "chemistry": "noncovalent",
+            "alchemy": {"model": "atm", "cycle": "transfer"},
+            "sampling": {"method": "async_re"},
             "workdir": "complexes",
             "receptor": "receptor/cdk2.pdb",
             "ligands_dir": "ligands",
@@ -206,6 +208,9 @@ def _test_object_pairs_external_metadata_and_ligand_mapping(tmp_path):
     workflow = {
         "workflow": {
             "type": "rbfe",
+            "chemistry": "noncovalent",
+            "alchemy": {"model": "atm", "cycle": "transfer"},
+            "sampling": {"method": "async_re"},
             "receptor": "receptor.pdb",
             "workdir": "run",
             "external_metadata": {"graph_id": 12, "edge_id": 1},
@@ -620,7 +625,9 @@ def _test_run_production_routes_neqti(monkeypatch):
         "MAX_SAMPLES": 1,
     }
     workflow = {
-        "production_method": "neqti",
+        "chemistry": "noncovalent",
+        "alchemy": {"model": "atm", "cycle": "transfer"},
+        "sampling": {"method": "neqti"},
         "neqti": {
             "n_snapshots": 1,
             "switch_steps_per_segment": 2,
@@ -657,7 +664,9 @@ def _test_run_production_routes_awh(monkeypatch):
         "ACORE": 0.0625,
     }
     workflow = {
-        "production_method": "awh",
+        "chemistry": "noncovalent",
+        "alchemy": {"model": "atm", "cycle": "transfer"},
+        "sampling": {"method": "awh"},
         "awh": {
             "adaptive": {"min_steps": 500, "max_steps": 1000},
             "production": {"steps": 500},
@@ -680,7 +689,7 @@ def _test_neqti_workflow_uses_physical_only_structprep(tmp_path, monkeypatch):
     config_file = _write_minimal_workflow(tmp_path)
     config = yaml.safe_load(config_file.read_text())
     config["workflow"]["prepare_only"] = False
-    config["workflow"]["production_method"] = "neqti"
+    config["workflow"]["sampling"]["method"] = "neqti"
     config["atom_options"]["TIME_STEP"] = 0.002
     config["workflow"]["equilibration"] = {
         "pre_atm": {

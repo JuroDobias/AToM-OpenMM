@@ -412,7 +412,9 @@ def workflow_for_pair(
         neqti.update(neqti_overrides)
     workflow = {
         "type": "rbfe",
-        "mode": "small_molecule",
+        "chemistry": "noncovalent",
+        "alchemy": {"model": "atm", "cycle": "transfer"},
+        "sampling": {"method": "neqti"},
         "workdir": "run",
         "receptor": "receptor/receptor.pdb",
         "ligands_dir": "ligands",
@@ -421,7 +423,6 @@ def workflow_for_pair(
         "forcefield_cache": "ff.json",
         "run": True,
         "analyze": True,
-        "production_method": "neqti",
         "equilibration": BENCHMARK_V1_EQUILIBRATION,
         "neqti": neqti,
         "setup": {

@@ -441,3 +441,7 @@ def solvate_capped_reference_hybrid(
         tuple(range(hybrid.topology.getNumAtoms())),
         provenance,
     )
+
+
+PreparedHybridSystem = PreparedCovalentHybrid
+merge_hybrid_with_environment = solvate_capped_reference_hybrid

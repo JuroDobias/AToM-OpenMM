@@ -89,7 +89,8 @@ def _test_generate_workflows_writes_one_job_per_pair(tmp_path):
     assert index_csv.exists()
 
     workflow = yaml.safe_load(workflow_path.read_text())
-    assert workflow["workflow"]["production_method"] == "neqti"
+    assert workflow["workflow"]["sampling"]["method"] == "neqti"
+    assert workflow["workflow"]["alchemy"] == {"model": "atm", "cycle": "transfer"}
     assert workflow["workflow"]["pairs"] == [["H1Q-p.mol2", "H1R-p.mol2"]]
     assert workflow["workflow"]["alignments"] == "alignments.yaml"
     assert workflow["workflow"]["setup"]["mode"] == "ambertools"

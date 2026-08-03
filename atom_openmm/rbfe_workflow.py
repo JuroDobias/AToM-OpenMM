@@ -17,6 +17,7 @@ from rdkit import Chem
 from atom_openmm.rbfe_production import rbfe_production
 from atom_openmm.rbfe_result import RBFEResultWriter
 from atom_openmm.rbfe_structprep import rbfe_structprep
+from atom_openmm.workflow_schema import WorkflowAxesError, normalize_workflow_axes
 from atom_openmm.equilibration import normalize_equilibration_protocol
 from atom_openmm.utils.AtomUtils import (
     calc_displ_vec,
@@ -56,13 +57,16 @@ def _resolve_path(path, base_dir):
     return p.resolve()
 
 
-def _workflow_mode(config_file):
+def _workflow_axes(config_file):
     config_path = Path(config_file).resolve()
     with config_path.open() as handle:
         config = yaml.safe_load(handle)
     if not isinstance(config, dict) or not isinstance(config.get("workflow"), dict):
         raise WorkflowConfigError("workflow config must contain a workflow mapping")
-    return config["workflow"].get("mode", "small_molecule")
+    try:
+        return normalize_workflow_axes(config["workflow"])
+    except WorkflowAxesError as exc:
+        raise WorkflowConfigError(str(exc)) from exc
 
 
 def _require_mapping(value, name):
@@ -218,12 +222,16 @@ def load_workflow_config(config_file):
 
     _require_mapping(config, "workflow config")
     workflow = _require_mapping(config.get("workflow"), "workflow")
-    atom_options = _require_mapping(config.get("atom_options"), "atom_options")
+    atom_options = _require_mapping(config.get("atom_options", {}), "atom_options")
 
     if workflow.get("type") != "rbfe":
         raise WorkflowConfigError("workflow.type must be 'rbfe'")
-    if workflow.get("mode", "small_molecule") != "small_molecule":
-        raise WorkflowConfigError("only workflow.mode='small_molecule' is supported")
+    try:
+        axes = normalize_workflow_axes(workflow)
+    except WorkflowAxesError as exc:
+        raise WorkflowConfigError(str(exc)) from exc
+    if axes.chemistry != "noncovalent":
+        raise WorkflowConfigError("small-molecule loader requires noncovalent chemistry")
 
     if "receptor" not in workflow:
         raise WorkflowConfigError("workflow.receptor is required")
@@ -1025,7 +1033,7 @@ def analyze_pair(options, workflow):
 
 
 def run_production(options, workflow, progress_callback=None):
-    production_method = workflow.get("production_method", "async_re")
+    production_method = normalize_workflow_axes(workflow).sampling_method
     if production_method == "async_re":
         if should_run_production(options):
             rbfe_production(config_file=None, options=options)
@@ -1045,7 +1053,7 @@ def run_production(options, workflow, progress_callback=None):
             return run_awh(options, awh_options)
         return run_awh(options, awh_options, progress_callback=progress_callback)
     raise WorkflowConfigError(
-        "workflow.production_method must be 'async_re', 'neqti', or 'awh'"
+        "workflow.sampling.method must be 'async_re', 'neqti', or 'awh'"
     )
 
 
@@ -1091,7 +1099,8 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
     options["BASENAME"] = pair_plan["jobname"]
     options["WORKDIR"] = str(jobdir.resolve())
     options["LIGAND_FORCE_FIELD"] = setup_options["ligandforcefield"]
-    production_method = workflow.get("production_method", "async_re")
+    axes = normalize_workflow_axes(workflow)
+    production_method = axes.sampling_method
     requested_samples = (
         (workflow.get("neqti") or {}).get("n_snapshots", atom_options.get("MAX_SAMPLES", 1))
         if production_method == "neqti"
@@ -1102,6 +1111,9 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
         receptor_file=receptor_file,
         workflow_yaml=workflow_yaml or (Path.cwd() / "workflow.yaml"),
         method=production_method,
+        chemistry=axes.chemistry,
+        alchemy_model=axes.alchemy_model,
+        thermodynamic_cycle=axes.thermodynamic_cycle,
         requested_samples=requested_samples,
         pair_index=pair_plan.get("pair_index", 1),
         total_pairs=pair_plan.get("total_pairs", 1),
@@ -1264,10 +1276,15 @@ def _prepare_run_context(config_file):
 
 
 def validate_workflow(config_file):
-    if _workflow_mode(config_file) == "covalent":
+    axes = _workflow_axes(config_file)
+    if axes.chemistry == "covalent":
         from atom_openmm.covalent_workflow import validate_covalent_workflow
 
         return validate_covalent_workflow(config_file)
+    if axes.alchemy_model == "hybrid_topology":
+        from atom_openmm.hybrid_workflow import validate_noncovalent_hybrid_workflow
+
+        return validate_noncovalent_hybrid_workflow(config_file)
     config = load_workflow_config(config_file)
     plan = build_small_molecule_plan(config)
     normalize_setup_options(config["workflow"], config["atom_options"])
@@ -1278,11 +1295,16 @@ def validate_workflow(config_file):
 
 
 def plan_workflow(config_file):
-    if _workflow_mode(config_file) == "covalent":
+    axes = _workflow_axes(config_file)
+    if axes.chemistry == "covalent":
         from atom_openmm.covalent_workflow import plan_covalent_workflow
 
         validate_workflow(config_file)
         return plan_covalent_workflow(config_file)
+    if axes.alchemy_model == "hybrid_topology":
+        from atom_openmm.hybrid_workflow import plan_noncovalent_hybrid_workflow
+
+        return plan_noncovalent_hybrid_workflow(config_file)
     config = load_workflow_config(config_file)
     # Build alignments too so --plan-only catches missing alignment inputs.
     plan = build_small_molecule_plan(config)
@@ -1316,7 +1338,8 @@ def analyze_awh_existing(options, workflow):
 
 
 def analyze_pair_existing(pair_plan, workflow, atom_options, receptor_file, workflow_yaml=None):
-    production_method = workflow.get("production_method", "async_re")
+    axes = normalize_workflow_axes(workflow)
+    production_method = axes.sampling_method
     requested_samples = (
         (workflow.get("neqti") or {}).get("n_snapshots", atom_options.get("MAX_SAMPLES", 1))
         if production_method == "neqti"
@@ -1327,6 +1350,9 @@ def analyze_pair_existing(pair_plan, workflow, atom_options, receptor_file, work
         receptor_file=receptor_file,
         workflow_yaml=workflow_yaml or (Path.cwd() / "workflow.yaml"),
         method=production_method,
+        chemistry=axes.chemistry,
+        alchemy_model=axes.alchemy_model,
+        thermodynamic_cycle=axes.thermodynamic_cycle,
         requested_samples=requested_samples,
         pair_index=pair_plan.get("pair_index", 1),
         total_pairs=pair_plan.get("total_pairs", 1),
@@ -1370,10 +1396,15 @@ def analyze_pair_existing(pair_plan, workflow, atom_options, receptor_file, work
 
 
 def run_rbfe_workflow(config_file):
-    if _workflow_mode(config_file) == "covalent":
+    axes = _workflow_axes(config_file)
+    if axes.chemistry == "covalent":
         from atom_openmm.covalent_workflow import run_covalent_workflow
 
         return run_covalent_workflow(config_file)
+    if axes.alchemy_model == "hybrid_topology":
+        from atom_openmm.hybrid_workflow import run_noncovalent_hybrid_workflow
+
+        return run_noncovalent_hybrid_workflow(config_file)
     config, plan, setup_options, alignments = _prepare_run_context(config_file)
     results = []
     for pair_plan in plan["pairs"]:
@@ -1392,10 +1423,15 @@ def run_rbfe_workflow(config_file):
 
 
 def analyze_existing_workflow(config_file):
-    if _workflow_mode(config_file) == "covalent":
+    axes = _workflow_axes(config_file)
+    if axes.chemistry == "covalent":
         from atom_openmm.covalent_workflow import analyze_covalent_workflow
 
         return analyze_covalent_workflow(config_file)
+    if axes.alchemy_model == "hybrid_topology":
+        from atom_openmm.hybrid_workflow import analyze_noncovalent_hybrid_workflow
+
+        return analyze_noncovalent_hybrid_workflow(config_file)
     config = load_workflow_config(config_file)
     plan = build_small_molecule_plan(config)
     results = []

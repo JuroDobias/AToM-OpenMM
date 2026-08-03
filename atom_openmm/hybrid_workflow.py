@@ -1,0 +1,542 @@
+from __future__ import annotations
+
+import hashlib
+import os
+import shutil
+from pathlib import Path
+
+import numpy as np
+import yaml
+from openff.toolkit import Molecule
+from openff.units import unit as offunit
+
+from atom_openmm.covalent_hybrid import HybridBondedScales, build_hybrid_molecule
+from atom_openmm.covalent_softcore import resolve_softcore_path
+from atom_openmm.covalent_systems import (
+    load_prepared_hybrid_bundle,
+    solvate_capped_reference_hybrid,
+    write_prepared_hybrid_bundle,
+)
+from atom_openmm.covalent_workflow import (
+    _normalized_settings,
+    _ensure_switch_protocol,
+    _platform,
+    _read_work,
+    _run_environment,
+    _validate_prepared_endpoint_charges,
+    _write_yaml_atomic,
+)
+from atom_openmm.hybrid_mapping import build_hybrid_atom_map
+from atom_openmm.hybrid_parameters import parameterize_ligand
+from atom_openmm.hybrid_systems import create_physical_ligand_environment
+from atom_openmm.neqti import analyze_two_leg_work
+
+
+class HybridWorkflowError(ValueError):
+    pass
+
+
+PREPARATION_SCHEMA_VERSION = 1
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _mapping_settings(workflow):
+    settings = dict((workflow.get("alchemy") or {}).get("mapping") or {})
+    method = settings.get("method", "mcs")
+    if method not in {"mcs", "mcs_core_smarts"}:
+        raise HybridWorkflowError(
+            "workflow.alchemy.mapping.method must be 'mcs' or 'mcs_core_smarts'"
+        )
+    settings["method"] = method
+    if method == "mcs_core_smarts" and not settings.get("smarts"):
+        raise HybridWorkflowError(
+            "mcs_core_smarts requires workflow.alchemy.mapping.smarts"
+        )
+    if "max_mapped_rmsd_a" in settings:
+        settings["max_mapped_rmsd_a"] = float(settings["max_mapped_rmsd_a"])
+    return settings
+
+
+def _formal_charge(path):
+    molecule = Molecule.from_file(str(path), allow_undefined_stereo=False)
+    return int(round(molecule.total_charge.m_as(offunit.elementary_charge)))
+
+
+def _validate_settings(workflow):
+    setup = workflow.get("setup") or {}
+    if not str(setup.get("ligand_forcefield", "espaloma-0.3.2")).startswith("espaloma"):
+        raise HybridWorkflowError(
+            "noncovalent hybrid topology currently supports Espaloma ligand force fields"
+        )
+    if setup.get("ligand_charge_model", "nn") != "nn":
+        raise HybridWorkflowError(
+            "noncovalent hybrid topology currently supports ligand_charge_model: nn"
+        )
+    config = _normalized_settings(workflow)
+    if config["interpolation"] != "softcore_linear":
+        raise HybridWorkflowError(
+            "noncovalent hybrid topology requires workflow.neqti.interpolation: softcore_linear"
+        )
+    if config["failed_switch_policy"] not in {"abort", "count_as_infinite"}:
+        raise HybridWorkflowError(
+            "workflow.neqti.failed_switch_policy must be 'abort' or 'count_as_infinite'"
+        )
+    try:
+        resolved = resolve_softcore_path(**{
+            key: value
+            for key, value in config["softcore"].items()
+            if key in {
+                "charge_steps_per_stage", "sterics_steps", "subdivisions_per_stage",
+                "total_steps", "path_nodes", "vdw_a", "charge_a",
+                "segments_per_interval",
+            }
+        })
+    except Exception as exc:
+        raise HybridWorkflowError(str(exc)) from exc
+    if config["n_snapshots"] < 1 or config["switch_steps"] < 1:
+        raise HybridWorkflowError("NEQTI snapshots and switching steps must be positive")
+    if config["schedule_optimization"]["enabled"]:
+        segments = sum(resolved["segments_per_interval"])
+        optimization = config["schedule_optimization"]
+        if optimization["min_segment_steps"] * segments > config["switch_steps"]:
+            raise HybridWorkflowError("schedule optimizer minimum segment allocation is too large")
+        if optimization["max_segment_steps"] * segments < config["switch_steps"]:
+            raise HybridWorkflowError("schedule optimizer maximum segment allocation is too small")
+    return config
+
+
+def validate_noncovalent_hybrid_workflow(path):
+    from atom_openmm.rbfe_workflow import build_small_molecule_plan, load_workflow_config
+
+    config = load_workflow_config(path)
+    plan = build_small_molecule_plan(config)
+    _mapping_settings(config["workflow"])
+    _validate_settings(config["workflow"])
+    for pair in plan["pairs"]:
+        charge_a = _formal_charge(pair["lig1_file"])
+        charge_b = _formal_charge(pair["lig2_file"])
+        if charge_a != charge_b:
+            raise HybridWorkflowError(
+                f"hybrid topology requires equal endpoint formal charges in this release: "
+                f"{pair['lig1_name']}={charge_a}, {pair['lig2_name']}={charge_b}"
+            )
+    return True
+
+
+def plan_noncovalent_hybrid_workflow(path):
+    from atom_openmm.rbfe_workflow import build_small_molecule_plan, load_workflow_config
+
+    validate_noncovalent_hybrid_workflow(path)
+    config = load_workflow_config(path)
+    plan = build_small_molecule_plan(config)
+    return {
+        "schema_version": 1,
+        "chemistry": "noncovalent",
+        "alchemy_model": "hybrid_topology",
+        "thermodynamic_cycle": "complex_solvent",
+        "sampling_method": "neqti",
+        "receptor": str(plan["receptor_file"]),
+        "workdir": str(plan["workdir"]),
+        "mapping": _mapping_settings(config["workflow"]),
+        "pairs": [
+            {
+                "ligand_a": pair["lig1_name"],
+                "ligand_b": pair["lig2_name"],
+                "workdir": str(pair["jobdir"]),
+                "environments": ["complex", "solvent"],
+            }
+            for pair in plan["pairs"]
+        ],
+    }
+
+
+def _preparation_fingerprint(pair, receptor, workflow, mapping):
+    files = {
+        "receptor": receptor,
+        "ligand_a": pair["lig1_file"],
+        "ligand_b": pair["lig2_file"],
+    }
+    payload = {
+        "schema_version": PREPARATION_SCHEMA_VERSION,
+        "files": {
+            name: {"path": str(Path(value).resolve()), "sha256": _sha256(value)}
+            for name, value in files.items()
+        },
+        "setup": workflow.get("setup") or {},
+        "mapping": mapping,
+    }
+    digest = hashlib.sha256(yaml.safe_dump(payload, sort_keys=True).encode()).hexdigest()
+    return digest, payload
+
+
+def _write_bundle(workdir, complex_system, solvent_system, manifest):
+    target = workdir / "prepared"
+    temporary = workdir / f".prepared.tmp-{os.getpid()}"
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    temporary.mkdir(parents=True)
+    manifest = {
+        **manifest,
+        "environments": {
+            "complex": write_prepared_hybrid_bundle(complex_system, temporary, "complex"),
+            "solvent": write_prepared_hybrid_bundle(solvent_system, temporary, "solvent"),
+        },
+    }
+    _write_yaml_atomic(temporary / "manifest.yaml", manifest)
+    if target.exists():
+        raise HybridWorkflowError(f"prepared bundle already exists: {target}")
+    os.replace(temporary, target)
+    return manifest
+
+
+def _load_bundle(workdir, fingerprint):
+    directory = workdir / "prepared"
+    manifest_path = directory / "manifest.yaml"
+    if not manifest_path.is_file():
+        return None
+    manifest = yaml.safe_load(manifest_path.read_text()) or {}
+    if manifest.get("schema_version") != PREPARATION_SCHEMA_VERSION:
+        raise HybridWorkflowError("prepared bundle schema differs; use a new workdir")
+    if manifest.get("fingerprint") != fingerprint:
+        raise HybridWorkflowError("prepared bundle inputs differ; use a new workdir")
+    return (
+        load_prepared_hybrid_bundle(directory, manifest["environments"]["complex"]),
+        load_prepared_hybrid_bundle(directory, manifest["environments"]["solvent"]),
+        manifest,
+    )
+
+
+def _runtime_artifacts_exist(workdir):
+    return any(
+        any(Path(workdir).glob(pattern))
+        for pattern in (
+            "*_endpoint_*_state*.xml",
+            "*_forward.csv",
+            "*_reverse.csv",
+            "*_rest2_*",
+        )
+    )
+
+
+def _prepare_pair(pair, receptor, workflow, workdir):
+    mapping_settings = _mapping_settings(workflow)
+    fingerprint, fingerprint_inputs = _preparation_fingerprint(
+        pair, receptor, workflow, mapping_settings
+    )
+    loaded = _load_bundle(workdir, fingerprint)
+    if loaded is not None:
+        return (*loaded[:2], loaded[2], fingerprint)
+    if _runtime_artifacts_exist(workdir):
+        raise HybridWorkflowError(
+            "resume_incompatible: runtime artifacts exist without the current prepared bundle; "
+            "use a new workdir"
+        )
+    setup = workflow.get("setup") or {}
+    ligand_forcefield = setup.get("ligand_forcefield", "espaloma-0.3.2")
+    charge_model = setup.get("ligand_charge_model", "nn")
+    parameters_a = parameterize_ligand(
+        pair["lig1_file"], ligand_forcefield=ligand_forcefield,
+        ligand_charge_model=charge_model,
+    )
+    parameters_b = parameterize_ligand(
+        pair["lig2_file"], ligand_forcefield=ligand_forcefield,
+        ligand_charge_model=charge_model,
+    )
+    if not np.isclose(parameters_a.charges_e.sum(), parameters_b.charges_e.sum(), atol=1e-6):
+        raise HybridWorkflowError("parameterized endpoint ligand charges differ")
+    atom_map, mapping_payload = build_hybrid_atom_map(
+        parameters_a, parameters_b, mapping_settings
+    )
+    hybrid = build_hybrid_molecule(
+        parameters_a,
+        parameters_b,
+        atom_map=atom_map,
+        dummy_bonded_scales=HybridBondedScales(
+            **_normalized_settings(workflow)["dummy_bonded_scales"]
+        ),
+    )
+    seed = int(setup.get("solvation_seed", _normalized_settings(workflow)["random_seed"]))
+    physical_complex = create_physical_ligand_environment(
+        parameters_a, receptor=receptor, setup=setup, solvation_seed=seed
+    )
+    physical_solvent = create_physical_ligand_environment(
+        parameters_a, receptor=None, setup=setup, solvation_seed=seed + 1
+    )
+    complex_system = solvate_capped_reference_hybrid(hybrid, physical_complex)
+    solvent_system = solvate_capped_reference_hybrid(hybrid, physical_solvent)
+    _validate_prepared_endpoint_charges(complex_system, "complex")
+    _validate_prepared_endpoint_charges(solvent_system, "solvent")
+    manifest = {
+        "schema_version": PREPARATION_SCHEMA_VERSION,
+        "fingerprint": fingerprint,
+        "fingerprint_inputs": fingerprint_inputs,
+        "mapping": mapping_payload,
+        "parameterization": {
+            "ligand_a": parameters_a.provenance,
+            "ligand_b": parameters_b.provenance,
+        },
+    }
+    manifest = _write_bundle(workdir, complex_system, solvent_system, manifest)
+    _write_yaml_atomic(workdir / "hybrid_mapping.yaml", mapping_payload)
+    return complex_system, solvent_system, manifest, fingerprint
+
+
+def _analysis_payload(work, config):
+    return analyze_two_leg_work(
+        work, config["temperature_k"], config["bootstrap_samples"], config["random_seed"]
+    )
+
+
+def _result(
+    pair,
+    workflow_path,
+    receptor,
+    workdir,
+    analysis,
+    manifest,
+    config,
+    status,
+    rest2=None,
+):
+    components = None if analysis is None else {
+        "complex": analysis["components"]["leg_a"],
+        "solvent": analysis["components"]["leg_b"],
+    }
+    counts = {
+        "leg_a_forward": len(_read_work(workdir / "complex_forward.csv")),
+        "leg_a_reverse": len(_read_work(workdir / "complex_reverse.csv")),
+        "leg_b_forward": len(_read_work(workdir / "solvent_forward.csv")),
+        "leg_b_reverse": len(_read_work(workdir / "solvent_reverse.csv")),
+    }
+    work_values = {
+        "leg_a_forward": _read_work(workdir / "complex_forward.csv"),
+        "leg_a_reverse": _read_work(workdir / "complex_reverse.csv"),
+        "leg_b_forward": _read_work(workdir / "solvent_forward.csv"),
+        "leg_b_reverse": _read_work(workdir / "solvent_reverse.csv"),
+    }
+    finite_counts = {
+        name: int(np.count_nonzero(np.isfinite(values)))
+        for name, values in work_values.items()
+    }
+    infinite_counts = {
+        name: counts[name] - finite_counts[name] for name in counts
+    }
+    optimizer_path = workdir / "covalent_schedule_optimization.yaml"
+    optimizer = (
+        yaml.safe_load(optimizer_path.read_text()) if optimizer_path.exists() else None
+    )
+    return {
+        "schema_version": 1,
+        "tool": "atom_openmm_rbfe",
+        "jobname": pair["jobname"],
+        "status": status,
+        "method": "neqti",
+        "chemistry": "noncovalent",
+        "alchemy_model": "hybrid_topology",
+        "thermodynamic_cycle": "complex_solvent",
+        "ligand_a": pair["lig1_name"],
+        "ligand_b": pair["lig2_name"],
+        "workdir": str(workdir.resolve()),
+        "external_metadata": pair.get("external_metadata") or {},
+        "termination_reason": None,
+        "convention": {
+            "edge_direction": "ligand_a_to_ligand_b",
+            "ddg_definition": "G(ligand_b) - G(ligand_a)",
+            "positive_value_meaning": "ligand_b binds weaker than ligand_a",
+        },
+        "result": {
+            "ddg_kcal_per_mol": None if analysis is None else analysis["bar_dg_kcal_per_mol"],
+            "ddg_error_kcal_per_mol": None if analysis is None else analysis["bar_bootstrap_std_kcal_per_mol"],
+            "ddg_kj_per_mol": None if analysis is None else analysis["bar_dg_kj_per_mol"],
+            "ddg_error_kj_per_mol": None if analysis is None else analysis["bar_bootstrap_std_kj_per_mol"],
+            "estimator": "BAR",
+            "samples_forward": counts["leg_a_forward"] + counts["leg_b_forward"],
+            "samples_reverse": counts["leg_a_reverse"] + counts["leg_b_reverse"],
+            "samples_per_replica": None,
+            "components": components,
+            "estimator_variants": None,
+        },
+        "quality": {
+            "convergence_status": "usable" if analysis and analysis["overlap_score"] >= 0.01 else "partial",
+            "overlap_score": None if analysis is None else analysis["overlap_score"],
+            "cycle_closure_error": None,
+            "warnings": [],
+            "rest2": rest2,
+            "finite_sample_counts": finite_counts,
+            "counted_infinite_work_counts": infinite_counts,
+            "convergence": None,
+            "schedule_optimization": optimizer,
+        },
+        "error": None,
+        "inputs": {
+            "receptor": str(Path(receptor).resolve()),
+            "ligand_a_file": str(pair["lig1_file"]),
+            "ligand_b_file": str(pair["lig2_file"]),
+            "workflow_yaml": str(Path(workflow_path).resolve()),
+            "final_pair_yaml": None,
+        },
+        "artifacts": {
+            "prepared_manifest": "prepared/manifest.yaml",
+            "hybrid_mapping": "hybrid_mapping.yaml",
+            "complex_forward_work_csv": "complex_forward.csv",
+            "complex_reverse_work_csv": "complex_reverse.csv",
+            "solvent_forward_work_csv": "solvent_forward.csv",
+            "solvent_reverse_work_csv": "solvent_reverse.csv",
+            "switch_protocol": "switch_protocol.yaml",
+            "schedule_optimization": (
+                "covalent_schedule_optimization.yaml" if optimizer is not None else None
+            ),
+        },
+        "parameterization": manifest.get("parameterization"),
+        "progress": {
+            "stage": status if status in {"prepared", "completed"} else "production",
+            "current_pair_index": pair.get("pair_index", 1),
+            "total_pairs": pair.get("total_pairs", 1),
+            "forward_samples": counts["leg_a_forward"] + counts["leg_b_forward"],
+            "reverse_samples": counts["leg_a_reverse"] + counts["leg_b_reverse"],
+            "target_forward_samples": 2 * config["n_snapshots"],
+            "target_reverse_samples": 2 * config["n_snapshots"],
+            "sample_counts": counts,
+            "target_sample_counts": {
+                name: config["n_snapshots"] for name in counts
+            },
+            "completed_snapshot_cycles": min(counts.values()),
+            "target_snapshot_cycles": config["n_snapshots"],
+        },
+    }
+
+
+def run_noncovalent_hybrid_workflow(path):
+    from atom_openmm.rbfe_workflow import build_small_molecule_plan, load_workflow_config
+
+    validate_noncovalent_hybrid_workflow(path)
+    loaded = load_workflow_config(path)
+    workflow = loaded["workflow"]
+    plan = build_small_molecule_plan(loaded)
+    config = _validate_settings(workflow)
+    platform, properties = _platform(workflow)
+    results = []
+    for pair in plan["pairs"]:
+        workdir = pair["jobdir"]
+        workdir.mkdir(parents=True, exist_ok=True)
+        try:
+            _ensure_switch_protocol(
+                workdir,
+                config,
+                _mapping_settings(workflow),
+                environments=("complex", "solvent"),
+                mapping_label="hybrid_mapping",
+            )
+            complex_system, solvent_system, manifest, _ = _prepare_pair(
+                pair, plan["receptor_file"], workflow, workdir
+            )
+            if workflow.get("prepare_only", False) or not workflow.get("run", True):
+                payload = _result(
+                    pair,
+                    path,
+                    plan["receptor_file"],
+                    workdir,
+                    None,
+                    manifest,
+                    config,
+                    "prepared",
+                )
+                _write_yaml_atomic(workdir / "result.yaml", payload)
+                results.append(
+                    {
+                        "jobname": pair["jobname"],
+                        "status": "prepared",
+                        "workdir": str(workdir),
+                    }
+                )
+                continue
+            _write_yaml_atomic(
+                workdir / "result.yaml",
+                _result(pair, path, plan["receptor_file"], workdir, None, manifest, config, "running"),
+            )
+            complex_forward, complex_reverse, complex_rest2 = _run_environment(
+                "complex", complex_system, config, workdir, platform, properties,
+                config["random_seed"],
+            )
+            solvent_forward, solvent_reverse, solvent_rest2 = _run_environment(
+                "solvent", solvent_system, config, workdir, platform, properties,
+                config["random_seed"] + 100000,
+            )
+            work = {
+                "leg_a_forward": complex_forward,
+                "leg_a_reverse": complex_reverse,
+                "leg_b_forward": solvent_forward,
+                "leg_b_reverse": solvent_reverse,
+            }
+            analysis = _analysis_payload(work, config)
+            status = "completed" if analysis is not None else "partial"
+            payload = _result(
+                pair,
+                path,
+                plan["receptor_file"],
+                workdir,
+                analysis,
+                manifest,
+                config,
+                status,
+                rest2={"complex": complex_rest2, "solvent": solvent_rest2},
+            )
+            _write_yaml_atomic(workdir / "result.yaml", payload)
+            results.append({
+                "jobname": pair["jobname"], "status": status,
+                "workdir": str(workdir),
+                "ddg": None if analysis is None else analysis["bar_dg_kcal_per_mol"],
+                "ddg_std": None if analysis is None else analysis["bar_bootstrap_std_kcal_per_mol"],
+            })
+        except (Exception, KeyboardInterrupt) as exc:
+            failure = {
+                "schema_version": 1, "tool": "atom_openmm_rbfe",
+                "jobname": pair["jobname"], "status": "failed", "method": "neqti",
+                "chemistry": "noncovalent", "alchemy_model": "hybrid_topology",
+                "thermodynamic_cycle": "complex_solvent",
+                "ligand_a": pair["lig1_name"], "ligand_b": pair["lig2_name"],
+                "workdir": str(workdir.resolve()),
+                "error": {"type": type(exc).__name__, "message": str(exc), "stage": "production"},
+            }
+            _write_yaml_atomic(workdir / "result.yaml", failure)
+            raise
+    return results
+
+
+def analyze_noncovalent_hybrid_workflow(path):
+    from atom_openmm.rbfe_workflow import build_small_molecule_plan, load_workflow_config
+
+    validate_noncovalent_hybrid_workflow(path)
+    loaded = load_workflow_config(path)
+    workflow = loaded["workflow"]
+    plan = build_small_molecule_plan(loaded)
+    config = _validate_settings(workflow)
+    results = []
+    for pair in plan["pairs"]:
+        workdir = pair["jobdir"]
+        work = {
+            "leg_a_forward": _read_work(workdir / "complex_forward.csv"),
+            "leg_a_reverse": _read_work(workdir / "complex_reverse.csv"),
+            "leg_b_forward": _read_work(workdir / "solvent_forward.csv"),
+            "leg_b_reverse": _read_work(workdir / "solvent_reverse.csv"),
+        }
+        analysis = _analysis_payload(work, config)
+        manifest = yaml.safe_load((workdir / "prepared" / "manifest.yaml").read_text())
+        status = "completed" if analysis is not None else "partial"
+        _write_yaml_atomic(
+            workdir / "result.yaml",
+            _result(pair, path, plan["receptor_file"], workdir, analysis, manifest, config, status),
+        )
+        results.append({
+            "jobname": pair["jobname"], "status": status, "workdir": str(workdir),
+            "ddg": None if analysis is None else analysis["bar_dg_kcal_per_mol"],
+            "ddg_std": None if analysis is None else analysis["bar_bootstrap_std_kcal_per_mol"],
+        })
+    return results
