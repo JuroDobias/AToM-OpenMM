@@ -67,6 +67,23 @@ cd $HOME/AToM-OpenMM/examples/RBFE/cdk2
 atom-rbfe workflow.yaml
 ```
 
+Every workflow selects independent chemistry, alchemy, cycle, and sampling axes:
+
+```yaml
+workflow:
+  type: rbfe
+  chemistry: noncovalent
+  alchemy:
+    model: atm
+    cycle: transfer
+  sampling:
+    method: neqti
+```
+
+ATM transfer supports `async_re`, `neqti`, and `awh`. Noncovalent and covalent
+`hybrid_topology` currently require the `complex_solvent` cycle and `neqti`.
+Unsupported combinations are rejected before preparation.
+
 `workflow.yaml` contains the receptor, ligand directory, ligand pairs, alignment atom selection, and the original AToM options under `atom_options`. Relative input paths are resolved from the workflow YAML location. Each ligand pair is expanded into `complexes/<jobname>/`, where the wrapper writes the final per-pair `<jobname>.yaml` used by the existing `rbfe_structprep`, `rbfe_production`, and UWHAM analysis code. If `alignments_out` is set, relative output paths are written under the workflow `workdir`.
 
 Set `prepare_only: true` under `workflow` to create the per-pair directories and final YAML files without starting production.
@@ -183,7 +200,12 @@ The wrapper can also run the experimental NEQTI switching protocol instead of as
 
 ```yaml
 workflow:
-  production_method: neqti
+  chemistry: noncovalent
+  alchemy:
+    model: atm
+    cycle: transfer
+  sampling:
+    method: neqti
   neqti:
     initial_equilibration_steps: 10000
     n_snapshots: 20
@@ -276,9 +298,42 @@ With convergence stopping enabled, BAR is recomputed after each complete product
 
 Four half-path switches have approximately the same total integration length as two complete A↔B switches. Logs report effective ns/day for equilibration, decorrelation, and switching segments.
 
+## Conventional hybrid-topology NEQTI
+
+Set `alchemy.model: hybrid_topology` and `alchemy.cycle: complex_solvent` to
+run conventional dual-topology FEP in separate complex and solvent boxes. The
+same mapped hybrid molecule is used in both environments. Inactive unique
+branches do not interact with the environment, but retain their complete
+intramolecular vacuum interactions. The reported result is
+`DG_complex(A->B) - DG_solvent(A->B)`.
+
+Mapping uses either an automatic connected MCS or a SMARTS-constrained MCS:
+
+```yaml
+workflow:
+  chemistry: noncovalent
+  alchemy:
+    model: hybrid_topology
+    cycle: complex_solvent
+    mapping:
+      method: mcs_core_smarts
+      smarts: "Nc(nc1O)nc2c1ncn2"
+      # Optional hard validation; coordinates are never fitted automatically.
+      max_mapped_rmsd_a: 1.0
+  sampling:
+    method: neqti
+```
+
+Input ligands must already share the intended pose. Common atoms use ligand A
+coordinates and unique ligand B atoms retain their input coordinates. The
+selected mapping and direct mapped-atom RMSD are written to
+`hybrid_mapping.yaml`. This initial implementation requires equal ligand formal
+charges, Espaloma parameters with NN charges, and `softcore_linear` switching.
+See `examples/RBFE/cdk2/workflow.hybrid.yaml` for a complete input.
+
 ## ATM-AWH with endpoint REST2
 
-Set `workflow.production_method: awh` to run one expanded-ensemble walker over
+Set `workflow.sampling.method: awh` with `alchemy.model: atm` to run one expanded-ensemble walker over
 the complete ATM schedule. Endpoint REST2 states extend the linear graph:
 
 ```text
@@ -293,7 +348,12 @@ therefore selects ligand B on the A branch and ligand A on the B branch.
 
 ```yaml
 workflow:
-  production_method: awh
+  chemistry: noncovalent
+  alchemy:
+    model: atm
+    cycle: transfer
+  sampling:
+    method: awh
   awh:
     state_move_interval_steps: 500
     state_sampling:
@@ -534,7 +594,12 @@ reuses the endpoint steps:
 
 ```yaml
 workflow:
-  production_method: neqti
+  chemistry: noncovalent
+  alchemy:
+    model: atm
+    cycle: transfer
+  sampling:
+    method: neqti
   equilibration:
     pre_atm:
       steps:
@@ -735,7 +800,7 @@ Without `workflow.neqti.convergence`, `quality.convergence_status: usable` means
 
 ## Current Limitations
 
-- The single-YAML wrapper currently supports `workflow.mode: small_molecule`.
+- The first unified release supports the documented ATM combinations and two-leg hybrid-topology NEQTI. Hybrid-topology ASYNC_RE/AWH and charge-balanced single-box hybrid transfer are not implemented.
 - NEQTI is experimental and has not replaced asynchronous replica exchange as the established production method.
 - NEQTI currently uses the configured discrete ATM schedule as interpolation knots; it does not yet implement an arbitrary continuous OpenMMTools-style alchemical function.
 - NEQTI REST2 supports shared-ATM interleaved sampling and native A/B interleaved or batched sampling. SMARTS-defined partial hot regions and adaptive switching schedules are experimental; automatic REST2 ladder tuning is not implemented.
@@ -760,7 +825,8 @@ Tutorial defaults are intentionally short. For production work, increase `MAX_SA
 
 ## Covalent RBFE prototype
 
-`workflow.mode: covalent` is an experimental direct-endpoint NEQTI workflow for
+`chemistry: covalent`, `alchemy.model: hybrid_topology`, and
+`alchemy.cycle: complex_solvent` select the experimental direct-endpoint NEQTI workflow for
 congeneric cysteine-aldehyde inhibitors. It uses a chemically complete
 ACE-Cys-product-NME thiohemiacetal in the aqueous reference leg and grafts the same
 local product parameters onto the target cysteine in the protein leg. The endpoint
@@ -787,7 +853,12 @@ back to AM1-BCC.
 ```yaml
 workflow:
   type: rbfe
-  mode: covalent
+  chemistry: covalent
+  alchemy:
+    model: hybrid_topology
+    cycle: complex_solvent
+  sampling:
+    method: neqti
   dataset: normalized/dataset.yaml
   workdir: run
   pairs:
@@ -851,15 +922,18 @@ Cys-SG--warhead bond. `method: mcs_core_smarts` instead calculates the MCS among
 ligand A, ligand B, and the supplied core pattern. This caps the common region so
 that chemically shared atoms outside the selected core remain alchemical. All
 matching combinations are evaluated without coordinate alignment and the pair
-with the smallest direct RMSD is selected. A workflow-level `mapping` applies to
+with the smallest direct RMSD is selected. A workflow-level `alchemy.mapping` applies to
 the series; a pair-level `mapping` shallow-overrides it, and
 `method: dataset_core` opts an individual pair back into the default behavior.
 
 ```yaml
 workflow:
-  mapping:
-    method: mcs_core_smarts
-    smarts: "O=CNc1cccn(C2(C(=O)N[C@H](C=O)C[C@@H]3CCNC3=O)Cc3ccccc3C2)c1=O"
+  alchemy:
+    model: hybrid_topology
+    cycle: complex_solvent
+    mapping:
+      method: mcs_core_smarts
+      smarts: "O=CNc1cccn(C2(C(=O)N[C@H](C=O)C[C@@H]3CCNC3=O)Cc3ccccc3C2)c1=O"
 ```
 
 The constrained core must include the common electrophile carbon and produce a

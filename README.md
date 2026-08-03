@@ -5,7 +5,7 @@ AToM-OpenMM v8.5
 
 The Alchemical Transfer Method for OpenMM (AToM-OpenMM) is an extensible Python package for estimating absolute and relative binding free energies of molecular complexes. It implements the [Alchemical Transfer Method (ATM)](https://pubs.acs.org/doi/10.1021/acs.jcim.1c01129) with [OpenMM](https://github.com/openmm) and can run on GPU workstations or cluster nodes.
 
-This fork adds a single-YAML RBFE workflow on top of the original AToM-OpenMM implementation. The wrapper can prepare and run complete ligand-pair calculations, select setup force fields and ligand charges, define custom equilibration protocols with Amber masks, and use asynchronous replica exchange, experimental nonequilibrium switching (NEQTI), or experimental ATM-AWH with endpoint REST2. An experimental `workflow.mode: covalent` path supports congeneric cysteine-aldehyde inhibitors through explicit thiohemiacetal product models.
+This fork adds a single-YAML RBFE workflow on top of the original AToM-OpenMM implementation. The wrapper separates chemistry, alchemical representation, thermodynamic cycle, and sampling. ATM transfer supports asynchronous replica exchange, experimental nonequilibrium switching (NEQTI), and experimental AWH. Conventional complex-plus-solvent hybrid topology supports NEQTI for noncovalent ligands and congeneric covalent inhibitors.
 
 This version of AToM-OpenMM has been tested with OpenMM 8.5 and 8.4; it uses [ATMForce](https://github.com/openmm/openmm/pull/4110) in the 8.4.0 or later versions of [OpenMM](https://github.com/openmm/openmm).
 
@@ -108,11 +108,16 @@ workflow:
 
 For SMARTS alignment, `smarts_atom_ids` are 1-based positions inside the SMARTS match. If the SMARTS matches symmetrically, all match combinations are evaluated for each ligand pair and the one with the smallest direct coordinate RMSD is used. No fitting, rotation, or translation is performed; input ligands should already be aligned.
 
-The default production method is the original asynchronous replica exchange implementation. To select experimental NEQTI switching:
+The workflow axes are explicit. For ATM NEQTI use:
 
 ```yaml
 workflow:
-  production_method: neqti
+  chemistry: noncovalent
+  alchemy:
+    model: atm
+    cycle: transfer
+  sampling:
+    method: neqti
   neqti:
     initial_equilibration_steps: 25000
     n_snapshots: 10
@@ -167,7 +172,7 @@ Experimental native endpoint sampling removes `ATMForce` from A/B equilibration 
 
 See the [RBFE user guide](docs/user-guide/rbfe.md) for the complete YAML schema, force-field examples, custom equilibration, restart behavior, outputs, and swapped-coordinate diagnostics.
 
-The covalent prototype is documented in [`examples/RBFE/covalent-rhino`](examples/RBFE/covalent-rhino). It normalizes aldehyde poses into ACE-Cys-product-NME reference molecules, retains crystallographic waters by a configurable distance rule, assigns Espaloma NN charges with OpenFF 2.2.1 parameters, and runs direct endpoint NEQTI in protein and capped-reference environments. Covalent switching supports selectable Beutler or Gapsys Lennard-Jones softcore functions and optional windowed protocol-work profiles for diagnosing difficult transformations. This mode currently supports the fixed ff19SB/OPC/OpenFF 2.2.1 protocol described by the example and should be treated as a validation workflow rather than a general covalent transformation engine.
+For a conventional noncovalent dual-topology comparison, use [`examples/RBFE/cdk2/workflow.hybrid.yaml`](examples/RBFE/cdk2/workflow.hybrid.yaml). It maps the ligands by MCS or SMARTS-constrained MCS, preserves inactive-branch intramolecular interactions, and combines complex and solvent BAR estimates. The covalent hybrid-topology workflow is documented in [`examples/RBFE/covalent-rhino`](examples/RBFE/covalent-rhino).
 
 Every ligand-pair directory also contains an atomically updated `result.yaml` for integration with workflow managers and databases. It uses the same schema for asynchronous replica exchange and NEQTI, reports DDG in kcal/mol and kJ/mol, records input provenance and artifacts, and exposes `prepared`, `running`, `partial`, `completed`, or `failed` status.
 

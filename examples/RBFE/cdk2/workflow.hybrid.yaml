@@ -1,25 +1,24 @@
 workflow:
   type: rbfe
-  chemistry: covalent
+  chemistry: noncovalent
   alchemy:
     model: hybrid_topology
     cycle: complex_solvent
+    mapping:
+      method: mcs
   sampling:
     method: neqti
-  dataset: ../../../../rhino_benchmarks/normalized/dataset.yaml
-  workdir: run
+  workdir: hybrid_neqti
+  receptor: receptor/cdk2.pdb
+  ligands_dir: ligands
   pairs:
-  - ligand_a: I79DJ_543
-    ligand_b: LIBA225
-  platform: CUDA
-  platform_properties:
-    Precision: mixed
+    - [H1Q, H1R]
   setup:
-    protein_forcefield: amber19/protein.ff19SB.xml
-    water_forcefield: amber19/opc.xml
-    ligand_forcefield: openff-2.2.1.offxml
-    ligand_charge_model: espaloma_nn
-    espaloma_model: espaloma-0.3.2
+    protein_forcefield: [amber14-all.xml]
+    solvent_forcefield: [amber14/tip3p.xml]
+    solvent_model: tip3p
+    ligand_forcefield: espaloma-0.3.2
+    ligand_charge_model: nn
     solvent_padding_a: 10.0
     ionic_strength_molar: 0.15
     dummy_bonded_scales:
@@ -27,7 +26,7 @@ workflow:
       angle: 1.0
       proper_torsion: 1.0
       junction_angle: 1.0
-      junction_proper_torsion: 0.0
+      junction_proper_torsion: 1.0
   neqti:
     temperature_k: 300.0
     pressure_bar: 1.0
@@ -43,16 +42,15 @@ workflow:
     decorrelation_steps: 100000
     interpolation: softcore_linear
     softcore:
+      function: beutler
       alpha: 0.3
       sigma_nm: 0.25
       power: 1
       charge_steps_per_stage: 10000
       sterics_steps: 30000
+      long_range_correction: dynamic
     failed_switch_policy: count_as_infinite
     bootstrap_samples: 500
     random_seed: 2026
     rest2:
-      enabled: true
-      effective_temperatures_k: [300.0, 344.6, 395.9, 454.7, 522.3, 600.0]
-      exchange_interval_steps: 500
-      checkpoint_interval_cycles: 10
+      enabled: false

@@ -1,6 +1,11 @@
 workflow:
   type: rbfe
-  mode: small_molecule
+  chemistry: noncovalent
+  alchemy:
+    model: atm
+    cycle: transfer
+  sampling:
+    method: async_re
   workdir: complexes
   receptor: receptor/cdk2.pdb
   ligands_dir: ligands

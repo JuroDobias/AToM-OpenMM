@@ -29,7 +29,7 @@ the earlier PMX defaults: full bonds, angles, and internal proper torsions, with
 junction proper torsions disabled while the branch is inactive. The resolved map,
 unique atom roles, and scaling values are written to `covalent_mapping.yaml`.
 For edges where the unrestricted MCS is chemically undesirable, set
-`workflow.mapping.method: mcs_core_smarts` and provide a molecule-like SMARTS.
+`workflow.alchemy.mapping.method: mcs_core_smarts` and provide a molecule-like SMARTS.
 The code calculates the MCS of both aldehyde ligands and that core, selects
 ambiguous matches by the smallest direct coordinate RMSD without alignment, and
 transfers the result into the generated covalent products. A pair-level `mapping`

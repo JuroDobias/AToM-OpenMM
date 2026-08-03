@@ -1,6 +1,11 @@
 workflow:
   type: rbfe
-  mode: small_molecule
+  chemistry: noncovalent
+  alchemy:
+    model: atm
+    cycle: transfer
+  sampling:
+    method: awh
   workdir: awh_pilot
   receptor: receptor/cdk2.pdb
   ligands_dir: ligands
@@ -11,7 +16,6 @@ workflow:
     smarts: "Nc(nc1O)nc2c1ncn2"
     smarts_atom_ids: [7, 1, 5]
   forcefield_cache: ff.json
-  production_method: awh
   awh:
     state_move_interval_steps: 500
     # Set to 100 with state_move_interval_steps: 100 for a dense ATM pilot.
