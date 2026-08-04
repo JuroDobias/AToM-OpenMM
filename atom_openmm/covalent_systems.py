@@ -437,6 +437,7 @@ def solvate_capped_reference_hybrid(
             ],
             "dummy_bonded_scales": dict(hybrid.dummy_bonded_scales.__dict__),
             "dummy_nonbonded": "unique_branch_vacuum",
+            "cross_branch_nonbonded": "excluded",
             "solvent_source": "endpoint_a_single_solvation",
         }
     )

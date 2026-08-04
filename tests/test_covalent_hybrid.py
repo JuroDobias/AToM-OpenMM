@@ -36,6 +36,40 @@ def test_hybrid_topology_sanitizes_atom_names_for_mmcif():
     assert [atom.name for atom in topology.atoms()] == ["C1", "O2"]
 
 
+def test_endpoint_excludes_all_cross_branch_nonbonded_pairs():
+    hybrid = build_covalent_hybrid_molecule(_bundle("CCO"), _bundle("CCN"))
+    nonbonded = next(
+        force
+        for force in hybrid.endpoint_a.getForces()
+        if isinstance(force, mm.NonbondedForce)
+    )
+    exceptions = {
+        tuple(
+            sorted(
+                (
+                    int(nonbonded.getExceptionParameters(index)[0]),
+                    int(nonbonded.getExceptionParameters(index)[1]),
+                )
+            )
+        )
+        for index in range(nonbonded.getNumExceptions())
+    }
+    expected = {
+        tuple(
+            sorted(
+                (
+                    hybrid.map_a_to_hybrid[atom_a],
+                    hybrid.map_b_to_hybrid[atom_b],
+                )
+            )
+        )
+        for atom_a in hybrid.unique_a
+        for atom_b in hybrid.unique_b
+    }
+
+    assert expected <= exceptions
+
+
 def _test_hybrid_molecule_has_identical_endpoint_particles():
     hybrid = build_covalent_hybrid_molecule(_bundle("CCO"), _bundle("CCCO"))
     assert hybrid.endpoint_a.getNumParticles() == hybrid.endpoint_b.getNumParticles()

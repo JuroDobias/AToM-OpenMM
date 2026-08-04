@@ -508,6 +508,17 @@ def _build_endpoint(
     for index in range(source_nonbonded.getNumExceptions()):
         p1, p2, charge, sigma, epsilon = source_nonbonded.getExceptionParameters(index)
         nonbonded.addException(source_mapping[int(p1)], source_mapping[int(p2)], charge, sigma, epsilon)
+    for atom_a in unique_a:
+        hybrid_a = map_a_to_hybrid[atom_a]
+        for atom_b in unique_b:
+            hybrid_b = map_b_to_hybrid[atom_b]
+            nonbonded.addException(
+                hybrid_a,
+                hybrid_b,
+                0.0,
+                1.0 * unit.nanometer,
+                0.0,
+            )
     output.addForce(nonbonded)
     _add_unique_vacuum_nonbonded(
         output,
