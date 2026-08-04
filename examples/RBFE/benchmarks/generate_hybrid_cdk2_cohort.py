@@ -182,15 +182,63 @@ def _run_script(edge):
 #SBATCH --job-name=hyb-{edge}
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
-#SBATCH --gres=gpu:geforce_rtx_3090:1
+#SBATCH --gres=gpu:1
+#SBATCH --constraint=gen-b|gen-d
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=100G
 #SBATCH -t 12:00:00
+#SBATCH --signal=B:USR1@600
 
 set -euo pipefail
+MAX_CHAIN_JOBS="${{ATOM_MAX_CHAIN_JOBS:-10}}"
+CHAIN_INDEX="${{ATOM_CHAIN_INDEX:-0}}"
+ROOT_JOB_ID="${{ATOM_ROOT_JOB_ID:-${{SLURM_JOB_ID:-manual}}}}"
 RUN_DIR="${{SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")}}"
+SCRIPT_PATH="$RUN_DIR/run.sh"
+CHAIN_LOG="$RUN_DIR/slurm-chain.log"
 SOURCE_DIR="$HOME/myAToM/AToM-OpenMM-unified"
+RESULT_FILE="$RUN_DIR/run/receptor-{edge.replace('--', '-')}/result.yaml"
+CHILD_PID=""
+RESUBMITTING=0
+
+log_chain() {{
+    printf '%s root=%s job=%s chain_index=%s %s\n' \
+        "$(date --iso-8601=seconds)" "$ROOT_JOB_ID" \
+        "${{SLURM_JOB_ID:-manual}}" "$CHAIN_INDEX" "$*" >> "$CHAIN_LOG"
+}}
+
+completed() {{
+    [[ -f "$RESULT_FILE" ]] && grep -q '^status: completed$' "$RESULT_FILE"
+}}
+
+on_timeout() {{
+    if (( RESUBMITTING )); then return; fi
+    RESUBMITTING=1
+    log_chain "received pre-timeout USR1"
+    if [[ -n "$CHILD_PID" ]] && kill -0 "$CHILD_PID" 2>/dev/null; then
+        kill -TERM "$CHILD_PID" 2>/dev/null || true
+        wait "$CHILD_PID" 2>/dev/null || true
+    fi
+    if completed; then
+        log_chain "workflow completed during shutdown; no successor submitted"
+    elif (( CHAIN_INDEX + 1 >= MAX_CHAIN_JOBS )); then
+        log_chain "automatic resubmission cap reached; no successor submitted"
+    else
+        submission="$(sbatch --dependency="afterany:${{SLURM_JOB_ID}}" \
+            --export=ALL,ATOM_CHAIN_INDEX=$((CHAIN_INDEX + 1)),ATOM_ROOT_JOB_ID="$ROOT_JOB_ID",ATOM_MAX_CHAIN_JOBS="$MAX_CHAIN_JOBS" \
+            "$SCRIPT_PATH")"
+        log_chain "submitted successor: $submission"
+    fi
+    exit 0
+}}
+
+trap on_timeout USR1
 cd "$RUN_DIR"
+log_chain "started"
+if completed; then
+    log_chain "workflow already completed; exiting"
+    exit 0
+fi
 
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate myatom
@@ -201,7 +249,19 @@ PYTHON_BIN="$HOME/myAToM/atm-gates-venv/bin/python"
 
 git -C "$SOURCE_DIR" rev-parse HEAD > source_commit.txt
 "$PYTHON_BIN" -m atom_openmm.rbfe_workflow --validate workflow.yaml
-"$PYTHON_BIN" -m atom_openmm.rbfe_workflow workflow.yaml
+"$PYTHON_BIN" -m atom_openmm.rbfe_workflow workflow.yaml &
+CHILD_PID=$!
+set +e
+wait "$CHILD_PID"
+status=$?
+set -e
+CHILD_PID=""
+if (( status == 0 )); then
+    log_chain "workflow exited successfully"
+else
+    log_chain "workflow failed with exit code $status; no successor submitted"
+fi
+exit "$status"
 """
 
 
