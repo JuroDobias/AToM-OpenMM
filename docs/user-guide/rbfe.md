@@ -807,6 +807,56 @@ Without `workflow.neqti.convergence`, `quality.convergence_status: usable` means
 - GPU, CUDA, OpenMM, Espaloma, and `openmmforcefields` compatibility is the responsibility of the environment.
 - A numerically completed run is not sufficient validation. Inspect endpoint structures, swapped structures, work distributions, forward/reverse overlap, and sensitivity to equilibration and switching time.
 
+### Hybrid endpoint equilibration
+
+Hybrid-topology NEQTI uses the fixed minimization, NVT, and NPT settings under
+`workflow.neqti.endpoint_equilibration` unless a custom endpoint protocol is
+provided. `workflow.equilibration.neqti.endpoint` is a shared fallback;
+`complex_endpoint` and `solvent_endpoint` override it independently. An explicit
+`mode: default` selects the fixed protocol for that environment.
+
+```yaml
+workflow:
+  equilibration:
+    neqti:
+      complex_endpoint:
+        steps:
+        - id: restrained_minimization
+          type: minimization
+          tolerance_kj_mol_nm: 10.0
+          max_iterations: 1000
+          positional_restraints:
+            mask: '#active:"Nc(nc1O)nc2c1ncn2"'
+            k_kcal_mol_a2: 5.0
+            tolerance_a: 0.25
+        - id: restrained_npt
+          type: md
+          ensemble: NPT
+          n_steps: 250000
+          timestep_ps: 0.002
+          thermostat:
+            temperature_k: 300.0
+            friction_per_ps: 1.0
+          positional_restraints:
+            mask: '#active:"Nc(nc1O)nc2c1ncn2"'
+            k_kcal_mol_a2: 1.0
+            tolerance_a: 0.5
+          reporters:
+            state:
+              interval: 5000
+      solvent_endpoint:
+        mode: default
+```
+
+The same step sequence runs at endpoint A and endpoint B. In noncovalent hybrid
+systems, `#active:"SMARTS"` resolves against ligand A at endpoint A and ligand B
+at endpoint B, so one restraint definition follows the physical ligand.
+Amber-mask operators and role-aware SMARTS leaves can be combined in one
+expression. Each step has an independent checkpoint under
+`equilibration/{complex|solvent}/endpoint_{a|b}`. The resolved protocol is signed
+in `equilibration_protocol.yaml`; changing it requires a new workdir rather than
+silently reusing endpoint states or protocol work.
+
 ## Planning and Adapting
 
 For small-molecule RBFE, plan the perturbation network before setup. Choose ligand pairs that are scientifically meaningful and that have reliable bound poses. The CDK2 workflow can generate alignment atoms from a reference ligand, but you should still inspect the chosen atoms and the resulting structures. Poor alignment atoms can lead to unstable restraints or unhelpful ligand orientations.

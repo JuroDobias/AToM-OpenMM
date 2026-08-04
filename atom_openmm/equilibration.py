@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
+import os
 import time
 import xml.etree.ElementTree as ET
 from copy import deepcopy
@@ -145,6 +147,28 @@ def neqti_midpoint_steps(options: dict[str, Any]) -> list[dict[str, Any]] | None
     return midpoint if midpoint is not None else neqti_endpoint_steps(options)
 
 
+def neqti_hybrid_endpoint_steps(
+    protocol: dict[str, Any] | None,
+    environment: str,
+) -> list[dict[str, Any]] | None:
+    """Resolve custom hybrid endpoint steps for a complex or solvent leg."""
+    if environment not in {"complex", "solvent"}:
+        raise EquilibrationConfigError(
+            f"hybrid endpoint environment must be 'complex' or 'solvent', not {environment!r}"
+        )
+    protocol = protocol or {}
+    neqti_cfg = protocol.get("neqti") or {}
+    if not isinstance(neqti_cfg, dict):
+        raise EquilibrationConfigError("workflow.equilibration.neqti must be a mapping")
+    override_key = f"{environment}_endpoint"
+    section = neqti_cfg.get(override_key)
+    label = f"workflow.equilibration.neqti.{override_key}"
+    if section is None:
+        section = neqti_cfg.get("endpoint")
+        label = "workflow.equilibration.neqti.endpoint"
+    return _steps_from_section(section, label)
+
+
 def _steps_from_section(section: Any, label: str) -> list[dict[str, Any]] | None:
     if section is None:
         return None
@@ -183,6 +207,14 @@ def _validate_equilibration_protocol(protocol: dict[str, Any], label: str):
         raise EquilibrationConfigError(f"{label}.neqti must be a mapping")
     _steps_from_section(neqti_cfg.get("endpoint"), f"{label}.neqti.endpoint")
     _steps_from_section(neqti_cfg.get("midpoint"), f"{label}.neqti.midpoint")
+    _steps_from_section(
+        neqti_cfg.get("complex_endpoint"),
+        f"{label}.neqti.complex_endpoint",
+    )
+    _steps_from_section(
+        neqti_cfg.get("solvent_endpoint"),
+        f"{label}.neqti.solvent_endpoint",
+    )
 
 
 def _clone_system(system):
@@ -496,6 +528,21 @@ def run_custom_equilibration(
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    protocol_fingerprint = hashlib.sha256(
+        json.dumps(steps, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    manifest_path = output_dir / "manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        saved_fingerprint = manifest.get("protocol_fingerprint")
+        if saved_fingerprint is not None and saved_fingerprint != protocol_fingerprint:
+            raise EquilibrationConfigError(
+                f"custom equilibration protocol differs from {manifest_path}; use a new workdir"
+            )
+        if saved_fingerprint is None:
+            manifest = {"schema_version": 2, "protocol_fingerprint": protocol_fingerprint, "steps": {}}
+    else:
+        manifest = {"schema_version": 2, "protocol_fingerprint": protocol_fingerprint, "steps": {}}
     resolved_restraints = _resolve_step_restraints(
         steps,
         ommsystem.topology,
@@ -507,13 +554,29 @@ def run_custom_equilibration(
     base_positions = ommsystem.positions
     prev_state_path = Path(initial_state_path) if initial_state_path else None
     default_temperature = getattr(ommsystem, "temperature", 300.0 * kelvin)
-    manifest = {"steps": {}}
-
     logger.info("Running custom equilibration protocol in %s (%d steps)", output_dir, len(steps))
     for i, step_cfg in enumerate(steps):
         step_id = _step_id(step_cfg, i)
         step_dir = output_dir / step_id
         step_dir.mkdir(parents=True, exist_ok=True)
+        step_state_path = step_dir / "final_state.xml"
+        step_pdb_path = step_dir / "final_state.pdb"
+        saved_step = manifest["steps"].get(step_id) or {}
+        if saved_step.get("status") == "completed" and step_state_path.exists():
+            state = _load_state(step_state_path)
+            if len(state.getPositions()) != ommsystem.system.getNumParticles():
+                raise EquilibrationConfigError(
+                    f"saved custom equilibration step {step_id!r} is incompatible with the current system"
+                )
+            logger.info(
+                "Custom equilibration step %d/%d %s already complete; resuming from %s",
+                i + 1,
+                len(steps),
+                step_id,
+                step_state_path,
+            )
+            prev_state_path = step_state_path
+            continue
         if prev_state_path is None:
             input_label = "initial positions"
         else:
@@ -633,8 +696,6 @@ def run_custom_equilibration(
                 )
             logger.info("Custom equilibration step %d/%d %s: MD integration finished", i + 1, len(steps), step_id)
 
-        step_state_path = step_dir / "final_state.xml"
-        step_pdb_path = step_dir / "final_state.pdb"
         logger.info("Custom equilibration step %d/%d %s: saving XML state to %s", i + 1, len(steps), step_id, step_state_path)
         simulation.saveState(str(step_state_path))
         _strip_integrator_parameters(step_state_path)
@@ -655,6 +716,7 @@ def run_custom_equilibration(
             )
         wall_seconds = time.perf_counter() - wall_start
         manifest["steps"][step_id] = {
+            "status": "completed",
             "type": step_cfg["type"],
             "completed_steps": completed_steps,
             "wall_seconds": wall_seconds,
@@ -683,8 +745,10 @@ def run_custom_equilibration(
                 wall_seconds,
                 step_state_path,
             )
-        with open(output_dir / "manifest.json", "w") as handle:
+        temporary_manifest = Path(str(manifest_path) + ".tmp")
+        with temporary_manifest.open("w") as handle:
             json.dump(manifest, handle, indent=2)
+        os.replace(temporary_manifest, manifest_path)
         prev_state_path = step_state_path
 
     if prev_state_path is None:

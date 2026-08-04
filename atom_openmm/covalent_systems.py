@@ -423,6 +423,14 @@ def solvate_capped_reference_hybrid(
             "unique_b_particle_indices": [
                 int(hybrid.map_b_to_hybrid[index]) for index in hybrid.unique_b
             ],
+            "ligand_a_system_atom_indices": [
+                int(hybrid.map_a_to_hybrid[index])
+                for index in range(len(hybrid.map_a_to_hybrid))
+            ],
+            "ligand_b_system_atom_indices": [
+                int(hybrid.map_b_to_hybrid[index])
+                for index in range(len(hybrid.map_b_to_hybrid))
+            ],
             "anchor_pairs": [list(pair) for pair in hybrid.anchor_pairs],
             "attachment_pairs": None if hybrid.attachment_pairs is None else [
                 list(pair) for pair in hybrid.attachment_pairs

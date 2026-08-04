@@ -7,6 +7,7 @@ import os
 import shutil
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import openmm as mm
@@ -47,6 +48,11 @@ from atom_openmm.covalent_systems import (
     load_prepared_hybrid_bundle,
     solvate_capped_reference_hybrid,
     write_prepared_hybrid_bundle,
+)
+from atom_openmm.equilibration import (
+    neqti_hybrid_endpoint_steps,
+    normalize_equilibration_protocol,
+    run_custom_equilibration,
 )
 from atom_openmm.neqti import (
     _allocate_segment_steps,
@@ -680,10 +686,51 @@ def _equilibrate_endpoint(
     properties,
     seed,
     label,
+    topology=None,
+    custom_steps=None,
+    custom_output_dir=None,
+    selection_metadata=None,
+    selection_endpoint=None,
 ):
     state_file = Path(state_file)
     if state_file.exists():
         LOGGER.info("%s equilibration already complete; resuming from %s", label, state_file)
+        state = _load_state(state_file)
+        _validate_state_system_compatibility(state, system, label)
+        return state
+
+    if custom_steps is not None:
+        if topology is None or custom_output_dir is None:
+            raise CovalentWorkflowError(
+                "custom endpoint equilibration requires topology and output directory"
+            )
+        boxvectors = topology.getPeriodicBoxVectors()
+        keywords = {
+            "WORKDIR": str(Path(custom_output_dir).parent),
+            "SELECTION_METADATA": selection_metadata or {},
+        }
+        adapter = SimpleNamespace(
+            topology=topology,
+            positions=positions,
+            system=system,
+            boxvectors=boxvectors,
+            keywords=keywords,
+            temperature=float(temperature_k) * unit.kelvin,
+        )
+        final_pdb = state_file.with_name(
+            state_file.name.replace("_state.xml", "_equilibrated.pdb")
+        )
+        run_custom_equilibration(
+            ommsystem=adapter,
+            steps=custom_steps,
+            platform=platform,
+            platform_properties=properties,
+            output_dir=custom_output_dir,
+            final_state_path=state_file,
+            final_pdb_path=final_pdb,
+            selection_endpoint=selection_endpoint,
+            logger=LOGGER,
+        )
         state = _load_state(state_file)
         _validate_state_system_compatibility(state, system, label)
         return state
@@ -1319,17 +1366,34 @@ def _run_environment(
         "a": workdir / f"{name}_endpoint_a_state.xml",
         "b": workdir / f"{name}_endpoint_b_state.xml",
     }
+    protocol_environment = {"protein": "complex", "reference": "solvent"}.get(
+        name, name
+    )
+    custom_steps = neqti_hybrid_endpoint_steps(
+        config.get("equilibration_protocol"), protocol_environment
+    )
+    selection_metadata = prepared.provenance.get("SELECTION_METADATA")
     _equilibrate_endpoint(
         prepared.endpoint_a, prepared.positions, state_files["a"],
         protocol=config["endpoint_equilibration"], temperature_k=temperature,
         pressure_bar=config["pressure_bar"], platform=platform, properties=properties, seed=seed,
         label=f"{name} endpoint A",
+        topology=prepared.topology,
+        custom_steps=custom_steps,
+        custom_output_dir=workdir / "equilibration" / name / "endpoint_a",
+        selection_metadata=selection_metadata,
+        selection_endpoint="a",
     )
     _equilibrate_endpoint(
         prepared.endpoint_b, prepared.positions, state_files["b"],
         protocol=config["endpoint_equilibration"], temperature_k=temperature,
         pressure_bar=config["pressure_bar"], platform=platform, properties=properties, seed=seed + 10,
         label=f"{name} endpoint B",
+        topology=prepared.topology,
+        custom_steps=custom_steps,
+        custom_output_dir=workdir / "equilibration" / name / "endpoint_b",
+        selection_metadata=selection_metadata,
+        selection_endpoint="b",
     )
     _write_state_pdb(
         workdir / f"{name}_endpoint_a_equilibrated.pdb",
@@ -1993,6 +2057,7 @@ def _normalized_settings(workflow):
         switch_steps = int(neqti.get("switch_steps", 50000))
     return {
         "temperature_k": float(neqti.get("temperature_k", 300.0)),
+        "equilibration_protocol": normalize_equilibration_protocol(workflow),
         "pressure_bar": float(neqti.get("pressure_bar", 1.0)),
         "timestep_fs": float(neqti.get("timestep_fs", 2.0)),
         "endpoint_equilibration": {
@@ -2365,6 +2430,42 @@ def _ensure_switch_protocol(
     return expected
 
 
+def _equilibration_protocol(config):
+    payload = {
+        "schema_version": 1,
+        "fixed_endpoint_equilibration": config["endpoint_equilibration"],
+        "custom_equilibration": config.get("equilibration_protocol"),
+    }
+    serialized = yaml.safe_dump(payload, sort_keys=True)
+    payload["fingerprint"] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return payload
+
+
+def _ensure_equilibration_protocol(workdir, config):
+    workdir = Path(workdir)
+    path = workdir / "equilibration_protocol.yaml"
+    expected = _equilibration_protocol(config)
+    existing_states = any(workdir.glob("*_endpoint_*_state*.xml"))
+    if path.exists():
+        observed = yaml.safe_load(path.read_text()) or {}
+        if observed != expected:
+            raise CovalentResumeError(
+                "resume_incompatible: endpoint equilibration protocol changed; use a new workdir"
+            )
+    elif existing_states and config.get("equilibration_protocol") is not None:
+        raise CovalentResumeError(
+            "resume_incompatible: custom endpoint states lack equilibration_protocol.yaml; "
+            "use a new workdir"
+        )
+    else:
+        if existing_states:
+            LOGGER.warning(
+                "Accepting legacy fixed endpoint states without equilibration provenance"
+            )
+        _write_yaml_atomic(path, expected)
+    return expected
+
+
 def run_covalent_pair(settings, pair):
     workflow = settings["workflow"]
     config = _normalized_settings(workflow)
@@ -2378,6 +2479,7 @@ def run_covalent_pair(settings, pair):
     workdir.mkdir(parents=True, exist_ok=True)
     mapping_settings = _mapping_settings(workflow, pair)
     switch_protocol = _ensure_switch_protocol(workdir, config, mapping_settings)
+    _ensure_equilibration_protocol(workdir, config)
     _write_yaml_atomic(
         workdir / "result.yaml",
         {

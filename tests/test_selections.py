@@ -58,6 +58,21 @@ def _test_wildcard_roles_reverse_between_endpoints(tmp_path):
     assert resolve_smarts_atoms('#unbound:"*"', keywords, endpoint="b", base_dir=tmp_path) == ligand_a
 
 
+def _test_active_role_tracks_physical_hybrid_endpoint(tmp_path):
+    from atom_openmm.selections import resolve_smarts_atoms
+
+    keywords = _metadata(tmp_path)
+    ligand_a = keywords["SELECTION_METADATA"]["ligand_a"]["system_atom_indices"]
+    ligand_b = keywords["SELECTION_METADATA"]["ligand_b"]["system_atom_indices"]
+
+    assert resolve_smarts_atoms(
+        '#active:"*"', keywords, endpoint="a", base_dir=tmp_path
+    ) == ligand_a
+    assert resolve_smarts_atoms(
+        '#active:"*"', keywords, endpoint="b", base_dir=tmp_path
+    ) == ligand_b
+
+
 def _test_midpoint_rejects_endpoint_dependent_role(tmp_path):
     from atom_openmm.selections import SelectionError, compile_selection_expression
 

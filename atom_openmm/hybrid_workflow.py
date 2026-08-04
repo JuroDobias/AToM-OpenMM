@@ -18,6 +18,7 @@ from atom_openmm.covalent_systems import (
     write_prepared_hybrid_bundle,
 )
 from atom_openmm.covalent_workflow import (
+    _ensure_equilibration_protocol,
     _normalized_settings,
     _ensure_switch_protocol,
     _platform,
@@ -36,7 +37,7 @@ class HybridWorkflowError(ValueError):
     pass
 
 
-PREPARATION_SCHEMA_VERSION = 1
+PREPARATION_SCHEMA_VERSION = 2
 
 
 def _sha256(path):
@@ -271,6 +272,24 @@ def _prepare_pair(pair, receptor, workflow, workdir):
     )
     complex_system = solvate_capped_reference_hybrid(hybrid, physical_complex)
     solvent_system = solvate_capped_reference_hybrid(hybrid, physical_solvent)
+    selection_metadata = {
+        "ligand_a": {
+            "structure_file": str(Path(pair["lig1_file"]).resolve()),
+            "system_atom_indices": [
+                int(hybrid.map_a_to_hybrid[index])
+                for index in range(parameters_a.molecule.n_atoms)
+            ],
+        },
+        "ligand_b": {
+            "structure_file": str(Path(pair["lig2_file"]).resolve()),
+            "system_atom_indices": [
+                int(hybrid.map_b_to_hybrid[index])
+                for index in range(parameters_b.molecule.n_atoms)
+            ],
+        },
+    }
+    complex_system.provenance["SELECTION_METADATA"] = selection_metadata
+    solvent_system.provenance["SELECTION_METADATA"] = selection_metadata
     _validate_prepared_endpoint_charges(complex_system, "complex")
     _validate_prepared_endpoint_charges(solvent_system, "solvent")
     manifest = {
@@ -390,6 +409,27 @@ def _result(
             "solvent_forward_work_csv": "solvent_forward.csv",
             "solvent_reverse_work_csv": "solvent_reverse.csv",
             "switch_protocol": "switch_protocol.yaml",
+            "equilibration_protocol": "equilibration_protocol.yaml",
+            "equilibration_manifests": {
+                f"{environment}_endpoint_{endpoint}": (
+                    str(
+                        Path("equilibration")
+                        / environment
+                        / f"endpoint_{endpoint}"
+                        / "manifest.json"
+                    )
+                    if (
+                        workdir
+                        / "equilibration"
+                        / environment
+                        / f"endpoint_{endpoint}"
+                        / "manifest.json"
+                    ).exists()
+                    else None
+                )
+                for environment in ("complex", "solvent")
+                for endpoint in ("a", "b")
+            },
             "schedule_optimization": (
                 "covalent_schedule_optimization.yaml" if optimizer is not None else None
             ),
@@ -434,6 +474,7 @@ def run_noncovalent_hybrid_workflow(path):
                 environments=("complex", "solvent"),
                 mapping_label="hybrid_mapping",
             )
+            _ensure_equilibration_protocol(workdir, config)
             complex_system, solvent_system, manifest, _ = _prepare_pair(
                 pair, plan["receptor_file"], workflow, workdir
             )

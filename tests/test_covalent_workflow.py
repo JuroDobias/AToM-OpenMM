@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import openmm as mm
+import pytest
 from openmm import app, unit
 from rdkit import Chem
 from rdkit.Chem import AllChem
@@ -333,6 +334,46 @@ def test_covalent_endpoint_equilibration_defaults_and_legacy_npt_alias():
     )["endpoint_equilibration"]
     assert configured["nvt_steps"] == 25000
     assert configured["npt_steps"] == 250000
+
+
+def _test_equilibration_protocol_fingerprint_rejects_changed_steps(tmp_path):
+    from atom_openmm.covalent_workflow import (
+        CovalentResumeError,
+        _ensure_equilibration_protocol,
+    )
+
+    first = _normalized_settings(
+        {
+            "equilibration": {
+                "neqti": {
+                    "complex_endpoint": {
+                        "steps": [{"id": "min", "type": "minimization"}]
+                    }
+                }
+            }
+        }
+    )
+    changed = _normalized_settings(
+        {
+            "equilibration": {
+                "neqti": {
+                    "complex_endpoint": {
+                        "steps": [
+                            {
+                                "id": "min",
+                                "type": "minimization",
+                                "max_iterations": 10,
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    )
+
+    _ensure_equilibration_protocol(tmp_path, first)
+    with pytest.raises(CovalentResumeError, match="equilibration protocol changed"):
+        _ensure_equilibration_protocol(tmp_path, changed)
 
 
 def _test_dummy_bonded_scales_preserve_junction_torsions_by_default():

@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 SMARTS_LEAF = re.compile(
-    r'#(?P<role>ligand_a|ligand_b|ligand|bound|unbound):"(?P<smarts>(?:\\.|[^"\\])*)"'
+    r'#(?P<role>ligand_a|ligand_b|ligand|bound|unbound|active):"(?P<smarts>(?:\\.|[^"\\])*)"'
 )
 
 
@@ -28,6 +28,8 @@ def _endpoint_role(role, endpoint):
             f"#{role} requires physical endpoint context 'a' or 'b'; "
             "bound/unbound roles are undefined at the ATM midpoint"
         )
+    if role == "active":
+        return "ligand_a" if endpoint == "a" else "ligand_b"
     if endpoint == "a":
         return "ligand_a" if role == "bound" else "ligand_b"
     return "ligand_b" if role == "bound" else "ligand_a"

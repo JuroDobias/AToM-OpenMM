@@ -40,6 +40,80 @@ def _test_normalize_equilibration_protocol_rejects_duplicate_step_ids():
         normalize_equilibration_protocol(workflow)
 
 
+def _test_hybrid_endpoint_steps_use_environment_override_and_shared_fallback():
+    from atom_openmm.equilibration import neqti_hybrid_endpoint_steps
+
+    shared = [{"id": "shared", "type": "minimization"}]
+    complex_steps = [{"id": "complex", "type": "minimization"}]
+    protocol = {
+        "neqti": {
+            "endpoint": {"steps": shared},
+            "complex_endpoint": {"steps": complex_steps},
+            "solvent_endpoint": {"mode": "default"},
+        }
+    }
+
+    assert neqti_hybrid_endpoint_steps(protocol, "complex") == complex_steps
+    assert neqti_hybrid_endpoint_steps(protocol, "solvent") is None
+    assert neqti_hybrid_endpoint_steps(
+        {"neqti": {"endpoint": {"steps": shared}}}, "solvent"
+    ) == shared
+
+
+def _test_custom_equilibration_resumes_completed_steps(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import openmm as mm
+    from openmm import app, unit
+
+    from atom_openmm import equilibration
+
+    topology = app.Topology()
+    chain = topology.addChain()
+    residue = topology.addResidue("ONE", chain)
+    topology.addAtom("Ar", app.Element.getByAtomicNumber(18), residue)
+    system = mm.System()
+    system.addParticle(39.9 * unit.dalton)
+    positions = unit.Quantity([[0.0, 0.0, 0.0]], unit.nanometer)
+    ommsystem = SimpleNamespace(
+        topology=topology,
+        positions=positions,
+        system=system,
+        boxvectors=None,
+        keywords={"WORKDIR": str(tmp_path)},
+        temperature=300.0 * unit.kelvin,
+    )
+    steps = [{"id": "min", "type": "minimization", "max_iterations": 1}]
+    output = tmp_path / "custom"
+    final_state = tmp_path / "final.xml"
+    final_pdb = tmp_path / "final.pdb"
+    platform = mm.Platform.getPlatformByName("Reference")
+
+    equilibration.run_custom_equilibration(
+        ommsystem=ommsystem,
+        steps=steps,
+        platform=platform,
+        platform_properties={},
+        output_dir=output,
+        final_state_path=final_state,
+        final_pdb_path=final_pdb,
+    )
+
+    def fail_minimize(*args, **kwargs):
+        raise AssertionError("completed minimization was rerun")
+
+    monkeypatch.setattr(mm.LocalEnergyMinimizer, "minimize", fail_minimize)
+    equilibration.run_custom_equilibration(
+        ommsystem=ommsystem,
+        steps=steps,
+        platform=platform,
+        platform_properties={},
+        output_dir=output,
+        final_state_path=final_state,
+        final_pdb_path=final_pdb,
+    )
+
+
 def _test_restraint_resolution_is_indexed_not_step_id(monkeypatch):
     from atom_openmm import equilibration
 
