@@ -8,6 +8,7 @@ from rdkit import Chem
 from atom_openmm.covalent_hybrid import (
     DummyBondedScales,
     _add_unique_vacuum_nonbonded,
+    _hybrid_topology,
     _inactive_scales,
     build_covalent_hybrid_molecule,
 )
@@ -23,6 +24,16 @@ def _bundle(smiles):
         molecule.to_topology(), charge_from_molecules=[molecule]
     )
     return CovalentParameterBundle(molecule, system, charges, smiles, {})
+
+
+def test_hybrid_topology_sanitizes_atom_names_for_mmcif():
+    molecule = Chem.MolFromSmiles("CO")
+    molecule.GetAtomWithIdx(0).SetProp("_Name", "C 1")
+    molecule.GetAtomWithIdx(1).SetProp("_Name", "O'2")
+
+    topology = _hybrid_topology(molecule, molecule, {0: 0, 1: 1}, {0: 0, 1: 1})
+
+    assert [atom.name for atom in topology.atoms()] == ["C1", "O2"]
 
 
 def _test_hybrid_molecule_has_identical_endpoint_particles():

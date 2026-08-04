@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from itertools import permutations
 
@@ -533,7 +534,10 @@ def _hybrid_topology(molecule_a, molecule_b, map_a_to_hybrid, map_b_to_hybrid):
             hybrid = mapping[atom.GetIdx()]
             if atoms[hybrid] is not None:
                 continue
-            base = atom.GetProp("_Name") if atom.HasProp("_Name") else f"{prefix}{atom.GetSymbol()}{atom.GetIdx()+1}"
+            raw_name = atom.GetProp("_Name") if atom.HasProp("_Name") else ""
+            base = re.sub(r"[^A-Za-z0-9_]", "", raw_name)
+            if not base:
+                base = f"{prefix}{atom.GetSymbol()}{atom.GetIdx()+1}"
             name = base
             suffix = 1
             while name in used_names:
