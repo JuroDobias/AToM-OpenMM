@@ -21,8 +21,10 @@ from atom_openmm.covalent_workflow import (
     _ensure_equilibration_protocol,
     _normalized_settings,
     _ensure_switch_protocol,
+    _iter_environment,
     _platform,
     _read_work,
+    _rewrite_work,
     _run_environment,
     _validate_prepared_endpoint_charges,
     _write_yaml_atomic,
@@ -30,7 +32,11 @@ from atom_openmm.covalent_workflow import (
 from atom_openmm.hybrid_mapping import build_hybrid_atom_map
 from atom_openmm.hybrid_parameters import parameterize_ligand
 from atom_openmm.hybrid_systems import create_physical_ligand_environment
-from atom_openmm.neqti import analyze_two_leg_work
+from atom_openmm.neqti import (
+    _convergence_reached,
+    _convergence_record,
+    analyze_two_leg_work,
+)
 
 
 class HybridWorkflowError(ValueError):
@@ -116,6 +122,75 @@ def _validate_settings(workflow):
             raise HybridWorkflowError("schedule optimizer minimum segment allocation is too large")
         if optimization["max_segment_steps"] * segments < config["switch_steps"]:
             raise HybridWorkflowError("schedule optimizer maximum segment allocation is too small")
+    adaptive = config["adaptive_switching"]
+    if adaptive["enabled"]:
+        candidates = adaptive["candidate_times_ps"]
+        candidate_steps = adaptive["candidate_total_steps"]
+        if not candidates or any(value <= 0 for value in candidates):
+            raise HybridWorkflowError(
+                "adaptive_switching.candidate_times_ps must contain positive values"
+            )
+        if any(right <= left for left, right in zip(candidates, candidates[1:])):
+            raise HybridWorkflowError(
+                "adaptive_switching.candidate_times_ps must be strictly increasing"
+            )
+        if candidate_steps[0] != config["switch_steps"]:
+            base_ps = config["switch_steps"] * config["timestep_fs"] / 1000.0
+            raise HybridWorkflowError(
+                "the first adaptive switching candidate must match the base softcore "
+                f"protocol duration ({base_ps:g} ps)"
+            )
+        for time_ps, steps in zip(candidates, candidate_steps):
+            represented = steps * config["timestep_fs"] / 1000.0
+            if not np.isclose(represented, time_ps, atol=1.0e-9, rtol=0.0):
+                raise HybridWorkflowError(
+                    f"adaptive switching time {time_ps:g} ps is not divisible by the "
+                    f"{config['timestep_fs']:g} fs timestep"
+                )
+        if adaptive["pilot_samples_per_direction"] < 2:
+            raise HybridWorkflowError(
+                "adaptive_switching.pilot_samples_per_direction must be at least 2"
+            )
+        if adaptive["pilot_samples_per_direction"] > config["n_snapshots"]:
+            raise HybridWorkflowError(
+                "adaptive switching pilot samples cannot exceed n_snapshots"
+            )
+        if adaptive["min_overlap_score_per_leg"] <= 0:
+            raise HybridWorkflowError(
+                "adaptive switching overlap threshold must be positive"
+            )
+        failed_fraction = adaptive["max_failed_fraction_per_direction"]
+        if not 0 <= failed_fraction < 1:
+            raise HybridWorkflowError(
+                "adaptive switching failed fraction must be in [0, 1)"
+            )
+        if adaptive["on_exhausted"] != "use_longest":
+            raise HybridWorkflowError(
+                "adaptive_switching.on_exhausted currently supports only use_longest"
+            )
+        if not adaptive["reuse_selected_pilot_samples"]:
+            raise HybridWorkflowError(
+                "hybrid adaptive switching currently requires "
+                "reuse_selected_pilot_samples: true"
+            )
+    convergence = config["convergence"]
+    if convergence["enabled"]:
+        if convergence["min_samples_per_direction"] < 2:
+            raise HybridWorkflowError(
+                "convergence.min_samples_per_direction must be at least 2"
+            )
+        if convergence["min_samples_per_direction"] > config["n_snapshots"]:
+            raise HybridWorkflowError(
+                "convergence.min_samples_per_direction cannot exceed n_snapshots"
+            )
+        if convergence["min_overlap_score_per_leg"] <= 0:
+            raise HybridWorkflowError("convergence overlap threshold must be positive")
+        if convergence["max_ddg_error_kcal_per_mol"] <= 0:
+            raise HybridWorkflowError("convergence uncertainty threshold must be positive")
+        if convergence["consecutive_checks"] < 1:
+            raise HybridWorkflowError("convergence.consecutive_checks must be positive")
+        if convergence["max_ddg_range_kcal_per_mol"] < 0:
+            raise HybridWorkflowError("convergence DDG range must be non-negative")
     return config
 
 
@@ -237,6 +312,8 @@ def _runtime_artifacts_exist(workdir):
             "*_forward.csv",
             "*_reverse.csv",
             "*_rest2_*",
+            "neqti_adaptive_switching*",
+            "neqti_convergence.yaml",
         )
     )
 
@@ -331,6 +408,136 @@ def _analysis_payload(work, config):
     )
 
 
+def _convergence_state(workdir, config):
+    path = workdir / "neqti_convergence.yaml"
+    if path.exists():
+        state = yaml.safe_load(path.read_text()) or {}
+        if state.get("settings") != config["convergence"]:
+            raise HybridWorkflowError(
+                "existing hybrid convergence state uses different settings"
+            )
+        return state
+    return {
+        "schema_version": 1,
+        "settings": config["convergence"],
+        "history": [],
+        "termination_reason": None,
+    }
+
+
+def _hybrid_convergence_callback(workdir, config):
+    path = workdir / "neqti_convergence.yaml"
+    state = _convergence_state(workdir, config)
+    settings = config["convergence"]
+
+    def callback(environment, _sample, _forward, _reverse):
+        if environment != "complex":
+            return False
+        if state.get("termination_reason") == "converged":
+            return True
+        work = {
+            "leg_a_forward": _read_work(workdir / "complex_forward.csv"),
+            "leg_a_reverse": _read_work(workdir / "complex_reverse.csv"),
+            "leg_b_forward": _read_work(workdir / "solvent_forward.csv"),
+            "leg_b_reverse": _read_work(workdir / "solvent_reverse.csv"),
+        }
+        available = min(len(values) for values in work.values())
+        previous = max(
+            (
+                int(record["sample_count_per_direction"])
+                for record in state.get("history", [])
+            ),
+            default=0,
+        )
+        first = max(previous + 1, settings["min_samples_per_direction"])
+        for sample_count in range(first, available + 1):
+            prefix = {
+                name: values[:sample_count] for name, values in work.items()
+            }
+            analysis = _analysis_payload(prefix, config)
+            counts = {name: sample_count for name in prefix}
+            record = _convergence_record(analysis, counts, settings)
+            state["history"].append(record)
+            reached = _convergence_reached(state["history"], settings)
+            if reached:
+                state["termination_reason"] = "converged"
+            _write_yaml_atomic(path, state)
+            if reached:
+                for name, values in work.items():
+                    environment_name, direction = name.removeprefix("leg_").split("_", 1)
+                    environment_name = {"a": "complex", "b": "solvent"}[environment_name]
+                    _rewrite_work(
+                        workdir / f"{environment_name}_{direction}.csv",
+                        values[:sample_count],
+                    )
+                return True
+        return False
+
+    return callback, state
+
+
+def _normalize_converged_work_prefix(workdir, convergence_state):
+    if convergence_state.get("termination_reason") != "converged":
+        return
+    history = convergence_state.get("history") or []
+    if not history:
+        raise HybridWorkflowError(
+            "converged hybrid state is missing convergence history"
+        )
+    sample_count = int(history[-1]["sample_count_per_direction"])
+    for environment in ("complex", "solvent"):
+        for direction in ("forward", "reverse"):
+            path = workdir / f"{environment}_{direction}.csv"
+            values = _read_work(path)
+            if len(values) < sample_count:
+                raise HybridWorkflowError(
+                    f"converged work is incomplete: {path} contains {len(values)} "
+                    f"of {sample_count} required samples"
+                )
+            if len(values) != sample_count:
+                _rewrite_work(path, values[:sample_count])
+
+
+def _run_matched_environment_iterators(iterators, workdir, convergence_callback):
+    completed = {environment: False for environment in iterators}
+    summaries = {environment: None for environment in iterators}
+
+    def advance(environment):
+        try:
+            latest = next(iterators[environment])
+        except StopIteration as stopped:
+            completed[environment] = True
+            latest = stopped.value
+        if latest is not None:
+            summaries[environment] = latest[2]
+
+    try:
+        while not all(completed.values()):
+            counts = {
+                environment: min(
+                    len(_read_work(workdir / f"{environment}_forward.csv")),
+                    len(_read_work(workdir / f"{environment}_reverse.csv")),
+                )
+                for environment in iterators
+            }
+            if not completed["solvent"] and counts["solvent"] <= counts["complex"]:
+                advance("solvent")
+            counts["solvent"] = min(
+                len(_read_work(workdir / "solvent_forward.csv")),
+                len(_read_work(workdir / "solvent_reverse.csv")),
+            )
+            if not completed["complex"] and counts["complex"] < counts["solvent"]:
+                advance("complex")
+            elif completed["solvent"] and not completed["complex"]:
+                advance("complex")
+            if convergence_callback("complex", 0, None, None):
+                break
+    finally:
+        for iterator in iterators.values():
+            iterator.close()
+    return summaries
+
+
 def _result(
     pair,
     workflow_path,
@@ -369,6 +576,43 @@ def _result(
     optimizer = (
         yaml.safe_load(optimizer_path.read_text()) if optimizer_path.exists() else None
     )
+    adaptive_path = workdir / "neqti_adaptive_switching.yaml"
+    adaptive = yaml.safe_load(adaptive_path.read_text()) if adaptive_path.exists() else None
+    convergence_path = workdir / "neqti_convergence.yaml"
+    convergence = (
+        yaml.safe_load(convergence_path.read_text())
+        if convergence_path.exists()
+        else None
+    )
+    warnings = []
+    if adaptive is not None:
+        if any(
+            item.get("selected", {}).get("selection_reason")
+            == "candidate_list_exhausted"
+            for item in adaptive.get("environments", {}).values()
+        ):
+            warnings.append(
+                "At least one hybrid NEQTI environment exhausted all adaptive "
+                "switching candidates; production used the longest duration."
+            )
+        if any(
+            item.get("selected", {}).get("pilot_samples_reused")
+            for item in adaptive.get("environments", {}).values()
+        ):
+            warnings.append(
+                "Selected adaptive pilot work was reused in the production BAR estimate."
+            )
+    convergence_status = (
+        "usable"
+        if config["convergence"]["enabled"]
+        and convergence is not None
+        and convergence.get("termination_reason") == "converged"
+        else (
+            "partial"
+            if config["convergence"]["enabled"]
+            else ("usable" if analysis and analysis["overlap_score"] >= 0.01 else "partial")
+        )
+    )
     return {
         "schema_version": 1,
         "tool": "atom_openmm_rbfe",
@@ -382,7 +626,9 @@ def _result(
         "ligand_b": pair["lig2_name"],
         "workdir": str(workdir.resolve()),
         "external_metadata": pair.get("external_metadata") or {},
-        "termination_reason": None,
+        "termination_reason": (
+            None if convergence is None else convergence.get("termination_reason")
+        ),
         "convention": {
             "edge_direction": "ligand_a_to_ligand_b",
             "ddg_definition": "G(ligand_b) - G(ligand_a)",
@@ -401,15 +647,16 @@ def _result(
             "estimator_variants": None,
         },
         "quality": {
-            "convergence_status": "usable" if analysis and analysis["overlap_score"] >= 0.01 else "partial",
+            "convergence_status": convergence_status,
             "overlap_score": None if analysis is None else analysis["overlap_score"],
             "cycle_closure_error": None,
-            "warnings": [],
+            "warnings": warnings,
             "rest2": rest2,
             "finite_sample_counts": finite_counts,
             "counted_infinite_work_counts": infinite_counts,
-            "convergence": None,
+            "convergence": convergence,
             "schedule_optimization": optimizer,
+            "adaptive_switching": adaptive,
         },
         "error": None,
         "inputs": {
@@ -450,6 +697,12 @@ def _result(
             },
             "schedule_optimization": (
                 "covalent_schedule_optimization.yaml" if optimizer is not None else None
+            ),
+            "adaptive_switching": (
+                "neqti_adaptive_switching.yaml" if adaptive is not None else None
+            ),
+            "neqti_convergence": (
+                "neqti_convergence.yaml" if convergence is not None else None
             ),
         },
         "parameterization": manifest.get("parameterization"),
@@ -516,26 +769,109 @@ def run_noncovalent_hybrid_workflow(path):
                     }
                 )
                 continue
+            previous_result = (
+                yaml.safe_load((workdir / "result.yaml").read_text()) or {}
+                if (workdir / "result.yaml").exists()
+                else {}
+            )
             _write_yaml_atomic(
                 workdir / "result.yaml",
                 _result(pair, path, plan["receptor_file"], workdir, None, manifest, config, "running"),
             )
-            complex_forward, complex_reverse, complex_rest2 = _run_environment(
-                "complex", complex_system, config, workdir, platform, properties,
-                config["random_seed"],
+            convergence_callback = None
+            convergence_state = None
+            if config["convergence"]["enabled"]:
+                convergence_callback, convergence_state = _hybrid_convergence_callback(
+                    workdir, config
+                )
+            terminal = (
+                convergence_state is not None
+                and convergence_state.get("termination_reason")
+                in {"converged", "max_samples"}
             )
-            solvent_forward, solvent_reverse, solvent_rest2 = _run_environment(
-                "solvent", solvent_system, config, workdir, platform, properties,
-                config["random_seed"] + 100000,
-            )
+            if terminal and convergence_state is not None:
+                _normalize_converged_work_prefix(workdir, convergence_state)
+            complex_rest2 = None
+            solvent_rest2 = None
+            if not terminal and config["convergence"]["enabled"]:
+                iterators = {
+                    "complex": _iter_environment(
+                        "complex", complex_system, config, workdir, platform,
+                        properties, config["random_seed"],
+                    ),
+                    "solvent": _iter_environment(
+                        "solvent", solvent_system, config, workdir, platform,
+                        properties, config["random_seed"] + 100000,
+                    ),
+                }
+                summaries = _run_matched_environment_iterators(
+                    iterators, workdir, convergence_callback
+                )
+                complex_forward = _read_work(workdir / "complex_forward.csv")
+                complex_reverse = _read_work(workdir / "complex_reverse.csv")
+                solvent_forward = _read_work(workdir / "solvent_forward.csv")
+                solvent_reverse = _read_work(workdir / "solvent_reverse.csv")
+                complex_rest2 = summaries["complex"]
+                solvent_rest2 = summaries["solvent"]
+                convergence_state = _convergence_state(workdir, config)
+                if convergence_state.get("termination_reason") is None:
+                    counts = [
+                        len(_read_work(workdir / f"{environment}_{direction}.csv"))
+                        for environment in ("complex", "solvent")
+                        for direction in ("forward", "reverse")
+                    ]
+                    if min(counts) >= config["n_snapshots"]:
+                        convergence_state["termination_reason"] = "max_samples"
+                        _write_yaml_atomic(
+                            workdir / "neqti_convergence.yaml", convergence_state
+                        )
+            elif not terminal:
+                complex_forward, complex_reverse, complex_rest2 = _run_environment(
+                    "complex", complex_system, config, workdir, platform, properties,
+                    config["random_seed"],
+                )
+                solvent_forward, solvent_reverse, solvent_rest2 = _run_environment(
+                    "solvent", solvent_system, config, workdir, platform, properties,
+                    config["random_seed"] + 100000,
+                )
+            else:
+                complex_forward = _read_work(workdir / "complex_forward.csv")
+                complex_reverse = _read_work(workdir / "complex_reverse.csv")
+                solvent_forward = _read_work(workdir / "solvent_forward.csv")
+                solvent_reverse = _read_work(workdir / "solvent_reverse.csv")
+                existing_rest2 = (
+                    previous_result.get("quality", {}).get("rest2") or {}
+                )
+                complex_rest2 = existing_rest2.get("complex")
+                solvent_rest2 = existing_rest2.get("solvent")
+                if complex_rest2 is None or solvent_rest2 is None:
+                    adaptive_path = workdir / "neqti_adaptive_switching.yaml"
+                    adaptive_state = (
+                        yaml.safe_load(adaptive_path.read_text()) or {}
+                        if adaptive_path.exists()
+                        else {}
+                    )
+                    environments = adaptive_state.get("environments", {})
+                    complex_rest2 = complex_rest2 or environments.get(
+                        "complex", {}
+                    ).get("rest2")
+                    solvent_rest2 = solvent_rest2 or environments.get(
+                        "solvent", {}
+                    ).get("rest2")
             work = {
-                "leg_a_forward": complex_forward,
-                "leg_a_reverse": complex_reverse,
-                "leg_b_forward": solvent_forward,
-                "leg_b_reverse": solvent_reverse,
+                "leg_a_forward": _read_work(workdir / "complex_forward.csv"),
+                "leg_a_reverse": _read_work(workdir / "complex_reverse.csv"),
+                "leg_b_forward": _read_work(workdir / "solvent_forward.csv"),
+                "leg_b_reverse": _read_work(workdir / "solvent_reverse.csv"),
             }
             analysis = _analysis_payload(work, config)
             status = "completed" if analysis is not None else "partial"
+            if (
+                config["convergence"]["enabled"]
+                and _convergence_state(workdir, config).get("termination_reason")
+                == "max_samples"
+            ):
+                status = "partial"
             payload = _result(
                 pair,
                 path,

@@ -9,6 +9,9 @@ ROOT = Path(__file__).resolve().parents[1]
 GENERATOR = ROOT / "examples" / "RBFE" / "benchmarks" / "generate_atm_benchmark_workflows.py"
 COLLECTOR = ROOT / "examples" / "RBFE" / "benchmarks" / "collect_results.py"
 ENRICHER = ROOT / "examples" / "RBFE" / "benchmarks" / "enrich_atm_benchmark_csv.py"
+HYBRID_GENERATOR = (
+    ROOT / "examples" / "RBFE" / "benchmarks" / "generate_hybrid_cdk2_cohort.py"
+)
 
 
 def _load_module(path, name):
@@ -16,6 +19,25 @@ def _load_module(path, name):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _test_hybrid_cdk2_generator_uses_adaptive_production_protocol():
+    generator = _load_module(HYBRID_GENERATOR, "generate_hybrid_cdk2_cohort")
+    workflow = generator._workflow("1oiy", "32")["workflow"]
+    neqti = workflow["neqti"]
+
+    assert neqti["n_snapshots"] == 100
+    assert neqti["adaptive_switching"]["candidate_times_ps"] == [100, 300, 1000]
+    assert neqti["adaptive_switching"]["pilot_samples_per_direction"] == 20
+    assert neqti["adaptive_switching"]["reuse_selected_pilot_samples"]
+    assert neqti["convergence"] == {
+        "enabled": True,
+        "min_samples_per_direction": 30,
+        "min_overlap_score_per_leg": 0.05,
+        "max_ddg_error_kcal_per_mol": 0.5,
+        "consecutive_checks": 3,
+        "max_ddg_range_kcal_per_mol": 0.25,
+    }
 
 
 def _write_synthetic_benchmark(tmp_path):

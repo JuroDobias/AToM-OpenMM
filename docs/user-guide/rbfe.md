@@ -360,6 +360,45 @@ selected mapping and direct mapped-atom RMSD are written to
 charges, Espaloma parameters with NN charges, and `softcore_linear` switching.
 See `examples/RBFE/cdk2/workflow.hybrid.yaml` for a complete input.
 
+Hybrid NEQTI can select switching duration independently in the complex and
+solvent environments before production:
+
+```yaml
+workflow:
+  neqti:
+    n_snapshots: 100
+    adaptive_switching:
+      enabled: true
+      candidate_times_ps: [100, 300, 1000]
+      pilot_samples_per_direction: 20
+      min_overlap_score_per_leg: 0.08
+      max_failed_fraction_per_direction: 0.05
+      reuse_selected_pilot_samples: true
+      on_exhausted: use_longest
+    convergence:
+      enabled: true
+      min_samples_per_direction: 30
+      min_overlap_score_per_leg: 0.05
+      max_ddg_error_kcal_per_mol: 0.5
+      consecutive_checks: 3
+      max_ddg_range_kcal_per_mol: 0.25
+```
+
+All candidate durations replay the same bank of endpoint snapshots. Rejected
+candidate work remains diagnostic, while work from the selected duration is
+promoted to the production CSVs and counts toward `n_snapshots`. Longer
+durations preserve the relative allocation of the base softcore schedule. If
+schedule optimization is enabled, its frozen allocation is scaled instead.
+Selection state and candidate statistics are stored in
+`neqti_adaptive_switching.yaml`.
+
+After both environments have selected durations, convergence uses matched
+complex and solvent prefixes. The first check is made at the configured minimum
+sample count. Reaching `n_snapshots` without satisfying all overlap,
+uncertainty, and stability criteria records `max_samples` and a partial result.
+Because selection and estimation reuse the same pilot work, `result.yaml`
+records this provenance and emits a quality warning.
+
 ## ATM-AWH with endpoint REST2
 
 Set `workflow.sampling.method: awh` with `alchemy.model: atm` to run one expanded-ensemble walker over

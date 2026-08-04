@@ -128,7 +128,7 @@ def _workflow(ligand_a, ligand_b):
                     "npt_steps": 250000,
                     "npt_timestep_fs": 2.0,
                 },
-                "n_snapshots": 20,
+                "n_snapshots": 100,
                 "decorrelation_steps": 50000,
                 "interpolation": "softcore_linear",
                 "softcore": {
@@ -143,6 +143,23 @@ def _workflow(ligand_a, ligand_b):
                 "failed_switch_policy": "count_as_infinite",
                 "bootstrap_samples": 500,
                 "random_seed": 2026,
+                "adaptive_switching": {
+                    "enabled": True,
+                    "candidate_times_ps": [100, 300, 1000],
+                    "pilot_samples_per_direction": 20,
+                    "min_overlap_score_per_leg": 0.08,
+                    "max_failed_fraction_per_direction": 0.05,
+                    "reuse_selected_pilot_samples": True,
+                    "on_exhausted": "use_longest",
+                },
+                "convergence": {
+                    "enabled": True,
+                    "min_samples_per_direction": 30,
+                    "min_overlap_score_per_leg": 0.05,
+                    "max_ddg_error_kcal_per_mol": 0.5,
+                    "consecutive_checks": 3,
+                    "max_ddg_range_kcal_per_mol": 0.25,
+                },
                 "rest2": {
                     "enabled": True,
                     "effective_temperatures_k": [300.0, 356.8, 424.3, 504.5, 600.0],
@@ -218,7 +235,10 @@ def generate(source_cohort: Path, benchmark_root: Path, output: Path):
         "# CDK2 hybrid-topology cohort\n\n"
         "Ten published CDK2 benchmark edges are repeated with a noncovalent "
         "hybrid topology, Espaloma NN ligand parameters, REST2 endpoint "
-        "sampling, and 100 ps NEQTI switches. The exact benchmark receptor "
+        "sampling, adaptive 100/300/1000 ps NEQTI switches, and automatic "
+        "BAR convergence stopping. Twenty matched pilot samples select the "
+        "complex and solvent durations independently and are retained for "
+        "production. The exact benchmark receptor "
         "is retained and TPO161 is parameterized with ff14SB/phosaa14SB.\n"
     )
 

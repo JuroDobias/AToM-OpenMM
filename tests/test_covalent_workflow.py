@@ -591,6 +591,39 @@ def test_softcore_resume_rejects_changed_lrc_mode(tmp_path):
         raise AssertionError("changed LRC mode was accepted for resume")
 
 
+def _test_adaptive_segment_scaling_preserves_shape_and_total():
+    from atom_openmm.covalent_workflow import _scale_segment_steps
+
+    assert _scale_segment_steps([10, 20, 10], 120) == [30, 60, 30]
+    uneven = _scale_segment_steps([1, 2, 4], 100)
+    assert sum(uneven) == 100
+    assert all(value > 0 for value in uneven)
+
+
+def _test_adaptive_work_statistics_apply_overlap_and_failure_thresholds():
+    from atom_openmm.covalent_workflow import _adaptive_work_statistics
+
+    config = {
+        "temperature_k": 300.0,
+        "bootstrap_samples": 10,
+        "random_seed": 2026,
+        "adaptive_switching": {
+            "pilot_samples_per_direction": 20,
+            "min_overlap_score_per_leg": 0.08,
+            "max_failed_fraction_per_direction": 0.05,
+        },
+    }
+    passed = _adaptive_work_statistics([1.0] * 20, [-1.0] * 20, config)
+    assert passed["passed"]
+    failed = _adaptive_work_statistics(
+        [1.0] * 18 + [float("inf")] * 2,
+        [-1.0] * 20,
+        config,
+    )
+    assert not failed["passed"]
+    assert failed["failed_fraction"]["forward"] == 0.1
+
+
 def test_endpoint_lrc_protocol_records_stable_correction_version():
     config = _normalized_settings(
         {

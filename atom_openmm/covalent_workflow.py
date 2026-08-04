@@ -56,9 +56,13 @@ from atom_openmm.equilibration import (
 )
 from atom_openmm.neqti import (
     _allocate_segment_steps,
+    _bar_overlap_score,
+    _convergence_reached,
+    _convergence_record,
     _is_numerical_switch_failure,
     _optimizer_cycle_scores,
     _schedule_change_fraction,
+    analyze_neqti_work,
     analyze_two_leg_work,
 )
 from atom_openmm.neqti_integrator import ATMNonequilibriumLangevinIntegrator
@@ -263,6 +267,16 @@ def validate_covalent_workflow(path):
             "schedule_optimization.subdivisions_per_stage"
         )
     config = _normalized_settings(workflow)
+    if config["adaptive_switching"]["enabled"]:
+        raise CovalentWorkflowError(
+            "adaptive_switching is currently implemented only for noncovalent "
+            "hybrid-topology workflows"
+        )
+    if config["convergence"]["enabled"]:
+        raise CovalentWorkflowError(
+            "automatic convergence stopping is currently implemented only for "
+            "noncovalent hybrid-topology workflows"
+        )
     if config["interpolation"] == "softcore_linear":
         for pair in settings["pairs"]:
             charge_a = ligands[pair["ligand_a"]].get("formal_charge")
@@ -933,6 +947,101 @@ def _read_work(path):
         return [float(row["work_kcal_per_mol"]) for row in csv.DictReader(handle)]
 
 
+def _rewrite_work(path, work_kcal):
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["sample", "work_kj_per_mol", "work_kcal_per_mol"])
+        for sample, value in enumerate(work_kcal, 1):
+            writer.writerow([sample, value * KCAL_TO_KJ, value])
+    os.replace(temporary, path)
+
+
+def _scale_segment_steps(segment_steps, target_total_steps):
+    current = np.asarray(segment_steps, dtype=int)
+    if current.ndim != 1 or not len(current) or np.any(current < 1):
+        raise CovalentWorkflowError(
+            "segment steps must be a non-empty list of positive integers"
+        )
+    target_total_steps = int(target_total_steps)
+    if target_total_steps < len(current):
+        raise CovalentWorkflowError(
+            "adaptive switching duration is too short for one step per segment"
+        )
+    raw = current.astype(float) * target_total_steps / int(current.sum())
+    scaled = np.maximum(1, np.floor(raw).astype(int))
+    remainder = target_total_steps - int(scaled.sum())
+    if remainder > 0:
+        order = np.argsort(-(raw - np.floor(raw)))
+        for index in range(remainder):
+            scaled[order[index % len(order)]] += 1
+    elif remainder < 0:
+        for index in np.argsort(raw - np.floor(raw)):
+            removable = min(scaled[index] - 1, -remainder)
+            scaled[index] -= removable
+            remainder += removable
+            if remainder == 0:
+                break
+    if int(scaled.sum()) != target_total_steps:
+        raise CovalentWorkflowError(
+            "could not scale the switching schedule to the requested duration"
+        )
+    return [int(value) for value in scaled]
+
+
+def _adaptive_work_statistics(forward, reverse, config):
+    analysis = analyze_neqti_work(
+        forward,
+        reverse,
+        config["temperature_k"],
+        min(200, config["bootstrap_samples"]),
+        config["random_seed"],
+    )
+    dg = None if analysis is None else analysis["bar_dg_kcal_per_mol"]
+    overlap = _bar_overlap_score(
+        forward, reverse, dg, config["temperature_k"]
+    )
+    failed = {
+        "forward": int(np.count_nonzero(~np.isfinite(forward))),
+        "reverse": int(np.count_nonzero(~np.isfinite(reverse))),
+    }
+    total = {"forward": len(forward), "reverse": len(reverse)}
+    failed_fraction = {
+        key: (None if total[key] == 0 else failed[key] / total[key])
+        for key in failed
+    }
+    settings = config["adaptive_switching"]
+    passed = (
+        overlap is not None
+        and overlap >= settings["min_overlap_score_per_leg"]
+        and all(value >= settings["pilot_samples_per_direction"] for value in total.values())
+        and all(
+            value is not None
+            and value <= settings["max_failed_fraction_per_direction"]
+            for value in failed_fraction.values()
+        )
+    )
+    finite_forward = np.asarray(forward)[np.isfinite(forward)]
+    finite_reverse = np.asarray(reverse)[np.isfinite(reverse)]
+    return {
+        "bar_dg_kcal_per_mol": dg,
+        "bar_bootstrap_std_kcal_per_mol": (
+            None if analysis is None else analysis["bar_bootstrap_std_kcal_per_mol"]
+        ),
+        "overlap_score": overlap,
+        "dissipation_kcal_per_mol": (
+            None
+            if not len(finite_forward) or not len(finite_reverse)
+            else float(np.mean(finite_forward) + np.mean(finite_reverse))
+        ),
+        "samples": total,
+        "failed_switches": failed,
+        "failed_fraction": failed_fraction,
+        "passed": bool(passed),
+    }
+
+
 def _switch_context(
     endpoint_a,
     endpoint_b,
@@ -1351,7 +1460,7 @@ def _sample_endpoint(
     return state, None
 
 
-def _run_environment(
+def _iter_environment(
     name,
     prepared,
     config,
@@ -1359,6 +1468,7 @@ def _run_environment(
     platform,
     properties,
     seed,
+    stop_callback=None,
 ):
     temperature = float(config["temperature_k"])
     timestep = float(config["timestep_fs"])
@@ -1700,7 +1810,257 @@ def _run_environment(
             optimization["pilot_samples"],
             segment_steps,
         )
-    for sample in range(int(config["n_snapshots"])):
+    adaptive = config["adaptive_switching"]
+    if adaptive["enabled"]:
+        adaptive_path = workdir / "neqti_adaptive_switching.yaml"
+        adaptive_dir = workdir / "neqti_adaptive_switching"
+        snapshot_dir = adaptive_dir / "snapshots" / name
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        if adaptive_path.exists():
+            adaptive_state = yaml.safe_load(adaptive_path.read_text()) or {}
+        else:
+            adaptive_state = {
+                "schema_version": 1,
+                "status": "running",
+                "settings": adaptive,
+                "environments": {},
+            }
+        if adaptive_state.get("settings") != adaptive:
+            raise CovalentResumeError(
+                "existing adaptive switching uses different settings"
+            )
+        environment_state = adaptive_state["environments"].setdefault(
+            name,
+            {
+                "status": "collecting_snapshots",
+                "completed_snapshot_cycles": 0,
+                "base_segment_steps": list(segment_steps),
+                "candidates": {},
+                "selected": None,
+                "rest2": {},
+            },
+        )
+        base_segment_steps = [
+            int(value) for value in environment_state["base_segment_steps"]
+        ]
+        pilot_samples = adaptive["pilot_samples_per_direction"]
+        completed_snapshots = int(environment_state["completed_snapshot_cycles"])
+        for cycle in range(completed_snapshots):
+            for endpoint in ("a", "b"):
+                snapshot_path = snapshot_dir / f"{endpoint}_{cycle:04d}.xml"
+                if not snapshot_path.exists():
+                    raise CovalentResumeError(
+                        f"adaptive snapshot bank is incomplete: {snapshot_path}"
+                    )
+        for cycle in range(completed_snapshots, pilot_samples):
+            LOGGER.info(
+                "%s adaptive snapshot cycle %d/%d",
+                name,
+                cycle + 1,
+                pilot_samples,
+            )
+            for endpoint, system, offset in (
+                ("a", prepared.endpoint_a, 0),
+                ("b", prepared.endpoint_b, 100),
+            ):
+                state, rest2_summary = _sample_endpoint(
+                    system,
+                    prepared.topology,
+                    state_files[endpoint],
+                    prepared.hot_atom_indices,
+                    ensemble=endpoint,
+                    steps=config["decorrelation_steps"],
+                    rest2_config=config["rest2"],
+                    output_dir=workdir / f"{name}_rest2_{endpoint}",
+                    platform=platform,
+                    properties=properties,
+                    temperature_k=temperature,
+                    timestep_fs=timestep,
+                    seed=seed + 700000 + cycle * 1000 + offset,
+                )
+                if rest2_summary is not None:
+                    rest2_summaries[endpoint] = rest2_summary
+                    environment_state.setdefault("rest2", {})[endpoint] = rest2_summary
+                _write_state(snapshot_dir / f"{endpoint}_{cycle:04d}.xml", state)
+            environment_state["completed_snapshot_cycles"] = cycle + 1
+            environment_state["status"] = (
+                "evaluating" if cycle + 1 == pilot_samples else "collecting_snapshots"
+            )
+            _write_yaml_atomic(adaptive_path, adaptive_state)
+
+        def run_adaptive_switch(direction, endpoint, state, direction_steps, cycle):
+            cached = softcore_contexts.get(direction)
+            if cached is None:
+                cached = _softcore_switch_context(
+                    softcore,
+                    start=endpoint,
+                    timestep_fs=timestep,
+                    temperature_k=temperature,
+                    platform=platform,
+                    properties=properties,
+                    seed=seed + 710000 + cycle * 1000 + (0 if endpoint == "a" else 100),
+                )
+                softcore_contexts[direction] = cached
+            context, integrator, parameter_values = cached
+            integrator.set_segment_steps(direction_steps)
+            _reset_softcore_context(context, integrator, parameter_values)
+            _apply_state(context, state)
+            try:
+                raw_work, _ = _run_segmented_protocol(integrator, direction_steps)
+                if lrc_corrections is not None:
+                    correction = lrc_corrections[direction]
+                    raw_work += correction["final"] - correction["initial"]
+                return raw_work
+            except Exception as exc:
+                if (
+                    config["failed_switch_policy"] == "count_as_infinite"
+                    and _is_numerical_switch_failure(exc)
+                ):
+                    softcore_contexts.pop(direction, None)
+                    LOGGER.warning(
+                        "%s adaptive %s pilot %d failed numerically and was recorded "
+                        "as +inf work: %s",
+                        name,
+                        direction,
+                        cycle + 1,
+                        exc,
+                    )
+                    return float("inf")
+                raise
+
+        selected = environment_state.get("selected")
+        for time_ps, total_steps in zip(
+            adaptive["candidate_times_ps"], adaptive["candidate_total_steps"]
+        ):
+            if selected is not None:
+                break
+            candidate_key = f"{time_ps:g}ps"
+            candidate_dir = adaptive_dir / candidate_key
+            candidate_dir.mkdir(parents=True, exist_ok=True)
+            candidate = environment_state["candidates"].setdefault(
+                candidate_key,
+                {
+                    "time_ps": time_ps,
+                    "total_steps": total_steps,
+                    "completed_cycles": 0,
+                    "statistics": None,
+                },
+            )
+            forward_steps = _scale_segment_steps(base_segment_steps, total_steps)
+            reverse_steps = list(reversed(forward_steps))
+            candidate["forward_segment_steps"] = forward_steps
+            candidate["reverse_segment_steps"] = reverse_steps
+            candidate_files = {
+                "forward": candidate_dir / f"{name}_forward.csv",
+                "reverse": candidate_dir / f"{name}_reverse.csv",
+            }
+            completed_cycles = int(candidate["completed_cycles"])
+            for direction in ("forward", "reverse"):
+                existing_candidate = _read_work(candidate_files[direction])
+                if len(existing_candidate) != completed_cycles:
+                    _rewrite_work(
+                        candidate_files[direction],
+                        existing_candidate[:completed_cycles],
+                    )
+            for cycle in range(completed_cycles, pilot_samples):
+                LOGGER.info(
+                    "%s adaptive %s pilot %d/%d",
+                    name,
+                    candidate_key,
+                    cycle + 1,
+                    pilot_samples,
+                )
+                for direction, endpoint, direction_steps in (
+                    ("forward", "a", forward_steps),
+                    ("reverse", "b", reverse_steps),
+                ):
+                    state = _load_state(snapshot_dir / f"{endpoint}_{cycle:04d}.xml")
+                    work_kj = run_adaptive_switch(
+                        direction, endpoint, state, direction_steps, cycle
+                    )
+                    _append_work(candidate_files[direction], cycle + 1, work_kj)
+                candidate["completed_cycles"] = cycle + 1
+                _write_yaml_atomic(adaptive_path, adaptive_state)
+            statistics = _adaptive_work_statistics(
+                _read_work(candidate_files["forward"]),
+                _read_work(candidate_files["reverse"]),
+                config,
+            )
+            candidate["statistics"] = statistics
+            LOGGER.info(
+                "%s adaptive %s: overlap=%s, failed fractions=%s, passed=%s",
+                name,
+                candidate_key,
+                statistics["overlap_score"],
+                statistics["failed_fraction"],
+                statistics["passed"],
+            )
+            if statistics["passed"]:
+                selected = {
+                    "candidate": candidate_key,
+                    "time_ps": time_ps,
+                    "total_steps": total_steps,
+                    "forward_segment_steps": forward_steps,
+                    "reverse_segment_steps": reverse_steps,
+                    "selection_reason": "thresholds_passed",
+                    "pilot_samples_reused": True,
+                }
+                environment_state["selected"] = selected
+            _write_yaml_atomic(adaptive_path, adaptive_state)
+        if selected is None:
+            time_ps = adaptive["candidate_times_ps"][-1]
+            total_steps = adaptive["candidate_total_steps"][-1]
+            candidate_key = f"{time_ps:g}ps"
+            forward_steps = _scale_segment_steps(base_segment_steps, total_steps)
+            selected = {
+                "candidate": candidate_key,
+                "time_ps": time_ps,
+                "total_steps": total_steps,
+                "forward_segment_steps": forward_steps,
+                "reverse_segment_steps": list(reversed(forward_steps)),
+                "selection_reason": "candidate_list_exhausted",
+                "pilot_samples_reused": True,
+            }
+            environment_state["selected"] = selected
+            LOGGER.warning(
+                "%s adaptive switching exhausted all candidates; using %.3g ps",
+                name,
+                time_ps,
+            )
+        selected_dir = adaptive_dir / selected["candidate"]
+        for direction in ("forward", "reverse"):
+            selected_work = _read_work(selected_dir / f"{name}_{direction}.csv")
+            production_work = _read_work(files[direction])
+            if not production_work:
+                _rewrite_work(files[direction], selected_work)
+            elif production_work[:pilot_samples] != selected_work:
+                raise CovalentResumeError(
+                    f"existing {name} {direction} production work does not match "
+                    "the selected adaptive pilot"
+                )
+        forward = _read_work(files["forward"])
+        reverse = _read_work(files["reverse"])
+        segment_steps = [int(value) for value in selected["forward_segment_steps"]]
+        environment_state["status"] = "complete"
+        adaptive_state["status"] = (
+            "complete"
+            if set(adaptive_state["environments"]) >= {"complex", "solvent"}
+            and all(
+                item.get("status") == "complete"
+                for item in adaptive_state["environments"].values()
+            )
+            else "running"
+        )
+        _write_yaml_atomic(adaptive_path, adaptive_state)
+        LOGGER.info(
+            "%s adaptive switching selected %.3g ps and reused %d pilot samples",
+            name,
+            selected["time_ps"],
+            pilot_samples,
+        )
+    if stop_callback is not None and stop_callback(name, len(forward), forward, reverse):
+        return forward, reverse, rest2_summaries
+    for sample in range(min(len(forward), len(reverse)), int(config["n_snapshots"])):
         for direction, endpoint, system, offset in (
             ("forward", "a", prepared.endpoint_a, 0),
             ("reverse", "b", prepared.endpoint_b, 100),
@@ -1720,6 +2080,9 @@ def _run_environment(
             )
             if rest2_summary is not None:
                 rest2_summaries[endpoint] = rest2_summary
+                if adaptive["enabled"]:
+                    environment_state.setdefault("rest2", {})[endpoint] = rest2_summary
+                    _write_yaml_atomic(adaptive_path, adaptive_state)
             _write_state_pdb(
                 workdir / f"{name}_endpoint_{endpoint}_equilibrated.pdb",
                 prepared.topology,
@@ -1820,14 +2183,19 @@ def _run_environment(
                         },
                     )
                 switch_elapsed = time.perf_counter() - started
-                simulated_ns = config["switch_steps"] * timestep * 1.0e-6
+                executed_steps = (
+                    config["switch_steps"]
+                    if softcore is None
+                    else int(sum(direction_steps))
+                )
+                simulated_ns = executed_steps * timestep * 1.0e-6
                 switch_ns_per_day = simulated_ns * 86400.0 / switch_elapsed
                 LOGGER.info(
                     "%s %s sample %d switch complete: %d steps in %.3f s, %.3f ns/day",
                     name,
                     direction,
                     sample + 1,
-                    config["switch_steps"],
+                    executed_steps,
                     switch_elapsed,
                     switch_ns_per_day,
                 )
@@ -1927,7 +2295,7 @@ def _run_environment(
                     name,
                     direction,
                     sample + 1,
-                    config["switch_steps"],
+                    executed_steps,
                     timestep,
                     switch_elapsed,
                 )
@@ -1944,7 +2312,48 @@ def _run_environment(
             name, sample + 1, config["n_snapshots"],
             forward[-1] * KCAL_TO_KJ, reverse[-1] * KCAL_TO_KJ,
         )
+        if stop_callback is not None and stop_callback(
+            name, sample + 1, forward, reverse
+        ):
+            return forward, reverse, rest2_summaries
+        yield forward, reverse, rest2_summaries
     return forward, reverse, rest2_summaries
+
+
+def _run_environment(
+    name,
+    prepared,
+    config,
+    workdir,
+    platform,
+    properties,
+    seed,
+    stop_callback=None,
+):
+    iterator = _iter_environment(
+        name,
+        prepared,
+        config,
+        workdir,
+        platform,
+        properties,
+        seed,
+        stop_callback=stop_callback,
+    )
+    latest = None
+    while True:
+        try:
+            latest = next(iterator)
+        except StopIteration as stopped:
+            if stopped.value is not None:
+                return stopped.value
+            if latest is not None:
+                return latest
+            return (
+                _read_work(Path(workdir) / f"{name}_forward.csv"),
+                _read_work(Path(workdir) / f"{name}_reverse.csv"),
+                {},
+            )
 
 
 def _normalized_settings(workflow):
@@ -1956,6 +2365,8 @@ def _normalized_settings(workflow):
     softcore = neqti.get("softcore") or {}
     work_profile_raw = neqti.get("switch_work_profile") or {}
     optimization_raw = neqti.get("schedule_optimization") or {}
+    adaptive_raw = neqti.get("adaptive_switching") or {}
+    convergence_raw = neqti.get("convergence") or {}
     path_raw = softcore.get("path")
     interpolation = str(neqti.get("interpolation", "envelope"))
     enabled = bool(rest2.get("enabled", True))
@@ -2055,6 +2466,14 @@ def _normalized_settings(workflow):
         )
     else:
         switch_steps = int(neqti.get("switch_steps", 50000))
+    candidate_times_ps = [
+        float(value)
+        for value in adaptive_raw.get("candidate_times_ps", [100.0, 300.0, 1000.0])
+    ]
+    candidate_total_steps = [
+        int(round(value * 1000.0 / float(neqti.get("timestep_fs", 2.0))))
+        for value in candidate_times_ps
+    ]
     return {
         "temperature_k": float(neqti.get("temperature_k", 300.0)),
         "equilibration_protocol": normalize_equilibration_protocol(workflow),
@@ -2096,6 +2515,44 @@ def _normalized_settings(workflow):
             ],
         },
         "schedule_optimization": schedule_optimization,
+        "adaptive_switching": {
+            "enabled": bool(adaptive_raw.get("enabled", False)),
+            "candidate_times_ps": candidate_times_ps,
+            "candidate_total_steps": candidate_total_steps,
+            "pilot_samples_per_direction": int(
+                adaptive_raw.get("pilot_samples_per_direction", 20)
+            ),
+            "min_overlap_score_per_leg": float(
+                adaptive_raw.get("min_overlap_score_per_leg", 0.08)
+            ),
+            "max_failed_fraction_per_direction": float(
+                adaptive_raw.get("max_failed_fraction_per_direction", 0.05)
+            ),
+            "reuse_selected_pilot_samples": bool(
+                adaptive_raw.get("reuse_selected_pilot_samples", False)
+            ),
+            "on_exhausted": str(
+                adaptive_raw.get("on_exhausted", "use_longest")
+            ).lower(),
+        },
+        "convergence": {
+            "enabled": bool(convergence_raw.get("enabled", False)),
+            "min_samples_per_direction": int(
+                convergence_raw.get("min_samples_per_direction", 30)
+            ),
+            "min_overlap_score_per_leg": float(
+                convergence_raw.get("min_overlap_score_per_leg", 0.05)
+            ),
+            "max_ddg_error_kcal_per_mol": float(
+                convergence_raw.get("max_ddg_error_kcal_per_mol", 0.5)
+            ),
+            "consecutive_checks": int(
+                convergence_raw.get("consecutive_checks", 3)
+            ),
+            "max_ddg_range_kcal_per_mol": float(
+                convergence_raw.get("max_ddg_range_kcal_per_mol", 0.25)
+            ),
+        },
         "failed_switch_policy": str(
             neqti.get("failed_switch_policy", "count_as_infinite")
         ),
@@ -2321,6 +2778,8 @@ def _switch_protocol(config, mapping_settings=None, mapping_label="covalent_mapp
         "total_steps": config["switch_steps"],
         "switch_work_profile": dict(config["switch_work_profile"]),
     }
+    if config["adaptive_switching"]["enabled"]:
+        protocol["adaptive_switching"] = dict(config["adaptive_switching"])
     if config["interpolation"] == "softcore_linear":
         protocol["softcore"] = dict(config["softcore"])
         if "path_nodes" in config["softcore"]:
