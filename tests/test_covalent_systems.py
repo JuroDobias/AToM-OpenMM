@@ -5,10 +5,39 @@ from openff.toolkit import ForceField, Molecule
 from openff.units import unit as offunit
 
 from atom_openmm.covalent_parameters import CovalentParameterBundle
-from atom_openmm.covalent_systems import create_solvated_capped_reference
+from atom_openmm.covalent_systems import (
+    PreparedCovalentHybrid,
+    create_solvated_capped_reference,
+    load_prepared_hybrid_bundle,
+    write_prepared_hybrid_bundle,
+)
 from atom_openmm.covalent_systems import add_deterministic_ions
 from atom_openmm.covalent_hybrid import build_covalent_hybrid_molecule
 from atom_openmm.covalent_systems import solvate_capped_reference_hybrid
+
+
+def test_prepared_bundle_roundtrips_topology_with_blank_input_ids(tmp_path):
+    topology = app.Topology()
+    residue = topology.addResidue("LIG", topology.addChain(""), "")
+    topology.addAtom("C1", app.Element.getBySymbol("C"), residue)
+    system_a = mm.System()
+    system_b = mm.System()
+    system_a.addParticle(12.0)
+    system_b.addParticle(12.0)
+    prepared = PreparedCovalentHybrid(
+        topology,
+        [mm.Vec3(0, 0, 0)] * unit.nanometer,
+        system_a,
+        system_b,
+        1,
+        (0,),
+        {},
+    )
+
+    payload = write_prepared_hybrid_bundle(prepared, tmp_path, "blank_ids")
+    loaded = load_prepared_hybrid_bundle(tmp_path, payload)
+
+    assert loaded.topology.getNumAtoms() == 1
 
 
 def _test_solvated_reference_preserves_supplied_charges(tmp_path):

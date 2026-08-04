@@ -94,7 +94,7 @@ def write_prepared_hybrid_bundle(prepared, directory, name):
     }
     with paths["topology"].open("w") as handle:
         app.PDBxFile.writeFile(
-            prepared.topology, prepared.positions, handle, keepIds=True
+            prepared.topology, prepared.positions, handle, keepIds=False
         )
     paths["endpoint_a"].write_text(mm.XmlSerializer.serialize(prepared.endpoint_a))
     paths["endpoint_b"].write_text(mm.XmlSerializer.serialize(prepared.endpoint_b))
