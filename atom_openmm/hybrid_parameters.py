@@ -26,6 +26,7 @@ def parameterize_ligand(
     *,
     ligand_forcefield: str = "espaloma-0.3.2",
     ligand_charge_model: str = "nn",
+    allow_undefined_stereo: bool = False,
 ) -> HybridParameterBundle:
     if not ligand_forcefield.startswith("espaloma"):
         raise HybridParameterError(
@@ -35,7 +36,9 @@ def parameterize_ligand(
         raise HybridParameterError(
             "noncovalent hybrid topology currently requires ligand_charge_model: nn"
         )
-    molecule = Molecule.from_file(str(sdf), allow_undefined_stereo=False)
+    molecule = Molecule.from_file(
+        str(sdf), allow_undefined_stereo=bool(allow_undefined_stereo)
+    )
     generator = EspalomaTemplateGenerator(
         molecules=[molecule],
         forcefield=ligand_forcefield,
@@ -68,6 +71,7 @@ def parameterize_ligand(
         "net_charge_e": float(charges.sum()),
         "uniform_charge_correction_e": float(correction),
         "source": str(Path(sdf).resolve()),
+        "allow_undefined_stereo": bool(allow_undefined_stereo),
     }
     return HybridParameterBundle(
         molecule=molecule,

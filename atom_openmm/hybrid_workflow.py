@@ -65,13 +65,19 @@ def _mapping_settings(workflow):
     return settings
 
 
-def _formal_charge(path):
-    molecule = Molecule.from_file(str(path), allow_undefined_stereo=False)
+def _formal_charge(path, *, allow_undefined_stereo=False):
+    molecule = Molecule.from_file(
+        str(path), allow_undefined_stereo=bool(allow_undefined_stereo)
+    )
     return int(round(molecule.total_charge.m_as(offunit.elementary_charge)))
 
 
 def _validate_settings(workflow):
     setup = workflow.get("setup") or {}
+    if not isinstance(setup.get("allow_undefined_stereo", False), bool):
+        raise HybridWorkflowError(
+            "workflow.setup.allow_undefined_stereo must be true or false"
+        )
     if not str(setup.get("ligand_forcefield", "espaloma-0.3.2")).startswith("espaloma"):
         raise HybridWorkflowError(
             "noncovalent hybrid topology currently supports Espaloma ligand force fields"
@@ -118,11 +124,20 @@ def validate_noncovalent_hybrid_workflow(path):
 
     config = load_workflow_config(path)
     plan = build_small_molecule_plan(config)
+    allow_undefined_stereo = bool(
+        (config["workflow"].get("setup") or {}).get(
+            "allow_undefined_stereo", False
+        )
+    )
     _mapping_settings(config["workflow"])
     _validate_settings(config["workflow"])
     for pair in plan["pairs"]:
-        charge_a = _formal_charge(pair["lig1_file"])
-        charge_b = _formal_charge(pair["lig2_file"])
+        charge_a = _formal_charge(
+            pair["lig1_file"], allow_undefined_stereo=allow_undefined_stereo
+        )
+        charge_b = _formal_charge(
+            pair["lig2_file"], allow_undefined_stereo=allow_undefined_stereo
+        )
         if charge_a != charge_b:
             raise HybridWorkflowError(
                 f"hybrid topology requires equal endpoint formal charges in this release: "
@@ -242,13 +257,16 @@ def _prepare_pair(pair, receptor, workflow, workdir):
     setup = workflow.get("setup") or {}
     ligand_forcefield = setup.get("ligand_forcefield", "espaloma-0.3.2")
     charge_model = setup.get("ligand_charge_model", "nn")
+    allow_undefined_stereo = bool(setup.get("allow_undefined_stereo", False))
     parameters_a = parameterize_ligand(
         pair["lig1_file"], ligand_forcefield=ligand_forcefield,
         ligand_charge_model=charge_model,
+        allow_undefined_stereo=allow_undefined_stereo,
     )
     parameters_b = parameterize_ligand(
         pair["lig2_file"], ligand_forcefield=ligand_forcefield,
         ligand_charge_model=charge_model,
+        allow_undefined_stereo=allow_undefined_stereo,
     )
     if not np.isclose(parameters_a.charges_e.sum(), parameters_b.charges_e.sum(), atol=1e-6):
         raise HybridWorkflowError("parameterized endpoint ligand charges differ")

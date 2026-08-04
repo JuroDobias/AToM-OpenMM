@@ -49,7 +49,7 @@ def _md_step(identifier, ensemble, n_steps, timestep_ps, restrained):
 
 
 def _workflow(ligand_a, ligand_b):
-    return {
+    payload = {
         "workflow": {
             "type": "rbfe",
             "chemistry": "noncovalent",
@@ -153,6 +153,9 @@ def _workflow(ligand_a, ligand_b):
             },
         }
     }
+    if (ligand_a, ligand_b) == ("30", "31"):
+        payload["workflow"]["setup"]["allow_undefined_stereo"] = True
+    return payload
 
 
 def _run_script(edge):

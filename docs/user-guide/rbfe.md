@@ -195,6 +195,11 @@ be `cube` (the default), `dodecahedron`, `octahedron`, or `rectangular`. The
 rectangular mode applies `solvent_padding_a` independently to each coordinate
 extent and is closest to tleap's rectangular solvent-box behavior.
 
+Hybrid workflows reject undefined ligand stereochemistry by default. For a
+source dataset that intentionally leaves a stereocenter unspecified, set
+`setup.allow_undefined_stereo: true`. This is an explicit opt-in and does not
+assign a configuration; the supplied conformer is retained.
+
 `solvent_model` is the OpenMM solvent packing model passed to `Modeller.addSolvent()`. If omitted, the wrapper infers it from `solvent_forcefield`. For example, `amber19/opc.xml` uses `solvent_model: tip4pew` for four-site water placement while parameterizing with OPC.
 
 For phosphorylated proteins or other receptor chemistry that needs tleap-specific force fields, use AmberTools setup. Ligands can be supplied as pre-parameterized MOL2/FRCMOD files, or parameterized from SDF on the fly with antechamber:
