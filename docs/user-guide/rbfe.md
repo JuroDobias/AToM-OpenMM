@@ -171,6 +171,30 @@ setup:
 
 The accepted ligand force-field families are `gaff-*`, `openff-*`, and `espaloma-*`, subject to the versions available in the installed `openmmforcefields`. Protein and solvent values are OpenMM force-field XML files. Do not combine arbitrary protein and water XML files without checking that they are intended to be used together.
 
+Hybrid-topology workflows can load XML resources distributed by
+`openmmforcefields` without using environment-specific absolute paths. Prefix the
+path below that package's `ffxml` directory with `openmmforcefields:`. For
+example, the compatible ff14SB, phosphorylated-amino-acid, and TIP3P stack is:
+
+```yaml
+setup:
+  protein_forcefield:
+    - openmmforcefields:amber/ff14SB.xml
+    - openmmforcefields:amber/phosaa14SB.xml
+  solvent_forcefield:
+    - openmmforcefields:amber/tip3p_standard.xml
+```
+
+Do not combine `phosaa14SB.xml` with OpenMM's namespaced
+`amber14-all.xml`; their atom-type namespaces are incompatible. The hybrid
+builder also restores bonds for exact supplemental residue templates, such as
+TPO, when OpenMM's PDB reader does not recognize the modified residue.
+
+`solvent_box_shape` controls packing for hybrid-topology environments. It can
+be `cube` (the default), `dodecahedron`, `octahedron`, or `rectangular`. The
+rectangular mode applies `solvent_padding_a` independently to each coordinate
+extent and is closest to tleap's rectangular solvent-box behavior.
+
 `solvent_model` is the OpenMM solvent packing model passed to `Modeller.addSolvent()`. If omitted, the wrapper infers it from `solvent_forcefield`. For example, `amber19/opc.xml` uses `solvent_model: tip4pew` for four-site water placement while parameterizing with OPC.
 
 For phosphorylated proteins or other receptor chemistry that needs tleap-specific force fields, use AmberTools setup. Ligands can be supplied as pre-parameterized MOL2/FRCMOD files, or parameterized from SDF on the fly with antechamber:

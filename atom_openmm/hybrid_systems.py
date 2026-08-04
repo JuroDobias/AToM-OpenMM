@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from importlib import resources
 from pathlib import Path
 
 import numpy as np
@@ -16,12 +17,98 @@ HybridSystemError = CovalentParameterError
 
 def _forcefield_files(value, default):
     if value is None:
-        return list(default)
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, list) and all(isinstance(item, str) for item in value):
-        return list(value)
-    raise HybridSystemError("force-field settings must be strings or lists of strings")
+        values = list(default)
+    elif isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+        values = list(value)
+    else:
+        raise HybridSystemError("force-field settings must be strings or lists of strings")
+    return [_resolve_forcefield_file(item) for item in values]
+
+
+def _resolve_forcefield_file(value: str) -> str:
+    prefix = "openmmforcefields:"
+    if not value.startswith(prefix):
+        return value
+    relative = Path(value[len(prefix) :])
+    if relative.is_absolute() or ".." in relative.parts:
+        raise HybridSystemError(
+            f"invalid openmmforcefields resource path: {value}"
+        )
+    resource = resources.files("openmmforcefields").joinpath("ffxml", *relative.parts)
+    if not resource.is_file():
+        raise HybridSystemError(
+            f"openmmforcefields resource does not exist: {value}"
+        )
+    return str(resource)
+
+
+def _repair_template_bonds(topology, positions, forcefield):
+    """Add bonds omitted when PDBFile does not recognize a supplemental residue."""
+    existing = {
+        frozenset((atom1.index, atom2.index)) for atom1, atom2 in topology.bonds()
+    }
+    repaired = set()
+    for residue in topology.residues():
+        template = forcefield._templates.get(residue.name)
+        if template is None:
+            continue
+        atoms = {atom.name: atom for atom in residue.atoms()}
+        if set(atoms) != set(template.atomIndices):
+            continue
+        missing = []
+        for first, second in template.bonds:
+            atom1 = atoms[template.atoms[first].name]
+            atom2 = atoms[template.atoms[second].name]
+            pair = frozenset((atom1.index, atom2.index))
+            if pair not in existing:
+                missing.append((atom1, atom2, pair))
+        if not missing:
+            continue
+        for atom1, atom2, pair in missing:
+            topology.addBond(atom1, atom2)
+            existing.add(pair)
+        repaired.add(residue)
+
+    for chain in topology.chains():
+        residues = list(chain.residues())
+        for first, second in zip(residues, residues[1:]):
+            if first not in repaired and second not in repaired:
+                continue
+            atoms1 = {atom.name: atom for atom in first.atoms()}
+            atoms2 = {atom.name: atom for atom in second.atoms()}
+            if "C" not in atoms1 or "N" not in atoms2:
+                continue
+            atom1, atom2 = atoms1["C"], atoms2["N"]
+            pair = frozenset((atom1.index, atom2.index))
+            if pair in existing:
+                continue
+            delta = positions[atom1.index] - positions[atom2.index]
+            distance_nm = np.linalg.norm(
+                np.asarray(delta.value_in_unit(unit.nanometer))
+            )
+            if distance_nm <= 0.2:
+                topology.addBond(atom1, atom2)
+                existing.add(pair)
+
+
+def _solvation_box_options(positions, padding_a: float, box_shape: str):
+    allowed = {"cube", "dodecahedron", "octahedron", "rectangular"}
+    if box_shape not in allowed:
+        raise HybridSystemError(
+            f"solvent_box_shape must be one of {sorted(allowed)}"
+        )
+    if box_shape != "rectangular":
+        return {
+            "padding": padding_a * unit.angstrom,
+            "boxShape": box_shape,
+        }
+    coordinates = np.asarray(
+        [position.value_in_unit(unit.nanometer) for position in positions]
+    )
+    dimensions_nm = np.ptp(coordinates, axis=0) + 2.0 * padding_a / 10.0
+    return {"boxSize": dimensions_nm * unit.nanometer}
 
 
 def create_physical_ligand_environment(
@@ -35,10 +122,6 @@ def create_physical_ligand_environment(
     topology = molecule.to_topology().to_openmm()
     positions = molecule.conformers[0].to_openmm()
     modeller = app.Modeller(topology, positions)
-    if receptor is not None:
-        receptor_pdb = app.PDBFile(str(receptor))
-        modeller.add(receptor_pdb.topology, receptor_pdb.positions)
-
     protein_files = _forcefield_files(
         setup.get("protein_forcefield"), ["amber14-all.xml"]
     )
@@ -46,6 +129,12 @@ def create_physical_ligand_environment(
         setup.get("solvent_forcefield"), ["amber14/tip3p.xml"]
     )
     forcefield = app.ForceField(*(protein_files + solvent_files))
+    if receptor is not None:
+        receptor_pdb = app.PDBFile(str(receptor))
+        _repair_template_bonds(
+            receptor_pdb.topology, receptor_pdb.positions, forcefield
+        )
+        modeller.add(receptor_pdb.topology, receptor_pdb.positions)
     generator = EspalomaTemplateGenerator(
         molecules=[molecule],
         forcefield=setup.get("ligand_forcefield", "espaloma-0.3.2"),
@@ -61,6 +150,7 @@ def create_physical_ligand_environment(
             else "tip3p"
         )
     padding_a = float(setup.get("solvent_padding_a", 10.0))
+    box_shape = str(setup.get("solvent_box_shape", "cube"))
     ionic_strength = float(setup.get("ionic_strength_molar", 0.15))
     from atom_openmm.covalent_systems import _seeded_python_random
 
@@ -68,9 +158,9 @@ def create_physical_ligand_environment(
         modeller.addSolvent(
             forcefield,
             model=solvent_model,
-            padding=padding_a * unit.angstrom,
             ionicStrength=ionic_strength * unit.molar,
             neutralize=True,
+            **_solvation_box_options(modeller.positions, padding_a, box_shape),
         )
     cutoff_a = float(setup.get("nonbonded_cutoff_a", 9.0))
     system = forcefield.createSystem(
@@ -100,6 +190,7 @@ def create_physical_ligand_environment(
         "solvent_forcefield": solvent_files,
         "solvent_model": solvent_model,
         "padding_a": padding_a,
+        "solvent_box_shape": box_shape,
         "ionic_strength_molar": ionic_strength,
         "nonbonded_cutoff_a": cutoff_a,
         "solvation_seed": int(solvation_seed),
