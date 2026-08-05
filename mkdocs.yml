@@ -28,6 +28,7 @@ nav:
   - Theory: theory/index.md
   - API Reference: api-reference/index.md
   - Troubleshooting: troubleshooting.md
+  - Development Roadmap: development-roadmap.md
   - Contributing: contributing.md
 
 plugins:

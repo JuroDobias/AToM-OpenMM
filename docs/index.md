@@ -14,6 +14,7 @@ This version uses [ATMForce](https://github.com/openmm/openmm/pull/4110), availa
 - [User guide](user-guide/index.md): learn the high-level ABFE and legacy RBFE workflow layout.
 - [Theory](theory/index.md): introduces the theory of the Alchemical Transfer approach
 - [API reference](api-reference/index.md): find command-line entry points, workflow modules, and utility modules.
+- [Development roadmap](development-roadmap.md): planned validation and implementation order for hybrid softcore, state-placement, REST2, and ACES work.
 
 ## Credits
 
