@@ -3,6 +3,7 @@ import yaml
 
 from atom_openmm.hybrid_switch_benchmark import (
     HybridSwitchBenchmarkError,
+    _long_range_correction_mode,
     _resolve_config,
     _source_softcore,
     archive_snapshot_bank,
@@ -122,3 +123,10 @@ def _test_source_softcore_preserves_concerted_path_mode():
     assert observed["ssc2_alpha_coul"] == 1.25
     assert "charge_steps_per_stage" not in observed
     assert "sterics_steps" not in observed
+    assert (
+        _long_range_correction_mode(
+            protocol,
+            {**variant, "softcore": {"long_range_correction": "endpoint_correction"}},
+        )
+        == "endpoint_correction"
+    )

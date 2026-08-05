@@ -345,6 +345,13 @@ def _source_softcore(protocol, variant):
     return {key: value for key, value in softcore.items() if key in supported}
 
 
+def _long_range_correction_mode(protocol, variant):
+    return variant["softcore"].get(
+        "long_range_correction",
+        protocol["softcore"].get("long_range_correction", "dynamic"),
+    )
+
+
 def _run_variant(config, bank_root, edge, edge_payload, variant, platform, properties):
     edge_root = bank_root / edge_payload["root"]
     prepared_manifest = yaml.safe_load((edge_root / "prepared" / "manifest.yaml").read_text()) or {}
@@ -393,21 +400,19 @@ def _run_variant(config, bank_root, edge, edge_payload, variant, platform, prope
         unique_a = prepared.provenance["unique_a_particle_indices"]
         unique_b = prepared.provenance["unique_b_particle_indices"]
         options = _source_softcore(source_protocol, variant)
+        lrc_mode = _long_range_correction_mode(source_protocol, variant)
         hamiltonian = create_softcore_hamiltonian(
             prepared.endpoint_a,
             prepared.endpoint_b,
             unique_a,
             unique_b,
-            use_long_range_correction=(
-                source_protocol["softcore"].get("long_range_correction", "dynamic")
-                == "dynamic"
-            ),
+            use_long_range_correction=lrc_mode == "dynamic",
             **options,
         )
         segment_steps = _scale_segment_steps(hamiltonian.segment_steps, total_steps)
         _assert_fixed_volume_switch(hamiltonian.system)
         lrc = None
-        if source_protocol["softcore"].get("long_range_correction") == "endpoint_correction":
+        if lrc_mode == "endpoint_correction":
             lrc_hamiltonian = create_softcore_hamiltonian(
                 prepared.endpoint_a,
                 prepared.endpoint_b,
