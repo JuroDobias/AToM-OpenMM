@@ -311,15 +311,41 @@ def _gapsys_energy_expression(scale, *, mixing):
     )
 
 
-def _softcore_expression(scale, function):
+def _amber_ssc2_energy_expression(scale, *, mixing, cutoff):
+    definitions = (
+        "x=(sigma^2/reff2)^3;"
+        "reff2=r^2+SSC2_ALPHA_LJ*fsw*(1-w)*sigma^2;"
+    )
+    if cutoff:
+        definitions += (
+            "fsw=1-rsw^3*(10+rsw*(-15+6*rsw));"
+            "rsw=min(1,max(0,(r-SSC2_SWITCH_START)"
+            "/(SSC2_SWITCH_END-SSC2_SWITCH_START)));"
+        )
+    else:
+        definitions += "fsw=1;"
+    definitions += (
+        "w=s^3*(10+s*(-15+6*s));"
+        f"s=min(1,max(0,{scale}))"
+    )
+    if mixing:
+        definitions += ";sigma=0.5*(sigma1+sigma2);epsilon=sqrt(epsilon1*epsilon2)"
+    return "4*w*epsilon*(x*x-x);" + definitions
+
+
+def _softcore_expression(scale, function, *, cutoff=True):
     if function == "gapsys":
         return _gapsys_energy_expression(scale, mixing=True)
+    if function == "amber_ssc2":
+        return _amber_ssc2_energy_expression(scale, mixing=True, cutoff=cutoff)
     return _beutler_expression(scale)
 
 
 def _softcore_bond_expression(scale, function):
     if function == "gapsys":
         return _gapsys_energy_expression(scale, mixing=False)
+    if function == "amber_ssc2":
+        return _amber_ssc2_energy_expression(scale, mixing=False, cutoff=False)
     return _beutler_bond_expression(scale)
 
 
@@ -333,10 +359,15 @@ def _new_softcore_force(
     power,
     gapsys_scale_linpoint_lj,
     gapsys_sigma_nm,
+    ssc2_alpha_lj,
+    ssc2_switch_width_nm,
     *,
     use_long_range_correction,
 ):
-    force = mm.CustomNonbondedForce(_softcore_expression(scale, function))
+    has_cutoff = source.getNonbondedMethod() != mm.NonbondedForce.NoCutoff
+    force = mm.CustomNonbondedForce(
+        _softcore_expression(scale, function, cutoff=has_cutoff)
+    )
     force.setName(f"CovalentSoftcoreNonbonded{label}")
     force.addGlobalParameter(scale, 0.0)
     if function == "gapsys":
@@ -344,6 +375,18 @@ def _new_softcore_force(
             "GAPSYS_SCALE_LINPOINT_LJ", float(gapsys_scale_linpoint_lj)
         )
         force.addGlobalParameter("GAPSYS_SIGMA", float(gapsys_sigma_nm))
+    elif function == "amber_ssc2":
+        force.addGlobalParameter("SSC2_ALPHA_LJ", float(ssc2_alpha_lj))
+        if has_cutoff:
+            cutoff_nm = _float(source.getCutoffDistance(), unit.nanometer)
+            if float(ssc2_switch_width_nm) >= cutoff_nm:
+                raise CovalentAlchemyError(
+                    "ssc2_switch_width_nm must be smaller than the nonbonded cutoff"
+                )
+            force.addGlobalParameter(
+                "SSC2_SWITCH_START", cutoff_nm - float(ssc2_switch_width_nm)
+            )
+            force.addGlobalParameter("SSC2_SWITCH_END", cutoff_nm)
     else:
         force.addGlobalParameter("SOFTCORE_ALPHA", float(alpha))
         force.addGlobalParameter("SOFTCORE_SIGMA", float(sigma_nm))
@@ -368,6 +411,8 @@ def _new_softcore_exception_force(
     power,
     gapsys_scale_linpoint_lj,
     gapsys_sigma_nm,
+    ssc2_alpha_lj,
+    ssc2_switch_width_nm,
 ):
     force = mm.CustomBondForce(_softcore_bond_expression(scale, function))
     force.setName(f"CovalentSoftcoreExceptions{label}")
@@ -377,6 +422,8 @@ def _new_softcore_exception_force(
             "GAPSYS_SCALE_LINPOINT_LJ", float(gapsys_scale_linpoint_lj)
         )
         force.addGlobalParameter("GAPSYS_SIGMA", float(gapsys_sigma_nm))
+    elif function == "amber_ssc2":
+        force.addGlobalParameter("SSC2_ALPHA_LJ", float(ssc2_alpha_lj))
     else:
         force.addGlobalParameter("SOFTCORE_ALPHA", float(alpha))
         force.addGlobalParameter("SOFTCORE_SIGMA", float(sigma_nm))
@@ -400,6 +447,8 @@ def _add_nonbonded_forces(
     power,
     gapsys_scale_linpoint_lj,
     gapsys_sigma_nm,
+    ssc2_alpha_lj,
+    ssc2_switch_width_nm,
     use_long_range_correction,
 ):
     source_a = _force(endpoint_a, mm.NonbondedForce)
@@ -464,6 +513,8 @@ def _add_nonbonded_forces(
         power,
         gapsys_scale_linpoint_lj,
         gapsys_sigma_nm,
+        ssc2_alpha_lj,
+        ssc2_switch_width_nm,
         use_long_range_correction=use_long_range_correction,
     )
     softcore_b = _new_softcore_force(
@@ -476,6 +527,8 @@ def _add_nonbonded_forces(
         power,
         gapsys_scale_linpoint_lj,
         gapsys_sigma_nm,
+        ssc2_alpha_lj,
+        ssc2_switch_width_nm,
         use_long_range_correction=use_long_range_correction,
     )
     for particle in range(endpoint_a.getNumParticles()):
@@ -496,6 +549,8 @@ def _add_nonbonded_forces(
         power,
         gapsys_scale_linpoint_lj,
         gapsys_sigma_nm,
+        ssc2_alpha_lj,
+        ssc2_switch_width_nm,
     )
     exception_lj_b = _new_softcore_exception_force(
         "B",
@@ -506,6 +561,8 @@ def _add_nonbonded_forces(
         power,
         gapsys_scale_linpoint_lj,
         gapsys_sigma_nm,
+        ssc2_alpha_lj,
+        ssc2_switch_width_nm,
     )
 
     for pair in sorted(exception_pairs):
@@ -759,6 +816,8 @@ def create_softcore_hamiltonian(
     power: int = 1,
     gapsys_scale_linpoint_lj: float = 0.85,
     gapsys_sigma_nm: float = 0.30,
+    ssc2_alpha_lj: float = 0.5,
+    ssc2_switch_width_nm: float = 0.2,
     charge_steps_per_stage: int = 10000,
     sterics_steps: int = 30000,
     subdivisions_per_stage: int = 1,
@@ -773,9 +832,9 @@ def create_softcore_hamiltonian(
     _assert_compatible_endpoints(endpoint_a, endpoint_b)
     function = str(function).lower()
     stage_interpolation = str(stage_interpolation).lower()
-    if function not in {"beutler", "gapsys"}:
+    if function not in {"beutler", "gapsys", "amber_ssc2"}:
         raise CovalentAlchemyError(
-            "softcore function must be 'beutler' or 'gapsys'"
+            "softcore function must be 'beutler', 'gapsys', or 'amber_ssc2'"
         )
     if stage_interpolation not in {"linear", "smoothstep2"}:
         raise CovalentAlchemyError(
@@ -787,6 +846,8 @@ def create_softcore_hamiltonian(
         raise CovalentAlchemyError(
             "Gapsys scale linearization point and sigma must be positive"
         )
+    if ssc2_alpha_lj <= 0.0 or ssc2_switch_width_nm <= 0.0:
+        raise CovalentAlchemyError("Amber SSC(2) LJ parameters must be positive")
     resolved_path = resolve_softcore_path(
         charge_steps_per_stage=int(charge_steps_per_stage),
         sterics_steps=int(sterics_steps),
@@ -811,6 +872,8 @@ def create_softcore_hamiltonian(
         power=int(power),
         gapsys_scale_linpoint_lj=float(gapsys_scale_linpoint_lj),
         gapsys_sigma_nm=float(gapsys_sigma_nm),
+        ssc2_alpha_lj=float(ssc2_alpha_lj),
+        ssc2_switch_width_nm=float(ssc2_switch_width_nm),
         use_long_range_correction=bool(use_long_range_correction),
     )
     _copy_other_forces(output, endpoint_a, endpoint_b)

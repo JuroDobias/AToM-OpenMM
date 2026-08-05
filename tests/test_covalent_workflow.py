@@ -499,6 +499,28 @@ def _test_gapsys_and_work_profile_settings_are_recorded_in_protocol():
     assert protocol["switch_work_profile"]["interval_steps"] == 100
 
 
+def _test_amber_ssc2_settings_are_recorded_in_protocol():
+    config = _normalized_settings(
+        {
+            "neqti": {
+                "interpolation": "softcore_linear",
+                "softcore": {
+                    "function": "amber_ssc2",
+                    "ssc2_alpha_lj": 0.5,
+                    "ssc2_switch_width_nm": 0.2,
+                },
+            }
+        }
+    )
+
+    assert config["softcore"]["function"] == "amber_ssc2"
+    assert config["softcore"]["ssc2_alpha_lj"] == 0.5
+    assert config["softcore"]["ssc2_switch_width_nm"] == 0.2
+    protocol = _switch_protocol(config)
+    assert protocol["softcore"]["function"] == "amber_ssc2"
+    assert protocol["softcore"]["ssc2_alpha_lj"] == 0.5
+
+
 def test_switch_pdb_output_can_be_disabled():
     default = _normalized_settings({"neqti": {}})
     disabled = _normalized_settings(
@@ -518,6 +540,8 @@ def _test_legacy_beutler_protocol_resumes_with_new_default_fields(tmp_path):
     legacy["softcore"].pop("function")
     legacy["softcore"].pop("gapsys_scale_linpoint_lj")
     legacy["softcore"].pop("gapsys_sigma_nm")
+    legacy["softcore"].pop("ssc2_alpha_lj")
+    legacy["softcore"].pop("ssc2_switch_width_nm")
     legacy["fingerprint"] = "legacy"
     path = tmp_path / "switch_protocol.yaml"
     path.write_text(yaml.safe_dump(legacy, sort_keys=False))

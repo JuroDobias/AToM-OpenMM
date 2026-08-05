@@ -313,6 +313,8 @@ def _source_softcore(protocol, variant):
         "power",
         "gapsys_scale_linpoint_lj",
         "gapsys_sigma_nm",
+        "ssc2_alpha_lj",
+        "ssc2_switch_width_nm",
         "charge_steps_per_stage",
         "sterics_steps",
         "subdivisions_per_stage",

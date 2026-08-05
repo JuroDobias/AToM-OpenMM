@@ -105,6 +105,20 @@ def _validate_settings(workflow):
             "workflow.neqti.softcore.stage_interpolation must be "
             "'linear' or 'smoothstep2'"
         )
+    if config["softcore"]["function"] not in {
+        "beutler",
+        "gapsys",
+        "amber_ssc2",
+    }:
+        raise HybridWorkflowError(
+            "workflow.neqti.softcore.function must be 'beutler', 'gapsys', "
+            "or 'amber_ssc2'"
+        )
+    if (
+        config["softcore"]["ssc2_alpha_lj"] <= 0.0
+        or config["softcore"]["ssc2_switch_width_nm"] <= 0.0
+    ):
+        raise HybridWorkflowError("Amber SSC(2) LJ parameters must be positive")
     if config["failed_switch_policy"] not in {"abort", "count_as_infinite"}:
         raise HybridWorkflowError(
             "workflow.neqti.failed_switch_policy must be 'abort' or 'count_as_infinite'"

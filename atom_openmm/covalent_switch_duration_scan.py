@@ -32,7 +32,6 @@ from atom_openmm.covalent_workflow import (
     _reset_softcore_context,
     _run_segmented_protocol,
     _sample_endpoint,
-    _softcore_path_options,
     _softcore_switch_context,
     _state_volume_nm3,
     _write_state,
@@ -342,19 +341,28 @@ def _collect_snapshot_bank(config, settings, prepared, source_identity, platform
 
 def _softcore_options(source_softcore, total_steps):
     options = {
-        "function": source_softcore["function"],
+        "function": source_softcore.get("function", "beutler"),
+        "stage_interpolation": source_softcore.get(
+            "stage_interpolation", "linear"
+        ),
         "alpha": source_softcore["alpha"],
         "sigma_nm": source_softcore["sigma_nm"],
         "power": source_softcore["power"],
-        "gapsys_scale_linpoint_lj": source_softcore["gapsys_scale_linpoint_lj"],
-        "gapsys_sigma_nm": source_softcore["gapsys_sigma_nm"],
+        "gapsys_scale_linpoint_lj": source_softcore.get(
+            "gapsys_scale_linpoint_lj", 0.85
+        ),
+        "gapsys_sigma_nm": source_softcore.get("gapsys_sigma_nm", 0.30),
+        "ssc2_alpha_lj": source_softcore.get("ssc2_alpha_lj", 0.5),
+        "ssc2_switch_width_nm": source_softcore.get(
+            "ssc2_switch_width_nm", 0.2
+        ),
         "total_steps": int(total_steps),
         "path_nodes": source_softcore["path_nodes"],
         "vdw_a": source_softcore["vdw_a"],
         "charge_a": source_softcore["charge_a"],
         "segments_per_interval": source_softcore["segments_per_interval"],
     }
-    return _softcore_path_options(options)
+    return options
 
 
 def _duration_name(duration_ps):

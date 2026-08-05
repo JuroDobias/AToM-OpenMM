@@ -6,6 +6,7 @@ from atom_openmm.covalent_softcore import (
     SOFTCORE_NONBONDED_FORCE_GROUP,
     STERICS_A_PARAMETER,
     STERICS_B_PARAMETER,
+    _amber_ssc2_energy_expression,
     _gapsys_energy_expression,
     create_softcore_hamiltonian,
 )
@@ -116,6 +117,208 @@ def _gapsys_reference_energy(r, sigma, epsilon, scale, alpha):
             - 28.0 * c6 / rsc**6
         )
     return scale * potential
+
+
+def _smoothstep2(value):
+    return value**3 * (10.0 + value * (-15.0 + 6.0 * value))
+
+
+def _amber_ssc2_reference_energy(
+    r,
+    sigma,
+    epsilon,
+    scale,
+    alpha,
+    *,
+    switch_start=None,
+    switch_end=None,
+):
+    weight = _smoothstep2(scale)
+    if switch_start is None or r <= switch_start:
+        cutoff_scale = 1.0
+    elif r >= switch_end:
+        cutoff_scale = 0.0
+    else:
+        progress = (r - switch_start) / (switch_end - switch_start)
+        cutoff_scale = 1.0 - _smoothstep2(progress)
+    effective_r2 = r**2 + alpha * cutoff_scale * (1.0 - weight) * sigma**2
+    x = (sigma**2 / effective_r2) ** 3
+    return 4.0 * weight * epsilon * (x * x - x)
+
+
+def _test_amber_ssc2_pair_energy_force_and_cutoff_joins():
+    sigma = 0.32
+    epsilon = 0.40
+    scale = 0.35
+    alpha = 0.5
+    switch_start = 0.8
+    switch_end = 1.0
+    force = mm.CustomBondForce(
+        _amber_ssc2_energy_expression(
+            "COVALENT_STERICS_A", mixing=False, cutoff=True
+        )
+    )
+    force.addGlobalParameter("COVALENT_STERICS_A", scale)
+    force.addGlobalParameter("SSC2_ALPHA_LJ", alpha)
+    force.addGlobalParameter("SSC2_SWITCH_START", switch_start)
+    force.addGlobalParameter("SSC2_SWITCH_END", switch_end)
+    force.addPerBondParameter("sigma")
+    force.addPerBondParameter("epsilon")
+    force.addBond(0, 1, [sigma, epsilon])
+    system = mm.System()
+    system.addParticle(12.0)
+    system.addParticle(12.0)
+    system.addForce(force)
+
+    def evaluate(distance):
+        positions = np.asarray([[0.0, 0.0, 0.0], [distance, 0.0, 0.0]])
+        return _energy_forces(system, positions * unit.nanometer)
+
+    for distance in (0.05, 0.30, 0.799, 0.8, 0.9, 0.999, 1.0, 1.01):
+        observed, forces = evaluate(distance)
+        expected = _amber_ssc2_reference_energy(
+            distance,
+            sigma,
+            epsilon,
+            scale,
+            alpha,
+            switch_start=switch_start,
+            switch_end=switch_end,
+        )
+        assert np.isclose(observed, expected, atol=1.0e-9, rtol=1.0e-7)
+        delta = 1.0e-5
+        plus = _amber_ssc2_reference_energy(
+            distance + delta,
+            sigma,
+            epsilon,
+            scale,
+            alpha,
+            switch_start=switch_start,
+            switch_end=switch_end,
+        )
+        minus = _amber_ssc2_reference_energy(
+            distance - delta,
+            sigma,
+            epsilon,
+            scale,
+            alpha,
+            switch_start=switch_start,
+            switch_end=switch_end,
+        )
+        expected_force = -(plus - minus) / (2.0 * delta)
+        assert np.isclose(forces[1, 0], expected_force, atol=2.0e-4, rtol=2.0e-4)
+
+    for boundary in (switch_start, switch_end):
+        left_energy, left_force = evaluate(boundary - 1.0e-6)
+        right_energy, right_force = evaluate(boundary + 1.0e-6)
+        assert np.isclose(left_energy, right_energy, atol=1.0e-5, rtol=1.0e-5)
+        assert np.isclose(left_force[1, 0], right_force[1, 0], atol=1.0e-4, rtol=1.0e-4)
+
+
+def _test_amber_ssc2_reproduces_endpoint_energies_and_forces():
+    endpoint_a = _endpoint("a")
+    endpoint_b = _endpoint("b")
+    hamiltonian = create_softcore_hamiltonian(
+        endpoint_a,
+        endpoint_b,
+        [2],
+        [3],
+        function="amber_ssc2",
+        charge_steps_per_stage=2,
+        sterics_steps=3,
+    )
+    positions = np.asarray(
+        [[0, 0, 0], [0.15, 0, 0], [0.28, 0.08, 0], [0.29, -0.09, 0.03], [0.7, 0.4, 0.3]]
+    ) * unit.nanometer
+    for endpoint, node in ((endpoint_a, 0), (endpoint_b, -1)):
+        expected_energy, expected_forces = _energy_forces(endpoint, positions)
+        parameters = {
+            name: values[node]
+            for name, values in hamiltonian.parameter_values.items()
+        }
+        observed_energy, observed_forces = _energy_forces(
+            hamiltonian.system, positions, parameters
+        )
+        assert np.isclose(observed_energy, expected_energy, atol=1.0e-5)
+        assert np.allclose(observed_forces, expected_forces, atol=1.0e-3)
+
+    overlap = positions.value_in_unit(unit.nanometer)
+    overlap[3] = overlap[2]
+    midpoint = {
+        name: 0.5 * (values[1] + values[2])
+        for name, values in hamiltonian.parameter_values.items()
+    }
+    energy, forces = _energy_forces(
+        hamiltonian.system, overlap * unit.nanometer, midpoint
+    )
+    assert np.isfinite(energy)
+    assert np.all(np.isfinite(forces))
+
+
+def _test_amber_ssc2_checkpoint_restart_matches_uninterrupted_switch():
+    hamiltonian = create_softcore_hamiltonian(
+        _endpoint("a"),
+        _endpoint("b"),
+        [2],
+        [3],
+        function="amber_ssc2",
+        charge_steps_per_stage=2,
+        sterics_steps=3,
+    )
+    positions = np.asarray(
+        [[0, 0, 0], [0.15, 0, 0], [0.28, 0.08, 0], [0.29, -0.09, 0.03], [0.7, 0.4, 0.3]]
+    ) * unit.nanometer
+
+    def make_context():
+        integrator = ATMNonequilibriumLangevinIntegrator(
+            temperature=300.0 * unit.kelvin,
+            collision_rate=1.0 / unit.picosecond,
+            timestep=1.0 * unit.femtosecond,
+            parameter_values=hamiltonian.parameter_values,
+            steps_per_segment=hamiltonian.segment_steps,
+            random_seed=71,
+        )
+        context = mm.Context(
+            hamiltonian.system,
+            integrator,
+            mm.Platform.getPlatformByName("Reference"),
+        )
+        context.setPositions(positions)
+        context.setVelocitiesToTemperature(300.0 * unit.kelvin, 71)
+        for name, values in hamiltonian.parameter_values.items():
+            context.setParameter(name, values[0])
+        return context, integrator
+
+    uninterrupted_context, uninterrupted = make_context()
+    uninterrupted.step(3)
+    checkpoint = uninterrupted_context.createCheckpoint()
+    uninterrupted.step(hamiltonian.total_steps - 3)
+
+    resumed_context, resumed = make_context()
+    resumed_context.loadCheckpoint(checkpoint)
+    resumed.step(hamiltonian.total_steps - 3)
+
+    uninterrupted_state = uninterrupted_context.getState(
+        getPositions=True, getVelocities=True, getEnergy=True
+    )
+    resumed_state = resumed_context.getState(
+        getPositions=True, getVelocities=True, getEnergy=True
+    )
+    assert np.allclose(
+        uninterrupted_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+        resumed_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+        atol=1.0e-12,
+    )
+    assert np.isclose(
+        uninterrupted_state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole),
+        resumed_state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole),
+        atol=1.0e-10,
+    )
+    assert np.isclose(
+        uninterrupted.get_protocol_work().value_in_unit(unit.kilojoule_per_mole),
+        resumed.get_protocol_work().value_in_unit(unit.kilojoule_per_mole),
+        atol=1.0e-10,
+    )
 
 
 def _test_gapsys_pair_energy_matches_reference_equation():

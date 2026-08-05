@@ -1109,6 +1109,25 @@ unique-branch/environment LJ interactions and their exceptions. Electrostatics
 continue to follow the configured staged PME charge path. `function: beutler`
 retains the `alpha`, `sigma_nm`, and `power` settings.
 
+The experimental Amber SSC(2) LJ form uses a pair-specific contact radius,
+quadratic effective distance, and intrinsic second-order smoothstep coupling:
+
+```yaml
+softcore:
+  function: amber_ssc2
+  stage_interpolation: linear
+  ssc2_alpha_lj: 0.5
+  ssc2_switch_width_nm: 0.2
+```
+
+The effective distance smoothly returns to the physical distance over the final
+`ssc2_switch_width_nm` before the nonbonded cutoff. This implements only the LJ
+part of Amber `S2*[2,2,0.5,1]`; charges continue through the staged PME path.
+Use linear stage interpolation for the direct Amber comparison because
+`amber_ssc2` already applies `S2` to its LJ weight and softening coordinate.
+Selecting `stage_interpolation: smoothstep2` as well intentionally composes the
+two smoothstep functions.
+
 A general path can replace the staged step settings:
 
 ```yaml

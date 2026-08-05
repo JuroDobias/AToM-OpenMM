@@ -16,3 +16,10 @@ protocols:
   - name: smoothstep2_100ps
     stage_interpolation: smoothstep2
     duration_ps: 100.0
+  - name: amber_ssc2_100ps
+    stage_interpolation: linear
+    duration_ps: 100.0
+    softcore:
+      function: amber_ssc2
+      ssc2_alpha_lj: 0.5
+      ssc2_switch_width_nm: 0.2

@@ -356,9 +356,14 @@ def validate_covalent_workflow(path):
             "workflow.neqti.softcore.long_range_correction must be "
             "'dynamic' or 'endpoint_correction'"
         )
-    if config["softcore"]["function"] not in {"beutler", "gapsys"}:
+    if config["softcore"]["function"] not in {
+        "beutler",
+        "gapsys",
+        "amber_ssc2",
+    }:
         raise CovalentWorkflowError(
-            "workflow.neqti.softcore.function must be 'beutler' or 'gapsys'"
+            "workflow.neqti.softcore.function must be 'beutler', 'gapsys', "
+            "or 'amber_ssc2'"
         )
     if config["softcore"]["stage_interpolation"] not in {
         "linear",
@@ -374,6 +379,13 @@ def validate_covalent_workflow(path):
     ):
         raise CovalentWorkflowError(
             "workflow.neqti.softcore Gapsys parameters must be positive"
+        )
+    if (
+        config["softcore"]["ssc2_alpha_lj"] <= 0.0
+        or config["softcore"]["ssc2_switch_width_nm"] <= 0.0
+    ):
+        raise CovalentWorkflowError(
+            "workflow.neqti.softcore Amber SSC(2) LJ parameters must be positive"
         )
     work_profile = config["switch_work_profile"]
     if work_profile["enabled"]:
@@ -2412,6 +2424,10 @@ def _normalized_settings(workflow):
             softcore.get("gapsys_scale_linpoint_lj", 0.85)
         ),
         "gapsys_sigma_nm": float(softcore.get("gapsys_sigma_nm", 0.30)),
+        "ssc2_alpha_lj": float(softcore.get("ssc2_alpha_lj", 0.5)),
+        "ssc2_switch_width_nm": float(
+            softcore.get("ssc2_switch_width_nm", 0.2)
+        ),
         "long_range_correction": str(
             softcore.get("long_range_correction", "dynamic")
         ),
@@ -2871,6 +2887,8 @@ def _upgrade_legacy_switch_protocol(protocol):
         softcore.setdefault("stage_interpolation", "linear")
         softcore.setdefault("gapsys_scale_linpoint_lj", 0.85)
         softcore.setdefault("gapsys_sigma_nm", 0.30)
+        softcore.setdefault("ssc2_alpha_lj", 0.5)
+        softcore.setdefault("ssc2_switch_width_nm", 0.2)
         upgraded["softcore"] = softcore
     serialized = yaml.safe_dump(upgraded, sort_keys=True)
     upgraded["fingerprint"] = hashlib.sha256(

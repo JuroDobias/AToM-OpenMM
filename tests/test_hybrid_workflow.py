@@ -126,6 +126,29 @@ def _test_hybrid_stage_interpolation_validation(tmp_path):
         raise AssertionError("unknown stage interpolation was accepted")
 
 
+def _test_hybrid_accepts_amber_ssc2_and_rejects_invalid_parameters(tmp_path):
+    from atom_openmm.hybrid_workflow import HybridWorkflowError, _validate_settings
+
+    workflow = yaml.safe_load(_workflow(tmp_path).read_text())["workflow"]
+    workflow["neqti"]["softcore"].update(
+        {
+            "function": "amber_ssc2",
+            "ssc2_alpha_lj": 0.5,
+            "ssc2_switch_width_nm": 0.2,
+        }
+    )
+    config = _validate_settings(workflow)
+    assert config["softcore"]["function"] == "amber_ssc2"
+
+    workflow["neqti"]["softcore"]["ssc2_alpha_lj"] = 0.0
+    try:
+        _validate_settings(workflow)
+    except HybridWorkflowError as exc:
+        assert "SSC(2)" in str(exc)
+    else:
+        raise AssertionError("non-positive SSC(2) alpha was accepted")
+
+
 def _test_hybrid_convergence_uses_matched_prefix_and_truncates_extra_work(tmp_path):
     from atom_openmm.covalent_workflow import _read_work, _rewrite_work
     from atom_openmm.hybrid_workflow import (

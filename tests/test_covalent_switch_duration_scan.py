@@ -6,6 +6,7 @@ import yaml
 from atom_openmm.covalent_switch_duration_scan import (
     CovalentSwitchScanError,
     _normalize_config,
+    _softcore_options,
     scale_segment_steps,
 )
 
@@ -54,3 +55,28 @@ def _test_normalize_scan_config(tmp_path):
     assert observed["output_dir"] == (tmp_path / "run").resolve()
     assert observed["switch_durations_ps"] == [500.0, 1000.0]
     assert observed["n_snapshots"] == 20
+
+
+def _test_duration_scan_preserves_softcore_function_and_interpolation():
+    source = {
+        "function": "amber_ssc2",
+        "stage_interpolation": "linear",
+        "alpha": 0.3,
+        "sigma_nm": 0.25,
+        "power": 1,
+        "gapsys_scale_linpoint_lj": 0.85,
+        "gapsys_sigma_nm": 0.30,
+        "ssc2_alpha_lj": 0.5,
+        "ssc2_switch_width_nm": 0.2,
+        "path_nodes": [],
+        "vdw_a": [1.0, 0.0],
+        "charge_a": [1.0, 0.0],
+        "segments_per_interval": [10],
+    }
+
+    observed = _softcore_options(source, 50000)
+
+    assert observed["function"] == "amber_ssc2"
+    assert observed["stage_interpolation"] == "linear"
+    assert observed["ssc2_alpha_lj"] == 0.5
+    assert observed["total_steps"] == 50000
