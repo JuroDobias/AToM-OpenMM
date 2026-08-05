@@ -17,6 +17,7 @@ from atom_openmm.covalent_softcore import (
 )
 from atom_openmm.covalent_workflow import (
     _EndpointLRCCorrectionEvaluator,
+    _PhysicalEndpointLRCCorrectionEvaluator,
     _merge_work_profile_rows,
     _run_segmented_protocol,
 )
@@ -926,4 +927,25 @@ def test_endpoint_lrc_correction_is_coordinate_invariant():
         atol=1.0e-4,
         rtol=0.0,
     )
+    evaluator.close()
+
+
+def _test_physical_endpoint_lrc_correction_is_finite():
+    endpoint_a = _endpoint("a")
+    endpoint_b = _endpoint("b")
+    positions = np.asarray(
+        [[0, 0, 0], [0.15, 0, 0], [0.28, 0.08, 0], [0.29, -0.09, 0.03], [0.7, 0.4, 0.3]]
+    ) * unit.nanometer
+    context = mm.Context(endpoint_a, mm.VerletIntegrator(0.001))
+    context.setPositions(positions)
+    state = context.getState(getPositions=True)
+    del context
+    evaluator = _PhysicalEndpointLRCCorrectionEvaluator(endpoint_a, endpoint_b)
+
+    corrections = [
+        evaluator.correction(state, {}, node)
+        for node in (0, -1)
+    ]
+
+    assert np.all(np.isfinite(corrections))
     evaluator.close()

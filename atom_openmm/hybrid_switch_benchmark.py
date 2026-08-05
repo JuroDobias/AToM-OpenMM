@@ -18,6 +18,7 @@ from atom_openmm.covalent_systems import load_prepared_hybrid_bundle
 from atom_openmm.covalent_workflow import (
     KCAL_TO_KJ,
     _EndpointLRCCorrectionEvaluator,
+    _PhysicalEndpointLRCCorrectionEvaluator,
     _apply_state,
     _assert_fixed_volume_switch,
     _is_numerical_switch_failure,
@@ -413,18 +414,28 @@ def _run_variant(config, bank_root, edge, edge_payload, variant, platform, prope
         _assert_fixed_volume_switch(hamiltonian.system)
         lrc = None
         if lrc_mode == "endpoint_correction":
-            lrc_hamiltonian = create_softcore_hamiltonian(
-                prepared.endpoint_a,
-                prepared.endpoint_b,
-                unique_a,
-                unique_b,
-                use_long_range_correction=True,
-                **options,
-            )
             first_a = _load_state(_verify_entry(bank_root, edge_payload["snapshots"][environment]["a"][0]))
             first_b = _load_state(_verify_entry(bank_root, edge_payload["snapshots"][environment]["b"][0]))
+            if options.get("coulomb_function") == "amber_ssc2":
+                evaluator = _PhysicalEndpointLRCCorrectionEvaluator(
+                    prepared.endpoint_a,
+                    prepared.endpoint_b,
+                )
+            else:
+                lrc_hamiltonian = create_softcore_hamiltonian(
+                    prepared.endpoint_a,
+                    prepared.endpoint_b,
+                    unique_a,
+                    unique_b,
+                    use_long_range_correction=True,
+                    **options,
+                )
+                evaluator = _EndpointLRCCorrectionEvaluator(
+                    hamiltonian,
+                    lrc_hamiltonian,
+                )
             lrc = _precompute_endpoint_lrc_corrections(
-                _EndpointLRCCorrectionEvaluator(hamiltonian, lrc_hamiltonian),
+                evaluator,
                 first_a,
                 first_b,
                 hamiltonian.parameter_values,

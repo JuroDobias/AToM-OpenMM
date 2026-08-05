@@ -1214,6 +1214,47 @@ class _EndpointLRCCorrectionEvaluator:
         self.lrc_integrator = None
 
 
+class _PhysicalEndpointLRCCorrectionEvaluator:
+    """Evaluate LRC from native physical endpoint systems."""
+
+    def __init__(self, endpoint_a, endpoint_b):
+        platform, properties = _lrc_correction_platform()
+        self.platform_name = platform.getName()
+        self.contexts = {}
+        self.integrators = []
+        for label, endpoint in (("a", endpoint_a), ("b", endpoint_b)):
+            pair = {}
+            for enabled in (False, True):
+                system = _clone_system(endpoint)
+                for force in system.getForces():
+                    if isinstance(force, mm.NonbondedForce):
+                        force.setUseDispersionCorrection(enabled)
+                    elif isinstance(force, mm.CustomNonbondedForce):
+                        force.setUseLongRangeCorrection(enabled)
+                integrator = mm.VerletIntegrator(1.0 * unit.femtosecond)
+                self.integrators.append(integrator)
+                pair[enabled] = mm.Context(system, integrator, platform, properties)
+            self.contexts[label] = pair
+
+    def correction(self, state, parameter_values, node):
+        del parameter_values
+        label = "a" if node == 0 else "b"
+        energies = {}
+        for enabled, context in self.contexts[label].items():
+            _apply_state(context, state)
+            energies[enabled] = context.getState(
+                getEnergy=True
+            ).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+        correction = energies[True] - energies[False]
+        if not np.isfinite(correction):
+            raise CovalentWorkflowError("non-finite physical endpoint LRC correction")
+        return float(correction)
+
+    def close(self):
+        self.contexts = None
+        self.integrators = None
+
+
 def _precompute_endpoint_lrc_corrections(evaluator, state_a, state_b, parameter_values):
     try:
         return {
