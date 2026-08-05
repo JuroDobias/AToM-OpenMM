@@ -149,8 +149,6 @@ class ATMNonequilibriumLangevinIntegrator(mm.CustomIntegrator):
         steps = normalize_segment_steps(
             steps_per_segment, len(self._segment_steps), label="segment_steps"
         )
-        if sum(steps) != sum(self._segment_steps):
-            raise ValueError("updated segment steps must preserve total switch steps")
         cumulative = 0
         for name, value in zip(self._segment_boundary_names, steps):
             cumulative += value

@@ -83,7 +83,7 @@ def _test_sampled_work_interval_one_matches_exact_and_other_intervals_share_traj
     assert sampled == pytest.approx({1: 1.0, 5: 1.0, 10: 1.0, 25: 1.0, 50: 1.0})
 
 
-def _test_custom_integrator_updates_segment_boundaries_without_rebuild():
+def _test_custom_integrator_updates_segment_boundaries_and_duration_without_rebuild():
     from atom_openmm.neqti_integrator import ATMNonequilibriumLangevinIntegrator
 
     system = _constant_parameter_system(0.0)
@@ -98,12 +98,13 @@ def _test_custom_integrator_updates_segment_boundaries_without_rebuild():
     context = mm.Context(system, integrator, mm.Platform.getPlatformByName("Reference"))
     context.setPositions([[0.0, 0.0, 0.0]])
 
-    integrator.set_segment_steps([1, 3])
-    integrator.step(1)
-    assert context.getParameter("switch_parameter") == pytest.approx(0.25)
+    integrator.set_segment_steps([3, 5])
     integrator.step(3)
+    assert context.getParameter("switch_parameter") == pytest.approx(0.25)
+    integrator.step(5)
     assert context.getParameter("switch_parameter") == pytest.approx(1.0)
-    assert integrator.get_segment_steps() == [1, 3]
+    assert integrator.get_protocol_work() / kilojoules_per_mole == pytest.approx(1.0)
+    assert integrator.get_segment_steps() == [3, 5]
 
 
 def _test_custom_integrator_drift_does_not_double_velocity():
