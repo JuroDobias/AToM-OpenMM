@@ -4,6 +4,30 @@ This directory contains utilities to generate and collect one YAML RBFE workflow
 ATM benchmark pair. The generated workflows are intended for independent Slurm
 jobs and use the experimental NEQTI production path with AmberTools/tleap setup.
 
+## Reusable hybrid switch snapshots
+
+Archive the prepared systems and the first 20 adaptive endpoint snapshots from a
+completed noncovalent hybrid cohort:
+
+```bash
+atom-hybrid-switch-benchmark archive COHORT_DIR SNAPSHOT_BANK_DIR --snapshots 20
+```
+
+The archive is created atomically. Files are hard-linked when source and target
+are on the same filesystem, with a copy fallback, and every artifact is recorded
+with a SHA256 checksum. All selected edges must contain A/B snapshots for both
+complex and solvent environments.
+
+Replay named switching protocols from identical states with:
+
+```bash
+atom-hybrid-switch-benchmark run hybrid_switch_benchmark.example.yaml
+```
+
+The command resumes completed work observations, writes per-protocol BAR and
+overlap results, and reports paired work differences between each variant and the
+first protocol in the configuration.
+
 Generate jobs:
 
 ```bash

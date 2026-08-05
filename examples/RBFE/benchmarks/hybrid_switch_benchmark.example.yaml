@@ -1,0 +1,18 @@
+snapshot_bank: /path/to/hybrid_cdk2_switch_snapshot_bank_v1
+output_dir: switch_interpolation_comparison
+edges: [17--21, 1oiy--32]
+environments: [complex, solvent]
+n_snapshots: 20
+temperature_k: 300.0
+timestep_fs: 2.0
+bootstrap_samples: 500
+random_seed: 20260805
+platform: CUDA
+
+protocols:
+  - name: linear_100ps
+    stage_interpolation: linear
+    duration_ps: 100.0
+  - name: smoothstep2_100ps
+    stage_interpolation: smoothstep2
+    duration_ps: 100.0
