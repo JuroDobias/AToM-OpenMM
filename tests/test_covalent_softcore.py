@@ -3,12 +3,17 @@ import openmm as mm
 from openmm import unit
 
 from atom_openmm.covalent_softcore import (
+    CHARGE_A_PARAMETER,
+    CHARGE_B_PARAMETER,
+    MAPPED_CHARGE_PARAMETER,
     SOFTCORE_NONBONDED_FORCE_GROUP,
+    STERICS_PARAMETER,
     STERICS_A_PARAMETER,
     STERICS_B_PARAMETER,
     _amber_ssc2_energy_expression,
     _gapsys_energy_expression,
     create_softcore_hamiltonian,
+    resolve_softcore_path,
 )
 from atom_openmm.covalent_workflow import (
     _EndpointLRCCorrectionEvaluator,
@@ -101,7 +106,6 @@ def _test_softcore_nodes_reproduce_endpoint_energies_and_forces():
         )
         assert np.isclose(observed_energy, expected_energy, atol=1.0e-5)
         assert np.allclose(observed_forces, expected_forces, atol=1.0e-3)
-
 
 def _gapsys_reference_energy(r, sigma, epsilon, scale, alpha):
     c6 = 4.0 * epsilon * sigma**6
@@ -253,6 +257,94 @@ def _test_amber_ssc2_reproduces_endpoint_energies_and_forces():
     )
     assert np.isfinite(energy)
     assert np.all(np.isfinite(forces))
+
+
+def _test_concerted_ssc2_coulomb_reproduces_pme_endpoints():
+    endpoint_a = _endpoint("a")
+    endpoint_b = _endpoint("b")
+    hamiltonian = create_softcore_hamiltonian(
+        endpoint_a,
+        endpoint_b,
+        [2],
+        [3],
+        function="amber_ssc2",
+        coulomb_function="amber_ssc2",
+        ssc2_alpha_coul=1.0,
+        total_steps=50,
+        path_mode="concerted",
+    )
+    positions = np.asarray(
+        [[0, 0, 0], [0.15, 0, 0], [0.28, 0.08, 0], [0.29, -0.09, 0.03], [0.7, 0.4, 0.3]]
+    ) * unit.nanometer
+    for endpoint, node in ((endpoint_a, 0), (endpoint_b, -1)):
+        expected_energy, expected_forces = _energy_forces(endpoint, positions)
+        parameters = {
+            name: values[node]
+            for name, values in hamiltonian.parameter_values.items()
+        }
+        observed_energy, observed_forces = _energy_forces(
+            hamiltonian.system, positions, parameters
+        )
+        assert np.isclose(observed_energy, expected_energy, atol=2.0e-3)
+        assert np.allclose(observed_forces, expected_forces, atol=1.0e-3)
+
+
+def _test_concerted_ssc2_coulomb_remains_finite_at_short_range():
+    def endpoint(active):
+        system = mm.System()
+        for _ in range(3):
+            system.addParticle(12.0)
+        system.setDefaultPeriodicBoxVectors(
+            mm.Vec3(2.5, 0, 0), mm.Vec3(0, 2.5, 0), mm.Vec3(0, 0, 2.5)
+        )
+        force = mm.NonbondedForce()
+        force.setNonbondedMethod(mm.NonbondedForce.PME)
+        force.setCutoffDistance(1.0)
+        force.addParticle(-0.2, 0.30, 0.30)
+        force.addParticle(0.2 if active == "a" else 0.0, 0.30, 0.20 if active == "a" else 0.0)
+        force.addParticle(0.2 if active == "b" else 0.0, 0.30, 0.20 if active == "b" else 0.0)
+        force.addException(1, 2, 0.0, 1.0, 0.0)
+        system.addForce(force)
+        return system
+
+    hamiltonian = create_softcore_hamiltonian(
+        endpoint("a"),
+        endpoint("b"),
+        [1],
+        [2],
+        function="amber_ssc2",
+        coulomb_function="amber_ssc2",
+        total_steps=50,
+        path_mode="concerted",
+    )
+    positions = np.asarray(
+        [[0, 0, 0], [1.0e-4, 0, 0], [2.0e-4, 0, 0]]
+    ) * unit.nanometer
+    parameters = {
+        CHARGE_A_PARAMETER: 0.5,
+        CHARGE_B_PARAMETER: 0.5,
+        MAPPED_CHARGE_PARAMETER: 0.5,
+        STERICS_A_PARAMETER: 0.5,
+        STERICS_B_PARAMETER: 0.5,
+        STERICS_PARAMETER: 0.5,
+    }
+    energy, forces = _energy_forces(hamiltonian.system, positions, parameters)
+    assert np.isfinite(energy)
+    assert np.all(np.isfinite(forces))
+
+
+def _test_concerted_path_shorthand_resolves_single_balanced_interval():
+    resolved = resolve_softcore_path(
+        total_steps=50000,
+        path_mode="concerted",
+        segments_per_interval=[10],
+    )
+    assert resolved["source"] == "concerted"
+    assert resolved["vdw_a"] == [1.0, 0.0]
+    assert resolved["charge_a"] == [1.0, 0.0]
+    assert resolved["vdw_b"] == [0.0, 1.0]
+    assert resolved["charge_b"] == [0.0, 1.0]
+    assert resolved["interval_steps"] == [50000]
 
 
 def _test_amber_ssc2_checkpoint_restart_matches_uninterrupted_switch():

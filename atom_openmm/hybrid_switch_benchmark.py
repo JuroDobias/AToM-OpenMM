@@ -304,16 +304,32 @@ def _sample_seed(base, edge, environment, direction, sample):
 def _source_softcore(protocol, variant):
     softcore = dict(protocol["softcore"])
     softcore.update(variant["softcore"])
+    path = softcore.pop("path", None)
+    if path is not None:
+        softcore["path_mode"] = path.get("mode")
+    if "path_mode" in softcore:
+        for key in (
+            "charge_steps_per_stage",
+            "sterics_steps",
+            "subdivisions_per_stage",
+            "path_nodes",
+            "vdw_a",
+            "charge_a",
+        ):
+            softcore.pop(key, None)
+        softcore.setdefault("segments_per_interval", [1])
     softcore["stage_interpolation"] = variant["stage_interpolation"]
     softcore.pop("long_range_correction", None)
     supported = {
         "function",
+        "coulomb_function",
         "alpha",
         "sigma_nm",
         "power",
         "gapsys_scale_linpoint_lj",
         "gapsys_sigma_nm",
         "ssc2_alpha_lj",
+        "ssc2_alpha_coul",
         "ssc2_switch_width_nm",
         "charge_steps_per_stage",
         "sterics_steps",
@@ -323,6 +339,7 @@ def _source_softcore(protocol, variant):
         "vdw_a",
         "charge_a",
         "segments_per_interval",
+        "path_mode",
         "stage_interpolation",
     }
     return {key: value for key, value in softcore.items() if key in supported}

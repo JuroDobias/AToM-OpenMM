@@ -149,6 +149,36 @@ def _test_hybrid_accepts_amber_ssc2_and_rejects_invalid_parameters(tmp_path):
         raise AssertionError("non-positive SSC(2) alpha was accepted")
 
 
+def _test_hybrid_accepts_only_balanced_concerted_ssc2_coulomb(tmp_path):
+    from atom_openmm.hybrid_workflow import HybridWorkflowError, _validate_settings
+
+    workflow = yaml.safe_load(_workflow(tmp_path).read_text())["workflow"]
+    workflow["neqti"]["softcore"] = {
+        "function": "amber_ssc2",
+        "coulomb_function": "amber_ssc2",
+        "ssc2_alpha_lj": 0.5,
+        "ssc2_alpha_coul": 1.0,
+        "ssc2_switch_width_nm": 0.2,
+        "total_steps": 50,
+        "path": {"mode": "concerted"},
+    }
+    config = _validate_settings(workflow)
+    assert config["softcore"]["path_mode"] == "concerted"
+    assert config["softcore"]["coulomb_function"] == "amber_ssc2"
+
+    workflow["neqti"]["softcore"]["path"] = {
+        "nodes": [],
+        "vdw_a": [1.0, 0.0],
+        "charge_a": [1.0, 0.0],
+    }
+    try:
+        _validate_settings(workflow)
+    except HybridWorkflowError as exc:
+        assert "path.mode: concerted" in str(exc)
+    else:
+        raise AssertionError("SSC(2) Coulomb accepted a non-concerted path")
+
+
 def _test_hybrid_convergence_uses_matched_prefix_and_truncates_extra_work(tmp_path):
     from atom_openmm.covalent_workflow import _read_work, _rewrite_work
     from atom_openmm.hybrid_workflow import (

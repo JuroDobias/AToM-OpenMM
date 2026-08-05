@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+import math
 import openmm as mm
 from openmm import unit
 
@@ -20,6 +21,7 @@ STERICS_PARAMETER = "COVALENT_STERICS"
 STERICS_A_PARAMETER = "COVALENT_STERICS_A"
 STERICS_B_PARAMETER = "COVALENT_STERICS_B"
 SOFTCORE_NONBONDED_FORCE_GROUP = 31
+ONE_4PI_EPS0 = 138.935456
 
 
 @dataclass(frozen=True)
@@ -250,6 +252,16 @@ def _configure_custom_nonbonded_like(
     )
 
 
+def _ewald_alpha(source):
+    alpha, _, _, _ = source.getPMEParameters()
+    alpha_nm = _float(alpha, unit.nanometer**-1)
+    if alpha_nm == 0.0:
+        cutoff_nm = _float(source.getCutoffDistance(), unit.nanometer)
+        tolerance = float(source.getEwaldErrorTolerance())
+        alpha_nm = math.sqrt(-math.log(2.0 * tolerance)) / cutoff_nm
+    return alpha_nm
+
+
 def _exception_dict(force):
     values = {}
     if force is None:
@@ -331,6 +343,71 @@ def _amber_ssc2_energy_expression(scale, *, mixing, cutoff):
     if mixing:
         definitions += ";sigma=0.5*(sigma1+sigma2);epsilon=sqrt(epsilon1*epsilon2)"
     return "4*w*epsilon*(x*x-x);" + definitions
+
+
+def _amber_ssc2_coulomb_expression(scale, *, mixing, cutoff, exception=False):
+    kernel = "1/reff" if exception else "erfc(EWALD_ALPHA*reff)/reff"
+    definitions = (
+        "reff=sqrt(r^2+SSC2_ALPHA_COUL*fsw*(1-w)*sigma^2);"
+    )
+    if cutoff:
+        definitions += (
+            "fsw=1-rsw^3*(10+rsw*(-15+6*rsw));"
+            "rsw=min(1,max(0,(r-SSC2_SWITCH_START)"
+            "/(SSC2_SWITCH_END-SSC2_SWITCH_START)));"
+        )
+    else:
+        definitions += "fsw=1;"
+    definitions += (
+        "w=s^3*(10+s*(-15+6*s));"
+        f"s=min(1,max(0,{scale}))"
+    )
+    if mixing:
+        definitions += (
+            ";chargeprod=(role1*qbranch1+role2*qbranch2)"
+            "*((1-role1)*(qenvA1+COVALENT_MAPPED_CHARGE*(qenvB1-qenvA1))"
+            "+(1-role2)*(qenvA2+COVALENT_MAPPED_CHARGE*(qenvB2-qenvA2)))"
+            ";sigma=0.5*(sigma1+sigma2)"
+        )
+    return f"ONE_4PI_EPS0*chargeprod*w*{kernel};" + definitions
+
+
+def _environment_direct_coulomb_expression():
+    return (
+        "ONE_4PI_EPS0*q1*q2*erfc(EWALD_ALPHA*r)/r;"
+        "q1=qA1+COVALENT_MAPPED_CHARGE*(qB1-qA1);"
+        "q2=qA2+COVALENT_MAPPED_CHARGE*(qB2-qA2)"
+    )
+
+
+def _environment_lj_expression():
+    return (
+        "4*epsilon*((sigma/r)^12-(sigma/r)^6);"
+        "sigma=0.5*(s1+s2);epsilon=sqrt(e1*e2);"
+        "s1=sA1+COVALENT_STERICS*(sB1-sA1);"
+        "s2=sA2+COVALENT_STERICS*(sB2-sA2);"
+        "e1=eA1+COVALENT_STERICS*(eB1-eA1);"
+        "e2=eA2+COVALENT_STERICS*(eB2-eA2)"
+    )
+
+
+def _exception_reciprocal_correction_expression():
+    return (
+        "-ONE_4PI_EPS0*q1*q2*erf(EWALD_ALPHA*r)/r;"
+        "q1=qbase1+COVALENT_CHARGE_A*qA1+COVALENT_CHARGE_B*qB1"
+        "+COVALENT_MAPPED_CHARGE*qmapped1;"
+        "q2=qbase2+COVALENT_CHARGE_A*qA2+COVALENT_CHARGE_B*qB2"
+        "+COVALENT_MAPPED_CHARGE*qmapped2"
+    )
+
+
+def _environment_exception_expression():
+    return (
+        "ONE_4PI_EPS0*q/r+4*epsilon*((sigma/r)^12-(sigma/r)^6);"
+        "q=qA+COVALENT_MAPPED_CHARGE*(qB-qA);"
+        "sigma=sA+COVALENT_STERICS*(sB-sA);"
+        "epsilon=eA+COVALENT_STERICS*(eB-eA)"
+    )
 
 
 def _softcore_expression(scale, function, *, cutoff=True):
@@ -434,6 +511,107 @@ def _new_softcore_exception_force(
     return force
 
 
+def _new_environment_direct_forces(source):
+    coulomb = mm.CustomNonbondedForce(_environment_direct_coulomb_expression())
+    coulomb.setName("CovalentEnvironmentPMEDirect")
+    coulomb.addGlobalParameter(MAPPED_CHARGE_PARAMETER, 0.0)
+    coulomb.addGlobalParameter("ONE_4PI_EPS0", ONE_4PI_EPS0)
+    coulomb.addGlobalParameter("EWALD_ALPHA", _ewald_alpha(source))
+    for name in ("qA", "qB"):
+        coulomb.addPerParticleParameter(name)
+    coulomb.setNonbondedMethod(mm.CustomNonbondedForce.CutoffPeriodic)
+    coulomb.setCutoffDistance(source.getCutoffDistance())
+
+    sterics = mm.CustomNonbondedForce(_environment_lj_expression())
+    sterics.setName("CovalentEnvironmentLennardJones")
+    sterics.addGlobalParameter(STERICS_PARAMETER, 0.0)
+    for name in ("sA", "sB", "eA", "eB"):
+        sterics.addPerParticleParameter(name)
+    _configure_custom_nonbonded_like(source, sterics)
+    sterics.setForceGroup(SOFTCORE_NONBONDED_FORCE_GROUP)
+    return coulomb, sterics
+
+
+def _new_ssc2_coulomb_force(
+    source,
+    label,
+    scale,
+    alpha_coul,
+    switch_width_nm,
+):
+    force = mm.CustomNonbondedForce(
+        _amber_ssc2_coulomb_expression(scale, mixing=True, cutoff=True)
+    )
+    force.setName(f"CovalentSoftcoreCoulomb{label}")
+    force.addGlobalParameter(scale, 0.0)
+    force.addGlobalParameter(MAPPED_CHARGE_PARAMETER, 0.0)
+    force.addGlobalParameter("ONE_4PI_EPS0", ONE_4PI_EPS0)
+    force.addGlobalParameter("EWALD_ALPHA", _ewald_alpha(source))
+    force.addGlobalParameter("SSC2_ALPHA_COUL", float(alpha_coul))
+    cutoff_nm = _float(source.getCutoffDistance(), unit.nanometer)
+    if float(switch_width_nm) >= cutoff_nm:
+        raise CovalentAlchemyError(
+            "ssc2_switch_width_nm must be smaller than the nonbonded cutoff"
+        )
+    force.addGlobalParameter("SSC2_SWITCH_START", cutoff_nm - float(switch_width_nm))
+    force.addGlobalParameter("SSC2_SWITCH_END", cutoff_nm)
+    for name in ("role", "qbranch", "qenvA", "qenvB", "sigma"):
+        force.addPerParticleParameter(name)
+    force.setNonbondedMethod(mm.CustomNonbondedForce.CutoffPeriodic)
+    force.setCutoffDistance(source.getCutoffDistance())
+    force.setForceGroup(SOFTCORE_NONBONDED_FORCE_GROUP)
+    return force
+
+
+def _new_ssc2_coulomb_exception_force(label, scale, alpha_coul):
+    force = mm.CustomBondForce(
+        _amber_ssc2_coulomb_expression(
+            scale, mixing=False, cutoff=False, exception=True
+        )
+    )
+    force.setName(f"CovalentSoftcoreCoulombExceptions{label}")
+    force.addGlobalParameter(scale, 0.0)
+    force.addGlobalParameter("ONE_4PI_EPS0", ONE_4PI_EPS0)
+    force.addGlobalParameter("SSC2_ALPHA_COUL", float(alpha_coul))
+    for name in ("chargeprod", "sigma"):
+        force.addPerBondParameter(name)
+    force.setUsesPeriodicBoundaryConditions(True)
+    force.setForceGroup(SOFTCORE_NONBONDED_FORCE_GROUP)
+    return force
+
+
+def _new_exception_reciprocal_correction_force(source):
+    force = mm.CustomBondForce(_exception_reciprocal_correction_expression())
+    force.setName("CovalentPMEExceptionReciprocalCorrection")
+    for name in (
+        CHARGE_A_PARAMETER,
+        CHARGE_B_PARAMETER,
+        MAPPED_CHARGE_PARAMETER,
+    ):
+        force.addGlobalParameter(name, 0.0)
+    force.addGlobalParameter("ONE_4PI_EPS0", ONE_4PI_EPS0)
+    force.addGlobalParameter("EWALD_ALPHA", _ewald_alpha(source))
+    for suffix in ("1", "2"):
+        for prefix in ("qbase", "qA", "qB", "qmapped"):
+            force.addPerBondParameter(prefix + suffix)
+    force.setUsesPeriodicBoundaryConditions(True)
+    force.setForceGroup(SOFTCORE_NONBONDED_FORCE_GROUP)
+    return force
+
+
+def _new_environment_exception_force():
+    force = mm.CustomBondForce(_environment_exception_expression())
+    force.setName("CovalentEnvironmentExceptions")
+    force.addGlobalParameter(MAPPED_CHARGE_PARAMETER, 0.0)
+    force.addGlobalParameter(STERICS_PARAMETER, 0.0)
+    force.addGlobalParameter("ONE_4PI_EPS0", ONE_4PI_EPS0)
+    for name in ("qA", "qB", "sA", "sB", "eA", "eB"):
+        force.addPerBondParameter(name)
+    force.setUsesPeriodicBoundaryConditions(True)
+    force.setForceGroup(SOFTCORE_NONBONDED_FORCE_GROUP)
+    return force
+
+
 def _add_nonbonded_forces(
     output,
     endpoint_a,
@@ -442,12 +620,14 @@ def _add_nonbonded_forces(
     unique_b,
     *,
     function,
+    coulomb_function,
     alpha,
     sigma_nm,
     power,
     gapsys_scale_linpoint_lj,
     gapsys_sigma_nm,
     ssc2_alpha_lj,
+    ssc2_alpha_coul,
     ssc2_switch_width_nm,
     use_long_range_correction,
 ):
@@ -457,6 +637,12 @@ def _add_nonbonded_forces(
         raise CovalentAlchemyError("softcore endpoints require one NonbondedForce")
     if source_a.getNonbondedMethod() != source_b.getNonbondedMethod():
         raise CovalentAlchemyError("softcore endpoint nonbonded methods differ")
+    use_ssc2_coulomb = coulomb_function == "amber_ssc2"
+    if use_ssc2_coulomb and source_a.getNonbondedMethod() not in {
+        mm.NonbondedForce.PME,
+        mm.NonbondedForce.Ewald,
+    }:
+        raise CovalentAlchemyError("Amber SSC(2) Coulomb requires PME or Ewald")
     unique_a = set(int(index) for index in unique_a)
     unique_b = set(int(index) for index in unique_b)
     if unique_a & unique_b:
@@ -467,6 +653,8 @@ def _add_nonbonded_forces(
     force = mm.NonbondedForce()
     force.setName("CovalentInterpolatedPMENonbonded")
     _configure_nonbonded_like(source_a, force)
+    if use_ssc2_coulomb:
+        force.setIncludeDirectSpace(False)
     for parameter in (
         CHARGE_A_PARAMETER,
         CHARGE_B_PARAMETER,
@@ -476,6 +664,7 @@ def _add_nonbonded_forces(
         STERICS_B_PARAMETER,
     ):
         force.addGlobalParameter(parameter, 0.0)
+    charge_coefficients = {}
     for particle in range(endpoint_a.getNumParticles()):
         q_a, sigma_a, epsilon_a = source_a.getParticleParameters(particle)
         q_b, sigma_b, epsilon_b = source_b.getParticleParameters(particle)
@@ -503,6 +692,38 @@ def _add_nonbonded_forces(
         tuple(sorted((particle_a, particle_b)))
         for particle_a in unique_a for particle_b in unique_b
     )
+    environment_coulomb = environment_sterics = None
+    coulomb_a = coulomb_b = None
+    exception_coulomb_a = exception_coulomb_b = None
+    reciprocal_exception_correction = environment_exceptions = None
+    if use_ssc2_coulomb:
+        environment_coulomb, environment_sterics = _new_environment_direct_forces(
+            source_a
+        )
+        coulomb_a = _new_ssc2_coulomb_force(
+            source_a,
+            "A",
+            CHARGE_A_PARAMETER,
+            ssc2_alpha_coul,
+            ssc2_switch_width_nm,
+        )
+        coulomb_b = _new_ssc2_coulomb_force(
+            source_b,
+            "B",
+            CHARGE_B_PARAMETER,
+            ssc2_alpha_coul,
+            ssc2_switch_width_nm,
+        )
+        exception_coulomb_a = _new_ssc2_coulomb_exception_force(
+            "A", CHARGE_A_PARAMETER, ssc2_alpha_coul
+        )
+        exception_coulomb_b = _new_ssc2_coulomb_exception_force(
+            "B", CHARGE_B_PARAMETER, ssc2_alpha_coul
+        )
+        reciprocal_exception_correction = (
+            _new_exception_reciprocal_correction_force(source_a)
+        )
+        environment_exceptions = _new_environment_exception_force()
     softcore_a = _new_softcore_force(
         source_a,
         "A",
@@ -532,14 +753,48 @@ def _add_nonbonded_forces(
         use_long_range_correction=use_long_range_correction,
     )
     for particle in range(endpoint_a.getNumParticles()):
-        _, sigma_a, epsilon_a = source_a.getParticleParameters(particle)
-        _, sigma_b, epsilon_b = source_b.getParticleParameters(particle)
+        charge_a, sigma_a, epsilon_a = source_a.getParticleParameters(particle)
+        charge_b, sigma_b, epsilon_b = source_b.getParticleParameters(particle)
         softcore_a.addParticle([sigma_a, epsilon_a])
         softcore_b.addParticle([sigma_b, epsilon_b])
+        if use_ssc2_coulomb:
+            qa_value = _float(charge_a, unit.elementary_charge)
+            qb_value = _float(charge_b, unit.elementary_charge)
+            role_a = 1.0 if particle in unique_a else 0.0
+            role_b = 1.0 if particle in unique_b else 0.0
+            coulomb_a.addParticle(
+                [role_a, charge_a if role_a else 0.0, charge_a, charge_b, sigma_a]
+            )
+            coulomb_b.addParticle(
+                [role_b, charge_b if role_b else 0.0, charge_a, charge_b, sigma_b]
+            )
+            environment_coulomb.addParticle([charge_a, charge_b])
+            environment_sterics.addParticle(
+                [sigma_a, sigma_b, epsilon_a, epsilon_b]
+            )
+            if particle in unique_a:
+                charge_coefficients[particle] = [0.0, qa_value, 0.0, 0.0]
+            elif particle in unique_b:
+                charge_coefficients[particle] = [0.0, 0.0, qb_value, 0.0]
+            else:
+                charge_coefficients[particle] = [
+                    qa_value,
+                    0.0,
+                    0.0,
+                    qb_value - qa_value,
+                ]
     if unique_a and environment:
         softcore_a.addInteractionGroup(unique_a, environment)
     if unique_b and environment:
         softcore_b.addInteractionGroup(unique_b, environment)
+    if use_ssc2_coulomb:
+        if environment:
+            environment_coulomb.addInteractionGroup(environment, environment)
+            environment_sterics.addInteractionGroup(environment, environment)
+        if unique_a and environment:
+            coulomb_a.addInteractionGroup(unique_a, environment)
+        if unique_b and environment:
+            coulomb_b.addInteractionGroup(unique_b, environment)
     exception_lj_a = _new_softcore_exception_force(
         "A",
         STERICS_A_PARAMETER,
@@ -573,16 +828,26 @@ def _add_nonbonded_forces(
         p1, p2 = pair
         in_a = int(p1 in unique_a) + int(p2 in unique_a)
         in_b = int(p1 in unique_b) + int(p2 in unique_b)
-        if in_a == 2 or in_b == 2 or (in_a and in_b):
+        if use_ssc2_coulomb:
+            index = force.addException(p1, p2, 0.0, 1.0, 0.0)
+        elif in_a == 2 or in_b == 2 or (in_a and in_b):
             index = force.addException(p1, p2, 0.0, 1.0, 0.0)
         elif in_a:
             index = force.addException(p1, p2, 0.0, sigma_a, 0.0)
-            _add_exception_offset(force, CHARGE_A_PARAMETER, index, charge=q_a)
+            if use_ssc2_coulomb:
+                if q_a != 0.0:
+                    exception_coulomb_a.addBond(p1, p2, [q_a, sigma_a])
+            else:
+                _add_exception_offset(force, CHARGE_A_PARAMETER, index, charge=q_a)
             if epsilon_a != 0.0:
                 exception_lj_a.addBond(p1, p2, [sigma_a, epsilon_a])
         elif in_b:
             index = force.addException(p1, p2, 0.0, sigma_b, 0.0)
-            _add_exception_offset(force, CHARGE_B_PARAMETER, index, charge=q_b)
+            if use_ssc2_coulomb:
+                if q_b != 0.0:
+                    exception_coulomb_b.addBond(p1, p2, [q_b, sigma_b])
+            else:
+                _add_exception_offset(force, CHARGE_B_PARAMETER, index, charge=q_b)
             if epsilon_b != 0.0:
                 exception_lj_b.addBond(p1, p2, [sigma_b, epsilon_b])
         else:
@@ -597,18 +862,60 @@ def _add_nonbonded_forces(
                 sigma=sigma_b - sigma_a,
                 epsilon=epsilon_b - epsilon_a,
             )
+        if use_ssc2_coulomb:
+            reciprocal_exception_correction.addBond(
+                p1,
+                p2,
+                [*charge_coefficients[p1], *charge_coefficients[p2]],
+            )
+            if not in_a and not in_b:
+                environment_exceptions.addBond(
+                    p1,
+                    p2,
+                    [q_a, q_b, sigma_a, sigma_b, epsilon_a, epsilon_b],
+                )
+            elif in_a == 1:
+                if q_a != 0.0:
+                    exception_coulomb_a.addBond(p1, p2, [q_a, sigma_a])
+                if epsilon_a != 0.0:
+                    exception_lj_a.addBond(p1, p2, [sigma_a, epsilon_a])
+            elif in_b == 1:
+                if q_b != 0.0:
+                    exception_coulomb_b.addBond(p1, p2, [q_b, sigma_b])
+                if epsilon_b != 0.0:
+                    exception_lj_b.addBond(p1, p2, [sigma_b, epsilon_b])
         softcore_a.addExclusion(p1, p2)
         softcore_b.addExclusion(p1, p2)
+        if use_ssc2_coulomb:
+            environment_coulomb.addExclusion(p1, p2)
+            environment_sterics.addExclusion(p1, p2)
+            coulomb_a.addExclusion(p1, p2)
+            coulomb_b.addExclusion(p1, p2)
 
     output.addForce(force)
+    if use_ssc2_coulomb:
+        output.addForce(environment_coulomb)
+        output.addForce(environment_sterics)
+        if environment_exceptions.getNumBonds():
+            output.addForce(environment_exceptions)
+        if reciprocal_exception_correction.getNumBonds():
+            output.addForce(reciprocal_exception_correction)
     if unique_a:
         output.addForce(softcore_a)
+        if use_ssc2_coulomb:
+            output.addForce(coulomb_a)
     if unique_b:
         output.addForce(softcore_b)
+        if use_ssc2_coulomb:
+            output.addForce(coulomb_b)
     if exception_lj_a.getNumBonds():
         output.addForce(exception_lj_a)
     if exception_lj_b.getNumBonds():
         output.addForce(exception_lj_b)
+    if use_ssc2_coulomb and exception_coulomb_a.getNumBonds():
+        output.addForce(exception_coulomb_a)
+    if use_ssc2_coulomb and exception_coulomb_b.getNumBonds():
+        output.addForce(exception_coulomb_b)
 
 
 def _copy_other_forces(output, endpoint_a, endpoint_b):
@@ -679,7 +986,21 @@ def resolve_softcore_path(
     vdw_a=None,
     charge_a=None,
     segments_per_interval=None,
+    path_mode=None,
 ):
+    if path_mode is not None:
+        path_mode = str(path_mode).lower()
+        if path_mode != "concerted":
+            raise CovalentAlchemyError("softcore path mode must be 'concerted'")
+        if any(value is not None for value in (path_nodes, vdw_a, charge_a)):
+            raise CovalentAlchemyError(
+                "softcore concerted mode cannot be combined with explicit path arrays"
+            )
+        path_nodes = []
+        vdw_a = [1.0, 0.0]
+        charge_a = [1.0, 0.0]
+        if segments_per_interval is None:
+            segments_per_interval = [1]
     general_values = (total_steps, path_nodes, vdw_a, charge_a, segments_per_interval)
     general = any(value is not None for value in general_values)
     if general:
@@ -728,7 +1049,7 @@ def resolve_softcore_path(
         if total < 1:
             raise CovalentAlchemyError("softcore total_steps must be positive")
         interval_steps = _allocate_interval_steps(total, nodes, segments)
-        source = "general"
+        source = "concerted" if path_mode == "concerted" else "general"
     else:
         if charge_steps_per_stage < 1 or sterics_steps < 1:
             raise CovalentAlchemyError("softcore stage steps must be positive")
@@ -811,12 +1132,14 @@ def create_softcore_hamiltonian(
     unique_b,
     *,
     function: str = "beutler",
+    coulomb_function: str = "linear_pme",
     alpha: float = 0.3,
     sigma_nm: float = 0.25,
     power: int = 1,
     gapsys_scale_linpoint_lj: float = 0.85,
     gapsys_sigma_nm: float = 0.30,
     ssc2_alpha_lj: float = 0.5,
+    ssc2_alpha_coul: float = 1.0,
     ssc2_switch_width_nm: float = 0.2,
     charge_steps_per_stage: int = 10000,
     sterics_steps: int = 30000,
@@ -826,15 +1149,21 @@ def create_softcore_hamiltonian(
     vdw_a=None,
     charge_a=None,
     segments_per_interval=None,
+    path_mode: str | None = None,
     stage_interpolation: str = "linear",
     use_long_range_correction: bool = True,
 ) -> CovalentSoftcoreHamiltonian:
     _assert_compatible_endpoints(endpoint_a, endpoint_b)
     function = str(function).lower()
+    coulomb_function = str(coulomb_function).lower()
     stage_interpolation = str(stage_interpolation).lower()
     if function not in {"beutler", "gapsys", "amber_ssc2"}:
         raise CovalentAlchemyError(
             "softcore function must be 'beutler', 'gapsys', or 'amber_ssc2'"
+        )
+    if coulomb_function not in {"linear_pme", "amber_ssc2"}:
+        raise CovalentAlchemyError(
+            "softcore coulomb_function must be 'linear_pme' or 'amber_ssc2'"
         )
     if stage_interpolation not in {"linear", "smoothstep2"}:
         raise CovalentAlchemyError(
@@ -846,8 +1175,25 @@ def create_softcore_hamiltonian(
         raise CovalentAlchemyError(
             "Gapsys scale linearization point and sigma must be positive"
         )
-    if ssc2_alpha_lj <= 0.0 or ssc2_switch_width_nm <= 0.0:
+    if (
+        ssc2_alpha_lj <= 0.0
+        or ssc2_alpha_coul <= 0.0
+        or ssc2_switch_width_nm <= 0.0
+    ):
         raise CovalentAlchemyError("Amber SSC(2) LJ parameters must be positive")
+    if coulomb_function == "amber_ssc2":
+        if function != "amber_ssc2":
+            raise CovalentAlchemyError(
+                "Amber SSC(2) Coulomb requires function: amber_ssc2"
+            )
+        if stage_interpolation != "linear":
+            raise CovalentAlchemyError(
+                "Amber SSC(2) Coulomb requires stage_interpolation: linear"
+            )
+        if str(path_mode).lower() != "concerted":
+            raise CovalentAlchemyError(
+                "Amber SSC(2) Coulomb requires softcore path mode: concerted"
+            )
     resolved_path = resolve_softcore_path(
         charge_steps_per_stage=int(charge_steps_per_stage),
         sterics_steps=int(sterics_steps),
@@ -857,6 +1203,7 @@ def create_softcore_hamiltonian(
         vdw_a=vdw_a,
         charge_a=charge_a,
         segments_per_interval=segments_per_interval,
+        path_mode=path_mode,
     )
     output = _system_shell(endpoint_a)
     _add_bonded_forces(output, endpoint_a, endpoint_b)
@@ -867,12 +1214,14 @@ def create_softcore_hamiltonian(
         unique_a,
         unique_b,
         function=function,
+        coulomb_function=coulomb_function,
         alpha=float(alpha),
         sigma_nm=float(sigma_nm),
         power=int(power),
         gapsys_scale_linpoint_lj=float(gapsys_scale_linpoint_lj),
         gapsys_sigma_nm=float(gapsys_sigma_nm),
         ssc2_alpha_lj=float(ssc2_alpha_lj),
+        ssc2_alpha_coul=float(ssc2_alpha_coul),
         ssc2_switch_width_nm=float(ssc2_switch_width_nm),
         use_long_range_correction=bool(use_long_range_correction),
     )

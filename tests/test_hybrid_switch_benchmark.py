@@ -4,6 +4,7 @@ import yaml
 from atom_openmm.hybrid_switch_benchmark import (
     HybridSwitchBenchmarkError,
     _resolve_config,
+    _source_softcore,
     archive_snapshot_bank,
 )
 
@@ -97,3 +98,27 @@ def _test_replay_config_normalizes_protocols_and_rejects_unknown_curve(tmp_path)
     config.write_text(yaml.safe_dump(payload))
     with pytest.raises(HybridSwitchBenchmarkError, match="unsupported"):
         _resolve_config(config)
+
+
+def _test_source_softcore_preserves_concerted_path_mode():
+    protocol = {
+        "softcore": {
+            "function": "amber_ssc2",
+            "coulomb_function": "amber_ssc2",
+            "charge_steps_per_stage": 100,
+            "sterics_steps": 200,
+            "path": {"mode": "concerted"},
+        }
+    }
+    variant = {
+        "softcore": {"ssc2_alpha_coul": 1.25},
+        "stage_interpolation": "linear",
+    }
+
+    observed = _source_softcore(protocol, variant)
+
+    assert observed["path_mode"] == "concerted"
+    assert observed["segments_per_interval"] == [1]
+    assert observed["ssc2_alpha_coul"] == 1.25
+    assert "charge_steps_per_stage" not in observed
+    assert "sterics_steps" not in observed

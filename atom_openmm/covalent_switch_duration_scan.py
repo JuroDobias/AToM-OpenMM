@@ -342,6 +342,9 @@ def _collect_snapshot_bank(config, settings, prepared, source_identity, platform
 def _softcore_options(source_softcore, total_steps):
     options = {
         "function": source_softcore.get("function", "beutler"),
+        "coulomb_function": source_softcore.get(
+            "coulomb_function", "linear_pme"
+        ),
         "stage_interpolation": source_softcore.get(
             "stage_interpolation", "linear"
         ),
@@ -353,15 +356,23 @@ def _softcore_options(source_softcore, total_steps):
         ),
         "gapsys_sigma_nm": source_softcore.get("gapsys_sigma_nm", 0.30),
         "ssc2_alpha_lj": source_softcore.get("ssc2_alpha_lj", 0.5),
+        "ssc2_alpha_coul": source_softcore.get("ssc2_alpha_coul", 1.0),
         "ssc2_switch_width_nm": source_softcore.get(
             "ssc2_switch_width_nm", 0.2
         ),
         "total_steps": int(total_steps),
-        "path_nodes": source_softcore["path_nodes"],
-        "vdw_a": source_softcore["vdw_a"],
-        "charge_a": source_softcore["charge_a"],
         "segments_per_interval": source_softcore["segments_per_interval"],
     }
+    if "path_mode" in source_softcore:
+        options["path_mode"] = source_softcore["path_mode"]
+    else:
+        options.update(
+            {
+                "path_nodes": source_softcore["path_nodes"],
+                "vdw_a": source_softcore["vdw_a"],
+                "charge_a": source_softcore["charge_a"],
+            }
+        )
     return options
 
 

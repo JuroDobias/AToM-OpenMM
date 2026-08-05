@@ -521,6 +521,32 @@ def _test_amber_ssc2_settings_are_recorded_in_protocol():
     assert protocol["softcore"]["ssc2_alpha_lj"] == 0.5
 
 
+def _test_concerted_ssc2_coulomb_settings_are_recorded_in_protocol():
+    config = _normalized_settings(
+        {
+            "neqti": {
+                "interpolation": "softcore_linear",
+                "softcore": {
+                    "function": "amber_ssc2",
+                    "coulomb_function": "amber_ssc2",
+                    "ssc2_alpha_lj": 0.5,
+                    "ssc2_alpha_coul": 1.0,
+                    "total_steps": 50000,
+                    "path": {"mode": "concerted"},
+                },
+            }
+        }
+    )
+
+    assert config["softcore"]["path_mode"] == "concerted"
+    assert config["softcore"]["segments_per_interval"] == [1]
+    assert config["switch_steps"] == 50000
+    protocol = _switch_protocol(config)
+    assert protocol["softcore"]["coulomb_function"] == "amber_ssc2"
+    assert protocol["softcore"]["ssc2_alpha_coul"] == 1.0
+    assert protocol["softcore"]["resolved_path"]["source"] == "concerted"
+
+
 def test_switch_pdb_output_can_be_disabled():
     default = _normalized_settings({"neqti": {}})
     disabled = _normalized_settings(

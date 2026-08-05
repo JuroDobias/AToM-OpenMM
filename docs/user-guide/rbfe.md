@@ -1121,12 +1121,36 @@ softcore:
 ```
 
 The effective distance smoothly returns to the physical distance over the final
-`ssc2_switch_width_nm` before the nonbonded cutoff. This implements only the LJ
-part of Amber `S2*[2,2,0.5,1]`; charges continue through the staged PME path.
-Use linear stage interpolation for the direct Amber comparison because
+`ssc2_switch_width_nm` before the nonbonded cutoff. By default this implements
+only the LJ part of Amber `S2*[2,2,0.5,1]`; charges continue through the staged
+PME path. Use linear stage interpolation for the direct Amber comparison because
 `amber_ssc2` already applies `S2` to its LJ weight and softening coordinate.
 Selecting `stage_interpolation: smoothstep2` as well intentionally composes the
 two smoothstep functions.
+
+The experimental concerted SSC(2) Coulomb-plus-LJ path is opt-in:
+
+```yaml
+softcore:
+  function: amber_ssc2
+  coulomb_function: amber_ssc2
+  stage_interpolation: linear
+  ssc2_alpha_lj: 0.5
+  ssc2_alpha_coul: 1.0
+  ssc2_switch_width_nm: 0.2
+  total_steps: 50000
+  path:
+    mode: concerted
+```
+
+In this mode, charge and LJ coupling change together along one interval. The PME
+reciprocal and self terms retain ordinary linear charge scaling, while the
+real-space Coulomb interaction uses the SSC(2) effective distance. PME exception
+pairs are reconstructed explicitly so that singular hard-direct energies are
+never evaluated for a disappearing or appearing branch. This mode currently
+requires PME or Ewald electrostatics, Amber SSC(2) LJ, linear stage
+interpolation, and `path.mode: concerted`. Existing staged workflows continue to
+use `coulomb_function: linear_pme` by default.
 
 A general path can replace the staged step settings:
 
@@ -1173,9 +1197,9 @@ schedule_optimization:
 Unique A/B branches remain mutually noninteracting. Changing bonded terms follow
 the van der Waals path, while mapped bonded and nonbonded parameters retain a
 normalized endpoint interpolation. General path fields are mutually exclusive
-with `charge_steps_per_stage`, `sterics_steps`, and
-`subdivisions_per_stage`. Electrostatics use PME charge interpolation; softcore
-Coulomb is not currently implemented.
+with `charge_steps_per_stage`, `sterics_steps`, and `subdivisions_per_stage`.
+Unless the concerted SSC(2) mode is selected, electrostatics use ordinary PME
+charge interpolation.
 
 `softcore.long_range_correction` accepts `dynamic` or `endpoint_correction`.
 `dynamic` is the backward-compatible default. `endpoint_correction` disables

@@ -95,6 +95,7 @@ def _softcore_path_options(settings):
         "vdw_a",
         "charge_a",
         "segments_per_interval",
+        "path_mode",
     }
     return {key: value for key, value in settings.items() if key in keys}
 
@@ -365,6 +366,14 @@ def validate_covalent_workflow(path):
             "workflow.neqti.softcore.function must be 'beutler', 'gapsys', "
             "or 'amber_ssc2'"
         )
+    if config["softcore"]["coulomb_function"] not in {
+        "linear_pme",
+        "amber_ssc2",
+    }:
+        raise CovalentWorkflowError(
+            "workflow.neqti.softcore.coulomb_function must be "
+            "'linear_pme' or 'amber_ssc2'"
+        )
     if config["softcore"]["stage_interpolation"] not in {
         "linear",
         "smoothstep2",
@@ -382,11 +391,25 @@ def validate_covalent_workflow(path):
         )
     if (
         config["softcore"]["ssc2_alpha_lj"] <= 0.0
+        or config["softcore"]["ssc2_alpha_coul"] <= 0.0
         or config["softcore"]["ssc2_switch_width_nm"] <= 0.0
     ):
         raise CovalentWorkflowError(
-            "workflow.neqti.softcore Amber SSC(2) LJ parameters must be positive"
+            "workflow.neqti.softcore Amber SSC(2) parameters must be positive"
         )
+    if config["softcore"]["coulomb_function"] == "amber_ssc2":
+        if config["softcore"]["function"] != "amber_ssc2":
+            raise CovalentWorkflowError(
+                "Amber SSC(2) Coulomb requires softcore.function: amber_ssc2"
+            )
+        if config["softcore"]["stage_interpolation"] != "linear":
+            raise CovalentWorkflowError(
+                "Amber SSC(2) Coulomb requires stage_interpolation: linear"
+            )
+        if config["softcore"].get("path_mode") != "concerted":
+            raise CovalentWorkflowError(
+                "Amber SSC(2) Coulomb requires softcore.path.mode: concerted"
+            )
     work_profile = config["switch_work_profile"]
     if work_profile["enabled"]:
         if config["interpolation"] != "softcore_linear":
@@ -2414,6 +2437,9 @@ def _normalized_settings(workflow):
     )
     softcore_settings = {
         "function": str(softcore.get("function", "beutler")).lower(),
+        "coulomb_function": str(
+            softcore.get("coulomb_function", "linear_pme")
+        ).lower(),
         "stage_interpolation": str(
             softcore.get("stage_interpolation", "linear")
         ).lower(),
@@ -2425,6 +2451,7 @@ def _normalized_settings(workflow):
         ),
         "gapsys_sigma_nm": float(softcore.get("gapsys_sigma_nm", 0.30)),
         "ssc2_alpha_lj": float(softcore.get("ssc2_alpha_lj", 0.5)),
+        "ssc2_alpha_coul": float(softcore.get("ssc2_alpha_coul", 1.0)),
         "ssc2_switch_width_nm": float(
             softcore.get("ssc2_switch_width_nm", 0.2)
         ),
@@ -2448,18 +2475,20 @@ def _normalized_settings(workflow):
             }
         )
     else:
-        nodes = list(path_raw.get("nodes", []))
+        path_mode = path_raw.get("mode")
+        if path_mode is not None and any(
+            key in path_raw for key in ("nodes", "vdw_a", "charge_a")
+        ):
+            raise CovalentWorkflowError(
+                "softcore path.mode cannot be combined with explicit path arrays"
+            )
+        nodes = [] if path_mode is not None else list(path_raw.get("nodes", []))
         default_segments = [10] * (len(nodes) + 1) if optimization_enabled else [1] * (
             len(nodes) + 1
         )
         softcore_settings.update(
             {
                 "total_steps": int(softcore.get("total_steps", 0)),
-                "path_nodes": [float(value) for value in nodes],
-                "vdw_a": [float(value) for value in path_raw.get("vdw_a", [])],
-                "charge_a": [
-                    float(value) for value in path_raw.get("charge_a", [])
-                ],
                 "segments_per_interval": [
                     int(value)
                     for value in optimization_raw.get(
@@ -2468,6 +2497,20 @@ def _normalized_settings(workflow):
                 ],
             }
         )
+        if path_mode is not None:
+            softcore_settings["path_mode"] = str(path_mode).lower()
+        else:
+            softcore_settings.update(
+                {
+                    "path_nodes": [float(value) for value in nodes],
+                    "vdw_a": [
+                        float(value) for value in path_raw.get("vdw_a", [])
+                    ],
+                    "charge_a": [
+                        float(value) for value in path_raw.get("charge_a", [])
+                    ],
+                }
+            )
     schedule_optimization = {
         "enabled": bool(optimization_raw.get("enabled", False)),
         "pilot_samples": int(optimization_raw.get("pilot_samples", 10)),
@@ -2827,7 +2870,10 @@ def _switch_protocol(config, mapping_settings=None, mapping_label="covalent_mapp
         protocol["adaptive_switching"] = dict(config["adaptive_switching"])
     if config["interpolation"] == "softcore_linear":
         protocol["softcore"] = dict(config["softcore"])
-        if "path_nodes" in config["softcore"]:
+        has_general_path = any(
+            key in config["softcore"] for key in ("path_nodes", "path_mode")
+        )
+        if has_general_path:
             protocol["softcore"]["resolved_path"] = resolve_softcore_path(
                 **_softcore_path_options(config["softcore"])
             )
@@ -2840,7 +2886,7 @@ def _switch_protocol(config, mapping_settings=None, mapping_label="covalent_mapp
                 "evaluation_platform": "CPU",
                 "evaluation": "precomputed_per_endpoint_and_switch_volume",
             }
-        if "path_nodes" in config["softcore"]:
+        if has_general_path:
             resolved = protocol["softcore"]["resolved_path"]
             boundaries = [0.0, *resolved["nodes"], 1.0]
             protocol["intervals"] = [
@@ -2884,10 +2930,12 @@ def _upgrade_legacy_switch_protocol(protocol):
     if "softcore" in upgraded:
         softcore = dict(upgraded["softcore"])
         softcore.setdefault("function", "beutler")
+        softcore.setdefault("coulomb_function", "linear_pme")
         softcore.setdefault("stage_interpolation", "linear")
         softcore.setdefault("gapsys_scale_linpoint_lj", 0.85)
         softcore.setdefault("gapsys_sigma_nm", 0.30)
         softcore.setdefault("ssc2_alpha_lj", 0.5)
+        softcore.setdefault("ssc2_alpha_coul", 1.0)
         softcore.setdefault("ssc2_switch_width_nm", 0.2)
         upgraded["softcore"] = softcore
     serialized = yaml.safe_dump(upgraded, sort_keys=True)

@@ -114,11 +114,33 @@ def _validate_settings(workflow):
             "workflow.neqti.softcore.function must be 'beutler', 'gapsys', "
             "or 'amber_ssc2'"
         )
+    if config["softcore"]["coulomb_function"] not in {
+        "linear_pme",
+        "amber_ssc2",
+    }:
+        raise HybridWorkflowError(
+            "workflow.neqti.softcore.coulomb_function must be "
+            "'linear_pme' or 'amber_ssc2'"
+        )
     if (
         config["softcore"]["ssc2_alpha_lj"] <= 0.0
+        or config["softcore"]["ssc2_alpha_coul"] <= 0.0
         or config["softcore"]["ssc2_switch_width_nm"] <= 0.0
     ):
         raise HybridWorkflowError("Amber SSC(2) LJ parameters must be positive")
+    if config["softcore"]["coulomb_function"] == "amber_ssc2":
+        if config["softcore"]["function"] != "amber_ssc2":
+            raise HybridWorkflowError(
+                "Amber SSC(2) Coulomb requires softcore.function: amber_ssc2"
+            )
+        if config["softcore"]["stage_interpolation"] != "linear":
+            raise HybridWorkflowError(
+                "Amber SSC(2) Coulomb requires stage_interpolation: linear"
+            )
+        if config["softcore"].get("path_mode") != "concerted":
+            raise HybridWorkflowError(
+                "Amber SSC(2) Coulomb requires softcore.path.mode: concerted"
+            )
     if config["failed_switch_policy"] not in {"abort", "count_as_infinite"}:
         raise HybridWorkflowError(
             "workflow.neqti.failed_switch_policy must be 'abort' or 'count_as_infinite'"
@@ -130,7 +152,7 @@ def _validate_settings(workflow):
             if key in {
                 "charge_steps_per_stage", "sterics_steps", "subdivisions_per_stage",
                 "total_steps", "path_nodes", "vdw_a", "charge_a",
-                "segments_per_interval",
+                "segments_per_interval", "path_mode",
             }
         })
     except Exception as exc:
