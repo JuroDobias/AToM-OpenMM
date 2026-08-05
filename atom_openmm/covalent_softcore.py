@@ -404,6 +404,32 @@ def _amber_ssc2_combined_direct_expression():
     )
 
 
+def _amber_ssc2_combined_lrc_expression():
+    return (
+        "tail*(EenvLJ+EaLJ+EbLJ);"
+        "EenvLJ=envpair*4*eenv*((senv/rtail)^12-(senv/rtail)^6);"
+        "EaLJ=apair*4*wsa*epsilonA*((sigmaA/rtail)^12-(sigmaA/rtail)^6);"
+        "EbLJ=bpair*4*wsb*epsilonB*((sigmaB/rtail)^12-(sigmaB/rtail)^6);"
+        "rtail=r+(1-tail)*CUTOFF;tail=step(r-CUTOFF);"
+        "wsa=ssa^3*(10+ssa*(-15+6*ssa));"
+        "wsb=ssb^3*(10+ssb*(-15+6*ssb));"
+        "ssa=min(1,max(0,COVALENT_STERICS_A));"
+        "ssb=min(1,max(0,COVALENT_STERICS_B));"
+        "senv=0.5*(senv1+senv2);eenv=sqrt(eenv1*eenv2);"
+        "senv1=sA1+COVALENT_STERICS*(sB1-sA1);"
+        "senv2=sA2+COVALENT_STERICS*(sB2-sA2);"
+        "eenv1=eA1+COVALENT_STERICS*(eB1-eA1);"
+        "eenv2=eA2+COVALENT_STERICS*(eB2-eA2);"
+        "sigmaA=0.5*(sA1+sA2);epsilonA=sqrt(eA1*eA2);"
+        "sigmaB=0.5*(sB1+sB2);epsilonB=sqrt(eB1*eB2);"
+        "envpair=env1*env2;apair=a1*env2+env1*a2;"
+        "bpair=b1*env2+env1*b2;"
+        "env1=delta(role1);env2=delta(role2);"
+        "a1=delta(role1-1);a2=delta(role2-1);"
+        "b1=delta(role1-2);b2=delta(role2-2)"
+    )
+
+
 def _exception_reciprocal_correction_expression():
     return (
         "-ONE_4PI_EPS0*q1*q2*erf(EWALD_ALPHA*r)/r;"
@@ -529,8 +555,6 @@ def _new_ssc2_combined_direct_force(
     alpha_lj,
     alpha_coul,
     switch_width_nm,
-    *,
-    use_long_range_correction,
 ):
     force = mm.CustomNonbondedForce(_amber_ssc2_combined_direct_expression())
     force.setName("CovalentSSC2CombinedDirect")
@@ -557,11 +581,24 @@ def _new_ssc2_combined_direct_force(
     for name in ("role", "qA", "qB", "sA", "sB", "eA", "eB"):
         force.addPerParticleParameter(name)
     force.setForceGroup(SOFTCORE_NONBONDED_FORCE_GROUP)
-    _configure_custom_nonbonded_like(
-        source,
-        force,
-        use_long_range_correction=use_long_range_correction,
+    _configure_custom_nonbonded_like(source, force, use_long_range_correction=False)
+    return force
+
+
+def _new_ssc2_combined_lrc_force(source):
+    force = mm.CustomNonbondedForce(_amber_ssc2_combined_lrc_expression())
+    force.setName("CovalentSSC2CombinedLRC")
+    for parameter in (STERICS_PARAMETER, STERICS_A_PARAMETER, STERICS_B_PARAMETER):
+        force.addGlobalParameter(parameter, 0.0)
+    force.addGlobalParameter(
+        "CUTOFF", _float(source.getCutoffDistance(), unit.nanometer)
     )
+    for name in ("role", "sA", "sB", "eA", "eB"):
+        force.addPerParticleParameter(name)
+    force.setNonbondedMethod(mm.CustomNonbondedForce.CutoffPeriodic)
+    force.setCutoffDistance(source.getCutoffDistance())
+    force.setUseLongRangeCorrection(True)
+    force.setForceGroup(SOFTCORE_NONBONDED_FORCE_GROUP)
     return force
 
 
@@ -693,7 +730,7 @@ def _add_nonbonded_forces(
     if use_ssc2_coulomb:
         exception_pairs.update(combinations(sorted(unique_a), 2))
         exception_pairs.update(combinations(sorted(unique_b), 2))
-    combined_direct = None
+    combined_direct = combined_lrc = None
     exception_coulomb_a = exception_coulomb_b = None
     reciprocal_exception_correction = environment_exceptions = None
     if use_ssc2_coulomb:
@@ -702,8 +739,9 @@ def _add_nonbonded_forces(
             ssc2_alpha_lj,
             ssc2_alpha_coul,
             ssc2_switch_width_nm,
-            use_long_range_correction=use_long_range_correction,
         )
+        if use_long_range_correction:
+            combined_lrc = _new_ssc2_combined_lrc_force(source_a)
         exception_coulomb_a = _new_ssc2_coulomb_exception_force(
             "A", CHARGE_A_PARAMETER, ssc2_alpha_coul
         )
@@ -754,6 +792,10 @@ def _add_nonbonded_forces(
             combined_direct.addParticle(
                 [role, charge_a, charge_b, sigma_a, sigma_b, epsilon_a, epsilon_b]
             )
+            if combined_lrc is not None:
+                combined_lrc.addParticle(
+                    [role, sigma_a, sigma_b, epsilon_a, epsilon_b]
+                )
             if particle in unique_a:
                 charge_coefficients[particle] = [0.0, qa_value, 0.0, 0.0]
             elif particle in unique_b:
@@ -864,6 +906,8 @@ def _add_nonbonded_forces(
                     exception_lj_b.addBond(p1, p2, [sigma_b, epsilon_b])
         if use_ssc2_coulomb:
             combined_direct.addExclusion(p1, p2)
+            if combined_lrc is not None:
+                combined_lrc.addExclusion(p1, p2)
         else:
             softcore_a.addExclusion(p1, p2)
             softcore_b.addExclusion(p1, p2)
@@ -871,6 +915,8 @@ def _add_nonbonded_forces(
     output.addForce(force)
     if use_ssc2_coulomb:
         output.addForce(combined_direct)
+        if combined_lrc is not None:
+            output.addForce(combined_lrc)
         if environment_exceptions.getNumBonds():
             output.addForce(environment_exceptions)
         if reciprocal_exception_correction.getNumBonds():
