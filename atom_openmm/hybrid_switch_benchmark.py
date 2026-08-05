@@ -362,6 +362,12 @@ def _run_variant(config, bank_root, edge, edge_payload, variant, platform, prope
     work = {}
     timing_path = result_dir / "switch_timing.csv"
     for environment in config["environments"]:
+        LOGGER.info(
+            "Loading %s %s for protocol %s",
+            edge,
+            environment,
+            variant["name"],
+        )
         prepared = load_prepared_hybrid_bundle(
             edge_root / "prepared", prepared_manifest["environments"][environment]
         )
@@ -402,6 +408,15 @@ def _run_variant(config, bank_root, edge, edge_payload, variant, platform, prope
         for direction, endpoint in (("forward", "a"), ("reverse", "b")):
             path = result_dir / f"{environment}_{direction}.csv"
             existing = _read_work(path)
+            LOGGER.info(
+                "%s %s %s %s: resuming at sample %d/%d",
+                edge,
+                variant["name"],
+                environment,
+                direction,
+                len(existing) + 1,
+                config["n_snapshots"],
+            )
             context, integrator, parameter_values = _softcore_switch_context(
                 hamiltonian,
                 start=endpoint,
@@ -454,6 +469,18 @@ def _run_variant(config, bank_root, edge, edge_payload, variant, platform, prope
                     "ns_per_day": ns_per_day,
                 }
                 _append_timing(timing_path, row)
+                LOGGER.info(
+                    "%s %s %s %s sample %d/%d complete: work %.6g kcal/mol, "
+                    "%.3f ns/day",
+                    edge,
+                    variant["name"],
+                    environment,
+                    direction,
+                    sample,
+                    config["n_snapshots"],
+                    work_kj / KCAL_TO_KJ,
+                    ns_per_day,
+                )
             work[f"{environment}_{direction}"] = _read_work(path)
 
     performance = {
@@ -502,6 +529,7 @@ def run_benchmark(path):
     edges = config["edges"] or sorted(manifest.get("edges", {}))
     config["output_dir"].mkdir(parents=True, exist_ok=True)
     platform, properties = _platform(config)
+    LOGGER.info("Using OpenMM %s platform", platform.getName())
     summary = {"schema_version": SCHEMA_VERSION, "status": "completed", "edges": {}}
     for edge in edges:
         if edge not in manifest.get("edges", {}):
@@ -509,6 +537,7 @@ def run_benchmark(path):
         variants = {}
         variant_work = {}
         for variant in config["protocols"]:
+            LOGGER.info("Running edge %s protocol %s", edge, variant["name"])
             result, work = _run_variant(
                 config, bank_root, edge, manifest["edges"][edge], variant, platform, properties
             )
@@ -537,6 +566,7 @@ def run_benchmark(path):
                 paired[f"{other}_minus_{baseline}"] = comparisons
         summary["edges"][edge] = {"variants": variants, "paired_work": paired}
         _write_yaml_atomic(config["output_dir"] / edge / "comparison.yaml", summary["edges"][edge])
+        LOGGER.info("Completed benchmark edge %s", edge)
     _write_yaml_atomic(config["output_dir"] / "result.yaml", summary)
     return summary
 
