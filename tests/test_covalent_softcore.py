@@ -273,6 +273,12 @@ def _test_concerted_ssc2_coulomb_reproduces_pme_endpoints():
         total_steps=50,
         path_mode="concerted",
     )
+    custom_nonbonded_names = [
+        force.getName()
+        for force in hamiltonian.system.getForces()
+        if isinstance(force, mm.CustomNonbondedForce)
+    ]
+    assert custom_nonbonded_names == ["CovalentSSC2CombinedDirect"]
     positions = np.asarray(
         [[0, 0, 0], [0.15, 0, 0], [0.28, 0.08, 0], [0.29, -0.09, 0.03], [0.7, 0.4, 0.3]]
     ) * unit.nanometer

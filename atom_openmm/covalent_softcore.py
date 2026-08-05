@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from itertools import combinations
 import math
 import openmm as mm
 from openmm import unit
@@ -345,49 +346,61 @@ def _amber_ssc2_energy_expression(scale, *, mixing, cutoff):
     return "4*w*epsilon*(x*x-x);" + definitions
 
 
-def _amber_ssc2_coulomb_expression(scale, *, mixing, cutoff, exception=False):
-    kernel = "1/reff" if exception else "erfc(EWALD_ALPHA*reff)/reff"
-    definitions = (
-        "reff=sqrt(r^2+SSC2_ALPHA_COUL*fsw*(1-w)*sigma^2);"
-    )
-    if cutoff:
-        definitions += (
-            "fsw=1-rsw^3*(10+rsw*(-15+6*rsw));"
-            "rsw=min(1,max(0,(r-SSC2_SWITCH_START)"
-            "/(SSC2_SWITCH_END-SSC2_SWITCH_START)));"
-        )
-    else:
-        definitions += "fsw=1;"
-    definitions += (
+def _amber_ssc2_coulomb_exception_expression(scale):
+    return (
+        "ONE_4PI_EPS0*chargeprod*w/reff;"
+        "reff=sqrt(r^2+SSC2_ALPHA_COUL*(1-w)*sigma^2);"
         "w=s^3*(10+s*(-15+6*s));"
         f"s=min(1,max(0,{scale}))"
     )
-    if mixing:
-        definitions += (
-            ";chargeprod=(role1*qbranch1+role2*qbranch2)"
-            "*((1-role1)*(qenvA1+COVALENT_MAPPED_CHARGE*(qenvB1-qenvA1))"
-            "+(1-role2)*(qenvA2+COVALENT_MAPPED_CHARGE*(qenvB2-qenvA2)))"
-            ";sigma=0.5*(sigma1+sigma2)"
-        )
-    return f"ONE_4PI_EPS0*chargeprod*w*{kernel};" + definitions
 
 
-def _environment_direct_coulomb_expression():
+def _amber_ssc2_combined_direct_expression():
     return (
-        "ONE_4PI_EPS0*q1*q2*erfc(EWALD_ALPHA*r)/r;"
-        "q1=qA1+COVALENT_MAPPED_CHARGE*(qB1-qA1);"
-        "q2=qA2+COVALENT_MAPPED_CHARGE*(qB2-qA2)"
-    )
-
-
-def _environment_lj_expression():
-    return (
-        "4*epsilon*((sigma/r)^12-(sigma/r)^6);"
-        "sigma=0.5*(s1+s2);epsilon=sqrt(e1*e2);"
-        "s1=sA1+COVALENT_STERICS*(sB1-sA1);"
-        "s2=sA2+COVALENT_STERICS*(sB2-sA2);"
-        "e1=eA1+COVALENT_STERICS*(eB1-eA1);"
-        "e2=eA2+COVALENT_STERICS*(eB2-eA2)"
+        "Eenv+Ea+Eb;"
+        "Eenv=envpair*(ONE_4PI_EPS0*qenv1*qenv2*erfc(EWALD_ALPHA*renv)/renv"
+        "+4*eenv*((senv/renv)^12-(senv/renv)^6));"
+        "Ea=apair*(ONE_4PI_EPS0*qprodA*wca*erfc(EWALD_ALPHA*rca)/rca"
+        "+4*wsa*epsilonA*(xA*xA-xA));"
+        "Eb=bpair*(ONE_4PI_EPS0*qprodB*wcb*erfc(EWALD_ALPHA*rcb)/rcb"
+        "+4*wsb*epsilonB*(xB*xB-xB));"
+        "xA=(sigmaA/rsa)^6;xB=(sigmaB/rsb)^6;"
+        "rca=sqrt(r^2+SSC2_ALPHA_COUL*fsw*(1-wca)*sigmaA^2);"
+        "rcb=sqrt(r^2+SSC2_ALPHA_COUL*fsw*(1-wcb)*sigmaB^2);"
+        "rsa=sqrt(r^2+SSC2_ALPHA_LJ*fsw*(1-wsa)*sigmaA^2);"
+        "rsb=sqrt(r^2+SSC2_ALPHA_LJ*fsw*(1-wsb)*sigmaB^2);"
+        "wca=sca^3*(10+sca*(-15+6*sca));"
+        "wcb=scb^3*(10+scb*(-15+6*scb));"
+        "wsa=ssa^3*(10+ssa*(-15+6*ssa));"
+        "wsb=ssb^3*(10+ssb*(-15+6*ssb));"
+        "sca=min(1,max(0,COVALENT_CHARGE_A));"
+        "scb=min(1,max(0,COVALENT_CHARGE_B));"
+        "ssa=min(1,max(0,COVALENT_STERICS_A));"
+        "ssb=min(1,max(0,COVALENT_STERICS_B));"
+        "fsw=1-rsw^3*(10+rsw*(-15+6*rsw));"
+        "rsw=min(1,max(0,(r-SSC2_SWITCH_START)"
+        "/(SSC2_SWITCH_END-SSC2_SWITCH_START)));"
+        "renv=r+(1-envpair)*SSC2_SWITCH_END;"
+        "qprodA=a1*env2*qA1*qenvA2+env1*a2*qenvA1*qA2;"
+        "qprodB=b1*env2*qB1*qenvB2+env1*b2*qenvB1*qB2;"
+        "qenv1=qA1+COVALENT_MAPPED_CHARGE*(qB1-qA1);"
+        "qenv2=qA2+COVALENT_MAPPED_CHARGE*(qB2-qA2);"
+        "qenvA1=qA1+COVALENT_MAPPED_CHARGE*(qB1-qA1);"
+        "qenvA2=qA2+COVALENT_MAPPED_CHARGE*(qB2-qA2);"
+        "qenvB1=qA1+COVALENT_MAPPED_CHARGE*(qB1-qA1);"
+        "qenvB2=qA2+COVALENT_MAPPED_CHARGE*(qB2-qA2);"
+        "senv=0.5*(senv1+senv2);eenv=sqrt(eenv1*eenv2);"
+        "senv1=sA1+COVALENT_STERICS*(sB1-sA1);"
+        "senv2=sA2+COVALENT_STERICS*(sB2-sA2);"
+        "eenv1=eA1+COVALENT_STERICS*(eB1-eA1);"
+        "eenv2=eA2+COVALENT_STERICS*(eB2-eA2);"
+        "sigmaA=0.5*(sA1+sA2);epsilonA=sqrt(eA1*eA2);"
+        "sigmaB=0.5*(sB1+sB2);epsilonB=sqrt(eB1*eB2);"
+        "envpair=env1*env2;apair=a1*env2+env1*a2;"
+        "bpair=b1*env2+env1*b2;"
+        "env1=delta(role1);env2=delta(role2);"
+        "a1=delta(role1-1);a2=delta(role2-1);"
+        "b1=delta(role1-2);b2=delta(role2-2)"
     )
 
 
@@ -511,42 +524,28 @@ def _new_softcore_exception_force(
     return force
 
 
-def _new_environment_direct_forces(source):
-    coulomb = mm.CustomNonbondedForce(_environment_direct_coulomb_expression())
-    coulomb.setName("CovalentEnvironmentPMEDirect")
-    coulomb.addGlobalParameter(MAPPED_CHARGE_PARAMETER, 0.0)
-    coulomb.addGlobalParameter("ONE_4PI_EPS0", ONE_4PI_EPS0)
-    coulomb.addGlobalParameter("EWALD_ALPHA", _ewald_alpha(source))
-    for name in ("qA", "qB"):
-        coulomb.addPerParticleParameter(name)
-    coulomb.setNonbondedMethod(mm.CustomNonbondedForce.CutoffPeriodic)
-    coulomb.setCutoffDistance(source.getCutoffDistance())
-
-    sterics = mm.CustomNonbondedForce(_environment_lj_expression())
-    sterics.setName("CovalentEnvironmentLennardJones")
-    sterics.addGlobalParameter(STERICS_PARAMETER, 0.0)
-    for name in ("sA", "sB", "eA", "eB"):
-        sterics.addPerParticleParameter(name)
-    _configure_custom_nonbonded_like(source, sterics)
-    sterics.setForceGroup(SOFTCORE_NONBONDED_FORCE_GROUP)
-    return coulomb, sterics
-
-
-def _new_ssc2_coulomb_force(
+def _new_ssc2_combined_direct_force(
     source,
-    label,
-    scale,
+    alpha_lj,
     alpha_coul,
     switch_width_nm,
+    *,
+    use_long_range_correction,
 ):
-    force = mm.CustomNonbondedForce(
-        _amber_ssc2_coulomb_expression(scale, mixing=True, cutoff=True)
-    )
-    force.setName(f"CovalentSoftcoreCoulomb{label}")
-    force.addGlobalParameter(scale, 0.0)
-    force.addGlobalParameter(MAPPED_CHARGE_PARAMETER, 0.0)
+    force = mm.CustomNonbondedForce(_amber_ssc2_combined_direct_expression())
+    force.setName("CovalentSSC2CombinedDirect")
+    for parameter in (
+        CHARGE_A_PARAMETER,
+        CHARGE_B_PARAMETER,
+        MAPPED_CHARGE_PARAMETER,
+        STERICS_PARAMETER,
+        STERICS_A_PARAMETER,
+        STERICS_B_PARAMETER,
+    ):
+        force.addGlobalParameter(parameter, 0.0)
     force.addGlobalParameter("ONE_4PI_EPS0", ONE_4PI_EPS0)
     force.addGlobalParameter("EWALD_ALPHA", _ewald_alpha(source))
+    force.addGlobalParameter("SSC2_ALPHA_LJ", float(alpha_lj))
     force.addGlobalParameter("SSC2_ALPHA_COUL", float(alpha_coul))
     cutoff_nm = _float(source.getCutoffDistance(), unit.nanometer)
     if float(switch_width_nm) >= cutoff_nm:
@@ -555,20 +554,19 @@ def _new_ssc2_coulomb_force(
         )
     force.addGlobalParameter("SSC2_SWITCH_START", cutoff_nm - float(switch_width_nm))
     force.addGlobalParameter("SSC2_SWITCH_END", cutoff_nm)
-    for name in ("role", "qbranch", "qenvA", "qenvB", "sigma"):
+    for name in ("role", "qA", "qB", "sA", "sB", "eA", "eB"):
         force.addPerParticleParameter(name)
-    force.setNonbondedMethod(mm.CustomNonbondedForce.CutoffPeriodic)
-    force.setCutoffDistance(source.getCutoffDistance())
     force.setForceGroup(SOFTCORE_NONBONDED_FORCE_GROUP)
+    _configure_custom_nonbonded_like(
+        source,
+        force,
+        use_long_range_correction=use_long_range_correction,
+    )
     return force
 
 
 def _new_ssc2_coulomb_exception_force(label, scale, alpha_coul):
-    force = mm.CustomBondForce(
-        _amber_ssc2_coulomb_expression(
-            scale, mixing=False, cutoff=False, exception=True
-        )
-    )
+    force = mm.CustomBondForce(_amber_ssc2_coulomb_exception_expression(scale))
     force.setName(f"CovalentSoftcoreCoulombExceptions{label}")
     force.addGlobalParameter(scale, 0.0)
     force.addGlobalParameter("ONE_4PI_EPS0", ONE_4PI_EPS0)
@@ -692,27 +690,19 @@ def _add_nonbonded_forces(
         tuple(sorted((particle_a, particle_b)))
         for particle_a in unique_a for particle_b in unique_b
     )
-    environment_coulomb = environment_sterics = None
-    coulomb_a = coulomb_b = None
+    if use_ssc2_coulomb:
+        exception_pairs.update(combinations(sorted(unique_a), 2))
+        exception_pairs.update(combinations(sorted(unique_b), 2))
+    combined_direct = None
     exception_coulomb_a = exception_coulomb_b = None
     reciprocal_exception_correction = environment_exceptions = None
     if use_ssc2_coulomb:
-        environment_coulomb, environment_sterics = _new_environment_direct_forces(
-            source_a
-        )
-        coulomb_a = _new_ssc2_coulomb_force(
+        combined_direct = _new_ssc2_combined_direct_force(
             source_a,
-            "A",
-            CHARGE_A_PARAMETER,
+            ssc2_alpha_lj,
             ssc2_alpha_coul,
             ssc2_switch_width_nm,
-        )
-        coulomb_b = _new_ssc2_coulomb_force(
-            source_b,
-            "B",
-            CHARGE_B_PARAMETER,
-            ssc2_alpha_coul,
-            ssc2_switch_width_nm,
+            use_long_range_correction=use_long_range_correction,
         )
         exception_coulomb_a = _new_ssc2_coulomb_exception_force(
             "A", CHARGE_A_PARAMETER, ssc2_alpha_coul
@@ -724,53 +714,45 @@ def _add_nonbonded_forces(
             _new_exception_reciprocal_correction_force(source_a)
         )
         environment_exceptions = _new_environment_exception_force()
-    softcore_a = _new_softcore_force(
-        source_a,
-        "A",
-        STERICS_A_PARAMETER,
-        function,
-        alpha,
-        sigma_nm,
-        power,
-        gapsys_scale_linpoint_lj,
-        gapsys_sigma_nm,
-        ssc2_alpha_lj,
-        ssc2_switch_width_nm,
-        use_long_range_correction=use_long_range_correction,
-    )
-    softcore_b = _new_softcore_force(
-        source_b,
-        "B",
-        STERICS_B_PARAMETER,
-        function,
-        alpha,
-        sigma_nm,
-        power,
-        gapsys_scale_linpoint_lj,
-        gapsys_sigma_nm,
-        ssc2_alpha_lj,
-        ssc2_switch_width_nm,
-        use_long_range_correction=use_long_range_correction,
-    )
+        softcore_a = softcore_b = None
+    else:
+        softcore_a = _new_softcore_force(
+            source_a,
+            "A",
+            STERICS_A_PARAMETER,
+            function,
+            alpha,
+            sigma_nm,
+            power,
+            gapsys_scale_linpoint_lj,
+            gapsys_sigma_nm,
+            ssc2_alpha_lj,
+            ssc2_switch_width_nm,
+            use_long_range_correction=use_long_range_correction,
+        )
+        softcore_b = _new_softcore_force(
+            source_b,
+            "B",
+            STERICS_B_PARAMETER,
+            function,
+            alpha,
+            sigma_nm,
+            power,
+            gapsys_scale_linpoint_lj,
+            gapsys_sigma_nm,
+            ssc2_alpha_lj,
+            ssc2_switch_width_nm,
+            use_long_range_correction=use_long_range_correction,
+        )
     for particle in range(endpoint_a.getNumParticles()):
         charge_a, sigma_a, epsilon_a = source_a.getParticleParameters(particle)
         charge_b, sigma_b, epsilon_b = source_b.getParticleParameters(particle)
-        softcore_a.addParticle([sigma_a, epsilon_a])
-        softcore_b.addParticle([sigma_b, epsilon_b])
         if use_ssc2_coulomb:
             qa_value = _float(charge_a, unit.elementary_charge)
             qb_value = _float(charge_b, unit.elementary_charge)
-            role_a = 1.0 if particle in unique_a else 0.0
-            role_b = 1.0 if particle in unique_b else 0.0
-            coulomb_a.addParticle(
-                [role_a, charge_a if role_a else 0.0, charge_a, charge_b, sigma_a]
-            )
-            coulomb_b.addParticle(
-                [role_b, charge_b if role_b else 0.0, charge_a, charge_b, sigma_b]
-            )
-            environment_coulomb.addParticle([charge_a, charge_b])
-            environment_sterics.addParticle(
-                [sigma_a, sigma_b, epsilon_a, epsilon_b]
+            role = 1.0 if particle in unique_a else 2.0 if particle in unique_b else 0.0
+            combined_direct.addParticle(
+                [role, charge_a, charge_b, sigma_a, sigma_b, epsilon_a, epsilon_b]
             )
             if particle in unique_a:
                 charge_coefficients[particle] = [0.0, qa_value, 0.0, 0.0]
@@ -783,18 +765,14 @@ def _add_nonbonded_forces(
                     0.0,
                     qb_value - qa_value,
                 ]
-    if unique_a and environment:
-        softcore_a.addInteractionGroup(unique_a, environment)
-    if unique_b and environment:
-        softcore_b.addInteractionGroup(unique_b, environment)
-    if use_ssc2_coulomb:
-        if environment:
-            environment_coulomb.addInteractionGroup(environment, environment)
-            environment_sterics.addInteractionGroup(environment, environment)
+        else:
+            softcore_a.addParticle([sigma_a, epsilon_a])
+            softcore_b.addParticle([sigma_b, epsilon_b])
+    if not use_ssc2_coulomb:
         if unique_a and environment:
-            coulomb_a.addInteractionGroup(unique_a, environment)
+            softcore_a.addInteractionGroup(unique_a, environment)
         if unique_b and environment:
-            coulomb_b.addInteractionGroup(unique_b, environment)
+            softcore_b.addInteractionGroup(unique_b, environment)
     exception_lj_a = _new_softcore_exception_force(
         "A",
         STERICS_A_PARAMETER,
@@ -884,30 +862,25 @@ def _add_nonbonded_forces(
                     exception_coulomb_b.addBond(p1, p2, [q_b, sigma_b])
                 if epsilon_b != 0.0:
                     exception_lj_b.addBond(p1, p2, [sigma_b, epsilon_b])
-        softcore_a.addExclusion(p1, p2)
-        softcore_b.addExclusion(p1, p2)
         if use_ssc2_coulomb:
-            environment_coulomb.addExclusion(p1, p2)
-            environment_sterics.addExclusion(p1, p2)
-            coulomb_a.addExclusion(p1, p2)
-            coulomb_b.addExclusion(p1, p2)
+            combined_direct.addExclusion(p1, p2)
+        else:
+            softcore_a.addExclusion(p1, p2)
+            softcore_b.addExclusion(p1, p2)
 
     output.addForce(force)
     if use_ssc2_coulomb:
-        output.addForce(environment_coulomb)
-        output.addForce(environment_sterics)
+        output.addForce(combined_direct)
         if environment_exceptions.getNumBonds():
             output.addForce(environment_exceptions)
         if reciprocal_exception_correction.getNumBonds():
             output.addForce(reciprocal_exception_correction)
     if unique_a:
-        output.addForce(softcore_a)
-        if use_ssc2_coulomb:
-            output.addForce(coulomb_a)
+        if not use_ssc2_coulomb:
+            output.addForce(softcore_a)
     if unique_b:
-        output.addForce(softcore_b)
-        if use_ssc2_coulomb:
-            output.addForce(coulomb_b)
+        if not use_ssc2_coulomb:
+            output.addForce(softcore_b)
     if exception_lj_a.getNumBonds():
         output.addForce(exception_lj_a)
     if exception_lj_b.getNumBonds():
