@@ -587,7 +587,7 @@ def _result(
     warnings = []
     if adaptive is not None:
         if any(
-            item.get("selected", {}).get("selection_reason")
+            (item.get("selected") or {}).get("selection_reason")
             == "candidate_list_exhausted"
             for item in adaptive.get("environments", {}).values()
         ):
@@ -596,7 +596,7 @@ def _result(
                 "switching candidates; production used the longest duration."
             )
         if any(
-            item.get("selected", {}).get("pilot_samples_reused")
+            (item.get("selected") or {}).get("pilot_samples_reused")
             for item in adaptive.get("environments", {}).values()
         ):
             warnings.append(

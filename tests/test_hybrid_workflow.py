@@ -166,6 +166,7 @@ def _test_hybrid_result_reports_adaptive_selection_and_max_samples(tmp_path):
             )
         }
     }
+    adaptive["environments"]["pending"] = {"selected": None}
     (tmp_path / "neqti_adaptive_switching.yaml").write_text(
         yaml.safe_dump(adaptive)
     )
