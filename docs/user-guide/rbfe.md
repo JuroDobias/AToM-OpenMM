@@ -1077,6 +1077,20 @@ The defaults (`alpha: 0.3`, `sigma_nm: 0.25`, `power: 1`) match the established
 GROMACS softcore settings used for the RHINO calculations. Endpoint total charges
 must currently be equal.
 
+Parameter changes are linear within each chemical path interval by default. An
+experimental second-order smoothstep schedule can instead be selected explicitly:
+
+```yaml
+softcore:
+  stage_interpolation: smoothstep2
+```
+
+`smoothstep2` uses `6x^5 - 15x^4 + 10x^3`, giving zero slope at both ends of
+each decharge, sterics, recharge, or user-defined path interval. Schedule-optimizer
+subdivisions remain equally spaced along that interval and do not introduce
+additional smoothstep endpoints. `stage_interpolation: linear` is the default and
+is assumed when resuming work created before this option was introduced.
+
 The Lennard-Jones softcore function is selectable. Existing workflows default to
 the Beutler form. The Gapsys form linearly continues the short-range LJ force
 below a coupling-dependent radius and can retain a stronger restoring force when

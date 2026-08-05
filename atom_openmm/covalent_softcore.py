@@ -29,6 +29,7 @@ class CovalentSoftcoreHamiltonian:
     segment_steps: list[int]
     total_steps: int
     resolved_path: dict
+    stage_interpolation: str = "linear"
 
 
 def _force(system: mm.System, cls):
@@ -766,13 +767,19 @@ def create_softcore_hamiltonian(
     vdw_a=None,
     charge_a=None,
     segments_per_interval=None,
+    stage_interpolation: str = "linear",
     use_long_range_correction: bool = True,
 ) -> CovalentSoftcoreHamiltonian:
     _assert_compatible_endpoints(endpoint_a, endpoint_b)
     function = str(function).lower()
+    stage_interpolation = str(stage_interpolation).lower()
     if function not in {"beutler", "gapsys"}:
         raise CovalentAlchemyError(
             "softcore function must be 'beutler' or 'gapsys'"
+        )
+    if stage_interpolation not in {"linear", "smoothstep2"}:
+        raise CovalentAlchemyError(
+            "stage_interpolation must be 'linear' or 'smoothstep2'"
         )
     if alpha <= 0.0 or sigma_nm <= 0.0 or power < 1:
         raise CovalentAlchemyError("softcore alpha, sigma_nm, and power must be positive")
@@ -814,4 +821,5 @@ def create_softcore_hamiltonian(
         steps,
         sum(steps),
         resolved_path,
+        stage_interpolation,
     )

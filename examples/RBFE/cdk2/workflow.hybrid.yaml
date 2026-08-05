@@ -43,6 +43,7 @@ workflow:
     interpolation: softcore_linear
     softcore:
       function: beutler
+      stage_interpolation: linear
       alpha: 0.3
       sigma_nm: 0.25
       power: 1

@@ -600,6 +600,51 @@ def _test_adaptive_segment_scaling_preserves_shape_and_total():
     assert all(value > 0 for value in uneven)
 
 
+def _test_legacy_switch_protocol_defaults_to_linear_stage_interpolation():
+    from atom_openmm.covalent_workflow import _upgrade_legacy_switch_protocol
+
+    upgraded = _upgrade_legacy_switch_protocol(
+        {
+            "schema_version": 1,
+            "interpolation": "softcore_linear",
+            "softcore": {"function": "beutler"},
+        }
+    )
+
+    assert upgraded["softcore"]["stage_interpolation"] == "linear"
+    assert len(upgraded["fingerprint"]) == 64
+
+
+def _test_softcore_resume_serializes_stage_interpolation(tmp_path):
+    from atom_openmm.covalent_workflow import (
+        CovalentWorkflowError,
+        _ensure_switch_protocol,
+        _normalized_settings,
+    )
+
+    smooth = _normalized_settings(
+        {
+            "neqti": {
+                "interpolation": "softcore_linear",
+                "softcore": {"stage_interpolation": "smoothstep2"},
+            }
+        }
+    )
+    _ensure_switch_protocol(tmp_path, smooth)
+    _ensure_switch_protocol(tmp_path, smooth)
+
+    linear = _normalized_settings(
+        {
+            "neqti": {
+                "interpolation": "softcore_linear",
+                "softcore": {"stage_interpolation": "linear"},
+            }
+        }
+    )
+    with pytest.raises(CovalentWorkflowError, match="different switching protocol"):
+        _ensure_switch_protocol(tmp_path, linear)
+
+
 def _test_adaptive_work_statistics_apply_overlap_and_failure_thresholds():
     from atom_openmm.covalent_workflow import _adaptive_work_statistics
 

@@ -107,6 +107,104 @@ def _test_custom_integrator_updates_segment_boundaries_and_duration_without_rebu
     assert integrator.get_segment_steps() == [3, 5]
 
 
+def _test_smoothstep2_spans_stage_subdivisions_without_resetting_at_boundary():
+    from atom_openmm.neqti_integrator import (
+        ATMNonequilibriumLangevinIntegrator,
+        parameter_values_at_step,
+        stage_interpolation_fraction,
+    )
+
+    system = _constant_parameter_system(0.0)
+    parameter_values = {"switch_parameter": [0.0, 0.5, 1.0]}
+    segment_steps = [2, 6]
+    integrator = ATMNonequilibriumLangevinIntegrator(
+        temperature=300.0 * kelvin,
+        collision_rate=1.0 / picosecond,
+        timestep=1.0 * femtosecond,
+        parameter_values=parameter_values,
+        steps_per_segment=segment_steps,
+        segments_per_stage=[2],
+        stage_interpolation="smoothstep2",
+        random_seed=5,
+    )
+    context = mm.Context(system, integrator, mm.Platform.getPlatformByName("Reference"))
+    context.setPositions([[0.0, 0.0, 0.0]])
+
+    integrator.step(1)
+    expected = stage_interpolation_fraction(0.25, "smoothstep2")
+    assert context.getParameter("switch_parameter") == pytest.approx(expected)
+    observed = parameter_values_at_step(
+        parameter_values,
+        segment_steps,
+        0,
+        1,
+        segments_per_stage=[2],
+        stage_interpolation="smoothstep2",
+    )
+    assert observed["switch_parameter"] == pytest.approx(expected)
+
+    integrator.step(1)
+    assert context.getParameter("switch_parameter") == pytest.approx(0.5)
+    integrator.step(6)
+    assert context.getParameter("switch_parameter") == pytest.approx(1.0)
+    assert integrator.get_protocol_work() / kilojoules_per_mole == pytest.approx(1.0)
+
+
+def _test_smoothstep2_math_has_symmetric_zero_slope_endpoints():
+    from atom_openmm.neqti_integrator import stage_interpolation_fraction
+
+    curve = lambda value: stage_interpolation_fraction(value, "smoothstep2")
+    grid = [index / 100.0 for index in range(101)]
+    values = [curve(value) for value in grid]
+    assert values[0] == pytest.approx(0.0)
+    assert values[50] == pytest.approx(0.5)
+    assert values[-1] == pytest.approx(1.0)
+    assert values == sorted(values)
+    epsilon = 1.0e-5
+    assert (curve(epsilon) - curve(0.0)) / epsilon == pytest.approx(0.0, abs=1.0e-8)
+    assert (curve(1.0) - curve(1.0 - epsilon)) / epsilon == pytest.approx(0.0, abs=1.0e-8)
+    for value in (0.1, 0.25, 0.7, 0.9):
+        assert curve(1.0 - value) == pytest.approx(1.0 - curve(value))
+
+
+def _test_smoothstep2_integrator_matches_python_updates_at_every_step():
+    from atom_openmm.neqti_integrator import (
+        ATMNonequilibriumLangevinIntegrator,
+        parameter_values_at_step,
+    )
+
+    system = _constant_parameter_system(0.0)
+    parameter_values = {"switch_parameter": [0.0, 0.5, 1.0, 2.0]}
+    segment_steps = [2, 3, 4]
+    integrator = ATMNonequilibriumLangevinIntegrator(
+        temperature=300.0 * kelvin,
+        collision_rate=1.0 / picosecond,
+        timestep=1.0 * femtosecond,
+        parameter_values=parameter_values,
+        steps_per_segment=segment_steps,
+        segments_per_stage=[2, 1],
+        stage_interpolation="smoothstep2",
+        random_seed=6,
+    )
+    context = mm.Context(system, integrator, mm.Platform.getPlatformByName("Reference"))
+    context.setPositions([[0.0, 0.0, 0.0]])
+
+    for segment, steps in enumerate(segment_steps):
+        for local_step in range(1, steps + 1):
+            integrator.step(1)
+            expected = parameter_values_at_step(
+                parameter_values,
+                segment_steps,
+                segment,
+                local_step,
+                segments_per_stage=[2, 1],
+                stage_interpolation="smoothstep2",
+            )
+            assert context.getParameter("switch_parameter") == pytest.approx(
+                expected["switch_parameter"]
+            )
+
+
 def _test_custom_integrator_drift_does_not_double_velocity():
     from atom_openmm.neqti_integrator import ATMNonequilibriumLangevinIntegrator
 

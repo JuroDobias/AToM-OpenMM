@@ -66,6 +66,7 @@ from atom_openmm.neqti import (
     analyze_two_leg_work,
 )
 from atom_openmm.neqti_integrator import ATMNonequilibriumLangevinIntegrator
+from atom_openmm.neqti_integrator import parameter_values_at_step
 from atom_openmm.rest2 import create_rest2_system
 from atom_openmm.rest2_exchange import REST2ExchangeSampler
 from atom_openmm.workflow_schema import WorkflowAxesError, normalize_workflow_axes
@@ -358,6 +359,14 @@ def validate_covalent_workflow(path):
     if config["softcore"]["function"] not in {"beutler", "gapsys"}:
         raise CovalentWorkflowError(
             "workflow.neqti.softcore.function must be 'beutler' or 'gapsys'"
+        )
+    if config["softcore"]["stage_interpolation"] not in {
+        "linear",
+        "smoothstep2",
+    }:
+        raise CovalentWorkflowError(
+            "workflow.neqti.softcore.stage_interpolation must be "
+            "'linear' or 'smoothstep2'"
         )
     if (
         config["softcore"]["gapsys_scale_linpoint_lj"] <= 0.0
@@ -1091,6 +1100,9 @@ def _softcore_switch_context(
     steps = list(
         hamiltonian.segment_steps if forward else reversed(hamiltonian.segment_steps)
     )
+    segments_per_stage = list(hamiltonian.resolved_path["segments_per_interval"])
+    if not forward:
+        segments_per_stage.reverse()
     integrator = ATMNonequilibriumLangevinIntegrator(
         temperature=float(temperature_k) * unit.kelvin,
         collision_rate=1.0 / unit.picosecond,
@@ -1098,6 +1110,8 @@ def _softcore_switch_context(
         parameter_values=values,
         steps_per_segment=steps,
         random_seed=int(seed),
+        segments_per_stage=segments_per_stage,
+        stage_interpolation=hamiltonian.stage_interpolation,
     )
     context = mm.Context(hamiltonian.system, integrator, platform, properties)
     return context, integrator, values
@@ -1201,13 +1215,23 @@ def _reset_softcore_context(context, integrator, parameter_values):
         context.setParameter(name, float(values[0]))
 
 
-def _parameter_values_at_step(parameter_values, segment_steps, segment, local_step):
-    fraction = float(local_step) / float(segment_steps[segment])
-    return {
-        name: float(values[segment])
-        + fraction * (float(values[segment + 1]) - float(values[segment]))
-        for name, values in parameter_values.items()
-    }
+def _parameter_values_at_step(
+    parameter_values,
+    segment_steps,
+    segment,
+    local_step,
+    *,
+    segments_per_stage=None,
+    stage_interpolation="linear",
+):
+    return parameter_values_at_step(
+        parameter_values,
+        segment_steps,
+        segment,
+        local_step,
+        segments_per_stage=segments_per_stage,
+        stage_interpolation=stage_interpolation,
+    )
 
 
 def _run_segmented_protocol(
@@ -1267,6 +1291,8 @@ def _run_segmented_protocol(
                     segment_steps,
                     segment,
                     local_step,
+                    segments_per_stage=integrator.get_segments_per_stage(),
+                    stage_interpolation=integrator.get_stage_interpolation(),
                 )
                 row = {
                     **profile_metadata,
@@ -2376,6 +2402,9 @@ def _normalized_settings(workflow):
     )
     softcore_settings = {
         "function": str(softcore.get("function", "beutler")).lower(),
+        "stage_interpolation": str(
+            softcore.get("stage_interpolation", "linear")
+        ).lower(),
         "alpha": float(softcore.get("alpha", 0.3)),
         "sigma_nm": float(softcore.get("sigma_nm", 0.25)),
         "power": int(softcore.get("power", 1)),
@@ -2839,6 +2868,7 @@ def _upgrade_legacy_switch_protocol(protocol):
     if "softcore" in upgraded:
         softcore = dict(upgraded["softcore"])
         softcore.setdefault("function", "beutler")
+        softcore.setdefault("stage_interpolation", "linear")
         softcore.setdefault("gapsys_scale_linpoint_lj", 0.85)
         softcore.setdefault("gapsys_sigma_nm", 0.30)
         upgraded["softcore"] = softcore

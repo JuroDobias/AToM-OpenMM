@@ -109,6 +109,23 @@ def _test_hybrid_adaptive_settings_validate_duration_and_sample_cap(tmp_path):
         raise AssertionError("mismatched base switching duration was accepted")
 
 
+def _test_hybrid_stage_interpolation_validation(tmp_path):
+    from atom_openmm.hybrid_workflow import HybridWorkflowError, _validate_settings
+
+    workflow = yaml.safe_load(_workflow(tmp_path).read_text())["workflow"]
+    workflow["neqti"]["softcore"]["stage_interpolation"] = "smoothstep2"
+    config = _validate_settings(workflow)
+    assert config["softcore"]["stage_interpolation"] == "smoothstep2"
+
+    workflow["neqti"]["softcore"]["stage_interpolation"] = "cubic"
+    try:
+        _validate_settings(workflow)
+    except HybridWorkflowError as exc:
+        assert "stage_interpolation" in str(exc)
+    else:
+        raise AssertionError("unknown stage interpolation was accepted")
+
+
 def _test_hybrid_convergence_uses_matched_prefix_and_truncates_extra_work(tmp_path):
     from atom_openmm.covalent_workflow import _read_work, _rewrite_work
     from atom_openmm.hybrid_workflow import (

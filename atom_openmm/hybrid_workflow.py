@@ -97,6 +97,14 @@ def _validate_settings(workflow):
         raise HybridWorkflowError(
             "noncovalent hybrid topology requires workflow.neqti.interpolation: softcore_linear"
         )
+    if config["softcore"]["stage_interpolation"] not in {
+        "linear",
+        "smoothstep2",
+    }:
+        raise HybridWorkflowError(
+            "workflow.neqti.softcore.stage_interpolation must be "
+            "'linear' or 'smoothstep2'"
+        )
     if config["failed_switch_policy"] not in {"abort", "count_as_infinite"}:
         raise HybridWorkflowError(
             "workflow.neqti.failed_switch_policy must be 'abort' or 'count_as_infinite'"

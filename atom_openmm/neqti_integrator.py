@@ -24,21 +24,94 @@ def normalize_segment_steps(steps_per_segment, nsegments, *, label="steps_per_se
     return steps
 
 
-def _piecewise_expression(values, boundary_names):
+def normalize_segments_per_stage(segments_per_stage, nsegments):
+    if segments_per_stage is None:
+        return [1] * nsegments
+    groups = [int(value) for value in segments_per_stage]
+    if not groups or any(value < 1 for value in groups):
+        raise ValueError("segments_per_stage must contain positive integers")
+    if sum(groups) != nsegments:
+        raise ValueError(f"segments_per_stage must account for {nsegments} segments")
+    return groups
+
+
+def _normalize_stage_interpolation(value):
+    value = str(value).lower()
+    if value not in {"linear", "smoothstep2"}:
+        raise ValueError("stage_interpolation must be 'linear' or 'smoothstep2'")
+    return value
+
+
+def stage_interpolation_fraction(progress, interpolation):
+    progress = float(progress)
+    interpolation = _normalize_stage_interpolation(interpolation)
+    if interpolation == "linear":
+        return progress
+    return progress**3 * (10.0 + progress * (-15.0 + 6.0 * progress))
+
+
+def _stage_progress_expression(boundary_names, first_segment, segment_count):
+    terms = []
+    for segment in range(first_segment, first_segment + segment_count):
+        start = "0" if segment == 0 else boundary_names[segment - 1]
+        end = boundary_names[segment]
+        terms.append(f"min(1,max(0,(neq_step-{start})/({end}-{start})))")
+    return f"(({'+'.join(terms)})/{segment_count})"
+
+
+def _stage_curve_expression(progress, interpolation):
+    if interpolation == "linear":
+        return progress
+    return f"(({progress})^3*(10+({progress})*(-15+6*({progress}))))"
+
+
+def _piecewise_expression(values, boundary_names, segments_per_stage=None, stage_interpolation="linear"):
     values = [float(value) for value in values]
+    interpolation = _normalize_stage_interpolation(stage_interpolation)
+    groups = normalize_segments_per_stage(segments_per_stage, len(boundary_names))
     expression = f"({values[0]:.17g})"
-    for segment, (start, end) in enumerate(zip(values[:-1], values[1:])):
-        delta = end - start
-        if delta == 0.0:
-            continue
-        segment_start = "0" if segment == 0 else boundary_names[segment - 1]
-        segment_end = boundary_names[segment]
-        progress = (
-            f"min(1,max(0,(neq_step-{segment_start})/"
-            f"({segment_end}-{segment_start})))"
-        )
-        expression += f"+({delta:.17g})*({progress})"
+    first_segment = 0
+    for segment_count in groups:
+        last_segment = first_segment + segment_count
+        delta = values[last_segment] - values[first_segment]
+        if delta != 0.0:
+            progress = _stage_progress_expression(
+                boundary_names, first_segment, segment_count
+            )
+            curve = _stage_curve_expression(progress, interpolation)
+            expression += f"+({delta:.17g})*({curve})"
+        first_segment = last_segment
     return expression
+
+
+def parameter_values_at_step(
+    parameter_values,
+    segment_steps,
+    segment,
+    local_step,
+    *,
+    segments_per_stage=None,
+    stage_interpolation="linear",
+):
+    groups = normalize_segments_per_stage(segments_per_stage, len(segment_steps))
+    interpolation = _normalize_stage_interpolation(stage_interpolation)
+    first_segment = 0
+    for segment_count in groups:
+        last_segment = first_segment + segment_count
+        if segment < last_segment:
+            progress = (
+                segment - first_segment
+                + float(local_step) / float(segment_steps[segment])
+            ) / float(segment_count)
+            fraction = stage_interpolation_fraction(progress, interpolation)
+            return {
+                name: float(values[first_segment])
+                + fraction
+                * (float(values[last_segment]) - float(values[first_segment]))
+                for name, values in parameter_values.items()
+            }
+        first_segment = last_segment
+    raise IndexError("segment index is outside the switching schedule")
 
 
 def _set_shared_random_seed(integrators, random_seed):
@@ -60,6 +133,8 @@ class ATMNonequilibriumLangevinIntegrator(mm.CustomIntegrator):
         steps_per_segment,
         random_seed=None,
         work_sample_intervals=None,
+        segments_per_stage=None,
+        stage_interpolation="linear",
     ):
         super().__init__(timestep)
         intervals = tuple(sorted({int(value) for value in (work_sample_intervals or ())}))
@@ -68,6 +143,10 @@ class ATMNonequilibriumLangevinIntegrator(mm.CustomIntegrator):
         self._work_sample_intervals = intervals
         nsegments = len(next(iter(parameter_values.values()))) - 1
         self._segment_steps = normalize_segment_steps(steps_per_segment, nsegments)
+        self._segments_per_stage = normalize_segments_per_stage(
+            segments_per_stage, nsegments
+        )
+        self._stage_interpolation = _normalize_stage_interpolation(stage_interpolation)
         self._segment_boundary_names = [f"neq_segment_end_{index}" for index in range(nsegments)]
         self._temperature = temperature
         self.addGlobalVariable("kT", MOLAR_GAS_CONSTANT_R * temperature)
@@ -96,7 +175,15 @@ class ATMNonequilibriumLangevinIntegrator(mm.CustomIntegrator):
         for name, values in parameter_values.items():
             if len(values) != nsegments + 1:
                 raise ValueError("all switching parameter schedules must have the same length")
-            self.addComputeGlobal(name, _piecewise_expression(values, self._segment_boundary_names))
+            self.addComputeGlobal(
+                name,
+                _piecewise_expression(
+                    values,
+                    self._segment_boundary_names,
+                    self._segments_per_stage,
+                    self._stage_interpolation,
+                ),
+            )
         self.addComputeGlobal("Enew", "energy")
         self.addComputeGlobal("protocol_work", "protocol_work+Enew-Eold")
         for interval in intervals:
@@ -157,6 +244,12 @@ class ATMNonequilibriumLangevinIntegrator(mm.CustomIntegrator):
 
     def get_segment_steps(self):
         return list(self._segment_steps)
+
+    def get_segments_per_stage(self):
+        return list(self._segments_per_stage)
+
+    def get_stage_interpolation(self):
+        return self._stage_interpolation
 
 
 def _context_parameter_values(ommsystem, schedule):
