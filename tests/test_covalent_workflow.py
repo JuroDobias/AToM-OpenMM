@@ -392,6 +392,62 @@ def _test_dummy_bonded_scales_preserve_junction_torsions_by_default():
     assert explicit["junction_proper_torsion"] == 0.0
 
 
+def _test_selective_rotor_scales_are_resolved_and_recorded():
+    inherited = _normalized_settings(
+        {
+            "setup": {
+                "dummy_bonded_scales": {
+                    "proper_torsion": 0.4,
+                    "junction_proper_torsion": 0.3,
+                }
+            },
+            "neqti": {"interpolation": "softcore_linear"},
+        }
+    )
+    explicit = _normalized_settings(
+        {
+            "setup": {
+                "dummy_bonded_scales": {
+                    "junction_rotatable_torsion": 0.1,
+                    "internal_rotatable_torsion": 0.2,
+                }
+            },
+            "neqti": {"interpolation": "softcore_linear"},
+        }
+    )
+
+    assert inherited["dummy_bonded_scales"]["junction_rotatable_torsion"] == 0.3
+    assert inherited["dummy_bonded_scales"]["internal_rotatable_torsion"] == 0.4
+    assert explicit["dummy_bonded_scales"]["junction_rotatable_torsion"] == 0.1
+    assert explicit["dummy_bonded_scales"]["internal_rotatable_torsion"] == 0.2
+    protocol = _switch_protocol(explicit)
+    assert protocol["dummy_bonded_scales"] == explicit["dummy_bonded_scales"]
+    assert protocol["softcore"]["coulomb_function"] == "linear_pme"
+
+
+def _test_selective_rotor_scale_change_invalidates_switch_resume(tmp_path):
+    first = _normalized_settings(
+        {
+            "setup": {
+                "dummy_bonded_scales": {
+                    "junction_rotatable_torsion": 0.1,
+                    "internal_rotatable_torsion": 0.1,
+                }
+            },
+            "neqti": {"interpolation": "softcore_linear"},
+        }
+    )
+    _ensure_switch_protocol(tmp_path, first)
+    changed = dict(first)
+    changed["dummy_bonded_scales"] = {
+        **first["dummy_bonded_scales"],
+        "junction_rotatable_torsion": 0.2,
+    }
+
+    with pytest.raises(CovalentWorkflowError, match="different switching protocol"):
+        _ensure_switch_protocol(tmp_path, changed)
+
+
 def test_softcore_settings_derive_total_switch_steps():
     config = _normalized_settings(
         {
@@ -530,7 +586,7 @@ def _test_concerted_ssc2_coulomb_settings_are_recorded_in_protocol():
                     "function": "amber_ssc2",
                     "coulomb_function": "amber_ssc2",
                     "ssc2_alpha_lj": 0.5,
-                    "ssc2_alpha_coul": 1.0,
+                    "ssc2_beta_coul": 1.0,
                     "total_steps": 50000,
                     "path": {"mode": "concerted"},
                 },
@@ -543,7 +599,8 @@ def _test_concerted_ssc2_coulomb_settings_are_recorded_in_protocol():
     assert config["switch_steps"] == 50000
     protocol = _switch_protocol(config)
     assert protocol["softcore"]["coulomb_function"] == "amber_ssc2"
-    assert protocol["softcore"]["ssc2_alpha_coul"] == 1.0
+    assert protocol["softcore"]["ssc2_beta_coul"] == 1.0
+    assert protocol["softcore"]["implementation"] == "amber_gti_ssc2_v1"
     assert protocol["softcore"]["resolved_path"]["source"] == "concerted"
 
 
@@ -567,6 +624,7 @@ def _test_legacy_beutler_protocol_resumes_with_new_default_fields(tmp_path):
     legacy["softcore"].pop("gapsys_scale_linpoint_lj")
     legacy["softcore"].pop("gapsys_sigma_nm")
     legacy["softcore"].pop("ssc2_alpha_lj")
+    legacy["softcore"].pop("ssc2_beta_coul")
     legacy["softcore"].pop("ssc2_switch_width_nm")
     legacy["fingerprint"] = "legacy"
     path = tmp_path / "switch_protocol.yaml"
@@ -576,6 +634,48 @@ def _test_legacy_beutler_protocol_resumes_with_new_default_fields(tmp_path):
 
     assert observed == _switch_protocol(config)
     assert yaml.safe_load(path.read_text()) == observed
+
+
+def _test_legacy_ssc2_protocol_requires_explicit_legacy_name(tmp_path):
+    config = _normalized_settings(
+        {
+            "neqti": {
+                "interpolation": "softcore_linear",
+                "softcore": {
+                    "function": "amber_ssc2",
+                    "coulomb_function": "amber_ssc2",
+                    "total_steps": 50,
+                    "path": {"mode": "concerted"},
+                },
+            }
+        }
+    )
+    legacy = _switch_protocol(config)
+    legacy["softcore"].pop("implementation")
+    legacy["softcore"].pop("ssc2_beta_coul")
+    legacy["fingerprint"] = "legacy"
+    (tmp_path / "switch_protocol.yaml").write_text(
+        yaml.safe_dump(legacy, sort_keys=False)
+    )
+
+    with pytest.raises(CovalentWorkflowError, match=r"effective-distance SSC\(2\)"):
+        _ensure_switch_protocol(tmp_path, config)
+
+    legacy_config = _normalized_settings(
+        {
+            "neqti": {
+                "interpolation": "softcore_linear",
+                "softcore": {
+                    "function": "effective_distance_ssc2",
+                    "coulomb_function": "effective_distance_ssc2",
+                    "total_steps": 50,
+                    "path": {"mode": "concerted"},
+                },
+            }
+        }
+    )
+    observed = _ensure_switch_protocol(tmp_path, legacy_config)
+    assert observed["softcore"]["implementation"] == "effective_distance_ssc2_v1"
 
 
 def _test_general_softcore_resume_rejects_changed_node_values(tmp_path):

@@ -10,7 +10,11 @@ import yaml
 from openff.toolkit import Molecule
 from openff.units import unit as offunit
 
-from atom_openmm.covalent_hybrid import HybridBondedScales, build_hybrid_molecule
+from atom_openmm.covalent_hybrid import (
+    HybridBondedScales,
+    build_hybrid_molecule,
+    vacuum_nonbonded_pair_counts,
+)
 from atom_openmm.covalent_softcore import resolve_softcore_path
 from atom_openmm.covalent_systems import (
     load_prepared_hybrid_bundle,
@@ -43,7 +47,7 @@ class HybridWorkflowError(ValueError):
     pass
 
 
-PREPARATION_SCHEMA_VERSION = 2
+PREPARATION_SCHEMA_VERSION = 3
 
 
 def _sha256(path):
@@ -93,6 +97,14 @@ def _validate_settings(workflow):
             "noncovalent hybrid topology currently supports ligand_charge_model: nn"
         )
     config = _normalized_settings(workflow)
+    if any(value < 0.0 for value in config["dummy_bonded_scales"].values()):
+        raise HybridWorkflowError(
+            "workflow.setup.dummy_bonded_scales values cannot be negative"
+        )
+    if config["dummy_core_nonbonded"] not in {"off", "retain"}:
+        raise HybridWorkflowError(
+            "workflow.alchemy.dummy_core_nonbonded must be 'off' or 'retain'"
+        )
     if config["interpolation"] != "softcore_linear":
         raise HybridWorkflowError(
             "noncovalent hybrid topology requires workflow.neqti.interpolation: softcore_linear"
@@ -109,29 +121,35 @@ def _validate_settings(workflow):
         "beutler",
         "gapsys",
         "amber_ssc2",
+        "effective_distance_ssc2",
     }:
         raise HybridWorkflowError(
             "workflow.neqti.softcore.function must be 'beutler', 'gapsys', "
-            "or 'amber_ssc2'"
+            "'amber_ssc2', or 'effective_distance_ssc2'"
         )
     if config["softcore"]["coulomb_function"] not in {
         "linear_pme",
         "amber_ssc2",
+        "effective_distance_ssc2",
     }:
         raise HybridWorkflowError(
             "workflow.neqti.softcore.coulomb_function must be "
-            "'linear_pme' or 'amber_ssc2'"
+            "'linear_pme', 'amber_ssc2', or 'effective_distance_ssc2'"
         )
     if (
         config["softcore"]["ssc2_alpha_lj"] <= 0.0
         or config["softcore"]["ssc2_alpha_coul"] <= 0.0
+        or config["softcore"]["ssc2_beta_coul"] <= 0.0
         or config["softcore"]["ssc2_switch_width_nm"] <= 0.0
     ):
         raise HybridWorkflowError("Amber SSC(2) LJ parameters must be positive")
-    if config["softcore"]["coulomb_function"] == "amber_ssc2":
-        if config["softcore"]["function"] != "amber_ssc2":
+    if config["softcore"]["coulomb_function"] in {
+        "amber_ssc2",
+        "effective_distance_ssc2",
+    }:
+        if config["softcore"]["function"] != config["softcore"]["coulomb_function"]:
             raise HybridWorkflowError(
-                "Amber SSC(2) Coulomb requires softcore.function: amber_ssc2"
+                "SSC(2) Coulomb function must match softcore.function"
             )
         if config["softcore"]["stage_interpolation"] != "linear":
             raise HybridWorkflowError(
@@ -277,6 +295,9 @@ def plan_noncovalent_hybrid_workflow(path):
         "alchemy_model": "hybrid_topology",
         "thermodynamic_cycle": "complex_solvent",
         "sampling_method": "neqti",
+        "dummy_core_nonbonded": _normalized_settings(config["workflow"])[
+            "dummy_core_nonbonded"
+        ],
         "receptor": str(plan["receptor_file"]),
         "workdir": str(plan["workdir"]),
         "mapping": _mapping_settings(config["workflow"]),
@@ -401,6 +422,9 @@ def _prepare_pair(pair, receptor, workflow, workdir):
         dummy_bonded_scales=HybridBondedScales(
             **_normalized_settings(workflow)["dummy_bonded_scales"]
         ),
+        dummy_core_nonbonded=_normalized_settings(workflow)[
+            "dummy_core_nonbonded"
+        ],
     )
     seed = int(setup.get("solvation_seed", _normalized_settings(workflow)["random_seed"]))
     physical_complex = create_physical_ligand_environment(
@@ -436,6 +460,8 @@ def _prepare_pair(pair, receptor, workflow, workdir):
         "fingerprint": fingerprint,
         "fingerprint_inputs": fingerprint_inputs,
         "mapping": mapping_payload,
+        "dummy_core_nonbonded": hybrid.dummy_core_nonbonded,
+        "vacuum_nonbonded_pair_counts": vacuum_nonbonded_pair_counts(hybrid),
         "parameterization": {
             "ligand_a": parameters_a.provenance,
             "ligand_b": parameters_b.provenance,
@@ -666,6 +692,7 @@ def _result(
         "chemistry": "noncovalent",
         "alchemy_model": "hybrid_topology",
         "thermodynamic_cycle": "complex_solvent",
+        "dummy_core_nonbonded": config.get("dummy_core_nonbonded", "off"),
         "ligand_a": pair["lig1_name"],
         "ligand_b": pair["lig2_name"],
         "workdir": str(workdir.resolve()),

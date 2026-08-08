@@ -1,0 +1,7 @@
+source leaprc.gaff2
+source leaprc.water.tip3p
+
+MTH = loadmol2 @MOL2@
+solvatebox MTH TIP3PBOX 18.0
+saveamberparm MTH system.parm7 system.rst7
+quit

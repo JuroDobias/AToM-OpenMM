@@ -4,6 +4,7 @@ workflow:
   alchemy:
     model: hybrid_topology
     cycle: complex_solvent
+    dummy_core_nonbonded: off
     mapping:
       method: mcs
   sampling:
@@ -27,6 +28,8 @@ workflow:
       proper_torsion: 1.0
       junction_angle: 1.0
       junction_proper_torsion: 1.0
+      junction_rotatable_torsion: 1.0
+      internal_rotatable_torsion: 1.0
   neqti:
     temperature_k: 300.0
     pressure_bar: 1.0
@@ -43,6 +46,7 @@ workflow:
     interpolation: softcore_linear
     softcore:
       function: beutler
+      coulomb_function: linear_pme
       stage_interpolation: linear
       alpha: 0.3
       sigma_nm: 0.25

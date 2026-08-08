@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import openmm as mm
 from openmm import unit
@@ -10,7 +12,10 @@ from atom_openmm.covalent_softcore import (
     STERICS_PARAMETER,
     STERICS_A_PARAMETER,
     STERICS_B_PARAMETER,
+    _amber_ssc2_combined_direct_expression,
+    _amber_ssc2_coulomb_exception_expression,
     _amber_ssc2_energy_expression,
+    _effective_distance_ssc2_combined_direct_expression,
     _gapsys_energy_expression,
     create_softcore_hamiltonian,
     resolve_softcore_path,
@@ -21,7 +26,10 @@ from atom_openmm.covalent_workflow import (
     _merge_work_profile_rows,
     _run_segmented_protocol,
 )
-from atom_openmm.neqti_integrator import ATMNonequilibriumLangevinIntegrator
+from atom_openmm.neqti_integrator import (
+    ATMNonequilibriumLangevinIntegrator,
+    parameter_values_at_step,
+)
 
 
 def _endpoint(state):
@@ -58,12 +66,10 @@ def _endpoint(state):
     for values in parameters:
         nonbonded.addParticle(*values)
     nonbonded.addException(0, 1, 0.0, 0.3, 0.0)
-    nonbonded.addException(
-        1, 2, -0.015 if state == "a" else 0.0, 0.315, 0.08 if state == "a" else 0.0
-    )
-    nonbonded.addException(
-        1, 3, 0.0 if state == "a" else -0.005, 0.32, 0.0 if state == "a" else 0.07
-    )
+    if state == "a":
+        nonbonded.addException(1, 2, -0.015, 0.315, 0.08)
+    else:
+        nonbonded.addException(1, 3, -0.005, 0.32, 0.07)
     nonbonded.addException(2, 3, 0.0, 1.0, 0.0)
     system.addForce(nonbonded)
     return system
@@ -107,6 +113,59 @@ def _test_softcore_nodes_reproduce_endpoint_energies_and_forces():
         )
         assert np.isclose(observed_energy, expected_energy, atol=1.0e-5)
         assert np.allclose(observed_forces, expected_forces, atol=1.0e-3)
+
+
+def _test_softcore_retained_dummy_core_force_reproduces_both_endpoints():
+    endpoint_a = _endpoint("a")
+    endpoint_b = _endpoint("b")
+
+    def add_vacuum(system, inactive_pair):
+        force = mm.CustomBondForce(
+            "ONE_4PI_EPS0*chargeprod/r + "
+            "4*epsilon*((sigma/r)^12-(sigma/r)^6)"
+        )
+        force.setName("CovalentUniqueVacuumNonbondedForce")
+        force.addGlobalParameter("ONE_4PI_EPS0", 138.935456)
+        for parameter in ("chargeprod", "sigma", "epsilon"):
+            force.addPerBondParameter(parameter)
+        force.addBond(2, 3, [-0.002, 0.31, 0.02])
+        force.addBond(*inactive_pair, [-0.004, 0.32, 0.04])
+        system.addForce(force)
+
+    add_vacuum(endpoint_a, (1, 3))
+    add_vacuum(endpoint_b, (1, 2))
+    hamiltonian = create_softcore_hamiltonian(
+        endpoint_a,
+        endpoint_b,
+        [2],
+        [3],
+        charge_steps_per_stage=2,
+        sterics_steps=2,
+    )
+    positions = np.asarray(
+        [[0.0, 0.0, 0.0], [0.16, 0.0, 0.0], [0.31, 0.1, 0.0],
+         [0.30, -0.12, 0.0], [0.5, 0.0, 0.0]]
+    ) * unit.nanometer
+    values_a = {
+        name: values[0] for name, values in hamiltonian.parameter_values.items()
+    }
+    values_b = {
+        name: values[-1] for name, values in hamiltonian.parameter_values.items()
+    }
+
+    energy_a, forces_a = _energy_forces(endpoint_a, positions)
+    energy_b, forces_b = _energy_forces(endpoint_b, positions)
+    switched_a, switched_forces_a = _energy_forces(
+        hamiltonian.system, positions, values_a
+    )
+    switched_b, switched_forces_b = _energy_forces(
+        hamiltonian.system, positions, values_b
+    )
+
+    assert np.isclose(switched_a, energy_a, atol=1.0e-6)
+    assert np.isclose(switched_b, energy_b, atol=1.0e-6)
+    assert np.allclose(switched_forces_a, forces_a, atol=1.0e-6)
+    assert np.allclose(switched_forces_b, forces_b, atol=1.0e-6)
 
 def _gapsys_reference_energy(r, sigma, epsilon, scale, alpha):
     c6 = 4.0 * epsilon * sigma**6
@@ -280,8 +339,17 @@ def _test_concerted_ssc2_coulomb_reproduces_pme_endpoints():
         if isinstance(force, mm.CustomNonbondedForce)
     ]
     assert custom_nonbonded_names == [
-        "CovalentSSC2CombinedDirect",
+        "CovalentAmberGTISSC2CombinedDirect",
         "CovalentSSC2CombinedLRC",
+    ]
+    endpoint_nonbonded_names = [
+        force.getName()
+        for force in hamiltonian.system.getForces()
+        if isinstance(force, mm.NonbondedForce)
+    ]
+    assert endpoint_nonbonded_names == [
+        "CovalentAmberGTIEndpointElectrostaticsA",
+        "CovalentAmberGTIEndpointElectrostaticsB",
     ]
     positions = np.asarray(
         [[0, 0, 0], [0.15, 0, 0], [0.28, 0.08, 0], [0.29, -0.09, 0.03], [0.7, 0.4, 0.3]]
@@ -297,6 +365,109 @@ def _test_concerted_ssc2_coulomb_reproduces_pme_endpoints():
         )
         assert np.isclose(observed_energy, expected_energy, atol=2.0e-3)
         assert np.allclose(observed_forces, expected_forces, atol=1.0e-3)
+
+
+def _test_amber_ssc2_coulomb_matches_gti_pair_equation_and_not_legacy():
+    scale = 0.35
+    distance = 0.30
+    sigma = 0.10
+    beta = 1.0
+    ewald_alpha = 3.0
+
+    def system_for(expression, amber):
+        force = mm.CustomNonbondedForce(expression)
+        for name, value in (
+            (CHARGE_A_PARAMETER, scale),
+            (CHARGE_B_PARAMETER, 1.0 - scale),
+            (MAPPED_CHARGE_PARAMETER, scale),
+            (STERICS_PARAMETER, scale),
+            (STERICS_A_PARAMETER, scale),
+            (STERICS_B_PARAMETER, 1.0 - scale),
+            ("ONE_4PI_EPS0", 138.935456),
+            ("EWALD_ALPHA", ewald_alpha),
+            ("SSC2_ALPHA_LJ", 0.5),
+            ("SSC2_SWITCH_START", 0.8),
+            ("SSC2_SWITCH_END", 1.0),
+        ):
+            force.addGlobalParameter(name, value)
+        if amber:
+            force.addGlobalParameter("SSC2_BETA_COUL", beta)
+            force.addGlobalParameter("SSC2_MIN_COUL_R2", 0.04)
+        else:
+            force.addGlobalParameter("SSC2_ALPHA_COUL", 1.0)
+        for name in ("role", "qA", "qB", "sA", "sB", "eA", "eB"):
+            force.addPerParticleParameter(name)
+        force.addParticle([1, 0.3, 0.0, sigma, sigma, 0.0, 0.0])
+        force.addParticle([0, -0.4, -0.4, sigma, sigma, 0.0, 0.0])
+        output = mm.System()
+        output.addParticle(12.0)
+        output.addParticle(12.0)
+        output.addForce(force)
+        return output
+
+    amber = system_for(_amber_ssc2_combined_direct_expression(), True)
+    legacy = system_for(_effective_distance_ssc2_combined_direct_expression(), False)
+    positions = np.asarray([[0.0, 0.0, 0.0], [distance, 0.0, 0.0]]) * unit.nanometer
+    observed, forces = _energy_forces(amber, positions)
+    legacy_energy, _ = _energy_forces(legacy, positions)
+
+    weight = _smoothstep2(scale)
+    rsc = math.sqrt(distance**2 + beta * (1.0 - weight) * 0.04)
+    softened = (
+        138.935456
+        * 0.3
+        * -0.4
+        * weight
+        * math.erfc(ewald_alpha * distance)
+        / rsc
+    )
+    hard = (
+        138.935456
+        * 0.3
+        * -0.4
+        * weight
+        * math.erfc(ewald_alpha * distance)
+        / distance
+    )
+    expected = softened - hard
+    assert np.isclose(observed, expected, atol=1.0e-9, rtol=1.0e-7)
+    assert not np.isclose(observed, legacy_energy, atol=1.0e-4)
+
+    delta = 1.0e-5
+    def reference(r):
+        softened = math.sqrt(r**2 + beta * (1.0 - weight) * 0.04)
+        soft = 138.935456 * 0.3 * -0.4 * weight * math.erfc(ewald_alpha * r) / softened
+        hard = 138.935456 * 0.3 * -0.4 * weight * math.erfc(ewald_alpha * r) / r
+        return soft - hard
+
+    expected_force = -(reference(distance + delta) - reference(distance - delta)) / (2 * delta)
+    assert np.isclose(forces[1, 0], expected_force, atol=2.0e-4, rtol=2.0e-4)
+
+
+def _test_amber_ssc2_exception_uses_unscaled_scbeta():
+    scale = 0.35
+    distance = 0.30
+    beta_a2 = 1.0
+    force = mm.CustomBondForce(
+        _amber_ssc2_coulomb_exception_expression(CHARGE_A_PARAMETER)
+    )
+    force.addGlobalParameter(CHARGE_A_PARAMETER, scale)
+    force.addGlobalParameter("ONE_4PI_EPS0", 138.935456)
+    force.addGlobalParameter("SSC2_BETA_COUL_14_NM2", beta_a2 * 0.01)
+    force.addPerBondParameter("chargeprod")
+    force.addPerBondParameter("sigma")
+    force.addBond(0, 1, [-0.12, 0.80])
+    system = mm.System()
+    system.addParticle(12.0)
+    system.addParticle(12.0)
+    system.addForce(force)
+    positions = np.asarray([[0.0, 0.0, 0.0], [distance, 0.0, 0.0]]) * unit.nanometer
+
+    observed, _ = _energy_forces(system, positions)
+    weight = _smoothstep2(scale)
+    rsc = math.sqrt(distance**2 + beta_a2 * 0.01 * (1.0 - weight))
+    expected = 138.935456 * -0.12 * weight * (1.0 / rsc - 1.0 / distance)
+    assert np.isclose(observed, expected, atol=1.0e-9, rtol=1.0e-7)
 
 
 def _test_concerted_ssc2_coulomb_remains_finite_at_short_range():
@@ -330,14 +501,14 @@ def _test_concerted_ssc2_coulomb_remains_finite_at_short_range():
     positions = np.asarray(
         [[0, 0, 0], [1.0e-4, 0, 0], [2.0e-4, 0, 0]]
     ) * unit.nanometer
-    parameters = {
-        CHARGE_A_PARAMETER: 0.5,
-        CHARGE_B_PARAMETER: 0.5,
-        MAPPED_CHARGE_PARAMETER: 0.5,
-        STERICS_A_PARAMETER: 0.5,
-        STERICS_B_PARAMETER: 0.5,
-        STERICS_PARAMETER: 0.5,
-    }
+    parameters = parameter_values_at_step(
+        hamiltonian.parameter_values,
+        hamiltonian.segment_steps,
+        0,
+        25,
+        segments_per_stage=hamiltonian.resolved_path["segments_per_interval"],
+        stage_interpolation=hamiltonian.stage_interpolation,
+    )
     energy, forces = _energy_forces(hamiltonian.system, positions, parameters)
     assert np.isfinite(energy)
     assert np.all(np.isfinite(forces))

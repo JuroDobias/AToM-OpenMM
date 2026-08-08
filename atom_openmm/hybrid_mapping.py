@@ -8,6 +8,7 @@ from atom_openmm.covalent_alchemy import CovalentAlchemyError
 from atom_openmm.covalent_hybrid import (
     complete_covalent_atom_map,
     find_covalent_atom_map,
+    normalize_mapping_aromaticity,
 )
 
 
@@ -54,8 +55,18 @@ def _smarts_constrained_map(molecule_a, molecule_b, smarts, timeout_seconds=30):
 
 
 def build_hybrid_atom_map(parameters_a, parameters_b, settings):
-    molecule_a = parameters_a.molecule.to_rdkit()
-    molecule_b = parameters_b.molecule.to_rdkit()
+    raw_a = parameters_a.molecule.to_rdkit()
+    raw_b = parameters_b.molecule.to_rdkit()
+    aromatic_before = {
+        "ligand_a": sum(atom.GetIsAromatic() for atom in raw_a.GetAtoms()),
+        "ligand_b": sum(atom.GetIsAromatic() for atom in raw_b.GetAtoms()),
+    }
+    molecule_a = normalize_mapping_aromaticity(raw_a)
+    molecule_b = normalize_mapping_aromaticity(raw_b)
+    aromatic_after = {
+        "ligand_a": sum(atom.GetIsAromatic() for atom in molecule_a.GetAtoms()),
+        "ligand_b": sum(atom.GetIsAromatic() for atom in molecule_b.GetAtoms()),
+    }
     method = settings.get("method", "mcs")
     if method == "mcs":
         mapping = find_covalent_atom_map(molecule_a, molecule_b)
@@ -77,7 +88,10 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
             f"mapped ligand RMSD {rmsd:.3f} A exceeds max_mapped_rmsd_a {float(maximum):.3f} A"
         )
     return mapping, {
-        "schema_version": 1,
+        "schema_version": 2,
+        "aromaticity_model": "rdkit",
+        "aromatic_atom_count_before": aromatic_before,
+        "aromatic_atom_count_after": aromatic_after,
         "method": method,
         "smarts": settings.get("smarts") if method == "mcs_core_smarts" else None,
         "mapped_atom_count": len(mapping),

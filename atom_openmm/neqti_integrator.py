@@ -12,6 +12,41 @@ from atom_openmm.ommworker import OMMWorkerATMSync
 # https://github.com/choderalab/openmmtools/blob/main/openmmtools/integrators.py
 
 
+_AMBER_RECIPROCAL_TRANSFORMS = {
+    "COVALENT_RECIPROCAL_A_CHARGE": (
+        "sqrt(max(0,COVALENT_CHARGE_A^3*(10+COVALENT_CHARGE_A*"
+        "(-15+6*COVALENT_CHARGE_A))))-1"
+    ),
+    "COVALENT_RECIPROCAL_B_CHARGE": (
+        "sqrt(max(0,COVALENT_CHARGE_B^3*(10+COVALENT_CHARGE_B*"
+        "(-15+6*COVALENT_CHARGE_B))))-1"
+    ),
+    "COVALENT_RECIPROCAL_A_EXCEPTION": (
+        "COVALENT_CHARGE_A^3*(10+COVALENT_CHARGE_A*"
+        "(-15+6*COVALENT_CHARGE_A))-1"
+    ),
+    "COVALENT_RECIPROCAL_B_EXCEPTION": (
+        "COVALENT_CHARGE_B^3*(10+COVALENT_CHARGE_B*"
+        "(-15+6*COVALENT_CHARGE_B))-1"
+    ),
+}
+
+
+def _apply_amber_reciprocal_transforms(values):
+    for label in ("A", "B"):
+        charge = values.get(f"COVALENT_CHARGE_{label}")
+        if charge is None:
+            continue
+        weight = charge**3 * (10.0 + charge * (-15.0 + 6.0 * charge))
+        charge_name = f"COVALENT_RECIPROCAL_{label}_CHARGE"
+        exception_name = f"COVALENT_RECIPROCAL_{label}_EXCEPTION"
+        if charge_name in values:
+            values[charge_name] = math.sqrt(max(0.0, weight)) - 1.0
+        if exception_name in values:
+            values[exception_name] = weight - 1.0
+    return values
+
+
 def normalize_segment_steps(steps_per_segment, nsegments, *, label="steps_per_segment"):
     if isinstance(steps_per_segment, int):
         steps = [int(steps_per_segment)] * nsegments
@@ -104,12 +139,13 @@ def parameter_values_at_step(
                 + float(local_step) / float(segment_steps[segment])
             ) / float(segment_count)
             fraction = stage_interpolation_fraction(progress, interpolation)
-            return {
+            values = {
                 name: float(values[first_segment])
                 + fraction
                 * (float(values[last_segment]) - float(values[first_segment]))
                 for name, values in parameter_values.items()
             }
+            return _apply_amber_reciprocal_transforms(values)
         first_segment = last_segment
     raise IndexError("segment index is outside the switching schedule")
 
@@ -175,15 +211,15 @@ class ATMNonequilibriumLangevinIntegrator(mm.CustomIntegrator):
         for name, values in parameter_values.items():
             if len(values) != nsegments + 1:
                 raise ValueError("all switching parameter schedules must have the same length")
-            self.addComputeGlobal(
-                name,
-                _piecewise_expression(
+            expression = _AMBER_RECIPROCAL_TRANSFORMS.get(name)
+            if expression is None:
+                expression = _piecewise_expression(
                     values,
                     self._segment_boundary_names,
                     self._segments_per_stage,
                     self._stage_interpolation,
-                ),
-            )
+                )
+            self.addComputeGlobal(name, expression)
         self.addComputeGlobal("Enew", "energy")
         self.addComputeGlobal("protocol_work", "protocol_work+Enew-Eold")
         for interval in intervals:

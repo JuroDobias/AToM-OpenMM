@@ -48,7 +48,19 @@ def _md_step(identifier, ensemble, n_steps, timestep_ps, restrained):
     return step
 
 
-def _workflow(ligand_a, ligand_b):
+def _workflow(
+    ligand_a,
+    ligand_b,
+    *,
+    n_snapshots=100,
+    switch_time_ps=100.0,
+    adaptive_switching=True,
+    convergence=True,
+    dummy_core_nonbonded="off",
+):
+    total_switch_steps = int(round(float(switch_time_ps) * 1000.0 / 2.0))
+    charge_steps = total_switch_steps // 4
+    sterics_steps = total_switch_steps - 2 * charge_steps
     payload = {
         "workflow": {
             "type": "rbfe",
@@ -56,6 +68,7 @@ def _workflow(ligand_a, ligand_b):
             "alchemy": {
                 "model": "hybrid_topology",
                 "cycle": "complex_solvent",
+                "dummy_core_nonbonded": str(dummy_core_nonbonded),
                 "mapping": {
                     "method": "mcs_core_smarts",
                     "smarts": MAPPING_SMARTS,
@@ -114,6 +127,8 @@ def _workflow(ligand_a, ligand_b):
                     "proper_torsion": 1.0,
                     "junction_angle": 1.0,
                     "junction_proper_torsion": 1.0,
+                    "junction_rotatable_torsion": 1.0,
+                    "internal_rotatable_torsion": 1.0,
                 },
             },
             "neqti": {
@@ -128,7 +143,7 @@ def _workflow(ligand_a, ligand_b):
                     "npt_steps": 250000,
                     "npt_timestep_fs": 2.0,
                 },
-                "n_snapshots": 100,
+                "n_snapshots": int(n_snapshots),
                 "decorrelation_steps": 50000,
                 "interpolation": "softcore_linear",
                 "softcore": {
@@ -136,30 +151,13 @@ def _workflow(ligand_a, ligand_b):
                     "alpha": 0.3,
                     "sigma_nm": 0.25,
                     "power": 1,
-                    "charge_steps_per_stage": 12500,
-                    "sterics_steps": 25000,
+                    "charge_steps_per_stage": charge_steps,
+                    "sterics_steps": sterics_steps,
                     "long_range_correction": "dynamic",
                 },
                 "failed_switch_policy": "count_as_infinite",
                 "bootstrap_samples": 500,
                 "random_seed": 2026,
-                "adaptive_switching": {
-                    "enabled": True,
-                    "candidate_times_ps": [100, 300, 1000],
-                    "pilot_samples_per_direction": 20,
-                    "min_overlap_score_per_leg": 0.08,
-                    "max_failed_fraction_per_direction": 0.05,
-                    "reuse_selected_pilot_samples": True,
-                    "on_exhausted": "use_longest",
-                },
-                "convergence": {
-                    "enabled": True,
-                    "min_samples_per_direction": 30,
-                    "min_overlap_score_per_leg": 0.05,
-                    "max_ddg_error_kcal_per_mol": 0.5,
-                    "consecutive_checks": 3,
-                    "max_ddg_range_kcal_per_mol": 0.25,
-                },
                 "rest2": {
                     "enabled": True,
                     "effective_temperatures_k": [300.0, 356.8, 424.3, 504.5, 600.0],
@@ -170,12 +168,31 @@ def _workflow(ligand_a, ligand_b):
             },
         }
     }
+    if adaptive_switching:
+        payload["workflow"]["neqti"]["adaptive_switching"] = {
+            "enabled": True,
+            "candidate_times_ps": [100, 300, 1000],
+            "pilot_samples_per_direction": 20,
+            "min_overlap_score_per_leg": 0.08,
+            "max_failed_fraction_per_direction": 0.05,
+            "reuse_selected_pilot_samples": True,
+            "on_exhausted": "use_longest",
+        }
+    if convergence:
+        payload["workflow"]["neqti"]["convergence"] = {
+            "enabled": True,
+            "min_samples_per_direction": 30,
+            "min_overlap_score_per_leg": 0.05,
+            "max_ddg_error_kcal_per_mol": 0.5,
+            "consecutive_checks": 3,
+            "max_ddg_range_kcal_per_mol": 0.25,
+        }
     if (ligand_a, ligand_b) == ("30", "31"):
         payload["workflow"]["setup"]["allow_undefined_stereo"] = True
     return payload
 
 
-def _run_script(edge):
+def _run_script(edge, source_dir_name="AToM-OpenMM-unified"):
     return f"""#!/usr/bin/env bash
 #SBATCH -N 1
 #SBATCH --ntasks=1
@@ -196,7 +213,7 @@ ROOT_JOB_ID="${{ATOM_ROOT_JOB_ID:-${{SLURM_JOB_ID:-manual}}}}"
 RUN_DIR="${{SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")}}"
 SCRIPT_PATH="$RUN_DIR/run.sh"
 CHAIN_LOG="$RUN_DIR/slurm-chain.log"
-SOURCE_DIR="$HOME/myAToM/AToM-OpenMM-unified"
+SOURCE_DIR="$HOME/myAToM/{source_dir_name}"
 RESULT_FILE="$RUN_DIR/run/receptor-{edge.replace('--', '-')}/result.yaml"
 CHILD_PID=""
 RESUBMITTING=0
@@ -248,6 +265,7 @@ export OPENMM_PLUGIN_DIR="$HOME/myAToM/openmm-endpoint-gates-install/lib/plugins
 PYTHON_BIN="$HOME/myAToM/atm-gates-venv/bin/python"
 
 git -C "$SOURCE_DIR" rev-parse HEAD > source_commit.txt
+git -C "$SOURCE_DIR" diff --binary | sha256sum > source_worktree_diff.sha256
 "$PYTHON_BIN" -m atom_openmm.rbfe_workflow --validate workflow.yaml
 "$PYTHON_BIN" -m atom_openmm.rbfe_workflow workflow.yaml &
 CHILD_PID=$!
@@ -265,7 +283,18 @@ exit "$status"
 """
 
 
-def generate(source_cohort: Path, benchmark_root: Path, output: Path):
+def generate(
+    source_cohort: Path,
+    benchmark_root: Path,
+    output: Path,
+    *,
+    n_snapshots=100,
+    switch_time_ps=100.0,
+    adaptive_switching=True,
+    convergence=True,
+    dummy_core_nonbonded="off",
+    source_dir_name="AToM-OpenMM-unified",
+):
     receptor = benchmark_root / "ATM_Validation/CDK2/receptor/CDK2_new_2_edit.pdb"
     if not receptor.is_file():
         raise FileNotFoundError(receptor)
@@ -279,10 +308,21 @@ def generate(source_cohort: Path, benchmark_root: Path, output: Path):
         for ligand in (ligand_a, ligand_b):
             shutil.copy2(source / f"{ligand}-p.sdf", target / "ligands")
         (target / "workflow.yaml").write_text(
-            yaml.safe_dump(_workflow(ligand_a, ligand_b), sort_keys=False)
+            yaml.safe_dump(
+                _workflow(
+                    ligand_a,
+                    ligand_b,
+                    n_snapshots=n_snapshots,
+                    switch_time_ps=switch_time_ps,
+                    adaptive_switching=adaptive_switching,
+                    convergence=convergence,
+                    dummy_core_nonbonded=dummy_core_nonbonded,
+                ),
+                sort_keys=False,
+            )
         )
         script = target / "run.sh"
-        script.write_text(_run_script(edge))
+        script.write_text(_run_script(edge, source_dir_name=source_dir_name))
         script.chmod(0o755)
     submit = output / "submit_all.sh"
     submit.write_text(
@@ -291,14 +331,23 @@ def generate(source_cohort: Path, benchmark_root: Path, output: Path):
         + "\n"
     )
     submit.chmod(0o755)
+    archive = output / "archive_snapshot_bank.sh"
+    archive.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        "if [[ $# -ne 1 ]]; then echo 'usage: archive_snapshot_bank.sh OUTPUT_DIR' >&2; exit 2; fi\n"
+        f'python -m atom_openmm.hybrid_switch_benchmark archive "$(dirname "$0")" "$1" --snapshots {int(n_snapshots)}\n'
+    )
+    archive.chmod(0o755)
+    mode = "adaptive 100/300/1000 ps" if adaptive_switching else f"fixed {float(switch_time_ps):g} ps"
+    stopping = "automatic BAR convergence stopping" if convergence else "a fixed sample count"
     (output / "README.md").write_text(
         "# CDK2 hybrid-topology cohort\n\n"
         "Ten published CDK2 benchmark edges are repeated with a noncovalent "
         "hybrid topology, Espaloma NN ligand parameters, REST2 endpoint "
-        "sampling, adaptive 100/300/1000 ps NEQTI switches, and automatic "
-        "BAR convergence stopping. Twenty matched pilot samples select the "
-        "complex and solvent durations independently and are retained for "
-        "production. The exact benchmark receptor "
+        f"sampling, {mode} staged-linear NEQTI switches, and {stopping}. "
+        f"Each endpoint produces {int(n_snapshots)} decorrelated snapshots. "
+        f"Inactive dummy-core interactions use `{dummy_core_nonbonded}` mode. "
+        "The exact benchmark receptor "
         "is retained and TPO161 is parameterized with ff14SB/phosaa14SB.\n"
     )
 
@@ -308,8 +357,28 @@ def main():
     parser.add_argument("--source-cohort", type=Path, required=True)
     parser.add_argument("--benchmark-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--n-snapshots", type=int, default=100)
+    parser.add_argument("--switch-time-ps", type=float, default=100.0)
+    parser.add_argument("--no-adaptive-switching", action="store_true")
+    parser.add_argument("--no-convergence", action="store_true")
+    parser.add_argument(
+        "--dummy-core-nonbonded", choices=("off", "retain"), default="off"
+    )
+    parser.add_argument("--source-dir-name", default="AToM-OpenMM-unified")
     args = parser.parse_args()
-    generate(args.source_cohort.resolve(), args.benchmark_root.resolve(), args.output.resolve())
+    if args.n_snapshots < 1 or args.switch_time_ps <= 0.0:
+        parser.error("n-snapshots and switch-time-ps must be positive")
+    generate(
+        args.source_cohort.resolve(),
+        args.benchmark_root.resolve(),
+        args.output.resolve(),
+        n_snapshots=args.n_snapshots,
+        switch_time_ps=args.switch_time_ps,
+        adaptive_switching=not args.no_adaptive_switching,
+        convergence=not args.no_convergence,
+        dummy_core_nonbonded=args.dummy_core_nonbonded,
+        source_dir_name=args.source_dir_name,
+    )
 
 
 if __name__ == "__main__":

@@ -107,6 +107,61 @@ def test_explicit_atom_map_does_not_expand_to_unrestricted_mcs():
     assert 2 in hybrid.unique_b
 
 
+def _test_retained_dummy_core_adds_only_state_specific_vacuum_pairs():
+    left = _bundle("CCO")
+    right = _bundle("CCN")
+    common = {0: 0, 1: 1}
+    default = build_covalent_hybrid_molecule(left, right, atom_map=common)
+    retained = build_covalent_hybrid_molecule(
+        left,
+        right,
+        atom_map=common,
+        dummy_core_nonbonded="retain",
+    )
+
+    def vacuum_pairs(system):
+        force = next((
+            force
+            for force in system.getForces()
+            if force.getName() == "CovalentUniqueVacuumNonbondedForce"
+        ), None)
+        if force is None:
+            return set()
+        return {
+            tuple(sorted(map(int, force.getBondParameters(index)[:2])))
+            for index in range(force.getNumBonds())
+        }
+
+    default_a = vacuum_pairs(default.endpoint_a)
+    default_b = vacuum_pairs(default.endpoint_b)
+    retained_a = vacuum_pairs(retained.endpoint_a)
+    retained_b = vacuum_pairs(retained.endpoint_b)
+    common_hybrid = {
+        retained.map_a_to_hybrid[index] for index in retained.map_a_to_b
+    }
+    unique_a = {retained.map_a_to_hybrid[index] for index in retained.unique_a}
+    unique_b = {retained.map_b_to_hybrid[index] for index in retained.unique_b}
+
+    assert default.dummy_core_nonbonded == "off"
+    assert default_a == default_b
+    assert default_a < retained_a
+    assert default_b < retained_b
+    assert retained_a - default_a
+    assert retained_b - default_b
+    assert all(
+        set(pair) & unique_b and set(pair) & common_hybrid
+        for pair in retained_a - default_a
+    )
+    assert all(
+        set(pair) & unique_a and set(pair) & common_hybrid
+        for pair in retained_b - default_b
+    )
+    assert not any(
+        set(pair) & unique_a and set(pair) & unique_b
+        for pair in retained_a | retained_b
+    )
+
+
 def _test_junction_proper_torsions_are_preserved_by_default():
     molecule = Chem.MolFromSmiles("CCCC")
     _, torsion_scale = _inactive_scales(
@@ -128,6 +183,49 @@ def _test_junction_proper_torsions_can_be_disabled_explicitly():
     )
 
     assert torsion_scale((0, 1, 2, 3)) == 0.0
+
+
+def _test_selective_rotatable_torsion_scales_classify_central_bonds():
+    scales = DummyBondedScales(
+        proper_torsion=0.8,
+        junction_proper_torsion=0.7,
+        junction_rotatable_torsion=0.1,
+        internal_rotatable_torsion=0.2,
+    )
+    _, junction_scale = _inactive_scales(
+        Chem.MolFromSmiles("CCCC"), unique={2, 3}, scales=scales
+    )
+    _, internal_scale = _inactive_scales(
+        Chem.MolFromSmiles("CCCCC"), unique={2, 3, 4}, scales=scales
+    )
+    _, ring_scale = _inactive_scales(
+        Chem.MolFromSmiles("C1CCCCC1"), unique=set(range(6)), scales=scales
+    )
+    _, double_bond_scale = _inactive_scales(
+        Chem.MolFromSmiles("CC=CC"), unique={2, 3}, scales=scales
+    )
+
+    assert junction_scale((0, 1, 2, 3)) == 0.1
+    assert internal_scale((1, 2, 3, 4)) == 0.2
+    assert ring_scale((0, 1, 2, 3)) == 0.8
+    assert double_bond_scale((0, 1, 2, 3)) == 0.7
+
+
+def _test_selective_rotatable_torsion_scales_inherit_legacy_values():
+    molecule = Chem.MolFromSmiles("CCCCC")
+    scales = DummyBondedScales(
+        proper_torsion=0.4,
+        junction_proper_torsion=0.3,
+    )
+    _, junction_scale = _inactive_scales(
+        molecule, unique={3, 4}, scales=scales
+    )
+    _, internal_scale = _inactive_scales(
+        molecule, unique={2, 3, 4}, scales=scales
+    )
+
+    assert junction_scale((1, 2, 3, 4)) == 0.3
+    assert internal_scale((1, 2, 3, 4)) == 0.4
 
 
 def _test_unique_vacuum_force_exactly_replaces_internal_nonbonded_energy():

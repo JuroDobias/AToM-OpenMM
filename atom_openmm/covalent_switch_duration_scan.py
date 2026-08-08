@@ -357,6 +357,7 @@ def _softcore_options(source_softcore, total_steps):
         "gapsys_sigma_nm": source_softcore.get("gapsys_sigma_nm", 0.30),
         "ssc2_alpha_lj": source_softcore.get("ssc2_alpha_lj", 0.5),
         "ssc2_alpha_coul": source_softcore.get("ssc2_alpha_coul", 1.0),
+        "ssc2_beta_coul": source_softcore.get("ssc2_beta_coul", 1.0),
         "ssc2_switch_width_nm": source_softcore.get(
             "ssc2_switch_width_nm", 0.2
         ),

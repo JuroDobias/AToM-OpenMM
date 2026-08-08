@@ -24,6 +24,8 @@ from atom_openmm.covalent_hybrid import (
     DummyBondedScales,
     build_covalent_hybrid_molecule,
     complete_covalent_atom_map,
+    normalize_mapping_aromaticity,
+    vacuum_nonbonded_pair_counts,
 )
 from atom_openmm.covalent_parameters import (
     CovalentParameterError,
@@ -33,9 +35,11 @@ from atom_openmm.covalent_parameters import (
 )
 from atom_openmm.covalent_protein import prepare_protein_covalent_hybrid
 from atom_openmm.covalent_softcore import (
+    AMBER_SSC2_IMPLEMENTATION,
     CHARGE_A_PARAMETER,
     CHARGE_B_PARAMETER,
     MAPPED_CHARGE_PARAMETER,
+    LEGACY_SSC2_IMPLEMENTATION,
     SOFTCORE_NONBONDED_FORCE_GROUP,
     STERICS_A_PARAMETER,
     STERICS_B_PARAMETER,
@@ -108,7 +112,7 @@ class CovalentResumeError(CovalentWorkflowError):
     pass
 
 
-PREPARATION_SCHEMA_VERSION = 1
+PREPARATION_SCHEMA_VERSION = 2
 
 
 def _resolve(path, base):
@@ -190,6 +194,9 @@ def plan_covalent_workflow(path):
         "alchemy_model": "hybrid_topology",
         "thermodynamic_cycle": "complex_solvent",
         "sampling_method": "neqti",
+        "dummy_core_nonbonded": _normalized_settings(workflow)[
+            "dummy_core_nonbonded"
+        ],
         "dataset": str(settings["dataset_path"]),
         "receptor": str(settings["dataset_root"] / settings["dataset"]["receptor"]),
         "workdir": str(workdir),
@@ -361,18 +368,20 @@ def validate_covalent_workflow(path):
         "beutler",
         "gapsys",
         "amber_ssc2",
+        "effective_distance_ssc2",
     }:
         raise CovalentWorkflowError(
             "workflow.neqti.softcore.function must be 'beutler', 'gapsys', "
-            "or 'amber_ssc2'"
+            "'amber_ssc2', or 'effective_distance_ssc2'"
         )
     if config["softcore"]["coulomb_function"] not in {
         "linear_pme",
         "amber_ssc2",
+        "effective_distance_ssc2",
     }:
         raise CovalentWorkflowError(
             "workflow.neqti.softcore.coulomb_function must be "
-            "'linear_pme' or 'amber_ssc2'"
+            "'linear_pme', 'amber_ssc2', or 'effective_distance_ssc2'"
         )
     if config["softcore"]["stage_interpolation"] not in {
         "linear",
@@ -392,15 +401,19 @@ def validate_covalent_workflow(path):
     if (
         config["softcore"]["ssc2_alpha_lj"] <= 0.0
         or config["softcore"]["ssc2_alpha_coul"] <= 0.0
+        or config["softcore"]["ssc2_beta_coul"] <= 0.0
         or config["softcore"]["ssc2_switch_width_nm"] <= 0.0
     ):
         raise CovalentWorkflowError(
             "workflow.neqti.softcore Amber SSC(2) parameters must be positive"
         )
-    if config["softcore"]["coulomb_function"] == "amber_ssc2":
-        if config["softcore"]["function"] != "amber_ssc2":
+    if config["softcore"]["coulomb_function"] in {
+        "amber_ssc2",
+        "effective_distance_ssc2",
+    }:
+        if config["softcore"]["function"] != config["softcore"]["coulomb_function"]:
             raise CovalentWorkflowError(
-                "Amber SSC(2) Coulomb requires softcore.function: amber_ssc2"
+                "SSC(2) Coulomb function must match softcore.function"
             )
         if config["softcore"]["stage_interpolation"] != "linear":
             raise CovalentWorkflowError(
@@ -432,6 +445,10 @@ def validate_covalent_workflow(path):
             )
     if any(value < 0.0 for value in config["dummy_bonded_scales"].values()):
         raise CovalentWorkflowError("workflow.setup.dummy_bonded_scales values cannot be negative")
+    if config["dummy_core_nonbonded"] not in {"off", "retain"}:
+        raise CovalentWorkflowError(
+            "workflow.alchemy.dummy_core_nonbonded must be 'off' or 'retain'"
+        )
     equilibration = config["endpoint_equilibration"]
     if config["decorrelation_steps"] < 0 or any(
         equilibration[key] < 0
@@ -536,6 +553,11 @@ def _preparation_fingerprint(settings, pair, inputs, mapping_settings, solvation
         },
         "mapping": mapping_settings,
         "setup": workflow.get("setup") or {},
+        "alchemy": {
+            "dummy_core_nonbonded": _normalized_settings(workflow)[
+                "dummy_core_nonbonded"
+            ]
+        },
         "covalent_residue": settings["dataset"]["covalent_residue"],
         "solvation_seed": int(solvation_seed),
     }
@@ -2460,7 +2482,17 @@ def _run_environment(
 
 def _normalized_settings(workflow):
     setup = workflow.get("setup") or {}
+    alchemy = workflow.get("alchemy") or {}
     dummy = setup.get("dummy_bonded_scales") or {}
+    proper_torsion_scale = float(dummy.get("proper_torsion", 1.0))
+    junction_proper_torsion_scale = float(
+        dummy.get("junction_proper_torsion", 1.0)
+    )
+
+    def resolved_rotatable_scale(name, fallback):
+        value = dummy.get(name)
+        return float(fallback if value is None else value)
+
     neqti = workflow.get("neqti") or {}
     equilibration = neqti.get("endpoint_equilibration") or {}
     rest2 = neqti.get("rest2") or {}
@@ -2476,6 +2508,29 @@ def _normalized_settings(workflow):
         "effective_temperatures_k",
         [300.0, 344.6, 395.9, 454.7, 522.3, 600.0],
     )
+    coordinate_reporter_raw = rest2.get("coordinate_reporter") or {}
+    coordinate_reporter_enabled = bool(
+        coordinate_reporter_raw.get("enabled", False)
+    )
+    coordinate_reporter_interval = int(
+        coordinate_reporter_raw.get("interval_cycles", 10)
+    )
+    coordinate_state_indices = coordinate_reporter_raw.get(
+        "state_indices", "all"
+    )
+    if coordinate_state_indices != "all":
+        coordinate_state_indices = [int(value) for value in coordinate_state_indices]
+        if len(set(coordinate_state_indices)) != len(coordinate_state_indices) or any(
+            value < 0 or value >= len(temperatures)
+            for value in coordinate_state_indices
+        ):
+            raise CovalentWorkflowError(
+                "REST2 coordinate_reporter.state_indices are invalid"
+            )
+    if coordinate_reporter_enabled and coordinate_reporter_interval < 1:
+        raise CovalentWorkflowError(
+            "REST2 coordinate_reporter.interval_cycles must be positive"
+        )
     softcore_settings = {
         "function": str(softcore.get("function", "beutler")).lower(),
         "coulomb_function": str(
@@ -2493,6 +2548,7 @@ def _normalized_settings(workflow):
         "gapsys_sigma_nm": float(softcore.get("gapsys_sigma_nm", 0.30)),
         "ssc2_alpha_lj": float(softcore.get("ssc2_alpha_lj", 0.5)),
         "ssc2_alpha_coul": float(softcore.get("ssc2_alpha_coul", 1.0)),
+        "ssc2_beta_coul": float(softcore.get("ssc2_beta_coul", 1.0)),
         "ssc2_switch_width_nm": float(
             softcore.get("ssc2_switch_width_nm", 0.2)
         ),
@@ -2688,12 +2744,20 @@ def _normalized_settings(workflow):
         "dummy_bonded_scales": {
             "bond": float(dummy.get("bond", 1.0)),
             "angle": float(dummy.get("angle", 1.0)),
-            "proper_torsion": float(dummy.get("proper_torsion", 1.0)),
+            "proper_torsion": proper_torsion_scale,
             "junction_angle": float(dummy.get("junction_angle", 1.0)),
-            "junction_proper_torsion": float(
-                dummy.get("junction_proper_torsion", 1.0)
+            "junction_proper_torsion": junction_proper_torsion_scale,
+            "internal_rotatable_torsion": resolved_rotatable_scale(
+                "internal_rotatable_torsion", proper_torsion_scale
+            ),
+            "junction_rotatable_torsion": resolved_rotatable_scale(
+                "junction_rotatable_torsion",
+                junction_proper_torsion_scale,
             ),
         },
+        "dummy_core_nonbonded": str(
+            alchemy.get("dummy_core_nonbonded", "off")
+        ).lower(),
         "rest2": {
             "enabled": enabled,
             "effective_temperatures_k": [float(value) for value in temperatures],
@@ -2701,6 +2765,11 @@ def _normalized_settings(workflow):
             "checkpoint_interval_cycles": int(rest2.get("checkpoint_interval_cycles", 10)),
             "execution": str(rest2.get("execution", "serial")),
             "device_indices": rest2.get("device_indices"),
+            "coordinate_reporter": {
+                "enabled": coordinate_reporter_enabled,
+                "interval_cycles": coordinate_reporter_interval,
+                "state_indices": coordinate_state_indices,
+            },
         },
     }
 
@@ -2746,12 +2815,14 @@ def _direct_match_rmsd(molecule_a, match_a, molecule_b, match_b):
 
 
 def _constrained_ligand_atom_map(inputs, smarts, timeout_seconds=30):
-    molecule_a = _load_covalent_sdf(
+    raw_a = _load_covalent_sdf(
         inputs["ligand_a"]["aldehyde"], inputs["ligand_a"]["name"]
     )
-    molecule_b = _load_covalent_sdf(
+    raw_b = _load_covalent_sdf(
         inputs["ligand_b"]["aldehyde"], inputs["ligand_b"]["name"]
     )
+    molecule_a = normalize_mapping_aromaticity(raw_a)
+    molecule_b = normalize_mapping_aromaticity(raw_b)
     core = Chem.MolFromSmarts(smarts)
     result = rdFMCS.FindMCS(
         [molecule_a, molecule_b, core],
@@ -2787,6 +2858,19 @@ def _constrained_ligand_atom_map(inputs, smarts, timeout_seconds=30):
         candidates, key=lambda item: item[:3]
     )
     return dict(zip(match_a, match_b)), {
+        "aromaticity_model": "rdkit",
+        "aromatic_atom_count_before": {
+            "ligand_a": sum(atom.GetIsAromatic() for atom in raw_a.GetAtoms()),
+            "ligand_b": sum(atom.GetIsAromatic() for atom in raw_b.GetAtoms()),
+        },
+        "aromatic_atom_count_after": {
+            "ligand_a": sum(
+                atom.GetIsAromatic() for atom in molecule_a.GetAtoms()
+            ),
+            "ligand_b": sum(
+                atom.GetIsAromatic() for atom in molecule_b.GetAtoms()
+            ),
+        },
         "core_smarts": smarts,
         "mcs_smarts": Chem.MolToSmarts(query),
         "mcs_atom_count": int(result.numAtoms),
@@ -2804,12 +2888,39 @@ def _constrained_ligand_atom_map(inputs, smarts, timeout_seconds=30):
 def _prepare_covalent_atom_map(inputs, mapping_settings):
     meta_a = inputs["ligand_a"]["metadata"]
     meta_b = inputs["ligand_b"]["metadata"]
+    product_molecule_a_raw = _load_covalent_sdf(
+        inputs["ligand_a"]["product"], inputs["ligand_a"]["name"]
+    )
+    product_molecule_b_raw = _load_covalent_sdf(
+        inputs["ligand_b"]["product"], inputs["ligand_b"]["name"]
+    )
+    product_molecule_a = normalize_mapping_aromaticity(product_molecule_a_raw)
+    product_molecule_b = normalize_mapping_aromaticity(product_molecule_b_raw)
     cap_count_a = int(meta_a["capped_cys_atom_count"])
     cap_count_b = int(meta_b["capped_cys_atom_count"])
     if cap_count_a != cap_count_b:
         raise CovalentWorkflowError("capped cysteine atom counts differ between ligands")
     required = [(index, index) for index in range(cap_count_a)]
-    provenance = {"mapping_mode": mapping_settings["method"]}
+    provenance = {
+        "mapping_mode": mapping_settings["method"],
+        "aromaticity_model": "rdkit",
+        "product_aromatic_atom_count_before": {
+            "ligand_a": sum(
+                atom.GetIsAromatic() for atom in product_molecule_a_raw.GetAtoms()
+            ),
+            "ligand_b": sum(
+                atom.GetIsAromatic() for atom in product_molecule_b_raw.GetAtoms()
+            ),
+        },
+        "product_aromatic_atom_count_after": {
+            "ligand_a": sum(
+                atom.GetIsAromatic() for atom in product_molecule_a.GetAtoms()
+            ),
+            "ligand_b": sum(
+                atom.GetIsAromatic() for atom in product_molecule_b.GetAtoms()
+            ),
+        },
+    }
     atom_map = None
     if mapping_settings["method"] == "dataset_core":
         core_a = inputs["ligand_a"]["info"]["core_match_atom_indices_1based"]
@@ -2872,12 +2983,6 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
             raise CovalentWorkflowError(
                 "SMARTS-constrained MCS must contain the ligand electrophile carbon"
             )
-        product_molecule_a = _load_covalent_sdf(
-            inputs["ligand_a"]["product"], inputs["ligand_a"]["name"]
-        )
-        product_molecule_b = _load_covalent_sdf(
-            inputs["ligand_b"]["product"], inputs["ligand_b"]["name"]
-        )
         atom_map = complete_covalent_atom_map(
             product_molecule_a,
             product_molecule_b,
@@ -2906,11 +3011,20 @@ def _switch_protocol(config, mapping_settings=None, mapping_label="covalent_mapp
         "timestep_fs": config["timestep_fs"],
         "total_steps": config["switch_steps"],
         "switch_work_profile": dict(config["switch_work_profile"]),
+        "dummy_bonded_scales": dict(config["dummy_bonded_scales"]),
     }
     if config["adaptive_switching"]["enabled"]:
         protocol["adaptive_switching"] = dict(config["adaptive_switching"])
     if config["interpolation"] == "softcore_linear":
         protocol["softcore"] = dict(config["softcore"])
+        function = protocol["softcore"]["function"]
+        if function == "amber_ssc2":
+            implementation = AMBER_SSC2_IMPLEMENTATION
+        elif function == "effective_distance_ssc2":
+            implementation = LEGACY_SSC2_IMPLEMENTATION
+        else:
+            implementation = function
+        protocol["softcore"]["implementation"] = implementation
         has_general_path = any(
             key in config["softcore"] for key in ("path_nodes", "path_mode")
         )
@@ -2961,9 +3075,13 @@ def _switch_protocol(config, mapping_settings=None, mapping_label="covalent_mapp
     return protocol
 
 
-def _upgrade_legacy_switch_protocol(protocol):
+def _upgrade_legacy_switch_protocol(protocol, dummy_bonded_scales=None):
     upgraded = dict(protocol)
     upgraded.pop("fingerprint", None)
+    if dummy_bonded_scales is not None:
+        upgraded.setdefault(
+            "dummy_bonded_scales", dict(dummy_bonded_scales)
+        )
     upgraded.setdefault(
         "switch_work_profile",
         {"enabled": False, "interval_steps": 100, "phases": ["optimizer"]},
@@ -2976,7 +3094,14 @@ def _upgrade_legacy_switch_protocol(protocol):
         softcore.setdefault("gapsys_scale_linpoint_lj", 0.85)
         softcore.setdefault("gapsys_sigma_nm", 0.30)
         softcore.setdefault("ssc2_alpha_lj", 0.5)
+        if softcore.get("function") == "amber_ssc2" and "implementation" not in softcore:
+            softcore["function"] = "effective_distance_ssc2"
+            if softcore.get("coulomb_function") == "amber_ssc2":
+                softcore["coulomb_function"] = "effective_distance_ssc2"
+            softcore["implementation"] = LEGACY_SSC2_IMPLEMENTATION
+        softcore.setdefault("implementation", softcore["function"])
         softcore.setdefault("ssc2_alpha_coul", 1.0)
+        softcore.setdefault("ssc2_beta_coul", 1.0)
         softcore.setdefault("ssc2_switch_width_nm", 0.2)
         upgraded["softcore"] = softcore
     serialized = yaml.safe_dump(upgraded, sort_keys=True)
@@ -3004,7 +3129,20 @@ def _ensure_switch_protocol(
     )
     if path.exists():
         observed = yaml.safe_load(path.read_text()) or {}
-        observed = _upgrade_legacy_switch_protocol(observed)
+        observed_softcore = observed.get("softcore") or {}
+        if (
+            observed_softcore.get("function") == "amber_ssc2"
+            and "implementation" not in observed_softcore
+            and config["softcore"]["function"] == "amber_ssc2"
+        ):
+            raise CovalentWorkflowError(
+                "existing work used the legacy effective-distance SSC(2) Hamiltonian; "
+                "set function and coulomb_function to effective_distance_ssc2 to "
+                "resume it, or use a new workdir for Amber GTI SSC(2)"
+            )
+        observed = _upgrade_legacy_switch_protocol(
+            observed, expected["dummy_bonded_scales"]
+        )
         if observed != expected:
             raise CovalentWorkflowError(
                 "existing hybrid work uses a different switching protocol; "
@@ -3087,6 +3225,7 @@ def run_covalent_pair(settings, pair):
             "chemistry": "covalent",
             "alchemy_model": "hybrid_topology",
             "thermodynamic_cycle": "complex_solvent",
+            "dummy_core_nonbonded": config["dummy_core_nonbonded"],
             "ligand_a": pair["ligand_a"],
             "ligand_b": pair["ligand_b"],
             "workdir": str(workdir.resolve()),
@@ -3146,6 +3285,7 @@ def run_covalent_pair(settings, pair):
             atom_map=atom_map,
             attachment_pairs=attachment_pairs,
             dummy_bonded_scales=DummyBondedScales(**config["dummy_bonded_scales"]),
+            dummy_core_nonbonded=config["dummy_core_nonbonded"],
         )
         physical_reference_a = create_solvated_capped_reference(
             parameters_a,
@@ -3170,7 +3310,7 @@ def run_covalent_pair(settings, pair):
         _validate_prepared_endpoint_charges(protein, "protein")
         _validate_prepared_endpoint_charges(reference, "reference")
         mapping_payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             **mapping_provenance,
             "map_a_to_b_0based": {
                 int(atom_a): int(atom_b) for atom_a, atom_b in sorted(hybrid.map_a_to_b.items())
@@ -3181,6 +3321,8 @@ def run_covalent_pair(settings, pair):
             "unique_b_0based": list(hybrid.unique_b),
             "dummy_bonded_scales": config["dummy_bonded_scales"],
             "dummy_nonbonded": "full_unique_branch_vacuum",
+            "dummy_core_nonbonded": config["dummy_core_nonbonded"],
+            "vacuum_nonbonded_pair_counts": vacuum_nonbonded_pair_counts(hybrid),
         }
         parameterization = {
             "ligand_a": parameters_a.provenance,
@@ -3242,6 +3384,7 @@ def run_covalent_pair(settings, pair):
         "chemistry": "covalent",
         "alchemy_model": "hybrid_topology",
         "thermodynamic_cycle": "complex_solvent",
+        "dummy_core_nonbonded": config.get("dummy_core_nonbonded", "off"),
         "ligand_a": pair["ligand_a"],
         "ligand_b": pair["ligand_b"],
         "workdir": str(workdir.resolve()),

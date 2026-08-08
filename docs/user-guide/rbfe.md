@@ -287,6 +287,24 @@ For the example above, the execution order is:
 
 When `rest2.enabled: true`, the additional NEQTI sampling at A, M, and B uses a synchronous REST2 ladder instead of ordinary MD. `initial_equilibration_steps` and `decorrelation_steps` are steps per replica and must be divisible by `rest2.exchange_interval_steps`. All replicas use the physical thermostat temperature; the effective temperatures define REST2 Hamiltonian scales. `solute` accepts the selection syntax described below. Legacy `both_ligands` remains accepted and is equivalent to `'#ligand:"*"'`.
 
+REST2 coordinates can be recorded independently of the physical snapshots used
+for switching:
+
+```yaml
+rest2:
+  coordinate_reporter:
+    enabled: true
+    interval_cycles: 25
+    state_indices: all  # or an explicit list such as [0, 4, 7]
+```
+
+Each selected thermodynamic state gets a separate DCD stream under
+`*_rest2_*/<endpoint>/coordinates/`. The reporter follows state assignments rather
+than walker identities, so a high-temperature trajectory remains associated with
+that temperature across exchanges. `frames.csv` records cycle, state, temperature,
+walker, and trajectory for every frame. Reporting resumes by appending to the
+existing streams.
+
 Native endpoint REST2 is enabled explicitly:
 
 ```yaml
@@ -332,8 +350,8 @@ Four half-path switches have approximately the same total integration length as 
 Set `alchemy.model: hybrid_topology` and `alchemy.cycle: complex_solvent` to
 run conventional dual-topology FEP in separate complex and solvent boxes. The
 same mapped hybrid molecule is used in both environments. Inactive unique
-branches do not interact with the environment, but retain their complete
-intramolecular vacuum interactions. The reported result is
+branches do not interact with the environment. By default, they retain only
+unique-unique intramolecular vacuum interactions. The reported result is
 `DG_complex(A->B) - DG_solvent(A->B)`.
 
 Mapping uses either an automatic connected MCS or a SMARTS-constrained MCS:
@@ -344,6 +362,8 @@ workflow:
   alchemy:
     model: hybrid_topology
     cycle: complex_solvent
+    # Default for small transformations.
+    dummy_core_nonbonded: off
     mapping:
       method: mcs_core_smarts
       smarts: "Nc(nc1O)nc2c1ncn2"
@@ -356,9 +376,20 @@ workflow:
 Input ligands must already share the intended pose. Common atoms use ligand A
 coordinates and unique ligand B atoms retain their input coordinates. The
 selected mapping and direct mapped-atom RMSD are written to
-`hybrid_mapping.yaml`. This initial implementation requires equal ligand formal
+`hybrid_mapping.yaml`. RDKit aromaticity is perceived on atom-order-preserving
+copies before MCS construction, preventing Kekule representations from dropping
+otherwise common aromatic atoms. This initial implementation requires equal ligand formal
 charges, Espaloma parameters with NN charges, and `softcore_linear` switching.
 See `examples/RBFE/cdk2/workflow.hybrid.yaml` for a complete input.
+
+For large flexible transformations, `alchemy.dummy_core_nonbonded: retain`
+also preserves inactive unique-common electrostatics, Lennard-Jones terms,
+exclusions, and 1-4 interactions. This prevents a large vacuum branch from
+collapsing through its mapped core. The force is conservative: the dummy branch
+therefore also acts on the common core. It is not a one-way restraint. Select a
+chemically coherent common core and validate this alternate endpoint Hamiltonian
+with complex/solvent cancellation and cycle closure. The default `off` mode
+remains preferable for small substitutions.
 
 Hybrid NEQTI can select switching duration independently in the complex and
 solvent environments before production:
@@ -975,6 +1006,7 @@ workflow:
   alchemy:
     model: hybrid_topology
     cycle: complex_solvent
+    dummy_core_nonbonded: off
   sampling:
     method: neqti
   dataset: normalized/dataset.yaml
@@ -995,7 +1027,9 @@ workflow:
       angle: 1.0
       proper_torsion: 1.0
       junction_angle: 1.0
-      junction_proper_torsion: 0.0
+      junction_proper_torsion: 1.0
+      junction_rotatable_torsion: 0.1
+      internal_rotatable_torsion: 0.1
   neqti:
     initial_equilibration_steps: 250000
     decorrelation_steps: 100000
@@ -1004,6 +1038,8 @@ workflow:
     bootstrap_samples: 500
     interpolation: softcore_linear
     softcore:
+      function: beutler
+      coulomb_function: linear_pme
       alpha: 0.3
       sigma_nm: 0.25
       power: 1
@@ -1017,6 +1053,17 @@ workflow:
       exchange_interval_steps: 500
       execution: serial
 ```
+
+The two selective rotatable-torsion scales provide ACES-like endpoint
+softening without changing the electrostatic path. A non-ring single central
+bond connecting common and unique atoms uses `junction_rotatable_torsion`; a
+non-ring single central bond wholly inside the unique branch uses
+`internal_rotatable_torsion`. Ring and improper torsions retain the broader
+`proper_torsion` or `junction_proper_torsion` scales. If either selective field
+is omitted, it inherits its corresponding broader scale for compatibility.
+During staged-linear switching, these inactive scales interpolate to the full
+physical torsion during `sterics_a_to_b`. With `coulomb_function: linear_pme`,
+electrostatics still follow the ordinary discharge-A/recharge-B PME path.
 
 Endpoint REST2 trajectories remain independent of switching trajectories: every
 switch starts from a physical REST2 snapshot, and its final coordinates are not fed
@@ -1056,11 +1103,17 @@ workflow:
 
 The constrained core must include the common electrophile carbon and produce a
 single protein-connected product subgraph. Explicit hydrogens are attached after
-the heavy-atom match. Warhead mutations are rejected. Unique A and B branches are
+the heavy-atom match. RDKit aromaticity is reperceived before matching without
+changing atom indices or parameterized endpoint systems. Warhead mutations are rejected. Unique A and B branches are
 noninteracting with the environment when inactive but retain full unique-unique
 vacuum electrostatics, Lennard-Jones, exclusions, and 1-4 interactions. The input
 core, generated MCS, selected match/RMSD, resolved map, and atom roles are recorded
 in `covalent_mapping.yaml`.
+
+The same `dummy_core_nonbonded: retain` option is available for large covalent
+mutations. It additionally keeps inactive unique-common vacuum terms and couples
+them continuously to the switching path. It should be used deliberately because
+the inactive branch then exerts real forces on the shared core.
 
 For charge consistency, ff19SB charges are copied for Cys N, H, CA, HA, C, and O.
 The remaining Cys sidechain, transferred hydrogen, and ligand charges are corrected
@@ -1109,8 +1162,8 @@ unique-branch/environment LJ interactions and their exceptions. Electrostatics
 continue to follow the configured staged PME charge path. `function: beutler`
 retains the `alpha`, `sigma_nm`, and `power` settings.
 
-The experimental Amber SSC(2) LJ form uses a pair-specific contact radius,
-quadratic effective distance, and intrinsic second-order smoothstep coupling:
+The Amber GTI SSC(2) LJ form uses a pair-specific contact radius, quadratic
+effective distance, and intrinsic second-order smoothstep coupling:
 
 ```yaml
 softcore:
@@ -1128,7 +1181,7 @@ PME path. Use linear stage interpolation for the direct Amber comparison because
 Selecting `stage_interpolation: smoothstep2` as well intentionally composes the
 two smoothstep functions.
 
-The experimental concerted SSC(2) Coulomb-plus-LJ path is opt-in:
+The source-matched Amber GTI concerted SSC(2) Coulomb-plus-LJ path is opt-in:
 
 ```yaml
 softcore:
@@ -1136,21 +1189,44 @@ softcore:
   coulomb_function: amber_ssc2
   stage_interpolation: linear
   ssc2_alpha_lj: 0.5
-  ssc2_alpha_coul: 1.0
+  ssc2_beta_coul: 1.0
   ssc2_switch_width_nm: 0.2
   total_steps: 50000
   path:
     mode: concerted
 ```
 
-In this mode, charge and LJ coupling change together along one interval. The PME
-reciprocal and self terms retain ordinary linear charge scaling, while the
-real-space Coulomb interaction uses the SSC(2) effective distance. PME exception
-pairs are reconstructed explicitly so that singular hard-direct energies are
-never evaluated for a disappearing or appearing branch. This mode currently
-requires PME or Ewald electrostatics, Amber SSC(2) LJ, linear stage
-interpolation, and `path.mode: concerted`. Existing staged workflows continue to
-use `coulomb_function: linear_pme` by default.
+In this mode, charge and LJ coupling change together along one interval. It
+implements the Amber 26 GTI `S2*[2,2,0.5,1]` direct-space equations: the Coulomb
+screening numerator remains `erfc(ewald_alpha*r)` at the physical distance,
+while its denominator uses the SSC(2) distance. Ordinary nonbonded pairs scale
+`ssc2_beta_coul` by the larger of the pair sigma squared and 4 A^2; 1-4 pairs use
+the unscaled value in A^2, matching the PMEMD kernel. The PME reciprocal and self
+terms retain ordinary linear charge scaling. PME exception pairs are
+reconstructed explicitly so singular hard-direct energies are not evaluated for
+a disappearing or appearing branch. This mode requires PME or Ewald
+electrostatics, Amber SSC(2) LJ, linear stage interpolation, and
+`path.mode: concerted`. Existing staged workflows continue to use
+`coulomb_function: linear_pme` by default.
+
+Calculations made with the earlier effective-distance Coulomb approximation are
+available explicitly for reproducibility:
+
+```yaml
+softcore:
+  function: effective_distance_ssc2
+  coulomb_function: effective_distance_ssc2
+  ssc2_alpha_lj: 0.5
+  ssc2_alpha_coul: 1.0
+  path:
+    mode: concerted
+```
+
+This legacy model evaluates `erfc(ewald_alpha*r_soft)/r_soft` and does not use
+Amber's 2 A minimum Coulomb softcore radius. It must not be interpreted as Amber
+GTI SSC(2). Checkpoints record a softcore implementation identifier. Old
+unlabelled `amber_ssc2` checkpoints are assigned to the legacy model, and the
+workflow refuses to resume them as the corrected Amber implementation.
 
 A general path can replace the staged step settings:
 

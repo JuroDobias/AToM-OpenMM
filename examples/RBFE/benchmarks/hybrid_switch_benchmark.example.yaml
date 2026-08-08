@@ -30,7 +30,7 @@ protocols:
       function: amber_ssc2
       coulomb_function: amber_ssc2
       ssc2_alpha_lj: 0.5
-      ssc2_alpha_coul: 1.0
+      ssc2_beta_coul: 1.0
       ssc2_switch_width_nm: 0.2
       total_steps: 50000
       path:

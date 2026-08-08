@@ -67,6 +67,12 @@ def _worker_main(
                     enforcePeriodicBox=True,
                 )
                 result = mm.XmlSerializer.serialize(state)
+            elif command == "coordinate_state":
+                state = context.getState(
+                    getPositions=True,
+                    enforcePeriodicBox=True,
+                )
+                result = mm.XmlSerializer.serialize(state)
             elif command == "parameter":
                 result = context.getParameter(str(payload))
             else:

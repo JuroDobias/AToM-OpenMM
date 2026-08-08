@@ -1,0 +1,40 @@
+from types import SimpleNamespace
+
+from openff.toolkit import Molecule
+
+from atom_openmm.hybrid_mapping import build_hybrid_atom_map
+
+
+def _parameters(smiles):
+    molecule = Molecule.from_smiles(smiles)
+    molecule.generate_conformers(n_conformers=1)
+    return SimpleNamespace(molecule=molecule)
+
+
+def _test_mapping_restores_openff_kekule_purine_aromaticity():
+    ligand_a = _parameters(
+        "NC(=O)c1ccc(Nc2nc(OCC3CCCCC3)c3nc[nH]c3n2)cc1"
+    )
+    ligand_b = _parameters(
+        "COc1cc(Nc2nc(OCC3CCCCC3)c3nc[nH]c3n2)ccc1S(N)(=O)=O"
+    )
+
+    _, metadata = build_hybrid_atom_map(
+        ligand_a,
+        ligand_b,
+        {
+            "method": "mcs_core_smarts",
+            "smarts": "c1cc(Nc2nc3c(ncn3)c(OCC3CCCCC3)n2)ccc1",
+        },
+    )
+
+    assert metadata["aromaticity_model"] == "rdkit"
+    assert metadata["aromatic_atom_count_before"] == {
+        "ligand_a": 12,
+        "ligand_b": 12,
+    }
+    assert metadata["aromatic_atom_count_after"] == {
+        "ligand_a": 15,
+        "ligand_b": 15,
+    }
+    assert metadata["mapped_heavy_atom_count"] == 24

@@ -176,15 +176,20 @@ restraint definition and correction.
 
 ### 10. Validate Experimental Concerted SSC Electrostatics
 
-An opt-in concerted Coulomb-plus-LJ SSC(2) path is now implemented. It keeps the
-PME reciprocal/self contribution, reconstructs real-space Coulomb and exception
-interactions with the SSC effective distance, and leaves the staged PME charge
-path as the default. Focused endpoint energy/force and overlap tests cover the
-decomposition.
+An opt-in concerted Coulomb-plus-LJ SSC(2) path is now implemented from the
+Amber 26 GTI CUDA equations. It keeps the PME reciprocal/self contribution,
+reconstructs real-space Coulomb and exception interactions with the source-
+matched SSC effective distances, and leaves the staged PME charge path as the
+default. Focused analytical, endpoint energy/force, finite-difference force,
+restart, and legacy-checkpoint tests cover the decomposition. The earlier
+effective-distance approximation remains available as
+`effective_distance_ssc2` and is deliberately not labelled Amber SSC(2).
 
-**Done when:** GPU benchmarks on representative easy and poor-overlap edges show
-whether the extra custom forces improve overlap enough to justify their runtime
-cost. Do not promote this path to the default before those comparisons.
+**Done when:** an executable Amber/OpenMM cross-engine comparison and GPU
+benchmarks on representative easy and poor-overlap edges show whether the extra
+custom forces improve overlap enough to justify their runtime cost. Source-level
+equation tests alone are not cross-engine validation. Do not promote this path
+to the default before those comparisons.
 
 ## Required Benchmark Matrix
 

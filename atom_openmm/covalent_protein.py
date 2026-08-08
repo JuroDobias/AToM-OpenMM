@@ -342,6 +342,23 @@ def _graft_endpoint(
             (parameters_b.system, source_to_global_b, unique_b),
         ),
         nonbonded,
+        inactive_core_source=(
+            (
+                parameters_b.system,
+                source_to_global_b,
+                unique_b,
+                set(source_to_global_b) - unique_b,
+            )
+            if state == "a" and hybrid.dummy_core_nonbonded == "retain"
+            else (
+                parameters_a.system,
+                source_to_global_a,
+                unique_a,
+                set(source_to_global_a) - unique_a,
+            )
+            if state == "b" and hybrid.dummy_core_nonbonded == "retain"
+            else None
+        ),
     )
     output.addForce(mm.CMMotionRemover())
     return output
@@ -545,6 +562,7 @@ def prepare_protein_covalent_hybrid(
         ],
         "dummy_bonded_scales": dict(hybrid.dummy_bonded_scales.__dict__),
         "dummy_nonbonded": "unique_branch_vacuum",
+        "dummy_core_nonbonded": hybrid.dummy_core_nonbonded,
     }
     hot_atoms = tuple(sorted({receptor_atoms["CB"], receptor_atoms["SG"], *global_to_atom.keys()}))
     return PreparedCovalentHybrid(

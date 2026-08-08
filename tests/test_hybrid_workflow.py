@@ -64,6 +64,24 @@ def _test_hybrid_workflow_validates_and_plans_two_environments(tmp_path):
     assert plan["pairs"][0]["environments"] == ["complex", "solvent"]
 
 
+def _test_hybrid_dummy_core_nonbonded_defaults_off_and_accepts_retain(tmp_path):
+    from atom_openmm.hybrid_workflow import HybridWorkflowError, _validate_settings
+
+    workflow = yaml.safe_load(_workflow(tmp_path).read_text())["workflow"]
+    assert _validate_settings(workflow)["dummy_core_nonbonded"] == "off"
+
+    workflow["alchemy"]["dummy_core_nonbonded"] = "retain"
+    assert _validate_settings(workflow)["dummy_core_nonbonded"] == "retain"
+
+    workflow["alchemy"]["dummy_core_nonbonded"] = "one_way"
+    try:
+        _validate_settings(workflow)
+    except HybridWorkflowError as exc:
+        assert "dummy_core_nonbonded" in str(exc)
+    else:
+        raise AssertionError("invalid dummy-core nonbonded mode was accepted")
+
+
 def _test_hybrid_workflow_rejects_charge_change(tmp_path):
     from atom_openmm.hybrid_workflow import HybridWorkflowError
     from atom_openmm.rbfe_workflow import validate_workflow
@@ -157,7 +175,7 @@ def _test_hybrid_accepts_only_balanced_concerted_ssc2_coulomb(tmp_path):
         "function": "amber_ssc2",
         "coulomb_function": "amber_ssc2",
         "ssc2_alpha_lj": 0.5,
-        "ssc2_alpha_coul": 1.0,
+        "ssc2_beta_coul": 1.0,
         "ssc2_switch_width_nm": 0.2,
         "total_steps": 50,
         "path": {"mode": "concerted"},

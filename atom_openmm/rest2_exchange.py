@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import openmm as mm
 from openmm import unit
+from openmm.app import DCDFile
 
 from atom_openmm.rest2 import set_rest2_scale
 from atom_openmm.rest2_process import REST2ReplicaProcess
@@ -136,6 +137,25 @@ class REST2ExchangeSampler:
         self.trip_phase = np.asarray([1, *([0] * (len(self.scales) - 1))], dtype=int)
         self.active_ensemble = None
         self.last_run_performance = None
+        reporter = config.get("coordinate_reporter") or {}
+        self.coordinate_reporter_enabled = bool(reporter.get("enabled", False))
+        self.coordinate_reporter_interval = int(reporter.get("interval_cycles", 10))
+        state_indices = reporter.get("state_indices", "all")
+        if state_indices == "all":
+            state_indices = list(range(len(self.scales)))
+        self.coordinate_reporter_states = tuple(int(value) for value in state_indices)
+        if self.coordinate_reporter_enabled:
+            if topology is None:
+                raise ValueError("REST2 coordinate reporting requires a topology")
+            if self.coordinate_reporter_interval < 1:
+                raise ValueError("REST2 coordinate reporter interval_cycles must be positive")
+            if len(set(self.coordinate_reporter_states)) != len(
+                self.coordinate_reporter_states
+            ) or any(
+                index < 0 or index >= len(self.scales)
+                for index in self.coordinate_reporter_states
+            ):
+                raise ValueError("REST2 coordinate reporter state_indices are invalid")
         if not self.resume and self.output_dir.exists():
             shutil.rmtree(self.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -207,6 +227,16 @@ class REST2ExchangeSampler:
             return _energy_kj(self.contexts[walker])
         return float(self.workers[walker].request("energy"))
 
+    def _coordinate_state(self, walker):
+        if self.execution == "serial":
+            return self.contexts[walker].getState(
+                getPositions=True,
+                enforcePeriodicBox=True,
+            )
+        return mm.XmlSerializer.deserialize(
+            self.workers[walker].request("coordinate_state")
+        )
+
     def _step_all(self):
         if self.execution == "serial":
             for integrator in self.integrators:
@@ -219,6 +249,65 @@ class REST2ExchangeSampler:
 
     def _directory(self, ensemble):
         return self.output_dir / str(ensemble)
+
+    def _report_coordinates(self, ensemble):
+        if (
+            not self.coordinate_reporter_enabled
+            or self.cycle % self.coordinate_reporter_interval
+        ):
+            return
+        directory = self._directory(ensemble) / "coordinates"
+        directory.mkdir(parents=True, exist_ok=True)
+        trace = directory / "frames.csv"
+        existing = set()
+        if trace.exists():
+            with trace.open(newline="") as handle:
+                existing = {
+                    (int(row["cycle"]), int(row["state_index"]))
+                    for row in csv.DictReader(handle)
+                }
+        for state_index in self.coordinate_reporter_states:
+            key = (self.cycle, state_index)
+            if key in existing:
+                continue
+            walker = self.assignments.index(state_index)
+            state = self._coordinate_state(walker)
+            temperature = self.temperatures[state_index]
+            temperature_label = f"{temperature:.2f}".rstrip("0").rstrip(".")
+            trajectory = directory / (
+                f"state_{state_index:02d}_{temperature_label}K.dcd"
+            )
+            append = trajectory.exists()
+            with trajectory.open("r+b" if append else "wb") as handle:
+                dcd = DCDFile(
+                    handle,
+                    self.topology,
+                    self.exchange_interval * self.timestep_fs * unit.femtosecond,
+                    firstStep=self.cycle * self.exchange_interval,
+                    interval=self.coordinate_reporter_interval * self.exchange_interval,
+                    append=append,
+                )
+                dcd.writeModel(
+                    state.getPositions(),
+                    periodicBoxVectors=state.getPeriodicBoxVectors(),
+                )
+            _append_csv(
+                trace,
+                [
+                    "cycle",
+                    "state_index",
+                    "effective_temperature_k",
+                    "walker",
+                    "trajectory",
+                ],
+                [
+                    self.cycle,
+                    state_index,
+                    temperature,
+                    walker,
+                    trajectory.name,
+                ],
+            )
 
     def _metadata_path(self, ensemble):
         return self._directory(ensemble) / "state.json"
@@ -411,6 +500,7 @@ class REST2ExchangeSampler:
                 ["cycle", *[f"walker_{i}" for i in range(len(self.scales))]],
                 [self.cycle, *self.assignments],
             )
+            self._report_coordinates(ensemble)
             if self.cycle % self.checkpoint_interval == 0:
                 self.save_bank()
         self.save_bank()
@@ -462,6 +552,11 @@ class REST2ExchangeSampler:
             "accepts": self.accepts.tolist(),
             "round_trips": self.round_trips.tolist(),
             "performance": self.last_run_performance,
+            "coordinate_reporter": {
+                "enabled": self.coordinate_reporter_enabled,
+                "interval_cycles": self.coordinate_reporter_interval,
+                "state_indices": list(self.coordinate_reporter_states),
+            },
         }
 
     def close(self):

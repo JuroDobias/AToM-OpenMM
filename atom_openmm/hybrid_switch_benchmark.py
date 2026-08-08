@@ -331,6 +331,7 @@ def _source_softcore(protocol, variant):
         "gapsys_sigma_nm",
         "ssc2_alpha_lj",
         "ssc2_alpha_coul",
+        "ssc2_beta_coul",
         "ssc2_switch_width_nm",
         "charge_steps_per_stage",
         "sterics_steps",
@@ -416,7 +417,10 @@ def _run_variant(config, bank_root, edge, edge_payload, variant, platform, prope
         if lrc_mode == "endpoint_correction":
             first_a = _load_state(_verify_entry(bank_root, edge_payload["snapshots"][environment]["a"][0]))
             first_b = _load_state(_verify_entry(bank_root, edge_payload["snapshots"][environment]["b"][0]))
-            if options.get("coulomb_function") == "amber_ssc2":
+            if options.get("coulomb_function") in {
+                "amber_ssc2",
+                "effective_distance_ssc2",
+            }:
                 evaluator = _PhysicalEndpointLRCCorrectionEvaluator(
                     prepared.endpoint_a,
                     prepared.endpoint_b,
