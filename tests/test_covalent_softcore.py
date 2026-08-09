@@ -797,11 +797,18 @@ def _test_segment_work_increments_sum_to_total_protocol_work():
     for name, values in hamiltonian.parameter_values.items():
         context.setParameter(name, values[0])
 
+    callbacks = []
     total, increments = _run_segmented_protocol(
-        integrator, hamiltonian.segment_steps
+        integrator,
+        hamiltonian.segment_steps,
+        segment_callback=lambda **values: callbacks.append(values),
     )
 
     assert len(increments) == 6
+    assert len(callbacks) == len(hamiltonian.segment_steps)
+    assert callbacks[-1]["completed_steps"] == hamiltonian.total_steps
+    assert callbacks[-1]["total_steps"] == hamiltonian.total_steps
+    assert np.isclose(callbacks[-1]["cumulative_work_kj_per_mol"], total)
     assert np.isclose(sum(increments), total)
     assert np.isclose(
         total,

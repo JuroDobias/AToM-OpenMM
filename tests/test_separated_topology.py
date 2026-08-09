@@ -109,6 +109,21 @@ def _test_assembled_state_aligns_inactive_frame_and_preserves_environment():
     assert np.allclose(observed[-1], active_positions[-1])
 
 
+def _test_anchor_rmsd_reports_direct_frame_separation():
+    from atom_openmm.separated_workflow import _anchor_rmsd_a
+
+    positions = np.asarray([
+        [0.0, 0.0, 0.0],
+        [0.1, 0.0, 0.0],
+        [0.0, 0.1, 0.0],
+        [0.1, 0.0, 0.0],
+        [0.2, 0.0, 0.0],
+        [0.1, 0.1, 0.0],
+    ]) * unit.nanometer
+
+    assert np.isclose(_anchor_rmsd_a(positions, (0, 1, 2), (3, 4, 5)), 1.0)
+
+
 def _test_workflow_schema_accepts_separated_neqti_only():
     from atom_openmm.workflow_schema import normalize_workflow_axes
 

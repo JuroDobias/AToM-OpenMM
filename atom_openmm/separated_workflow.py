@@ -282,6 +282,70 @@ def _write_diagnostic_pdb(path, topology, assembled, inactive_indices, endpoint)
     temporary.unlink()
 
 
+def _anchor_rmsd_a(positions, anchors_a, anchors_b):
+    positions_nm = np.asarray(
+        positions.value_in_unit(unit.nanometer), dtype=float
+    )
+    return float(np.sqrt(np.mean(np.sum(
+        (positions_nm[list(anchors_a)] - positions_nm[list(anchors_b)]) ** 2,
+        axis=1,
+    ))) * 10.0)
+
+
+def _write_switch_frame(path, topology, positions, metadata):
+    path = Path(path)
+    with path.open("w") as handle:
+        handle.write(
+            "REMARK 900 SEPARATED TOPOLOGY SWITCH FRAME "
+            f"{metadata['point']}\n"
+        )
+        handle.write(
+            "REMARK 900 PATH FRACTION "
+            f"{metadata['path_fraction']:.8f} ANCHOR RMSD "
+            f"{metadata['anchor_rmsd_a']:.6f} A\n"
+        )
+        app.PDBFile.writeFile(topology, positions, handle, keepIds=True)
+
+
+def _switch_frame_diagnostics(
+    *, context, topology, anchors_a, anchors_b, directory, direction, segment_steps
+):
+    directory = Path(directory)
+    frames = []
+    total_steps = sum(int(value) for value in segment_steps)
+
+    def capture(point, completed_steps, cumulative_work=None):
+        state = context.getState(getPositions=True)
+        positions = state.getPositions(asNumpy=True)
+        progress = completed_steps / float(total_steps)
+        path_fraction = progress if direction == "forward" else 1.0 - progress
+        metadata = {
+            "point": point,
+            "completed_steps": int(completed_steps),
+            "total_steps": int(total_steps),
+            "path_fraction": float(path_fraction),
+            "anchor_rmsd_a": _anchor_rmsd_a(
+                positions, anchors_a, anchors_b
+            ),
+        }
+        if cumulative_work is not None:
+            metadata["cumulative_work_kj_per_mol"] = float(cumulative_work)
+        filename = f"{direction}_frame_{len(frames):02d}_{point}.pdb"
+        metadata["coordinates"] = filename
+        _write_switch_frame(directory / filename, topology, positions, metadata)
+        frames.append(metadata)
+
+    capture("start", 0)
+
+    def after_segment(
+        *, segment, completed_steps, total_steps, cumulative_work_kj_per_mol
+    ):
+        point = "end" if completed_steps == total_steps else f"node_{segment + 1:02d}"
+        capture(point, completed_steps, cumulative_work_kj_per_mol)
+
+    return frames, after_segment
+
+
 def _candidate_label(time_ps):
     return f"{time_ps:g}ps"
 
@@ -404,13 +468,8 @@ def _run_environment(
         )
         dual_a = list(anchors_a)
         dual_b = [parameters_a.molecule.n_atoms + int(index) for index in anchors_b]
-        positions_nm = np.asarray(
-            value["positions"].value_in_unit(unit.nanometer), dtype=float
-        )
-        value["anchor_rmsd_a"] = float(
-            np.sqrt(np.mean(np.sum(
-                (positions_nm[dual_a] - positions_nm[dual_b]) ** 2, axis=1
-            ))) * 10.0
+        value["anchor_rmsd_a"] = _anchor_rmsd_a(
+            value["positions"], dual_a, dual_b
         )
         value.update({
             "active_name": active_name,
@@ -447,10 +506,25 @@ def _run_environment(
                         temperature_k=config["temperature_k"],
                         seed=seed + sample,
                     )
+                    frame_rows = None
+                    frame_callback = None
+                    frame_path = candidate_dir / f"{direction}_frame_diagnostics.yaml"
+                    if sample == 0 and not frame_path.exists():
+                        frame_rows, frame_callback = _switch_frame_diagnostics(
+                            context=context,
+                            topology=prepared.topology,
+                            anchors_a=dual_a,
+                            anchors_b=dual_b,
+                            directory=candidate_dir,
+                            direction=direction,
+                            segment_steps=segment_steps,
+                        )
                     status = "finite"
                     try:
                         raw_work, _ = _run_segmented_protocol(
-                            integrator, segment_steps
+                            integrator,
+                            segment_steps,
+                            segment_callback=frame_callback,
                         )
                     except Exception as exc:
                         if not _is_numerical_switch_failure(exc):
@@ -459,6 +533,15 @@ def _run_environment(
                             raise
                         raw_work = math.inf
                         status = "infinite"
+                    if frame_rows is not None:
+                        _write_yaml_atomic(frame_path, {
+                            "schema_version": 1,
+                            "environment": environment,
+                            "direction": direction,
+                            "sample": sample + 1,
+                            "status": status,
+                            "frames": frame_rows,
+                        })
                     row = {
                         "sample": sample + 1,
                         "work_kj_per_mol": raw_work,

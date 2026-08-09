@@ -1347,6 +1347,7 @@ def _run_segmented_protocol(
     profile_interval_steps=None,
     parameter_values=None,
     profile_metadata=None,
+    segment_callback=None,
 ):
     segment_work = []
     previous = 0.0
@@ -1424,6 +1425,13 @@ def _run_segmented_protocol(
                 profile_rows.append(row)
         segment_work.append(float(cumulative - previous))
         previous = cumulative
+        if segment_callback is not None:
+            segment_callback(
+                segment=segment,
+                completed_steps=total_step,
+                total_steps=total_steps,
+                cumulative_work_kj_per_mol=float(cumulative),
+            )
     return float(previous), segment_work
 
 
