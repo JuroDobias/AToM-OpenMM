@@ -11,6 +11,17 @@ import yaml
 
 
 PATHS = {
+    "ssc2_concerted_softcore_coulomb": {
+        "function": "amber_ssc2",
+        "coulomb_function": "amber_ssc2",
+        "stage_interpolation": "linear",
+        "ssc2_alpha_lj": 0.5,
+        "ssc2_beta_coul": 1.0,
+        "ssc2_switch_width_nm": 0.2,
+        "total_steps": 50000,
+        "path": {"mode": "concerted"},
+        "long_range_correction": "dynamic",
+    },
     "ssc2_full_vdw_midpoint": {
         "function": "amber_ssc2",
         "coulomb_function": "linear_pme",
@@ -88,7 +99,7 @@ PYTHON_BIN="${{ATOM_PYTHON:-$HOME/myAToM/atm-gates-venv/bin/python}}"
 """
 
 
-def generate(base_workflow, output, source_dir_name):
+def generate(base_workflow, output, source_dir_name, variants=None):
     base_workflow = Path(base_workflow).resolve()
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -103,7 +114,9 @@ def generate(base_workflow, output, source_dir_name):
     bank = workflow["alchemy"]["node_bank"]
     bank["path"] = _resolve_input(bank["path"], base)
 
-    for name, softcore in PATHS.items():
+    selected = list(PATHS) if variants is None else list(variants)
+    for name in selected:
+        softcore = PATHS[name]
         directory = output / name
         directory.mkdir()
         variant = copy.deepcopy(payload)
@@ -113,6 +126,11 @@ def generate(base_workflow, output, source_dir_name):
         neqti["n_snapshots"] = 20
         neqti["softcore"] = copy.deepcopy(softcore)
         neqti["adaptive_switching"] = {"enabled": False}
+        neqti["schedule_optimization"] = (
+            {"enabled": False, "segments_per_interval": [2]}
+            if name == "ssc2_concerted_softcore_coulomb"
+            else {"enabled": False}
+        )
         neqti["random_seed"] = 2026
         (directory / "workflow.yaml").write_text(
             yaml.safe_dump(variant, sort_keys=False)
@@ -126,19 +144,20 @@ def generate(base_workflow, output, source_dir_name):
         "#!/usr/bin/env bash\nset -euo pipefail\n"
         'cd "$(dirname "$0")"\n'
         + "\n".join(
-            f"(cd {name} && sbatch run.sh)" for name in PATHS
+            f"(cd {name} && sbatch run.sh)" for name in selected
         )
         + "\n"
     )
     submit.chmod(0o755)
     (output / "README.md").write_text(
         "# Separated-topology path comparison\n\n"
-        "All three 21--32 pilots reuse the same physical node bank, snapshot "
+        "All selected 21--32 pilots reuse the same physical node bank, snapshot "
         "permutation, random seed, 20 samples per direction, and 100 ps switch "
-        "duration. Adaptive duration selection is disabled. The variants compare "
-        "Amber SSC2 LJ with a full-VDW midpoint, Amber SSC2 LJ with linear VDWs, "
-        "and a Beutler charged handoff. Sample 1 writes start, path-node, and end "
-        "PDBs plus three-anchor RMSDs for both directions and environments.\n"
+        "duration. Adaptive duration selection is disabled. Available variants "
+        "include source-matched concerted Amber SSC2 Coulomb plus LJ, Amber SSC2 "
+        "LJ paths with ordinary PME charges, and a Beutler charged handoff. Sample "
+        "1 writes start, path-node, and end PDBs plus three-anchor RMSDs for both "
+        "directions and environments.\n"
     )
 
 
@@ -149,8 +168,11 @@ def main():
     parser.add_argument(
         "--source-dir-name", default="AToM-OpenMM-separated-topology"
     )
+    parser.add_argument(
+        "--variant", action="append", choices=tuple(PATHS), dest="variants"
+    )
     args = parser.parse_args()
-    generate(args.base_workflow, args.output, args.source_dir_name)
+    generate(args.base_workflow, args.output, args.source_dir_name, args.variants)
 
 
 if __name__ == "__main__":
