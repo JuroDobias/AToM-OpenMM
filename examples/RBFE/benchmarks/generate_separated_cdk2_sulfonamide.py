@@ -186,7 +186,7 @@ def _workflow(pairs, *, node_bank_path, receptor, ligands, workdir):
     }
 
 
-def _slurm_script(command, job_name, completion_file):
+def _slurm_script(command, job_name, completion_file, source_dir_name):
     return f"""#!/usr/bin/env bash
 #SBATCH -N 1
 #SBATCH --ntasks=1
@@ -217,13 +217,14 @@ cd "$RUN_DIR"
 [[ -f "{completion_file}" ]] && exit 0
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate myatom
+export PYTHONPATH="$HOME/myAToM/{source_dir_name}${{PYTHONPATH:+:$PYTHONPATH}}"
 {command} &
 CHILD=$!
 wait "$CHILD"
 """
 
 
-def generate(source_cohort, benchmark_root, output):
+def generate(source_cohort, benchmark_root, output, source_dir_name):
     source_cohort = Path(source_cohort).resolve()
     benchmark_root = Path(benchmark_root).resolve()
     output = Path(output).resolve()
@@ -250,9 +251,10 @@ def generate(source_cohort, benchmark_root, output):
     )
     prepare_script = output / "prepare_nodes.sh"
     prepare_script.write_text(_slurm_script(
-        "atom-rbfe --prepare-node-bank prepare_nodes.yaml",
+        "python -m atom_openmm.rbfe_workflow --prepare-node-bank prepare_nodes.yaml",
         "sep-cdk2-nodes",
         "node_bank/manifest.yaml",
+        source_dir_name,
     ))
     prepare_script.chmod(0o755)
 
@@ -277,7 +279,10 @@ def generate(source_cohort, benchmark_root, output):
         run_script = directory / "run.sh"
         result = f"run/receptor-{ligand_a}-{ligand_b}/result.yaml"
         run_script.write_text(_slurm_script(
-            "atom-rbfe workflow.yaml", f"sep-{edge}", result
+            "python -m atom_openmm.rbfe_workflow workflow.yaml",
+            f"sep-{edge}",
+            result,
+            source_dir_name,
         ))
         run_script.chmod(0o755)
 
@@ -344,8 +349,16 @@ def main():
     parser.add_argument("--source-cohort", type=Path, required=True)
     parser.add_argument("--benchmark-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--source-dir-name", default="AToM-OpenMM-separated-topology"
+    )
     args = parser.parse_args()
-    generate(args.source_cohort, args.benchmark_root, args.output)
+    generate(
+        args.source_cohort,
+        args.benchmark_root,
+        args.output,
+        args.source_dir_name,
+    )
 
 
 if __name__ == "__main__":
