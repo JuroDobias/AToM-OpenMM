@@ -1285,6 +1285,10 @@ def validate_workflow(config_file):
         from atom_openmm.hybrid_workflow import validate_noncovalent_hybrid_workflow
 
         return validate_noncovalent_hybrid_workflow(config_file)
+    if axes.alchemy_model == "separated_topology":
+        from atom_openmm.separated_workflow import validate_separated_workflow
+
+        return validate_separated_workflow(config_file)
     config = load_workflow_config(config_file)
     plan = build_small_molecule_plan(config)
     normalize_setup_options(config["workflow"], config["atom_options"])
@@ -1305,6 +1309,10 @@ def plan_workflow(config_file):
         from atom_openmm.hybrid_workflow import plan_noncovalent_hybrid_workflow
 
         return plan_noncovalent_hybrid_workflow(config_file)
+    if axes.alchemy_model == "separated_topology":
+        from atom_openmm.separated_workflow import plan_separated_workflow
+
+        return plan_separated_workflow(config_file)
     config = load_workflow_config(config_file)
     # Build alignments too so --plan-only catches missing alignment inputs.
     plan = build_small_molecule_plan(config)
@@ -1405,6 +1413,10 @@ def run_rbfe_workflow(config_file):
         from atom_openmm.hybrid_workflow import run_noncovalent_hybrid_workflow
 
         return run_noncovalent_hybrid_workflow(config_file)
+    if axes.alchemy_model == "separated_topology":
+        from atom_openmm.separated_workflow import run_separated_workflow
+
+        return run_separated_workflow(config_file)
     config, plan, setup_options, alignments = _prepare_run_context(config_file)
     results = []
     for pair_plan in plan["pairs"]:
@@ -1432,6 +1444,10 @@ def analyze_existing_workflow(config_file):
         from atom_openmm.hybrid_workflow import analyze_noncovalent_hybrid_workflow
 
         return analyze_noncovalent_hybrid_workflow(config_file)
+    if axes.alchemy_model == "separated_topology":
+        from atom_openmm.separated_workflow import analyze_separated_workflow
+
+        return analyze_separated_workflow(config_file)
     config = load_workflow_config(config_file)
     plan = build_small_molecule_plan(config)
     results = []
@@ -1454,9 +1470,25 @@ def main(argv=None):
     mode.add_argument("--validate", action="store_true", help="validate workflow inputs without creating outputs")
     mode.add_argument("--plan-only", action="store_true", help="print a machine-readable execution plan without creating outputs")
     mode.add_argument("--analyze-only", action="store_true", help="reanalyze existing pair outputs without running setup or simulation")
+    mode.add_argument(
+        "--prepare-node-bank",
+        action="store_true",
+        help="prepare reusable separated-topology node ensembles",
+    )
     parser.add_argument("workflow_yaml", help="High-level RBFE workflow YAML file")
     args = parser.parse_args(argv)
     try:
+        if args.prepare_node_bank:
+            axes = _workflow_axes(args.workflow_yaml)
+            if axes.alchemy_model != "separated_topology":
+                raise WorkflowConfigError(
+                    "--prepare-node-bank requires alchemy.model: separated_topology"
+                )
+            from atom_openmm.separated_node_bank import prepare_node_bank
+
+            result = prepare_node_bank(args.workflow_yaml)
+            print(yaml.safe_dump(result, sort_keys=False))
+            return 0
         if args.validate:
             validate_workflow(args.workflow_yaml)
             print("valid")

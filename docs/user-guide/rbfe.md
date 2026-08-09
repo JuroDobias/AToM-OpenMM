@@ -899,12 +899,50 @@ Without `workflow.neqti.convergence`, `quality.convergence_status: usable` means
 
 ## Current Limitations
 
-- The first unified release supports the documented ATM combinations and two-leg hybrid-topology NEQTI. Hybrid-topology ASYNC_RE/AWH and charge-balanced single-box hybrid transfer are not implemented.
+- The unified workflow supports the documented ATM combinations, two-leg
+  hybrid-topology NEQTI, and experimental separated-topology NEQTI.
+  Hybrid/separated ASYNC_RE or AWH and charge-changing separated transformations
+  are not implemented.
 - NEQTI is experimental and has not replaced asynchronous replica exchange as the established production method.
 - NEQTI currently uses the configured discrete ATM schedule as interpolation knots; it does not yet implement an arbitrary continuous OpenMMTools-style alchemical function.
 - NEQTI REST2 supports shared-ATM interleaved sampling and native A/B interleaved or batched sampling. SMARTS-defined partial hot regions and adaptive switching schedules are experimental; automatic REST2 ladder tuning is not implemented.
 - GPU, CUDA, OpenMM, Espaloma, and `openmmforcefields` compatibility is the responsibility of the environment.
 - A numerically completed run is not sufficient validation. Inspect endpoint structures, swapped structures, work distributions, forward/reverse overlap, and sensitivity to equilibration and switching time.
+
+## Reusable Separated-Topology Node Ensembles
+
+`workflow.alchemy.model: separated_topology` represents both ligands as complete,
+mutually noninteracting copies. Both retain all internal interactions. At endpoint
+A only ligand A interacts with the environment; at endpoint B only ligand B does.
+An ATM six-degree-of-freedom frame restraint keeps three selected atoms of both
+copies superimposed without the zero-distance singularity of a classical Boresch
+restraint.
+
+Physical endpoint simulations are performed once per graph node and reused by
+every incident edge:
+
+```bash
+atom-rbfe --prepare-node-bank workflow.separated.yaml
+atom-rbfe workflow.separated.yaml
+```
+
+The bank contains independent complex, solvent, and vacuum snapshots. Complex
+and solvent snapshots come from the physical REST2 replica. Each switch combines
+a physical active snapshot with an independently selected vacuum snapshot of the
+inactive ligand, aligns their stored three-atom frames, and briefly thermalizes
+only the inactive copy under the frame restraint. It does not minimize, resolvate,
+or propagate a switched configuration.
+
+All nodes use common box vectors and canonical water and ion counts. Water
+coordinates remain independent and are remapped into the common edge topology.
+The initial release requires equal formal charges, cube or rectangular solvent
+boxes, dynamic dispersion correction, and NEQTI sampling. Work CSV rows contain
+both node snapshot identifiers so graph analysis can retain correlations from
+snapshot reuse. See `examples/RBFE/cdk2/workflow.separated.yaml` for the complete
+schema and an overlap-preserving path with both steric envelopes present at the
+midpoint. `examples/RBFE/benchmarks/generate_separated_cdk2_sulfonamide.py`
+generates a shared-bank `21 -> 32` pilot and the complete four-edge CDK2
+sulfonamide cycle.
 
 ### Hybrid endpoint equilibration
 

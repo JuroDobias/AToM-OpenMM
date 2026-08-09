@@ -154,14 +154,54 @@ def create_physical_ligand_environment(
     ionic_strength = float(setup.get("ionic_strength_molar", 0.15))
     from atom_openmm.covalent_systems import _seeded_python_random
 
+    canonical_box_size = setup.get("_canonical_box_size_nm")
+    if canonical_box_size is not None:
+        box_options = {
+            "boxSize": np.asarray(canonical_box_size, dtype=float) * unit.nanometer
+        }
+    else:
+        box_options = _solvation_box_options(modeller.positions, padding_a, box_shape)
     with _seeded_python_random(solvation_seed):
         modeller.addSolvent(
             forcefield,
             model=solvent_model,
             ionicStrength=ionic_strength * unit.molar,
             neutralize=True,
-            **_solvation_box_options(modeller.positions, padding_a, box_shape),
+            **box_options,
         )
+    target_water_count = setup.get("_target_water_count")
+    if target_water_count is not None:
+        target_water_count = int(target_water_count)
+        waters = [
+            residue for residue in modeller.topology.residues()
+            if residue.name.upper() in {"HOH", "WAT", "TIP3", "TIP4", "OPC"}
+        ]
+        if len(waters) < target_water_count:
+            raise HybridSystemError(
+                f"canonical solvent requires {target_water_count} waters but only "
+                f"{len(waters)} were generated"
+            )
+        if len(waters) > target_water_count:
+            solute_positions = np.asarray([
+                position.value_in_unit(unit.nanometer)
+                for atom, position in zip(modeller.topology.atoms(), modeller.positions)
+                if atom.residue not in waters
+                and atom.residue.name.upper() not in {"NA", "CL", "K", "CA"}
+            ])
+            center = np.mean(solute_positions, axis=0)
+            ranked = []
+            for residue in waters:
+                oxygen = next(
+                    atom for atom in residue.atoms()
+                    if atom.element is not None and atom.element.symbol == "O"
+                )
+                position = modeller.positions[oxygen.index].value_in_unit(unit.nanometer)
+                ranked.append((float(np.linalg.norm(position - center)), residue))
+            modeller.delete([
+                residue for _, residue in sorted(ranked, reverse=True)[
+                    : len(waters) - target_water_count
+                ]
+            ])
     cutoff_a = float(setup.get("nonbonded_cutoff_a", 9.0))
     system = forcefield.createSystem(
         modeller.topology,
@@ -196,6 +236,18 @@ def create_physical_ligand_environment(
         "solvation_seed": int(solvation_seed),
         "solute_atom_count": molecule.n_atoms,
         "total_particle_count": system.getNumParticles(),
+        "water_count": sum(
+            residue.name.upper() in {"HOH", "WAT", "TIP3", "TIP4", "OPC"}
+            for residue in modeller.topology.residues()
+        ),
+        "ion_counts": {
+            name: sum(residue.name.upper() == name for residue in modeller.topology.residues())
+            for name in ("NA", "CL", "K", "CA")
+        },
+        "canonical_box_size_nm": (
+            None if canonical_box_size is None
+            else [float(value) for value in canonical_box_size]
+        ),
     }
     return PreparedPhysicalEnvironment(
         modeller.topology,

@@ -20,6 +20,7 @@ SUPPORTED_COMBINATIONS = {
     ("noncovalent", "atm", "transfer", "neqti"),
     ("noncovalent", "atm", "transfer", "awh"),
     ("noncovalent", "hybrid_topology", "complex_solvent", "neqti"),
+    ("noncovalent", "separated_topology", "complex_solvent", "neqti"),
     ("covalent", "hybrid_topology", "complex_solvent", "neqti"),
 }
 
@@ -43,9 +44,10 @@ def normalize_workflow_axes(workflow) -> WorkflowAxes:
     if not isinstance(alchemy, dict):
         raise WorkflowAxesError("workflow.alchemy must be a mapping")
     model = alchemy.get("model")
-    if model not in {"atm", "hybrid_topology"}:
+    if model not in {"atm", "hybrid_topology", "separated_topology"}:
         raise WorkflowAxesError(
-            "workflow.alchemy.model must be 'atm' or 'hybrid_topology'"
+            "workflow.alchemy.model must be 'atm', 'hybrid_topology', or "
+            "'separated_topology'"
         )
     cycle = alchemy.get("cycle")
     if cycle not in {"transfer", "complex_solvent"}:

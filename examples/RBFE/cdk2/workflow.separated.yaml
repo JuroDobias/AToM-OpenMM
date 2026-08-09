@@ -1,0 +1,81 @@
+workflow:
+  type: rbfe
+  chemistry: noncovalent
+  alchemy:
+    model: separated_topology
+    cycle: complex_solvent
+    node_bank:
+      path: separated_node_bank
+      snapshots: 20
+      vacuum_initial_steps: 50000
+      vacuum_decorrelation_steps: 10000
+    frame_restraint:
+      translation_k_kcal_mol_a2: 10.0
+      orientation_k_kcal_mol: 25.0
+      roll_k_kcal_mol: 25.0
+      thermalization_steps: 5000
+  sampling:
+    method: neqti
+  workdir: separated_neqti
+  receptor: receptor/cdk2.pdb
+  ligands_dir: ligands
+  pairs:
+    - [H1Q, H1R]
+  alignment:
+    method: smarts
+    smarts: "c1ncc2ncnc2n1"
+    smarts_atom_ids: [2, 5, 7]
+  alignments_out: separated_alignments.yaml
+  setup:
+    protein_forcefield: [amber14-all.xml]
+    solvent_forcefield: [amber14/tip3p.xml]
+    solvent_model: tip3p
+    solvent_box_shape: cube
+    solvent_padding_a: 10.0
+    ionic_strength_molar: 0.15
+    ligand_forcefield: espaloma-0.3.2
+    ligand_charge_model: nn
+  neqti:
+    temperature_k: 300.0
+    pressure_bar: 1.0
+    timestep_fs: 2.0
+    endpoint_equilibration:
+      minimization_tolerance_kj_mol_nm: 10.0
+      minimization_max_iterations: 2000
+      nvt_steps: 50000
+      nvt_timestep_fs: 1.0
+      npt_steps: 250000
+      npt_timestep_fs: 2.0
+    n_snapshots: 20
+    decorrelation_steps: 100000
+    interpolation: softcore_linear
+    softcore:
+      function: beutler
+      coulomb_function: linear_pme
+      stage_interpolation: linear
+      alpha: 0.3
+      sigma_nm: 0.25
+      power: 1
+      total_steps: 50000
+      path:
+        nodes: [0.20, 0.50, 0.80]
+        vdw_a: [1.0, 1.0, 1.0, 0.0, 0.0]
+        charge_a: [1.0, 0.0, 0.0, 0.0, 0.0]
+      long_range_correction: dynamic
+    adaptive_switching:
+      enabled: true
+      candidate_times_ps: [100.0, 300.0, 1000.0]
+      pilot_samples_per_direction: 20
+      min_overlap_score_per_leg: 0.08
+      max_failed_fraction_per_direction: 0.05
+      reuse_selected_pilot_samples: true
+      on_exhausted: use_longest
+    failed_switch_policy: count_as_infinite
+    bootstrap_samples: 500
+    random_seed: 2026
+    rest2:
+      enabled: true
+      effective_temperatures_k: [300.0, 356.8, 424.3, 504.5, 600.0]
+      exchange_interval_steps: 500
+      checkpoint_interval_cycles: 10
+      execution: serial

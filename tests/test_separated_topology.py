@@ -1,0 +1,164 @@
+import numpy as np
+import openmm as mm
+from openmm import unit
+from openff.toolkit import ForceField, Molecule
+from openff.units import unit as offunit
+import yaml
+
+from atom_openmm.covalent_parameters import CovalentParameterBundle
+from atom_openmm.separated_topology import (
+    assemble_positions_and_velocities,
+    build_separated_ligands,
+)
+
+
+def _bundle(smiles):
+    molecule = Molecule.from_smiles(smiles)
+    molecule.generate_conformers(n_conformers=1)
+    charges = np.zeros(molecule.n_atoms)
+    molecule.partial_charges = charges * offunit.elementary_charge
+    system = ForceField("openff-2.2.1.offxml").create_openmm_system(
+        molecule.to_topology(), charge_from_molecules=[molecule]
+    )
+    return CovalentParameterBundle(molecule, system, charges, smiles, {})
+
+
+def _state(positions):
+    system = mm.System()
+    for _ in positions:
+        system.addParticle(12.0)
+    integrator = mm.VerletIntegrator(1.0 * unit.femtosecond)
+    context = mm.Context(system, integrator, mm.Platform.getPlatformByName("Reference"))
+    context.setPositions(np.asarray(positions) * unit.nanometer)
+    context.setVelocities(np.zeros_like(positions) * unit.nanometer / unit.picosecond)
+    state = context.getState(getPositions=True, getVelocities=True)
+    del context, integrator
+    return state
+
+
+def _test_separated_ligands_have_no_common_atoms_and_full_particle_sets():
+    left = _bundle("CCO")
+    right = _bundle("CCN")
+    dual = build_separated_ligands(left, right)
+
+    assert dual.map_a_to_b == {}
+    assert len(dual.unique_a) == left.molecule.n_atoms
+    assert len(dual.unique_b) == right.molecule.n_atoms
+    assert dual.topology.getNumAtoms() == left.molecule.n_atoms + right.molecule.n_atoms
+    assert dual.endpoint_a.getNumParticles() == dual.endpoint_b.getNumParticles()
+
+    for system in (dual.endpoint_a, dual.endpoint_b):
+        nonbonded = next(
+            force for force in system.getForces()
+            if isinstance(force, mm.NonbondedForce)
+        )
+        exceptions = {
+            tuple(sorted(map(int, nonbonded.getExceptionParameters(index)[:2])))
+            for index in range(nonbonded.getNumExceptions())
+        }
+        cross = {
+            tuple(sorted((dual.map_a_to_hybrid[a], dual.map_b_to_hybrid[b])))
+            for a in range(left.molecule.n_atoms)
+            for b in range(right.molecule.n_atoms)
+        }
+        assert cross <= exceptions
+
+    positions = dual.positions
+    energies = []
+    for system in (dual.endpoint_a, dual.endpoint_b):
+        integrator = mm.VerletIntegrator(1.0 * unit.femtosecond)
+        context = mm.Context(
+            system, integrator, mm.Platform.getPlatformByName("Reference")
+        )
+        context.setPositions(positions)
+        energies.append(
+            context.getState(getEnergy=True)
+            .getPotentialEnergy()
+            .value_in_unit(unit.kilojoule_per_mole)
+        )
+        del context, integrator
+    assert np.isclose(energies[0], energies[1], atol=1.0e-6)
+
+
+def _test_assembled_state_aligns_inactive_frame_and_preserves_environment():
+    active_positions = np.asarray([
+        [0.0, 0.0, 0.0],
+        [0.1, 0.0, 0.0],
+        [0.0, 0.1, 0.0],
+        [2.0, 2.0, 2.0],
+    ])
+    inactive_positions = np.asarray([
+        [1.0, 1.0, 1.0],
+        [1.0, 1.1, 1.0],
+        [0.9, 1.0, 1.0],
+    ])
+    assembled = assemble_positions_and_velocities(
+        endpoint="a",
+        active_state=_state(active_positions),
+        inactive_state=_state(inactive_positions),
+        ligand_a_count=3,
+        ligand_b_count=3,
+        anchors_a=(0, 1, 2),
+        anchors_b=(0, 1, 2),
+    )
+    observed = assembled["positions"].value_in_unit(unit.nanometer)
+
+    assert observed.shape == (7, 3)
+    assert assembled["anchor_rmsd_a"] < 1.0e-6
+    assert np.allclose(observed[-1], active_positions[-1])
+
+
+def _test_workflow_schema_accepts_separated_neqti_only():
+    from atom_openmm.workflow_schema import normalize_workflow_axes
+
+    axes = normalize_workflow_axes({
+        "chemistry": "noncovalent",
+        "alchemy": {"model": "separated_topology", "cycle": "complex_solvent"},
+        "sampling": {"method": "neqti"},
+    })
+    assert axes.alchemy_model == "separated_topology"
+
+
+def _test_separated_workflow_plan_exposes_node_bank(tmp_path):
+    from atom_openmm.rbfe_workflow import plan_workflow
+
+    (tmp_path / "receptor.pdb").write_text("END\n")
+    ligands = tmp_path / "ligands"
+    ligands.mkdir()
+    for name, smiles in (("A", "CCO"), ("B", "CCN")):
+        molecule = Molecule.from_smiles(smiles)
+        molecule.generate_conformers(n_conformers=1)
+        molecule.to_file(str(ligands / f"{name}.sdf"), file_format="SDF")
+    payload = {
+        "workflow": {
+            "type": "rbfe",
+            "chemistry": "noncovalent",
+            "alchemy": {
+                "model": "separated_topology",
+                "cycle": "complex_solvent",
+                "node_bank": {"path": "bank", "snapshots": 2},
+            },
+            "sampling": {"method": "neqti"},
+            "receptor": "receptor.pdb",
+            "ligands_dir": "ligands",
+            "pairs": [["A", "B"]],
+            "workdir": "run",
+            "neqti": {
+                "interpolation": "softcore_linear",
+                "n_snapshots": 2,
+                "softcore": {
+                    "charge_steps_per_stage": 10,
+                    "sterics_steps": 20,
+                    "long_range_correction": "dynamic",
+                },
+                "rest2": {"enabled": False},
+            },
+        }
+    }
+    path = tmp_path / "workflow.yaml"
+    path.write_text(yaml.safe_dump(payload))
+
+    plan = plan_workflow(path)
+    assert plan["alchemy_model"] == "separated_topology"
+    assert plan["unique_nodes"] == ["A", "B"]
+    assert plan["node_bank"] == str((tmp_path / "bank").resolve())
