@@ -1475,18 +1475,53 @@ def main(argv=None):
         action="store_true",
         help="prepare reusable separated-topology node ensembles",
     )
+    mode.add_argument(
+        "--initialize-node-bank",
+        action="store_true",
+        help="initialize canonical metadata for parallel node preparation",
+    )
+    mode.add_argument(
+        "--prepare-node",
+        metavar="NODE",
+        help="prepare one separated-topology node-bank shard",
+    )
+    mode.add_argument(
+        "--finalize-node-bank",
+        action="store_true",
+        help="validate and publish completed node-bank shards",
+    )
     parser.add_argument("workflow_yaml", help="High-level RBFE workflow YAML file")
     args = parser.parse_args(argv)
     try:
-        if args.prepare_node_bank:
+        node_bank_mode = any((
+            args.prepare_node_bank,
+            args.initialize_node_bank,
+            args.prepare_node is not None,
+            args.finalize_node_bank,
+        ))
+        if node_bank_mode:
             axes = _workflow_axes(args.workflow_yaml)
             if axes.alchemy_model != "separated_topology":
                 raise WorkflowConfigError(
-                    "--prepare-node-bank requires alchemy.model: separated_topology"
+                    "node-bank preparation requires alchemy.model: separated_topology"
                 )
-            from atom_openmm.separated_node_bank import prepare_node_bank
+            from atom_openmm.separated_node_bank import (
+                finalize_node_bank,
+                initialize_node_bank,
+                prepare_node_bank,
+                prepare_node_bank_node,
+            )
 
-            result = prepare_node_bank(args.workflow_yaml)
+            if args.initialize_node_bank:
+                result = initialize_node_bank(args.workflow_yaml)
+            elif args.prepare_node is not None:
+                result = prepare_node_bank_node(
+                    args.workflow_yaml, args.prepare_node
+                )
+            elif args.finalize_node_bank:
+                result = finalize_node_bank(args.workflow_yaml)
+            else:
+                result = prepare_node_bank(args.workflow_yaml)
             print(yaml.safe_dump(result, sort_keys=False))
             return 0
         if args.validate:

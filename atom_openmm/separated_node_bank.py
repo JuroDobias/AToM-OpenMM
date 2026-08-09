@@ -241,7 +241,7 @@ def _vacuum_snapshots(
     }
 
 
-def prepare_node_bank(path):
+def _node_bank_context(path):
     from atom_openmm.rbfe_workflow import (
         build_small_molecule_plan,
         load_or_generate_alignments,
@@ -261,7 +261,6 @@ def prepare_node_bank(path):
     bank = Path(settings.get("path", plan["workdir"] / "node_bank"))
     if not bank.is_absolute():
         bank = (loaded["config_path"].parent / bank).resolve()
-    manifest_path = bank / "manifest.yaml"
     fingerprint_payload = {
         "schema_version": SCHEMA_VERSION,
         "receptor_sha256": _sha256(plan["receptor_file"]),
@@ -283,16 +282,6 @@ def prepare_node_bank(path):
     fingerprint = hashlib.sha256(
         yaml.safe_dump(fingerprint_payload, sort_keys=True).encode()
     ).hexdigest()
-    if manifest_path.exists():
-        manifest = yaml.safe_load(manifest_path.read_text()) or {}
-        if manifest.get("schema_version") != SCHEMA_VERSION:
-            raise NodeBankError("existing node bank has an unsupported schema")
-        if manifest.get("fingerprint") != fingerprint:
-            raise NodeBankError(
-                "existing node bank inputs differ from this workflow; use a new bank path"
-            )
-        return manifest
-
     if str(setup.get("solvent_box_shape", "cube")) not in {"cube", "rectangular"}:
         raise NodeBankError(
             "canonical node banks currently support cube or rectangular solvent boxes"
@@ -300,7 +289,71 @@ def prepare_node_bank(path):
     count = int(settings.get("snapshots", config["n_snapshots"]))
     if count < config["n_snapshots"]:
         raise NodeBankError("node bank must contain at least workflow.neqti.n_snapshots")
-    platform, properties = _platform(workflow)
+    return {
+        "loaded": loaded,
+        "workflow": workflow,
+        "plan": plan,
+        "nodes": nodes,
+        "anchors": anchors,
+        "settings": settings,
+        "setup": setup,
+        "config": config,
+        "bank": bank,
+        "staging": bank.with_name(f".{bank.name}.building"),
+        "fingerprint_payload": fingerprint_payload,
+        "fingerprint": fingerprint,
+        "snapshot_count": count,
+    }
+
+
+def _existing_bank(context):
+    manifest_path = context["bank"] / "manifest.yaml"
+    if not manifest_path.exists():
+        return None
+    manifest = yaml.safe_load(manifest_path.read_text()) or {}
+    if manifest.get("schema_version") != SCHEMA_VERSION:
+        raise NodeBankError("existing node bank has an unsupported schema")
+    if manifest.get("fingerprint") != context["fingerprint"]:
+        raise NodeBankError(
+            "existing node bank inputs differ from this workflow; use a new bank path"
+        )
+    return manifest
+
+
+def _validate_staging_fingerprint(context):
+    staging = context["staging"]
+    staging.mkdir(parents=True, exist_ok=True)
+    path = staging / "fingerprint.yaml"
+    if path.exists():
+        staged = yaml.safe_load(path.read_text()) or {}
+        if staged.get("fingerprint") != context["fingerprint"]:
+            raise NodeBankError(
+                f"staged node bank inputs differ: {staging}; move it aside or use a new path"
+            )
+    else:
+        _write_yaml_atomic(path, {
+            "fingerprint": context["fingerprint"],
+            "inputs": context["fingerprint_payload"],
+        })
+    return staging
+
+
+def initialize_node_bank(path):
+    context = _node_bank_context(path)
+    existing = _existing_bank(context)
+    if existing is not None:
+        return existing
+    staging = _validate_staging_fingerprint(context)
+    initialization_path = staging / "initialization.yaml"
+    if initialization_path.exists():
+        initialization = yaml.safe_load(initialization_path.read_text()) or {}
+        if initialization.get("fingerprint") != context["fingerprint"]:
+            raise NodeBankError("node-bank initialization fingerprint differs")
+        return initialization
+
+    setup = context["setup"]
+    config = context["config"]
+    nodes = context["nodes"]
     allow_stereo = bool(setup.get("allow_undefined_stereo", False))
     bundles = {
         name: parameterize_ligand(
@@ -314,165 +367,291 @@ def prepare_node_bank(path):
     charges = {round(float(bundle.charges_e.sum()), 6) for bundle in bundles.values()}
     if len(charges) != 1:
         raise NodeBankError("separated-topology node banks require equal ligand charges")
-
-    temporary = bank.with_name(f".{bank.name}.building")
-    temporary.mkdir(parents=True, exist_ok=True)
-    staging_fingerprint = temporary / "fingerprint.yaml"
-    if staging_fingerprint.exists():
-        staged = yaml.safe_load(staging_fingerprint.read_text()) or {}
-        if staged.get("fingerprint") != fingerprint:
-            raise NodeBankError(
-                f"staged node bank inputs differ: {temporary}; move it aside or use a new path"
+    canonical = {}
+    for environment in ("complex", "solvent"):
+        box = _canonical_box_size(
+            bundles,
+            context["plan"]["receptor_file"],
+            float(setup.get("solvent_padding_a", 10.0)),
+            environment,
+        )
+        provisional = {}
+        for index, (name, bundle) in enumerate(sorted(bundles.items())):
+            local_setup = dict(setup)
+            local_setup["_canonical_box_size_nm"] = box
+            provisional[name] = create_physical_ligand_environment(
+                bundle,
+                receptor=(
+                    context["plan"]["receptor_file"]
+                    if environment == "complex" else None
+                ),
+                setup=local_setup,
+                solvation_seed=(
+                    config["random_seed"] + index
+                    + (0 if environment == "complex" else 10000)
+                ),
             )
-    else:
-        _write_yaml_atomic(staging_fingerprint, {
-            "fingerprint": fingerprint,
-            "inputs": fingerprint_payload,
-        })
-    try:
-        prepared = {"complex": {}, "solvent": {}}
-        canonical = {}
-        for environment in ("complex", "solvent"):
-            box = _canonical_box_size(
-                bundles,
-                plan["receptor_file"],
-                float(setup.get("solvent_padding_a", 10.0)),
-                environment,
-            )
-            provisional = {}
-            for index, (name, bundle) in enumerate(sorted(bundles.items())):
-                local_setup = dict(setup)
-                local_setup["_canonical_box_size_nm"] = box
-                provisional[name] = create_physical_ligand_environment(
-                    bundle,
-                    receptor=plan["receptor_file"] if environment == "complex" else None,
-                    setup=local_setup,
-                    solvation_seed=config["random_seed"] + index + (0 if environment == "complex" else 10000),
-                )
-            target_waters = min(
-                int(item.provenance["water_count"]) for item in provisional.values()
-            )
-            ion_signatures = {
-                tuple(sorted(item.provenance["ion_counts"].items()))
-                for item in provisional.values()
-            }
-            if len(ion_signatures) != 1:
-                raise NodeBankError(
-                    f"canonical {environment} nodes generated different ion counts"
-                )
-            for index, (name, bundle) in enumerate(sorted(bundles.items())):
-                local_setup = dict(setup)
-                local_setup.update({
-                    "_canonical_box_size_nm": box,
-                    "_target_water_count": target_waters,
-                })
-                prepared[environment][name] = create_physical_ligand_environment(
-                    bundle,
-                    receptor=plan["receptor_file"] if environment == "complex" else None,
-                    setup=local_setup,
-                    solvation_seed=config["random_seed"] + index + (0 if environment == "complex" else 10000),
-                )
-            canonical[environment] = {
-                "box_size_nm": box,
-                "water_count": target_waters,
-                "ion_counts": dict(next(iter(ion_signatures))),
-            }
-
-        manifest = {
-            "schema_version": SCHEMA_VERSION,
-            "kind": "separated_topology_node_bank",
-            "fingerprint": fingerprint,
-            "fingerprint_inputs": fingerprint_payload,
-            "receptor": str(Path(plan["receptor_file"]).resolve()),
-            "receptor_sha256": _sha256(plan["receptor_file"]),
-            "canonical_environments": canonical,
-            "snapshot_count": count,
-            "nodes": {},
+        target_waters = min(
+            int(item.provenance["water_count"]) for item in provisional.values()
+        )
+        ion_signatures = {
+            tuple(sorted(item.provenance["ion_counts"].items()))
+            for item in provisional.values()
         }
-        for node_index, (name, bundle) in enumerate(sorted(bundles.items())):
-            node_dir = temporary / "nodes" / name
-            node_payload = {
+        if len(ion_signatures) != 1:
+            raise NodeBankError(
+                f"canonical {environment} nodes generated different ion counts"
+            )
+        canonical[environment] = {
+            "box_size_nm": box,
+            "water_count": target_waters,
+            "ion_counts": dict(next(iter(ion_signatures))),
+        }
+    initialization = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "separated_topology_node_bank_initialization",
+        "fingerprint": context["fingerprint"],
+        "fingerprint_inputs": context["fingerprint_payload"],
+        "receptor": str(Path(context["plan"]["receptor_file"]).resolve()),
+        "receptor_sha256": _sha256(context["plan"]["receptor_file"]),
+        "canonical_environments": canonical,
+        "snapshot_count": context["snapshot_count"],
+        "node_order": sorted(nodes),
+        "nodes": {
+            name: {
                 "ligand_file": str(nodes[name]),
                 "ligand_sha256": _sha256(nodes[name]),
                 "charge_e": float(bundle.charges_e.sum()),
-                "anchors": list(anchors[name]),
+                "anchors": list(context["anchors"][name]),
                 "parameterization": bundle.provenance,
-                "environments": {},
             }
-            for environment in ("complex", "solvent"):
-                physical = prepared[environment][name]
-                directory = node_dir / environment
-                payload = _serialize_system(directory, physical)
-                state_file = directory / "state.xml"
-                selection = {
-                    "ligand_a": {
-                        "structure_file": str(nodes[name]),
-                        "system_atom_indices": list(range(bundle.molecule.n_atoms)),
-                    }
-                }
-                custom_steps = neqti_hybrid_endpoint_steps(
-                    config.get("equilibration_protocol"), environment
-                )
-                _equilibrate_endpoint(
+            for name, bundle in sorted(bundles.items())
+        },
+    }
+    _write_yaml_atomic(initialization_path, initialization)
+    return initialization
+
+
+def _load_initialization(context):
+    path = context["staging"] / "initialization.yaml"
+    if not path.exists():
+        raise NodeBankError(
+            "node bank is not initialized; run --initialize-node-bank first"
+        )
+    payload = yaml.safe_load(path.read_text()) or {}
+    if payload.get("fingerprint") != context["fingerprint"]:
+        raise NodeBankError("node-bank initialization fingerprint differs")
+    return payload
+
+
+def _validate_node_payload(staging, name, payload):
+    node_dir = staging / "nodes" / name
+    for environment in ("complex", "solvent"):
+        environment_payload = payload["environments"][environment]
+        directory = node_dir / environment
+        _load_artifact(directory, environment_payload, "system")
+        _load_artifact(directory, environment_payload, "topology")
+        for snapshot in environment_payload["snapshots"]:
+            path = staging / snapshot["file"]
+            if not path.is_file() or _sha256(path) != snapshot["sha256"]:
+                raise NodeBankError(f"node snapshot is missing or changed: {path}")
+    for key in ("system", "topology"):
+        artifact = payload["vacuum"][key]
+        path = staging / artifact["file"]
+        if not path.is_file() or _sha256(path) != artifact["sha256"]:
+            raise NodeBankError(f"vacuum artifact is missing or changed: {path}")
+    for snapshot in payload["vacuum"]["snapshots"]:
+        path = staging / snapshot["file"]
+        if not path.is_file() or _sha256(path) != snapshot["sha256"]:
+            raise NodeBankError(f"vacuum snapshot is missing or changed: {path}")
+
+
+def prepare_node_bank_node(path, node):
+    context = _node_bank_context(path)
+    existing = _existing_bank(context)
+    if existing is not None:
+        if node not in existing["nodes"]:
+            raise NodeBankError(f"node bank does not contain {node}")
+        return existing["nodes"][node]
+    staging = _validate_staging_fingerprint(context)
+    initialization = _load_initialization(context)
+    node = str(node)
+    if node not in context["nodes"]:
+        raise NodeBankError(
+            f"unknown node {node}; choose one of {initialization['node_order']}"
+        )
+    node_dir = staging / "nodes" / node
+    node_manifest = node_dir / "manifest.yaml"
+    if node_manifest.exists():
+        payload = yaml.safe_load(node_manifest.read_text()) or {}
+        if payload.get("fingerprint") != context["fingerprint"]:
+            raise NodeBankError(f"completed node {node} has a different fingerprint")
+        _validate_node_payload(staging, node, payload["node"])
+        return payload["node"]
+
+    setup = context["setup"]
+    config = context["config"]
+    node_index = initialization["node_order"].index(node)
+    bundle = parameterize_ligand(
+        context["nodes"][node],
+        ligand_forcefield=setup.get("ligand_forcefield", "espaloma-0.3.2"),
+        ligand_charge_model=setup.get("ligand_charge_model", "nn"),
+        allow_undefined_stereo=bool(setup.get("allow_undefined_stereo", False)),
+    )
+    expected = initialization["nodes"][node]
+    if abs(float(bundle.charges_e.sum()) - float(expected["charge_e"])) > 1.0e-6:
+        raise NodeBankError(f"parameterized charge changed for node {node}")
+    platform, properties = _platform(context["workflow"])
+    node_payload = {**expected, "environments": {}}
+    for environment in ("complex", "solvent"):
+        canonical = initialization["canonical_environments"][environment]
+        local_setup = dict(setup)
+        local_setup.update({
+            "_canonical_box_size_nm": canonical["box_size_nm"],
+            "_target_water_count": canonical["water_count"],
+        })
+        physical = create_physical_ligand_environment(
+            bundle,
+            receptor=(
+                context["plan"]["receptor_file"]
+                if environment == "complex" else None
+            ),
+            setup=local_setup,
+            solvation_seed=(
+                config["random_seed"] + node_index
+                + (0 if environment == "complex" else 10000)
+            ),
+        )
+        if physical.provenance["ion_counts"] != canonical["ion_counts"]:
+            raise NodeBankError(f"canonical {environment} ion counts changed for {node}")
+        directory = node_dir / environment
+        payload = _serialize_system(directory, physical)
+        state_file = directory / "state.xml"
+        selection = {
+            "ligand_a": {
+                "structure_file": str(context["nodes"][node]),
+                "system_atom_indices": list(range(bundle.molecule.n_atoms)),
+            }
+        }
+        custom_steps = neqti_hybrid_endpoint_steps(
+            config.get("equilibration_protocol"), environment
+        )
+        _equilibrate_endpoint(
+            physical.system,
+            physical.positions,
+            state_file,
+            protocol=config["endpoint_equilibration"],
+            temperature_k=config["temperature_k"],
+            pressure_bar=config["pressure_bar"],
+            platform=platform,
+            properties=properties,
+            seed=(
+                config["random_seed"] + node_index * 100000
+                + (0 if environment == "complex" else 10000)
+            ),
+            label=f"node {node} {environment}",
+            topology=physical.topology,
+            custom_steps=custom_steps,
+            custom_output_dir=directory / "equilibration",
+            selection_metadata=selection,
+            selection_endpoint="a",
+        )
+        snapshots = []
+        snapshots_dir = directory / "snapshots"
+        snapshots_dir.mkdir(parents=True, exist_ok=True)
+        for sample in range(context["snapshot_count"]):
+            snapshot = snapshots_dir / f"{sample:04d}.xml"
+            if not snapshot.exists():
+                state, _ = _sample_endpoint(
                     physical.system,
-                    physical.positions,
+                    physical.topology,
                     state_file,
-                    protocol=config["endpoint_equilibration"],
-                    temperature_k=config["temperature_k"],
-                    pressure_bar=config["pressure_bar"],
+                    tuple(range(bundle.molecule.n_atoms)),
+                    ensemble=node,
+                    steps=config["decorrelation_steps"],
+                    rest2_config=config["rest2"],
+                    output_dir=directory / "rest2",
                     platform=platform,
                     properties=properties,
-                    seed=config["random_seed"] + node_index * 100000 + (0 if environment == "complex" else 10000),
-                    label=f"node {name} {environment}",
-                    topology=physical.topology,
-                    custom_steps=custom_steps,
-                    custom_output_dir=directory / "equilibration",
-                    selection_metadata=selection,
-                    selection_endpoint="a",
+                    temperature_k=config["temperature_k"],
+                    timestep_fs=config["timestep_fs"],
+                    seed=(
+                        config["random_seed"] + node_index * 100000
+                        + sample * 1000
+                    ),
                 )
-                snapshots = []
-                snapshots_dir = directory / "snapshots"
-                snapshots_dir.mkdir(parents=True, exist_ok=True)
-                for sample in range(count):
-                    snapshot = snapshots_dir / f"{sample:04d}.xml"
-                    if not snapshot.exists():
-                        state, _ = _sample_endpoint(
-                            physical.system,
-                            physical.topology,
-                            state_file,
-                            tuple(range(bundle.molecule.n_atoms)),
-                            ensemble=name,
-                            steps=config["decorrelation_steps"],
-                            rest2_config=config["rest2"],
-                            output_dir=directory / "rest2",
-                            platform=platform,
-                            properties=properties,
-                            temperature_k=config["temperature_k"],
-                            timestep_fs=config["timestep_fs"],
-                            seed=config["random_seed"] + node_index * 100000 + sample * 1000,
-                        )
-                        _write_state(snapshot, state)
-                    snapshots.append(_write_snapshot(snapshot, _load_state(snapshot), temporary))
-                payload["snapshots"] = snapshots
-                node_payload["environments"][environment] = payload
-            node_payload["vacuum"] = _vacuum_snapshots(
-                node_dir,
-                temporary,
-                bundle,
-                count=count,
-                initial_steps=int(settings.get("vacuum_initial_steps", 50000)),
-                decorrelation_steps=int(settings.get("vacuum_decorrelation_steps", 10000)),
-                config=config,
-                platform=platform,
-                properties=properties,
-                seed=config["random_seed"] + node_index * 100000 + 50000,
+                _write_state(snapshot, state)
+            snapshots.append(
+                _write_snapshot(snapshot, _load_state(snapshot), staging)
             )
-            manifest["nodes"][name] = node_payload
-            _write_yaml_atomic(temporary / "manifest.partial.yaml", manifest)
-        _write_yaml_atomic(temporary / "manifest.yaml", manifest)
-        (temporary / "manifest.partial.yaml").unlink(missing_ok=True)
-        os.replace(temporary, bank)
-        return manifest
-    except Exception:
-        # Keep the deterministic staging bank so a later invocation can resume.
-        raise
+        payload["snapshots"] = snapshots
+        node_payload["environments"][environment] = payload
+    node_payload["vacuum"] = _vacuum_snapshots(
+        node_dir,
+        staging,
+        bundle,
+        count=context["snapshot_count"],
+        initial_steps=int(context["settings"].get("vacuum_initial_steps", 50000)),
+        decorrelation_steps=int(
+            context["settings"].get("vacuum_decorrelation_steps", 10000)
+        ),
+        config=config,
+        platform=platform,
+        properties=properties,
+        seed=config["random_seed"] + node_index * 100000 + 50000,
+    )
+    _validate_node_payload(staging, node, node_payload)
+    _write_yaml_atomic(node_manifest, {
+        "schema_version": SCHEMA_VERSION,
+        "fingerprint": context["fingerprint"],
+        "node_id": node,
+        "node": node_payload,
+    })
+    return node_payload
+
+
+def finalize_node_bank(path):
+    context = _node_bank_context(path)
+    existing = _existing_bank(context)
+    if existing is not None:
+        return existing
+    staging = _validate_staging_fingerprint(context)
+    initialization = _load_initialization(context)
+    nodes = {}
+    missing = []
+    for name in initialization["node_order"]:
+        path = staging / "nodes" / name / "manifest.yaml"
+        if not path.exists():
+            missing.append(name)
+            continue
+        shard = yaml.safe_load(path.read_text()) or {}
+        if shard.get("fingerprint") != context["fingerprint"]:
+            raise NodeBankError(f"node shard {name} has a different fingerprint")
+        _validate_node_payload(staging, name, shard["node"])
+        nodes[name] = shard["node"]
+    if missing:
+        raise NodeBankError(f"node bank is incomplete; missing shards: {missing}")
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "separated_topology_node_bank",
+        "fingerprint": context["fingerprint"],
+        "fingerprint_inputs": context["fingerprint_payload"],
+        "receptor": initialization["receptor"],
+        "receptor_sha256": initialization["receptor_sha256"],
+        "canonical_environments": initialization["canonical_environments"],
+        "snapshot_count": initialization["snapshot_count"],
+        "nodes": nodes,
+    }
+    _write_yaml_atomic(staging / "manifest.yaml", manifest)
+    os.replace(staging, context["bank"])
+    return manifest
+
+
+def prepare_node_bank(path):
+    """Prepare all nodes serially; sharded callers should use the three phase API."""
+    initialization = initialize_node_bank(path)
+    if initialization.get("kind") == "separated_topology_node_bank":
+        return initialization
+    for node in initialization["node_order"]:
+        prepare_node_bank_node(path, node)
+    return finalize_node_bank(path)

@@ -926,6 +926,21 @@ atom-rbfe --prepare-node-bank workflow.separated.yaml
 atom-rbfe workflow.separated.yaml
 ```
 
+Large banks can be prepared concurrently without sharing writable manifests:
+
+```bash
+atom-rbfe --initialize-node-bank workflow.separated.yaml
+atom-rbfe --prepare-node LIGAND_A workflow.separated.yaml
+atom-rbfe --prepare-node LIGAND_B workflow.separated.yaml
+atom-rbfe --finalize-node-bank workflow.separated.yaml
+```
+
+The node commands may run as independent GPU jobs. Initialization fixes the
+common boxes, water counts, ion counts, input fingerprint, and node ordering.
+Each worker owns only its node shard. Finalization verifies every artifact and
+publishes the bank with one atomic directory rename. The serial
+`--prepare-node-bank` command remains available as a convenience wrapper.
+
 The bank contains independent complex, solvent, and vacuum snapshots. Complex
 and solvent snapshots come from the physical REST2 replica. Each switch combines
 a physical active snapshot with an independently selected vacuum snapshot of the

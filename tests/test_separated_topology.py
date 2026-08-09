@@ -3,6 +3,7 @@ import openmm as mm
 from openmm import unit
 from openff.toolkit import ForceField, Molecule
 from openff.units import unit as offunit
+import pytest
 import yaml
 
 from atom_openmm.covalent_parameters import CovalentParameterBundle
@@ -162,3 +163,86 @@ def _test_separated_workflow_plan_exposes_node_bank(tmp_path):
     assert plan["alchemy_model"] == "separated_topology"
     assert plan["unique_nodes"] == ["A", "B"]
     assert plan["node_bank"] == str((tmp_path / "bank").resolve())
+
+
+def _test_parallel_node_bank_finalization_is_atomic(tmp_path, monkeypatch):
+    from atom_openmm import separated_node_bank as module
+
+    bank = tmp_path / "bank"
+    staging = tmp_path / ".bank.building"
+    staging.mkdir()
+    context = {
+        "bank": bank,
+        "staging": staging,
+        "fingerprint": "fingerprint",
+        "fingerprint_payload": {"input": "value"},
+    }
+    monkeypatch.setattr(module, "_node_bank_context", lambda _: context)
+    (staging / "fingerprint.yaml").write_text(
+        yaml.safe_dump({"fingerprint": "fingerprint"})
+    )
+    (staging / "initialization.yaml").write_text(yaml.safe_dump({
+        "fingerprint": "fingerprint",
+        "receptor": "/receptor.pdb",
+        "receptor_sha256": "receptor-hash",
+        "canonical_environments": {},
+        "snapshot_count": 1,
+        "node_order": ["A", "B"],
+    }))
+
+    with pytest.raises(module.NodeBankError, match="missing shards"):
+        module.finalize_node_bank("workflow.yaml")
+    assert not bank.exists()
+
+    def artifact(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(path.name)
+        return {"file": path.name, "sha256": module._sha256(path)}
+
+    for node in ("A", "B"):
+        node_dir = staging / "nodes" / node
+        environments = {}
+        for environment in ("complex", "solvent"):
+            directory = node_dir / environment
+            snapshot = directory / "snapshots" / "0000.xml"
+            snapshot.parent.mkdir(parents=True, exist_ok=True)
+            snapshot.write_text("state")
+            environments[environment] = {
+                "system": artifact(directory / "system.xml"),
+                "topology": artifact(directory / "topology.cif"),
+                "snapshots": [{
+                    "file": str(snapshot.relative_to(staging)),
+                    "sha256": module._sha256(snapshot),
+                }],
+            }
+        vacuum = node_dir / "vacuum"
+        vacuum_snapshot = vacuum / "snapshots" / "0000.xml"
+        vacuum_snapshot.parent.mkdir(parents=True, exist_ok=True)
+        vacuum_snapshot.write_text("vacuum-state")
+        payload = {
+            "environments": environments,
+            "vacuum": {
+                "system": {
+                    **artifact(vacuum / "system.xml"),
+                    "file": str((vacuum / "system.xml").relative_to(staging)),
+                },
+                "topology": {
+                    **artifact(vacuum / "topology.cif"),
+                    "file": str((vacuum / "topology.cif").relative_to(staging)),
+                },
+                "snapshots": [{
+                    "file": str(vacuum_snapshot.relative_to(staging)),
+                    "sha256": module._sha256(vacuum_snapshot),
+                }],
+            },
+        }
+        (node_dir / "manifest.yaml").write_text(yaml.safe_dump({
+            "fingerprint": "fingerprint",
+            "node": payload,
+        }))
+
+    manifest = module.finalize_node_bank("workflow.yaml")
+
+    assert sorted(manifest["nodes"]) == ["A", "B"]
+    assert (bank / "manifest.yaml").is_file()
+    assert not staging.exists()

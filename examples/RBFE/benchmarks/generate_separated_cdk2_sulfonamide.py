@@ -227,6 +227,82 @@ wait "$CHILD"
 """
 
 
+def _runtime(source_dir_name):
+    return f"""source "$HOME/miniconda3/etc/profile.d/conda.sh"
+conda activate myatom
+export PYTHONPATH="$HOME/myAToM/{source_dir_name}${{PYTHONPATH:+:$PYTHONPATH}}"
+export LD_LIBRARY_PATH="$HOME/myAToM/openmm-build-env/lib:$HOME/myAToM/openmm-endpoint-gates-install/lib:${{LD_LIBRARY_PATH:-}}"
+export OPENMM_PLUGIN_DIR="$HOME/myAToM/openmm-endpoint-gates-install/lib/plugins"
+PYTHON_BIN="${{ATOM_PYTHON:-$HOME/myAToM/atm-gates-venv/bin/python}}"
+"""
+
+
+def _bank_initialize_script(source_dir_name):
+    return f"""#!/usr/bin/env bash
+#SBATCH -N 1
+#SBATCH --ntasks=1
+#SBATCH --job-name=sep-cdk2-init
+#SBATCH --output=slurm-init-%j.out
+#SBATCH --error=slurm-init-%j.err
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=100G
+#SBATCH -t 01:00:00
+
+set -euo pipefail
+cd "${{SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")}}"
+{_runtime(source_dir_name)}
+"$PYTHON_BIN" -m atom_openmm.rbfe_workflow \
+    --initialize-node-bank prepare_nodes.yaml
+"""
+
+
+def _bank_array_script(source_dir_name):
+    nodes = " ".join(NODES)
+    return f"""#!/usr/bin/env bash
+#SBATCH -N 1
+#SBATCH --ntasks=1
+#SBATCH --array=0-{len(NODES) - 1}
+#SBATCH --job-name=sep-cdk2-node
+#SBATCH --output=slurm-node-%A_%a.out
+#SBATCH --error=slurm-node-%A_%a.err
+#SBATCH --gres=gpu:1
+#SBATCH --constraint=gen-b|gen-d
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=100G
+#SBATCH -t 12:00:00
+
+set -euo pipefail
+cd "${{SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")}}"
+NODES=({nodes})
+NODE="${{NODES[${{SLURM_ARRAY_TASK_ID}}]}}"
+COMPLETION=".node_bank.building/nodes/$NODE/manifest.yaml"
+[[ -f "$COMPLETION" ]] && exit 0
+{_runtime(source_dir_name)}
+"$PYTHON_BIN" -m atom_openmm.rbfe_workflow \
+    --prepare-node "$NODE" prepare_nodes.yaml
+"""
+
+
+def _bank_finalize_script(source_dir_name):
+    return f"""#!/usr/bin/env bash
+#SBATCH -N 1
+#SBATCH --ntasks=1
+#SBATCH --job-name=sep-cdk2-finalize
+#SBATCH --output=slurm-finalize-%j.out
+#SBATCH --error=slurm-finalize-%j.err
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=16G
+#SBATCH -t 01:00:00
+
+set -euo pipefail
+cd "${{SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")}}"
+[[ -f node_bank/manifest.yaml ]] && exit 0
+{_runtime(source_dir_name)}
+"$PYTHON_BIN" -m atom_openmm.rbfe_workflow \
+    --finalize-node-bank prepare_nodes.yaml
+"""
+
+
 def generate(source_cohort, benchmark_root, output, source_dir_name):
     source_cohort = Path(source_cohort).resolve()
     benchmark_root = Path(benchmark_root).resolve()
@@ -252,14 +328,15 @@ def generate(source_cohort, benchmark_root, output, source_dir_name):
     (output / "prepare_nodes.yaml").write_text(
         yaml.safe_dump(bank_workflow, sort_keys=False)
     )
-    prepare_script = output / "prepare_nodes.sh"
-    prepare_script.write_text(_slurm_script(
-        '"$PYTHON_BIN" -m atom_openmm.rbfe_workflow --prepare-node-bank prepare_nodes.yaml',
-        "sep-cdk2-nodes",
-        "node_bank/manifest.yaml",
-        source_dir_name,
-    ))
-    prepare_script.chmod(0o755)
+    bank_scripts = {
+        "initialize_nodes.sh": _bank_initialize_script(source_dir_name),
+        "prepare_node_array.sh": _bank_array_script(source_dir_name),
+        "finalize_nodes.sh": _bank_finalize_script(source_dir_name),
+    }
+    for name, contents in bank_scripts.items():
+        script = output / name
+        script.write_text(contents)
+        script.chmod(0o755)
 
     for ligand_a, ligand_b in EDGES:
         edge = f"{ligand_a}--{ligand_b}"
@@ -313,7 +390,15 @@ def generate(source_cohort, benchmark_root, output, source_dir_name):
     }
     (output / "network.yaml").write_text(yaml.safe_dump(network, sort_keys=False))
     scripts = {
-        "submit_nodes.sh": 'sbatch prepare_nodes.sh\n',
+        "submit_nodes.sh": (
+            'init=$(sbatch --parsable initialize_nodes.sh)\n'
+            'init=${init%%;*}\n'
+            'array=$(sbatch --parsable --dependency="afterok:$init" prepare_node_array.sh)\n'
+            'array=${array%%;*}\n'
+            'final=$(sbatch --parsable --dependency="afterok:$array" finalize_nodes.sh)\n'
+            'final=${final%%;*}\n'
+            'printf "initialize=%s array=%s finalize=%s\\n" "$init" "$array" "$final"\n'
+        ),
         "submit_pilot.sh": '(cd 21--32 && sbatch run.sh)\n',
         "submit_cycle.sh": "\n".join(
             f"(cd {a}--{b} && sbatch run.sh)"
@@ -339,7 +424,9 @@ def generate(source_cohort, benchmark_root, output, source_dir_name):
         "node and reused by every edge. `21--32` is the first pilot edge. The four "
         "edges close the sulfonamide additivity cycle. Each edge uses 20 paired node "
         "snapshots and adaptive 100/300/1000 ps NEQTI switching.\n\n"
-        "Run `./submit_nodes.sh`; after its resumable bank job completes, run "
+        "Run `./submit_nodes.sh` to initialize common solvent metadata, prepare the "
+        "four nodes as a one-GPU-per-node Slurm array, and atomically finalize the "
+        "bank. Re-running the script resumes incomplete shards. After it completes, run "
         "`./submit_pilot.sh`. Submit the other three edges with `./submit_cycle.sh` "
         "after accepting the pilot diagnostics. The bank can also be prepared with "
         "`atom-rbfe --prepare-node-bank prepare_nodes.yaml`. Analyze completed edges "
