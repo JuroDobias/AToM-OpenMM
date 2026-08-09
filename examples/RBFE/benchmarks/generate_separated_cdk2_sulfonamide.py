@@ -218,6 +218,9 @@ cd "$RUN_DIR"
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate myatom
 export PYTHONPATH="$HOME/myAToM/{source_dir_name}${{PYTHONPATH:+:$PYTHONPATH}}"
+export LD_LIBRARY_PATH="$HOME/myAToM/openmm-build-env/lib:$HOME/myAToM/openmm-endpoint-gates-install/lib:${{LD_LIBRARY_PATH:-}}"
+export OPENMM_PLUGIN_DIR="$HOME/myAToM/openmm-endpoint-gates-install/lib/plugins"
+PYTHON_BIN="${{ATOM_PYTHON:-$HOME/myAToM/atm-gates-venv/bin/python}}"
 {command} &
 CHILD=$!
 wait "$CHILD"
@@ -251,7 +254,7 @@ def generate(source_cohort, benchmark_root, output, source_dir_name):
     )
     prepare_script = output / "prepare_nodes.sh"
     prepare_script.write_text(_slurm_script(
-        "python -m atom_openmm.rbfe_workflow --prepare-node-bank prepare_nodes.yaml",
+        '"$PYTHON_BIN" -m atom_openmm.rbfe_workflow --prepare-node-bank prepare_nodes.yaml',
         "sep-cdk2-nodes",
         "node_bank/manifest.yaml",
         source_dir_name,
@@ -279,7 +282,7 @@ def generate(source_cohort, benchmark_root, output, source_dir_name):
         run_script = directory / "run.sh"
         result = f"run/receptor-{ligand_a}-{ligand_b}/result.yaml"
         run_script.write_text(_slurm_script(
-            "python -m atom_openmm.rbfe_workflow workflow.yaml",
+            '"$PYTHON_BIN" -m atom_openmm.rbfe_workflow workflow.yaml',
             f"sep-{edge}",
             result,
             source_dir_name,
