@@ -263,6 +263,38 @@ def _test_parallel_node_bank_finalization_is_atomic(tmp_path, monkeypatch):
     assert not staging.exists()
 
 
+def _test_schema_v1_node_bank_is_readable_but_not_extensible(tmp_path, monkeypatch):
+    from atom_openmm import separated_node_bank as module
+
+    bank = tmp_path / "bank"
+    bank.mkdir()
+    (bank / "manifest.yaml").write_text(yaml.safe_dump({
+        "schema_version": 1,
+        "nodes": {},
+    }))
+    context = {
+        "bank": bank,
+        "nodes": {"C": tmp_path / "C.sdf"},
+        "fingerprint": "new-contract",
+    }
+    monkeypatch.setattr(module, "_node_bank_context", lambda _: context)
+
+    assert module._existing_bank(context)["schema_version"] == 1
+    with pytest.raises(module.NodeBankError, match="schema-v1"):
+        module.extend_node_bank("workflow.yaml", "C")
+
+
+def _test_triclinic_box_volume_uses_determinant():
+    from atom_openmm.separated_node_bank import _box_volume_nm3
+
+    vectors = np.asarray([
+        [3.0, 0.0, 0.0],
+        [1.0, 2.0, 0.0],
+        [0.5, 0.5, 1.5],
+    ])
+    assert np.isclose(_box_volume_nm3(vectors), 9.0)
+
+
 def _test_custom_equilibration_pdb_never_aliases_state_xml(tmp_path):
     from atom_openmm.covalent_workflow import _equilibrated_pdb_path
 

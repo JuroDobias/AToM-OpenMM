@@ -6,7 +6,9 @@ workflow:
     cycle: complex_solvent
     node_bank:
       path: separated_node_bank
-      snapshots: 20
+      snapshots: 100
+      extensible: true
+      extension_max_linear_scale: 1.05
       vacuum_initial_steps: 50000
       vacuum_decorrelation_steps: 10000
     frame_restraint:
@@ -30,7 +32,7 @@ workflow:
     protein_forcefield: [amber14-all.xml]
     solvent_forcefield: [amber14/tip3p.xml]
     solvent_model: tip3p
-    solvent_box_shape: cube
+    solvent_box_shape: dodecahedron
     solvent_padding_a: 10.0
     ionic_strength_molar: 0.15
     ligand_forcefield: espaloma-0.3.2
@@ -46,22 +48,26 @@ workflow:
       nvt_timestep_fs: 1.0
       npt_steps: 250000
       npt_timestep_fs: 2.0
-    n_snapshots: 20
+    n_snapshots: 100
     decorrelation_steps: 100000
     interpolation: softcore_linear
     softcore:
-      function: beutler
-      coulomb_function: linear_pme
+      function: amber_ssc2
+      coulomb_function: amber_ssc2
       stage_interpolation: linear
-      alpha: 0.3
-      sigma_nm: 0.25
-      power: 1
+      ssc2_alpha_lj: 0.5
+      ssc2_beta_coul: 1.0
+      ssc2_switch_width_nm: 0.2
       total_steps: 50000
       path:
-        nodes: [0.20, 0.50, 0.80]
-        vdw_a: [1.0, 1.0, 1.0, 0.0, 0.0]
-        charge_a: [1.0, 0.0, 0.0, 0.0, 0.0]
+        mode: concerted
       long_range_correction: dynamic
+    schedule_optimization:
+      enabled: true
+      pilot_samples: 20
+      segments_per_interval: [20]
+      min_segment_steps: 250
+      max_segment_steps: 15000
     adaptive_switching:
       enabled: true
       candidate_times_ps: [100.0, 300.0, 1000.0]

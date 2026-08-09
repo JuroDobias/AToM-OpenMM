@@ -1490,6 +1490,11 @@ def main(argv=None):
         action="store_true",
         help="validate and publish completed node-bank shards",
     )
+    mode.add_argument(
+        "--extend-node-bank",
+        metavar="NODE",
+        help="atomically add one node to an extensible separated-topology bank",
+    )
     parser.add_argument("workflow_yaml", help="High-level RBFE workflow YAML file")
     args = parser.parse_args(argv)
     try:
@@ -1498,6 +1503,7 @@ def main(argv=None):
             args.initialize_node_bank,
             args.prepare_node is not None,
             args.finalize_node_bank,
+            args.extend_node_bank is not None,
         ))
         if node_bank_mode:
             axes = _workflow_axes(args.workflow_yaml)
@@ -1507,6 +1513,7 @@ def main(argv=None):
                 )
             from atom_openmm.separated_node_bank import (
                 finalize_node_bank,
+                extend_node_bank,
                 initialize_node_bank,
                 prepare_node_bank,
                 prepare_node_bank_node,
@@ -1520,6 +1527,8 @@ def main(argv=None):
                 )
             elif args.finalize_node_bank:
                 result = finalize_node_bank(args.workflow_yaml)
+            elif args.extend_node_bank is not None:
+                result = extend_node_bank(args.workflow_yaml, args.extend_node_bank)
             else:
                 result = prepare_node_bank(args.workflow_yaml)
             print(yaml.safe_dump(result, sort_keys=False))

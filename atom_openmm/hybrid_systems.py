@@ -4,6 +4,7 @@ from importlib import resources
 from pathlib import Path
 
 import numpy as np
+import openmm as mm
 from openmm import app, unit
 from openmmforcefields.generators import EspalomaTemplateGenerator
 
@@ -154,8 +155,18 @@ def create_physical_ligand_environment(
     ionic_strength = float(setup.get("ionic_strength_molar", 0.15))
     from atom_openmm.covalent_systems import _seeded_python_random
 
+    canonical_box_vectors = setup.get("_canonical_box_vectors_nm")
     canonical_box_size = setup.get("_canonical_box_size_nm")
-    if canonical_box_size is not None:
+    if canonical_box_vectors is not None:
+        vectors = np.asarray(canonical_box_vectors, dtype=float)
+        if vectors.shape != (3, 3):
+            raise HybridSystemError("canonical box vectors must have shape (3, 3)")
+        box_options = {
+            "boxVectors": tuple(
+                mm.Vec3(*row) * unit.nanometer for row in vectors
+            )
+        }
+    elif canonical_box_size is not None:
         box_options = {
             "boxSize": np.asarray(canonical_box_size, dtype=float) * unit.nanometer
         }
@@ -189,6 +200,11 @@ def create_physical_ligand_environment(
                 and atom.residue.name.upper() not in {"NA", "CL", "K", "CA"}
             ])
             center = np.mean(solute_positions, axis=0)
+            box_vectors = np.asarray([
+                vector.value_in_unit(unit.nanometer)
+                for vector in modeller.topology.getPeriodicBoxVectors()
+            ])
+            inverse_box = np.linalg.inv(box_vectors)
             ranked = []
             for residue in waters:
                 oxygen = next(
@@ -196,7 +212,11 @@ def create_physical_ligand_environment(
                     if atom.element is not None and atom.element.symbol == "O"
                 )
                 position = modeller.positions[oxygen.index].value_in_unit(unit.nanometer)
-                ranked.append((float(np.linalg.norm(position - center)), residue))
+                displacement = position - center
+                fractional = displacement @ inverse_box
+                fractional -= np.rint(fractional)
+                minimum_image = fractional @ box_vectors
+                ranked.append((float(np.linalg.norm(minimum_image)), residue))
             modeller.delete([
                 residue for _, residue in sorted(ranked, reverse=True)[
                     : len(waters) - target_water_count
@@ -247,6 +267,10 @@ def create_physical_ligand_environment(
         "canonical_box_size_nm": (
             None if canonical_box_size is None
             else [float(value) for value in canonical_box_size]
+        ),
+        "canonical_box_vectors_nm": (
+            None if canonical_box_vectors is None
+            else np.asarray(canonical_box_vectors, dtype=float).tolist()
         ),
     }
     return PreparedPhysicalEnvironment(

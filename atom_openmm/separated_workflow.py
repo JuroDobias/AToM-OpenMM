@@ -15,16 +15,23 @@ from atom_openmm.covalent_workflow import (
     KCAL_TO_KJ,
     _adaptive_work_statistics,
     _is_numerical_switch_failure,
+    _load_state,
     _normalized_settings,
     _platform,
     _reset_softcore_context,
     _run_segmented_protocol,
     _scale_segment_steps,
     _softcore_switch_context,
+    _write_state,
     _write_yaml_atomic,
 )
 from atom_openmm.hybrid_parameters import parameterize_ligand
 from atom_openmm.neqti import analyze_two_leg_work
+from atom_openmm.neqti import (
+    _allocate_segment_steps,
+    _optimizer_cycle_scores,
+    _schedule_change_fraction,
+)
 from atom_openmm.separated_node_bank import (
     load_node_state,
     load_physical_node_environment,
@@ -83,10 +90,6 @@ def _validate_config(workflow, plan, config_path, require_bank=True):
         raise SeparatedWorkflowError(
             "separated topology initially requires softcore.long_range_correction: dynamic"
         )
-    if config["schedule_optimization"]["enabled"]:
-        raise SeparatedWorkflowError(
-            "separated topology does not yet support schedule optimization"
-        )
     if config["convergence"]["enabled"]:
         raise SeparatedWorkflowError(
             "separated topology initially uses adaptive duration without early convergence"
@@ -119,6 +122,16 @@ def _validate_config(workflow, plan, config_path, require_bank=True):
         if not adaptive["reuse_selected_pilot_samples"]:
             raise SeparatedWorkflowError(
                 "separated topology requires reuse_selected_pilot_samples: true"
+            )
+    optimization = config["schedule_optimization"]
+    if optimization["enabled"]:
+        if optimization["pilot_samples"] > config["n_snapshots"]:
+            raise SeparatedWorkflowError(
+                "schedule optimizer pilot samples cannot exceed neqti.n_snapshots"
+            )
+        if adaptive["enabled"] and optimization["pilot_samples"] != adaptive["pilot_samples_per_direction"]:
+            raise SeparatedWorkflowError(
+                "separated topology requires equal optimizer and adaptive pilot counts"
             )
     if require_bank and not (config["node_bank_path"] / "manifest.yaml").is_file():
         raise SeparatedWorkflowError(
@@ -350,6 +363,27 @@ def _candidate_label(time_ps):
     return f"{time_ps:g}ps"
 
 
+def _state_as_assembled(state, metadata):
+    return {
+        "positions": state.getPositions(),
+        "velocities": state.getVelocities(),
+        "box_vectors": state.getPeriodicBoxVectors(),
+        **metadata,
+    }
+
+
+def _append_optimizer_row(path, cycle, works, increments):
+    row = {
+        "cycle": cycle,
+        "forward_work_kj_per_mol": works["forward"],
+        "reverse_work_kj_per_mol": works["reverse"],
+    }
+    for direction in ("forward", "reverse"):
+        for index, value in enumerate(increments[direction], start=1):
+            row[f"{direction}_segment_{index}_kj_per_mol"] = value
+    _append_row(path, row)
+
+
 def _run_environment(
     pair,
     environment,
@@ -441,10 +475,18 @@ def _run_environment(
     diagnostics = []
     dual_a = list(anchors_a)
     dual_b = [parameters_a.molecule.n_atoms + int(index) for index in anchors_b]
+    starting_states = workdir / "separated_starting_states" / environment
+    starting_states.mkdir(parents=True, exist_ok=True)
 
     def assembled(endpoint, sample):
         active_name = pair["lig1_name"] if endpoint == "a" else pair["lig2_name"]
         inactive_name = pair["lig2_name"] if endpoint == "a" else pair["lig1_name"]
+        cache_path = starting_states / f"{endpoint}_{sample + 1:04d}.xml"
+        metadata_path = starting_states / f"{endpoint}_{sample + 1:04d}.yaml"
+        if cache_path.exists() and metadata_path.exists():
+            return _state_as_assembled(
+                _load_state(cache_path), yaml.safe_load(metadata_path.read_text()) or {}
+            )
         active_state, active_entry = load_node_state(
             config["node_bank_path"], active_name, environment, sample
         )
@@ -477,14 +519,115 @@ def _run_environment(
             "active_snapshot_id": active_entry["file"],
             "inactive_snapshot_id": inactive_entry["file"],
         })
+        direction = "forward" if endpoint == "a" else "reverse"
+        context, _, _ = contexts[direction]
+        apply_assembled_state(
+            context, value, temperature_k=config["temperature_k"], seed=seed + sample
+        )
+        _write_state(
+            cache_path,
+            context.getState(getPositions=True, getVelocities=True, getEnergy=True),
+        )
+        _write_yaml_atomic(metadata_path, {
+            key: value[key] for key in (
+                "anchor_rmsd_a", "active_name", "inactive_name",
+                "active_snapshot_id", "inactive_snapshot_id",
+            )
+        })
         return value
 
     try:
+        frozen_segment_steps = list(softcore.segment_steps)
+        optimization = config["schedule_optimization"]
+        if optimization["enabled"]:
+            optimizer_path = base / "schedule_optimization.yaml"
+            optimizer_csv = base / "schedule_optimization.csv"
+            optimizer_state = (
+                yaml.safe_load(optimizer_path.read_text()) or {}
+                if optimizer_path.exists() else {}
+            )
+            segment_steps = list(
+                optimizer_state.get("segment_steps", frozen_segment_steps)
+            )
+            scores = optimizer_state.get("scores")
+            completed_cycles = int(optimizer_state.get("completed_cycles", 0))
+            history = list(optimizer_state.get("history", []))
+            for cycle in range(completed_cycles, optimization["pilot_samples"]):
+                works = {}
+                increments = {}
+                for direction, endpoint, direction_steps in (
+                    ("forward", "a", segment_steps),
+                    ("reverse", "b", list(reversed(segment_steps))),
+                ):
+                    context, integrator, values = contexts[direction]
+                    integrator.set_segment_steps(direction_steps)
+                    _reset_softcore_context(context, integrator, values)
+                    apply_assembled_state(
+                        context, assembled(endpoint, cycle),
+                        temperature_k=config["temperature_k"], seed=seed + cycle,
+                    )
+                    raw_work, segment_work = _run_segmented_protocol(
+                        integrator, direction_steps
+                    )
+                    works[direction] = raw_work
+                    increments[direction] = segment_work
+                cycle_scores = _optimizer_cycle_scores(
+                    np.asarray(increments["forward"]) / KCAL_TO_KJ,
+                    np.asarray(increments["reverse"]) / KCAL_TO_KJ,
+                    optimization,
+                )
+                aggregate = (
+                    cycle_scores if scores is None else
+                    optimization["score_ewma_alpha"] * cycle_scores
+                    + (1.0 - optimization["score_ewma_alpha"])
+                    * np.asarray(scores, dtype=float)
+                )
+                previous = list(segment_steps)
+                segment_steps = _allocate_segment_steps(
+                    aggregate, sum(previous), previous, optimization
+                )
+                _append_optimizer_row(
+                    optimizer_csv, cycle + 1, works, increments
+                )
+                history.append({
+                    "cycle": cycle + 1,
+                    "scores": cycle_scores.tolist(),
+                    "aggregate_scores": aggregate.tolist(),
+                    "previous_steps": previous,
+                    "next_steps": list(segment_steps),
+                    "allocation_change_fraction": _schedule_change_fraction(
+                        previous, segment_steps
+                    ),
+                })
+                scores = aggregate.tolist()
+                _write_yaml_atomic(optimizer_path, {
+                    "schema_version": 1,
+                    "status": "running",
+                    "environment": environment,
+                    "completed_cycles": cycle + 1,
+                    "pilot_samples": optimization["pilot_samples"],
+                    "segment_steps": list(segment_steps),
+                    "scores": scores,
+                    "history": history,
+                    "work_included_in_bar": False,
+                })
+            frozen_segment_steps = list(segment_steps)
+            _write_yaml_atomic(optimizer_path, {
+                "schema_version": 1,
+                "status": "frozen",
+                "environment": environment,
+                "completed_cycles": optimization["pilot_samples"],
+                "pilot_samples": optimization["pilot_samples"],
+                "segment_steps": frozen_segment_steps,
+                "scores": scores,
+                "history": history,
+                "work_included_in_bar": False,
+            })
         for time_ps, total_steps in zip(candidate_times, candidate_steps):
             label = _candidate_label(time_ps)
             candidate_dir = base / label
             candidate_dir.mkdir(parents=True, exist_ok=True)
-            segment_forward = _scale_segment_steps(softcore.segment_steps, total_steps)
+            segment_forward = _scale_segment_steps(frozen_segment_steps, total_steps)
             segment_reverse = list(reversed(segment_forward))
             for direction, endpoint, segment_steps in (
                 ("forward", "a", segment_forward),
@@ -586,7 +729,7 @@ def _run_environment(
         if selected is None:
             raise SeparatedWorkflowError(f"no switching duration selected for {environment}")
         selected_dir = base / selected["label"]
-        segment_forward = _scale_segment_steps(softcore.segment_steps, selected["steps"])
+        segment_forward = _scale_segment_steps(frozen_segment_steps, selected["steps"])
         for direction, endpoint, segment_steps in (
             ("forward", "a", segment_forward),
             ("reverse", "b", list(reversed(segment_forward))),
@@ -634,6 +777,8 @@ def _run_environment(
             "schema_version": 1,
             "selected": selected,
             "diagnostics": diagnostics,
+            "frozen_segment_steps": frozen_segment_steps,
+            "optimizer_work_included_in_bar": False,
         })
         return selected
     finally:
@@ -692,6 +837,27 @@ def run_separated_workflow(path):
         analysis = analyze_two_leg_work(
             work, config["temperature_k"], config["bootstrap_samples"], config["random_seed"]
         )
+        final_quality = {
+            "complex": _adaptive_work_statistics(
+                work["leg_a_forward"], work["leg_a_reverse"], config
+            ),
+            "solvent": _adaptive_work_statistics(
+                work["leg_b_forward"], work["leg_b_reverse"], config
+            ),
+        }
+        quality_passed = analysis is not None and all(
+            item["passed"] for item in final_quality.values()
+        )
+        warnings = []
+        for environment, statistics in final_quality.items():
+            if not statistics["passed"]:
+                warnings.append(
+                    f"{environment} switching failed overlap/sample-quality thresholds"
+                )
+        node_payloads = {
+            name: bank_manifest["nodes"][name]
+            for name in (pair["lig1_name"], pair["lig2_name"])
+        }
         payload = {
             "schema_version": 1,
             "tool": "atom_openmm_rbfe",
@@ -707,6 +873,14 @@ def run_separated_workflow(path):
             "node_bank": {
                 "path": str(config["node_bank_path"]),
                 "manifest_sha256": _sha256(config["node_bank_path"] / "manifest.yaml"),
+                "schema_version": int(bank_manifest.get("schema_version", 1)),
+                "compatibility_fingerprint": bank_manifest.get(
+                    "compatibility_fingerprint", bank_manifest.get("fingerprint")
+                ),
+                "node_fingerprints": {
+                    name: item.get("node_fingerprint", item.get("ligand_sha256"))
+                    for name, item in node_payloads.items()
+                },
             },
             "frame_restraint": dict(config["frame_restraint"].__dict__),
             "adaptive_switching": selections,
@@ -722,12 +896,13 @@ def run_separated_workflow(path):
                 },
             },
             "quality": {
-                "convergence_status": "usable" if analysis is not None else "partial",
+                "convergence_status": "usable" if quality_passed else "partial",
                 "overlap_score": None if analysis is None else min(
                     analysis["components"]["leg_a"]["overlap_score"],
                     analysis["components"]["leg_b"]["overlap_score"],
                 ),
-                "warnings": [],
+                "switching": final_quality,
+                "warnings": warnings,
             },
         }
         if analysis is not None:

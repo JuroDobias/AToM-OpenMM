@@ -941,6 +941,20 @@ Each worker owns only its node shard. Finalization verifies every artifact and
 publishes the bank with one atomic directory rename. The serial
 `--prepare-node-bank` command remains available as a convenience wrapper.
 
+New banks use schema version 2. Their compatibility fingerprint covers the
+receptor, force fields, solvation policy, and sampling protocol but not graph
+membership. A compatible ligand can therefore be prepared and atomically
+published later:
+
+```bash
+atom-rbfe --extend-node-bank LIGAND_C workflow.separated.yaml
+```
+
+Schema-v1 banks remain readable but cannot be extended. Extension preserves the
+bank's water and ion counts. If necessary, only the new node's box vectors may
+grow up to `node_bank.extension_max_linear_scale` (default `1.05`); a ligand that
+still does not fit requires a new bank.
+
 The bank contains independent complex, solvent, and vacuum snapshots. Complex
 and solvent snapshots come from the physical REST2 replica. Each switch combines
 a physical active snapshot with an independently selected vacuum snapshot of the
@@ -950,8 +964,9 @@ or propagate a switched configuration.
 
 All nodes use common box vectors and canonical water and ion counts. Water
 coordinates remain independent and are remapped into the common edge topology.
-The initial release requires equal formal charges, cube or rectangular solvent
-boxes, dynamic dispersion correction, and NEQTI sampling. Work CSV rows contain
+The current implementation requires equal formal charges, supports cube,
+rectangular, and dodecahedral solvent boxes, and requires dynamic dispersion
+correction and NEQTI sampling. Work CSV rows contain
 both node snapshot identifiers so graph analysis can retain correlations from
 snapshot reuse. See `examples/RBFE/cdk2/workflow.separated.yaml` for the complete
 schema and an overlap-preserving path with both steric envelopes present at the

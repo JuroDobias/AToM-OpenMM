@@ -70,7 +70,9 @@ def _workflow(pairs, *, node_bank_path, receptor, ligands, workdir):
                 "cycle": "complex_solvent",
                 "node_bank": {
                     "path": node_bank_path,
-                    "snapshots": 20,
+                    "snapshots": 100,
+                    "extensible": True,
+                    "extension_max_linear_scale": 1.05,
                     "vacuum_initial_steps": 50000,
                     "vacuum_decorrelation_steps": 100000,
                 },
@@ -126,7 +128,7 @@ def _workflow(pairs, *, node_bank_path, receptor, ligands, workdir):
                     "openmmforcefields:amber/tip3p_standard.xml"
                 ],
                 "solvent_model": "tip3p",
-                "solvent_box_shape": "rectangular",
+                "solvent_box_shape": "dodecahedron",
                 "solvent_padding_a": 10.0,
                 "ionic_strength_molar": 0.15,
                 "ligand_forcefield": "espaloma-0.3.2",
@@ -144,23 +146,26 @@ def _workflow(pairs, *, node_bank_path, receptor, ligands, workdir):
                     "npt_steps": 250000,
                     "npt_timestep_fs": 2.0,
                 },
-                "n_snapshots": 20,
+                "n_snapshots": 100,
                 "decorrelation_steps": 100000,
                 "interpolation": "softcore_linear",
                 "softcore": {
-                    "function": "beutler",
-                    "coulomb_function": "linear_pme",
+                    "function": "amber_ssc2",
+                    "coulomb_function": "amber_ssc2",
                     "stage_interpolation": "linear",
-                    "alpha": 0.3,
-                    "sigma_nm": 0.25,
-                    "power": 1,
+                    "ssc2_alpha_lj": 0.5,
+                    "ssc2_beta_coul": 1.0,
+                    "ssc2_switch_width_nm": 0.2,
                     "total_steps": 50000,
-                    "path": {
-                        "nodes": [0.20, 0.50, 0.80],
-                        "vdw_a": [1.0, 1.0, 1.0, 0.0, 0.0],
-                        "charge_a": [1.0, 0.0, 0.0, 0.0, 0.0],
-                    },
+                    "path": {"mode": "concerted"},
                     "long_range_correction": "dynamic",
+                },
+                "schedule_optimization": {
+                    "enabled": True,
+                    "pilot_samples": 20,
+                    "segments_per_interval": [20],
+                    "min_segment_steps": 250,
+                    "max_segment_steps": 15000,
                 },
                 "adaptive_switching": {
                     "enabled": True,
@@ -256,30 +261,42 @@ cd "${{SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")}}"
 """
 
 
-def _bank_array_script(source_dir_name):
-    nodes = " ".join(NODES)
+def _bank_node_script(source_dir_name, node):
     return f"""#!/usr/bin/env bash
 #SBATCH -N 1
 #SBATCH --ntasks=1
-#SBATCH --array=0-{len(NODES) - 1}
-#SBATCH --job-name=sep-cdk2-node
-#SBATCH --output=slurm-node-%A_%a.out
-#SBATCH --error=slurm-node-%A_%a.err
+#SBATCH --job-name=sep-node-{node}
+#SBATCH --output=slurm-node-{node}-%j.out
+#SBATCH --error=slurm-node-{node}-%j.err
 #SBATCH --gres=gpu:1
 #SBATCH --constraint=gen-b|gen-d
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=100G
 #SBATCH -t 12:00:00
+#SBATCH --signal=B:USR1@600
 
 set -euo pipefail
-cd "${{SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")}}"
-NODES=({nodes})
-NODE="${{NODES[${{SLURM_ARRAY_TASK_ID}}]}}"
-COMPLETION=".node_bank.building/nodes/$NODE/manifest.yaml"
+RUN_DIR="${{SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")}}"
+SCRIPT="$RUN_DIR/$(basename "$0")"
+CHAIN_INDEX="${{ATOM_CHAIN_INDEX:-0}}"
+CHILD=""
+on_timeout() {{
+    [[ -z "$CHILD" ]] || kill -TERM "$CHILD" 2>/dev/null || true
+    [[ -f "$RUN_DIR/.node_bank.building/nodes/{node}/manifest.yaml" ]] || \
+        (( CHAIN_INDEX >= 19 )) || sbatch --dependency="afterany:${{SLURM_JOB_ID}}" \
+        --export=ALL,ATOM_CHAIN_INDEX=$((CHAIN_INDEX + 1)) "$SCRIPT"
+    exit 0
+}}
+trap on_timeout USR1
+cd "$RUN_DIR"
+NODE="{node}"
+COMPLETION=".node_bank.building/nodes/{node}/manifest.yaml"
 [[ -f "$COMPLETION" ]] && exit 0
 {_runtime(source_dir_name)}
 "$PYTHON_BIN" -m atom_openmm.rbfe_workflow \
-    --prepare-node "$NODE" prepare_nodes.yaml
+    --prepare-node "$NODE" prepare_nodes.yaml &
+CHILD=$!
+wait "$CHILD"
 """
 
 
@@ -295,8 +312,16 @@ def _bank_finalize_script(source_dir_name):
 #SBATCH -t 01:00:00
 
 set -euo pipefail
-cd "${{SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")}}"
+RUN_DIR="${{SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")}}"
+cd "$RUN_DIR"
 [[ -f node_bank/manifest.yaml ]] && exit 0
+if [[ ! -f .node_bank.building/nodes/1h1q/manifest.yaml || \
+      ! -f .node_bank.building/nodes/1h1s/manifest.yaml || \
+      ! -f .node_bank.building/nodes/21/manifest.yaml || \
+      ! -f .node_bank.building/nodes/32/manifest.yaml ]]; then
+    sbatch --begin=now+20minutes "$RUN_DIR/$(basename "$0")"
+    exit 0
+fi
 {_runtime(source_dir_name)}
 "$PYTHON_BIN" -m atom_openmm.rbfe_workflow \
     --finalize-node-bank prepare_nodes.yaml
@@ -330,9 +355,12 @@ def generate(source_cohort, benchmark_root, output, source_dir_name):
     )
     bank_scripts = {
         "initialize_nodes.sh": _bank_initialize_script(source_dir_name),
-        "prepare_node_array.sh": _bank_array_script(source_dir_name),
         "finalize_nodes.sh": _bank_finalize_script(source_dir_name),
     }
+    bank_scripts.update({
+        f"prepare_node_{node}.sh": _bank_node_script(source_dir_name, node)
+        for node in NODES
+    })
     for name, contents in bank_scripts.items():
         script = output / name
         script.write_text(contents)
@@ -393,11 +421,16 @@ def generate(source_cohort, benchmark_root, output, source_dir_name):
         "submit_nodes.sh": (
             'init=$(sbatch --parsable initialize_nodes.sh)\n'
             'init=${init%%;*}\n'
-            'array=$(sbatch --parsable --dependency="afterok:$init" prepare_node_array.sh)\n'
-            'array=${array%%;*}\n'
-            'final=$(sbatch --parsable --dependency="afterok:$array" finalize_nodes.sh)\n'
+            'node_ids=()\n'
+            + "".join(
+                f'job=$(sbatch --parsable --dependency="afterok:$init" prepare_node_{node}.sh)\n'
+                'node_ids+=("${job%%;*}")\n'
+                for node in NODES
+            )
+            + 'deps=$(IFS=:; echo "${node_ids[*]}")\n'
+            'final=$(sbatch --parsable --dependency="afterok:$deps" finalize_nodes.sh)\n'
             'final=${final%%;*}\n'
-            'printf "initialize=%s array=%s finalize=%s\\n" "$init" "$array" "$final"\n'
+            'printf "initialize=%s nodes=%s finalize=%s\\n" "$init" "$deps" "$final"\n'
         ),
         "submit_pilot.sh": '(cd 21--32 && sbatch run.sh)\n',
         "submit_cycle.sh": "\n".join(
@@ -422,10 +455,12 @@ def generate(source_cohort, benchmark_root, output, source_dir_name):
         "# CDK2 separated-topology sulfonamide cycle\n\n"
         "The physical complex, solvent, and vacuum ensembles are prepared once per "
         "node and reused by every edge. `21--32` is the first pilot edge. The four "
-        "edges close the sulfonamide additivity cycle. Each edge uses 20 paired node "
-        "snapshots and adaptive 100/300/1000 ps NEQTI switching.\n\n"
+        "edges close the sulfonamide additivity cycle. Each edge uses 100 paired node "
+        "snapshots. The first 20 optimize the SSC2 schedule and probe adaptive "
+        "100/300/1000 ps switching; the selected frozen protocol then produces the "
+        "100-sample BAR dataset.\n\n"
         "Run `./submit_nodes.sh` to initialize common solvent metadata, prepare the "
-        "four nodes as a one-GPU-per-node Slurm array, and atomically finalize the "
+        "four nodes as resumable one-GPU jobs, and atomically finalize the "
         "bank. Re-running the script resumes incomplete shards. After it completes, run "
         "`./submit_pilot.sh`. Submit the other three edges with `./submit_cycle.sh` "
         "after accepting the pilot diagnostics. The bank can also be prepared with "
