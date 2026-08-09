@@ -439,6 +439,8 @@ def _run_environment(
     base.mkdir(parents=True, exist_ok=True)
     selected = None
     diagnostics = []
+    dual_a = list(anchors_a)
+    dual_b = [parameters_a.molecule.n_atoms + int(index) for index in anchors_b]
 
     def assembled(endpoint, sample):
         active_name = pair["lig1_name"] if endpoint == "a" else pair["lig2_name"]
@@ -466,8 +468,6 @@ def _run_environment(
             config["frame_restraint"].thermalization_steps,
             seed + sample * 1000 + (0 if endpoint == "a" else 500),
         )
-        dual_a = list(anchors_a)
-        dual_b = [parameters_a.molecule.n_atoms + int(index) for index in anchors_b]
         value["anchor_rmsd_a"] = _anchor_rmsd_a(
             value["positions"], dual_a, dual_b
         )
