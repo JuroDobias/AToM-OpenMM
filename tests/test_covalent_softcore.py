@@ -8,6 +8,7 @@ from atom_openmm.covalent_softcore import (
     CHARGE_A_PARAMETER,
     CHARGE_B_PARAMETER,
     MAPPED_CHARGE_PARAMETER,
+    RECIPROCAL_A_CHARGE_PARAMETER,
     SOFTCORE_NONBONDED_FORCE_GROUP,
     STERICS_PARAMETER,
     STERICS_A_PARAMETER,
@@ -526,6 +527,26 @@ def _test_concerted_path_shorthand_resolves_single_balanced_interval():
     assert resolved["vdw_b"] == [0.0, 1.0]
     assert resolved["charge_b"] == [0.0, 1.0]
     assert resolved["interval_steps"] == [50000]
+
+
+def _test_concerted_ssc2_reciprocal_schedule_supports_subdivision():
+    hamiltonian = create_softcore_hamiltonian(
+        _endpoint("a"),
+        _endpoint("b"),
+        [2],
+        [3],
+        function="amber_ssc2",
+        coulomb_function="amber_ssc2",
+        total_steps=50,
+        path_mode="concerted",
+        segments_per_interval=[2],
+    )
+
+    assert hamiltonian.segment_steps == [25, 25]
+    assert {len(values) for values in hamiltonian.parameter_values.values()} == {3}
+    assert np.isclose(
+        hamiltonian.parameter_values[RECIPROCAL_A_CHARGE_PARAMETER][1], -0.5
+    )
 
 
 def _test_amber_ssc2_checkpoint_restart_matches_uninterrupted_switch():

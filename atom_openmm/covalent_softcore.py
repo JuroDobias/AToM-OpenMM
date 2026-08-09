@@ -1421,6 +1421,18 @@ def resolve_softcore_path(
     }
 
 
+def _expand_node_values(nodes, resolved):
+    values = [nodes[0]]
+    for interval, count in enumerate(resolved["segments_per_interval"]):
+        for subdivision in range(int(count)):
+            fraction = (subdivision + 1) / float(count)
+            values.append(
+                nodes[interval]
+                + fraction * (nodes[interval + 1] - nodes[interval])
+            )
+    return values
+
+
 def _expand_path(resolved):
     node_values = {
         CHARGE_A_PARAMETER: resolved["charge_a"],
@@ -1430,19 +1442,16 @@ def _expand_path(resolved):
         STERICS_B_PARAMETER: resolved["vdw_b"],
         STERICS_PARAMETER: resolved["mapped_vdw"],
     }
-    values = {name: [nodes[0]] for name, nodes in node_values.items()}
+    values = {
+        name: _expand_node_values(nodes, resolved)
+        for name, nodes in node_values.items()
+    }
     steps = []
     for interval, (count, total) in enumerate(
         zip(resolved["segments_per_interval"], resolved["interval_steps"])
     ):
         quotient, remainder = divmod(int(total), int(count))
         for subdivision in range(int(count)):
-            fraction = (subdivision + 1) / float(count)
-            for name, nodes in node_values.items():
-                values[name].append(
-                    nodes[interval]
-                    + fraction * (nodes[interval + 1] - nodes[interval])
-                )
             steps.append(quotient + (1 if subdivision < remainder else 0))
     return values, steps
 
@@ -1450,14 +1459,24 @@ def _expand_path(resolved):
 def _add_amber_reciprocal_path(values, resolved):
     weight_a = [_smoothstep2(value) for value in resolved["charge_a"]]
     weight_b = [_smoothstep2(value) for value in resolved["charge_b"]]
-    values[RECIPROCAL_A_CHARGE_PARAMETER] = [
+    reciprocal_a = [
         math.sqrt(value) - 1.0 for value in weight_a
     ]
-    values[RECIPROCAL_B_CHARGE_PARAMETER] = [
+    reciprocal_b = [
         math.sqrt(value) - 1.0 for value in weight_b
     ]
-    values[RECIPROCAL_A_EXCEPTION_PARAMETER] = [value - 1.0 for value in weight_a]
-    values[RECIPROCAL_B_EXCEPTION_PARAMETER] = [value - 1.0 for value in weight_b]
+    values[RECIPROCAL_A_CHARGE_PARAMETER] = _expand_node_values(
+        reciprocal_a, resolved
+    )
+    values[RECIPROCAL_B_CHARGE_PARAMETER] = _expand_node_values(
+        reciprocal_b, resolved
+    )
+    values[RECIPROCAL_A_EXCEPTION_PARAMETER] = _expand_node_values(
+        [value - 1.0 for value in weight_a], resolved
+    )
+    values[RECIPROCAL_B_EXCEPTION_PARAMETER] = _expand_node_values(
+        [value - 1.0 for value in weight_b], resolved
+    )
 
 
 def create_softcore_hamiltonian(
