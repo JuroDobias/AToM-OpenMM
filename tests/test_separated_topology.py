@@ -246,3 +246,15 @@ def _test_parallel_node_bank_finalization_is_atomic(tmp_path, monkeypatch):
     assert sorted(manifest["nodes"]) == ["A", "B"]
     assert (bank / "manifest.yaml").is_file()
     assert not staging.exists()
+
+
+def _test_custom_equilibration_pdb_never_aliases_state_xml(tmp_path):
+    from atom_openmm.covalent_workflow import _equilibrated_pdb_path
+
+    plain = tmp_path / "state.xml"
+    named = tmp_path / "complex_endpoint_a_state.xml"
+
+    assert _equilibrated_pdb_path(plain) == tmp_path / "state_equilibrated.pdb"
+    assert _equilibrated_pdb_path(named) == (
+        tmp_path / "complex_endpoint_a_equilibrated.pdb"
+    )

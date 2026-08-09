@@ -754,6 +754,15 @@ def _dummy_particles(prepared, endpoint):
         ) from exc
 
 
+def _equilibrated_pdb_path(state_file):
+    state_file = Path(state_file)
+    if state_file.name.endswith("_state.xml"):
+        return state_file.with_name(
+            f"{state_file.name[:-len('_state.xml')]}_equilibrated.pdb"
+        )
+    return state_file.with_name(f"{state_file.stem}_equilibrated.pdb")
+
+
 def _equilibrate_endpoint(
     system,
     positions,
@@ -797,9 +806,7 @@ def _equilibrate_endpoint(
             keywords=keywords,
             temperature=float(temperature_k) * unit.kelvin,
         )
-        final_pdb = state_file.with_name(
-            state_file.name.replace("_state.xml", "_equilibrated.pdb")
-        )
+        final_pdb = _equilibrated_pdb_path(state_file)
         run_custom_equilibration(
             ommsystem=adapter,
             steps=custom_steps,
