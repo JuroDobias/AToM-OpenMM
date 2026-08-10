@@ -285,7 +285,11 @@ def _test_schema_v1_node_bank_is_readable_but_not_extensible(tmp_path, monkeypat
 
 
 def _test_triclinic_box_volume_uses_determinant():
-    from atom_openmm.separated_node_bank import _box_volume_nm3
+    from atom_openmm.separated_node_bank import (
+        _box_heights_nm,
+        _box_volume_nm3,
+        _cutoff_safe_box_vectors,
+    )
 
     vectors = np.asarray([
         [3.0, 0.0, 0.0],
@@ -293,6 +297,11 @@ def _test_triclinic_box_volume_uses_determinant():
         [0.5, 0.5, 1.5],
     ])
     assert np.isclose(_box_volume_nm3(vectors), 9.0)
+    scaled = _cutoff_safe_box_vectors(vectors, 0.9, 0.2)
+    assert np.min(_box_heights_nm(scaled)) >= 2.0 - 1.0e-12
+    nonzero = vectors != 0.0
+    scale = scaled[nonzero][0] / vectors[nonzero][0]
+    assert np.allclose(scaled, vectors * scale)
 
 
 def _test_custom_equilibration_pdb_never_aliases_state_xml(tmp_path):

@@ -249,7 +249,9 @@ def thermalize_inactive_ligand(
     apply_assembled_state(context, assembled, temperature_k=temperature_k, seed=seed + 1)
     if int(steps):
         integrator.step(int(steps))
-    state = context.getState(getPositions=True, getVelocities=True, enforcePeriodicBox=True)
+    state = context.getState(
+        getPositions=True, getVelocities=True, enforcePeriodicBox=False
+    )
     result = dict(assembled)
     result["positions"] = state.getPositions()
     result["velocities"] = state.getVelocities()
@@ -295,7 +297,7 @@ class InactivePoseThermalizer:
         if int(steps):
             self.integrator.step(int(steps))
         state = self.context.getState(
-            getPositions=True, getVelocities=True, enforcePeriodicBox=True
+            getPositions=True, getVelocities=True, enforcePeriodicBox=False
         )
         result = dict(assembled)
         result["positions"] = state.getPositions()

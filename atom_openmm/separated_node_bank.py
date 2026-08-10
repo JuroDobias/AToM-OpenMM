@@ -62,6 +62,24 @@ def _box_volume_nm3(vectors):
     return abs(float(np.linalg.det(np.asarray(vectors, dtype=float))))
 
 
+def _box_heights_nm(vectors):
+    vectors = np.asarray(vectors, dtype=float)
+    volume = _box_volume_nm3(vectors)
+    return np.asarray([
+        volume / np.linalg.norm(np.cross(vectors[(index + 1) % 3], vectors[(index + 2) % 3]))
+        for index in range(3)
+    ])
+
+
+def _cutoff_safe_box_vectors(vectors, cutoff_nm, margin_nm=0.2):
+    vectors = np.asarray(vectors, dtype=float)
+    minimum_height = float(np.min(_box_heights_nm(vectors)))
+    required_height = 2.0 * float(cutoff_nm) + float(margin_nm)
+    if minimum_height < required_height:
+        vectors = vectors * (required_height / minimum_height)
+    return vectors
+
+
 def _serialize_system(directory, prepared):
     directory.mkdir(parents=True, exist_ok=True)
     system_path = directory / "system.xml"
@@ -421,6 +439,11 @@ def initialize_node_bank(path):
             key=lambda item: _box_volume_nm3(_box_vectors_nm(item.topology)),
         )
         box_vectors = _box_vectors_nm(largest.topology)
+        box_vectors = _cutoff_safe_box_vectors(
+            box_vectors,
+            float(setup.get("nonbonded_cutoff_a", 9.0)) / 10.0,
+            float(context["settings"].get("box_cutoff_margin_a", 2.0)) / 10.0,
+        )
         provisional = {}
         for index, (name, bundle) in enumerate(sorted(bundles.items())):
             local_setup = dict(setup)
@@ -451,6 +474,7 @@ def initialize_node_bank(path):
         canonical[environment] = {
             "box_vectors_nm": box_vectors.tolist(),
             "box_volume_nm3": _box_volume_nm3(box_vectors),
+            "box_heights_nm": _box_heights_nm(box_vectors).tolist(),
             "water_count": target_waters,
             "ion_counts": dict(next(iter(ion_signatures))),
         }
