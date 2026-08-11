@@ -5,7 +5,6 @@ import fcntl
 import os
 from pathlib import Path
 import shutil
-import tempfile
 
 import numpy as np
 import openmm as mm
@@ -546,11 +545,14 @@ def _validate_node_payload(staging, name, payload):
             raise NodeBankError(f"vacuum snapshot is missing or changed: {path}")
 
 
-def _prepare_node_payload(context, initialization, node, root, *, box_vectors=None):
+def _prepare_node_payload(
+    context, initialization, node, root, *, box_vectors=None, node_index=None
+):
     setup = context["setup"]
     config = context["config"]
     node_order = list(initialization.get("node_order", context["nodes"]))
-    node_index = node_order.index(node) if node in node_order else len(node_order)
+    if node_index is None:
+        node_index = node_order.index(node) if node in node_order else len(node_order)
     bundle = parameterize_ligand(
         context["nodes"][node],
         ligand_forcefield=setup.get("ligand_forcefield", "espaloma-0.3.2"),
@@ -699,7 +701,14 @@ def finalize_node_bank(path):
     return manifest
 
 
-def _extension_box_vectors(context, manifest, node, bundle):
+def _extension_seed_index(node):
+    # Keep extension seeds deterministic and outside the compact indices used when
+    # the original bank was built.  This makes parallel publication order irrelevant.
+    digest = hashlib.sha256(str(node).encode()).digest()
+    return 1000 + int.from_bytes(digest[:4], "big") % 8000
+
+
+def _extension_box_vectors(context, manifest, node, bundle, node_index):
     selected = {}
     maximum = float(manifest.get(
         "extension_max_linear_scale", context["extension_max_linear_scale"]
@@ -724,7 +733,7 @@ def _extension_box_vectors(context, manifest, node, bundle):
                     setup=setup,
                     solvation_seed=(
                         context["config"]["random_seed"]
-                        + len(manifest["nodes"])
+                        + node_index
                         + (0 if environment == "complex" else 10000)
                     ),
                 )
@@ -747,86 +756,140 @@ def _extension_box_vectors(context, manifest, node, bundle):
     return selected
 
 
+def _extension_manifest(context):
+    manifest_path = context["bank"] / "manifest.yaml"
+    if not manifest_path.is_file():
+        raise NodeBankError("node bank must be finalized before it can be extended")
+    manifest = yaml.safe_load(manifest_path.read_text()) or {}
+    if int(manifest.get("schema_version", 1)) != SCHEMA_VERSION:
+        raise NodeBankError("schema-v1 node banks are readable but cannot be extended")
+    if not manifest.get("extensible", False):
+        raise NodeBankError("this node bank is not marked extensible")
+    if manifest.get("compatibility_fingerprint") != context["fingerprint"]:
+        raise NodeBankError("workflow settings are incompatible with this node bank")
+    return manifest_path, manifest
+
+
+def _extension_expected(context, manifest, node, bundle):
+    charge = float(bundle.charges_e.sum())
+    existing_charges = {
+        round(float(payload["charge_e"]), 6)
+        for payload in manifest["nodes"].values()
+    }
+    if existing_charges and round(charge, 6) not in existing_charges:
+        raise NodeBankError("new node charge differs from the existing bank")
+    expected = {
+        "ligand_file": str(context["nodes"][node]),
+        "ligand_sha256": _sha256(context["nodes"][node]),
+        "charge_e": charge,
+        "anchors": list(context["anchors"][node]),
+        "parameterization": bundle.provenance,
+    }
+    expected["node_fingerprint"] = _fingerprint({
+        "compatibility_fingerprint": context["fingerprint"],
+        "node_id": node,
+        "ligand_sha256": expected["ligand_sha256"],
+        "anchors": expected["anchors"],
+        "charge_e": round(charge, 8),
+        "parameterization": bundle.provenance,
+    })
+    return expected
+
+
 def extend_node_bank(path, node):
-    """Prepare and atomically publish one node into an existing schema-v2 bank."""
+    """Prepare one extension without the bank lock, then publish it atomically."""
     context = _node_bank_context(path)
     node = str(node)
     if node not in context["nodes"]:
         raise NodeBankError(f"workflow does not define node {node}")
     lock_path = context["bank"].with_name(f".{context['bank'].name}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Take a consistent manifest snapshot, but do not hold the global lock while
+    # parameterizing, equilibrating, or sampling this node.
     with lock_path.open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        manifest_path = context["bank"] / "manifest.yaml"
-        if not manifest_path.is_file():
-            raise NodeBankError("node bank must be finalized before it can be extended")
-        manifest = yaml.safe_load(manifest_path.read_text()) or {}
-        if int(manifest.get("schema_version", 1)) != SCHEMA_VERSION:
-            raise NodeBankError("schema-v1 node banks are readable but cannot be extended")
-        if not manifest.get("extensible", False):
-            raise NodeBankError("this node bank is not marked extensible")
-        if manifest.get("compatibility_fingerprint") != context["fingerprint"]:
-            raise NodeBankError("workflow settings are incompatible with this node bank")
+        _, manifest = _extension_manifest(context)
         if node in manifest["nodes"]:
             return manifest["nodes"][node]
 
-        setup = context["setup"]
-        bundle = parameterize_ligand(
-            context["nodes"][node],
-            ligand_forcefield=setup.get("ligand_forcefield", "espaloma-0.3.2"),
-            ligand_charge_model=setup.get("ligand_charge_model", "nn"),
-            allow_undefined_stereo=bool(setup.get("allow_undefined_stereo", False)),
+    setup = context["setup"]
+    bundle = parameterize_ligand(
+        context["nodes"][node],
+        ligand_forcefield=setup.get("ligand_forcefield", "espaloma-0.3.2"),
+        ligand_charge_model=setup.get("ligand_charge_model", "nn"),
+        allow_undefined_stereo=bool(setup.get("allow_undefined_stereo", False)),
+    )
+    expected = _extension_expected(context, manifest, node, bundle)
+    node_index = _extension_seed_index(node)
+    initialization = {
+        "canonical_environments": manifest["canonical_environments"],
+        "node_order": [node],
+        "nodes": {node: expected},
+    }
+    vectors = _extension_box_vectors(
+        context, manifest, node, bundle, node_index
+    )
+    extension_root = context["bank"].with_name(
+        f".{context['bank'].name}.extensions"
+    ) / node
+    extension_manifest = extension_root / "nodes" / node / "manifest.yaml"
+    if extension_manifest.exists():
+        staged = yaml.safe_load(extension_manifest.read_text()) or {}
+        if (
+            staged.get("compatibility_fingerprint") != context["fingerprint"]
+            or staged.get("node", {}).get("node_fingerprint")
+            != expected["node_fingerprint"]
+        ):
+            raise NodeBankError(
+                f"staged extension inputs differ for {node}: {extension_root}"
+            )
+        payload = staged["node"]
+        _validate_node_payload(extension_root, node, payload)
+    else:
+        payload = _prepare_node_payload(
+            context,
+            initialization,
+            node,
+            extension_root,
+            box_vectors=vectors,
+            node_index=node_index,
         )
-        charge = float(bundle.charges_e.sum())
-        existing_charges = {
-            round(float(payload["charge_e"]), 6)
-            for payload in manifest["nodes"].values()
-        }
-        if existing_charges and round(charge, 6) not in existing_charges:
-            raise NodeBankError("new node charge differs from the existing bank")
-        expected = {
-            "ligand_file": str(context["nodes"][node]),
-            "ligand_sha256": _sha256(context["nodes"][node]),
-            "charge_e": charge,
-            "anchors": list(context["anchors"][node]),
-            "parameterization": bundle.provenance,
-        }
-        expected["node_fingerprint"] = _fingerprint({
+        _write_yaml_atomic(extension_manifest, {
+            "schema_version": SCHEMA_VERSION,
             "compatibility_fingerprint": context["fingerprint"],
             "node_id": node,
-            "ligand_sha256": expected["ligand_sha256"],
-            "anchors": expected["anchors"],
-            "charge_e": round(charge, 8),
-            "parameterization": bundle.provenance,
+            "node": payload,
         })
-        initialization = {
-            "canonical_environments": manifest["canonical_environments"],
-            "node_order": [*manifest["nodes"], node],
-            "nodes": {node: expected},
-        }
-        vectors = _extension_box_vectors(context, manifest, node, bundle)
-        temporary = Path(tempfile.mkdtemp(
-            prefix=f".{context['bank'].name}.{node}.", dir=context["bank"].parent
-        ))
-        try:
-            payload = _prepare_node_payload(
-                context, initialization, node, temporary, box_vectors=vectors
-            )
-            _write_yaml_atomic(temporary / "nodes" / node / "manifest.yaml", {
-                "schema_version": SCHEMA_VERSION,
-                "compatibility_fingerprint": context["fingerprint"],
-                "node_id": node,
-                "node": payload,
-            })
-            destination = context["bank"] / "nodes" / node
-            if destination.exists():
+
+    # Reload the manifest under lock so concurrent extensions cannot overwrite
+    # each other's publication.  The expensive staged payload is already complete.
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        manifest_path, current = _extension_manifest(context)
+        if node in current["nodes"]:
+            if current["nodes"][node].get("node_fingerprint") != expected["node_fingerprint"]:
+                raise NodeBankError(f"published node {node} has different inputs")
+            shutil.rmtree(extension_root, ignore_errors=True)
+            return current["nodes"][node]
+        _extension_expected(context, current, node, bundle)
+        destination = context["bank"] / "nodes" / node
+        if destination.exists():
+            published_manifest = destination / "manifest.yaml"
+            if not published_manifest.exists():
                 raise NodeBankError(f"orphaned destination already exists: {destination}")
-            os.replace(temporary / "nodes" / node, destination)
-            manifest["nodes"][node] = payload
-            _write_yaml_atomic(manifest_path, manifest)
-            return payload
-        finally:
-            shutil.rmtree(temporary, ignore_errors=True)
+            published = yaml.safe_load(published_manifest.read_text()) or {}
+            payload = published.get("node") or {}
+            if payload.get("node_fingerprint") != expected["node_fingerprint"]:
+                raise NodeBankError(f"orphaned destination differs for {node}")
+            _validate_node_payload(context["bank"], node, payload)
+        else:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(extension_root / "nodes" / node, destination)
+        current["nodes"][node] = payload
+        _write_yaml_atomic(manifest_path, current)
+    shutil.rmtree(extension_root, ignore_errors=True)
+    return payload
 
 
 def prepare_node_bank(path):

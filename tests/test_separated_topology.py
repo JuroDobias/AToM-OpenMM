@@ -3,7 +3,9 @@ import openmm as mm
 from openmm import unit
 from openff.toolkit import ForceField, Molecule
 from openff.units import unit as offunit
+import fcntl
 import pytest
+from types import SimpleNamespace
 import yaml
 
 from atom_openmm.covalent_parameters import CovalentParameterBundle
@@ -282,6 +284,72 @@ def _test_schema_v1_node_bank_is_readable_but_not_extensible(tmp_path, monkeypat
     assert module._existing_bank(context)["schema_version"] == 1
     with pytest.raises(module.NodeBankError, match="schema-v1"):
         module.extend_node_bank("workflow.yaml", "C")
+
+
+def _test_parallel_extension_prepares_without_bank_lock_and_reloads_manifest(
+    tmp_path, monkeypatch
+):
+    from atom_openmm import separated_node_bank as module
+
+    bank = tmp_path / "bank"
+    (bank / "nodes").mkdir(parents=True)
+    ligand = tmp_path / "C.sdf"
+    ligand.write_text("ligand")
+    manifest_path = bank / "manifest.yaml"
+    manifest_path.write_text(yaml.safe_dump({
+        "schema_version": module.SCHEMA_VERSION,
+        "compatibility_fingerprint": "fingerprint",
+        "extensible": True,
+        "extension_max_linear_scale": 1.05,
+        "canonical_environments": {},
+        "nodes": {"A": {"charge_e": 0.0, "node_fingerprint": "A"}},
+    }))
+    context = {
+        "bank": bank,
+        "nodes": {"C": ligand},
+        "anchors": {"C": (0, 1, 2)},
+        "fingerprint": "fingerprint",
+        "setup": {},
+        "config": {"random_seed": 7},
+        "extension_max_linear_scale": 1.05,
+    }
+    bundle = SimpleNamespace(
+        charges_e=np.asarray([0.0]),
+        provenance={"charge_model": "test"},
+    )
+    monkeypatch.setattr(module, "_node_bank_context", lambda _: context)
+    monkeypatch.setattr(module, "parameterize_ligand", lambda *args, **kwargs: bundle)
+    monkeypatch.setattr(
+        module, "_extension_box_vectors", lambda *args, **kwargs: {}
+    )
+    monkeypatch.setattr(module, "_validate_node_payload", lambda *args: None)
+
+    def prepare(context, initialization, node, root, **kwargs):
+        # A second process must be able to acquire the global publication lock
+        # while this expensive preparation callback is active.
+        lock_path = bank.with_name(".bank.lock")
+        with lock_path.open("a+") as probe:
+            fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+        node_dir = root / "nodes" / node
+        node_dir.mkdir(parents=True)
+        current = yaml.safe_load(manifest_path.read_text())
+        current["nodes"]["D"] = {
+            "charge_e": 0.0,
+            "node_fingerprint": "D",
+        }
+        manifest_path.write_text(yaml.safe_dump(current))
+        return dict(initialization["nodes"][node])
+
+    monkeypatch.setattr(module, "_prepare_node_payload", prepare)
+
+    payload = module.extend_node_bank("workflow.yaml", "C")
+    published = yaml.safe_load(manifest_path.read_text())
+
+    assert payload["node_fingerprint"] == published["nodes"]["C"]["node_fingerprint"]
+    assert sorted(published["nodes"]) == ["A", "C", "D"]
+    assert (bank / "nodes" / "C" / "manifest.yaml").is_file()
+    assert not (tmp_path / ".bank.extensions" / "C").exists()
 
 
 def _test_triclinic_box_volume_uses_determinant():
