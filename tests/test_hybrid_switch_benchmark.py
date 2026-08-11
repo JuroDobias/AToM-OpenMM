@@ -133,7 +133,14 @@ def _test_source_softcore_preserves_concerted_path_mode():
 
 
 def _test_source_softcore_preserves_explicit_gapsys_path():
-    protocol = {"softcore": {"function": "beutler"}}
+    protocol = {
+        "softcore": {
+            "function": "beutler",
+            "charge_steps_per_stage": 10000,
+            "sterics_steps": 30000,
+            "subdivisions_per_stage": 2,
+        }
+    }
     variant = {
         "stage_interpolation": "linear",
         "softcore": {
@@ -156,3 +163,6 @@ def _test_source_softcore_preserves_explicit_gapsys_path():
     assert observed["charge_a"] == [1.0, 0.5, 0.0]
     assert observed["segments_per_interval"] == [1, 1]
     assert observed["gapsys_scale_linpoint_q"] == 0.30
+    assert "charge_steps_per_stage" not in observed
+    assert "sterics_steps" not in observed
+    assert "subdivisions_per_stage" not in observed

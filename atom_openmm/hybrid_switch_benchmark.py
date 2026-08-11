@@ -321,6 +321,13 @@ def _source_softcore(protocol, variant):
             softcore["segments_per_interval"] = [1] * (
                 len(softcore["path_nodes"]) + 1
             )
+    if "path_nodes" in softcore:
+        for key in (
+            "charge_steps_per_stage",
+            "sterics_steps",
+            "subdivisions_per_stage",
+        ):
+            softcore.pop(key, None)
     if "path_mode" in softcore:
         for key in (
             "charge_steps_per_stage",
