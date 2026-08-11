@@ -57,6 +57,9 @@ def _workflow(
     adaptive_switching=True,
     convergence=True,
     dummy_core_nonbonded="off",
+    schedule_optimization=False,
+    unrestrained_npt_steps=500000,
+    random_seed=2026,
 ):
     total_switch_steps = int(round(float(switch_time_ps) * 1000.0 / 2.0))
     charge_steps = total_switch_steps // 4
@@ -101,7 +104,10 @@ def _workflow(
                             },
                             _md_step("restrained_nvt", "NVT", 50000, 0.001, True),
                             _md_step("restrained_npt", "NPT", 100000, 0.001, True),
-                            _md_step("unrestrained_npt", "NPT", 500000, 0.002, False),
+                            _md_step(
+                                "unrestrained_npt", "NPT",
+                                int(unrestrained_npt_steps), 0.002, False,
+                            ),
                         ]
                     },
                     "solvent_endpoint": {"mode": "default"},
@@ -157,7 +163,7 @@ def _workflow(
                 },
                 "failed_switch_policy": "count_as_infinite",
                 "bootstrap_samples": 500,
-                "random_seed": 2026,
+                "random_seed": int(random_seed),
                 "rest2": {
                     "enabled": True,
                     "effective_temperatures_k": [300.0, 356.8, 424.3, 504.5, 600.0],
@@ -178,14 +184,22 @@ def _workflow(
             "reuse_selected_pilot_samples": True,
             "on_exhausted": "use_longest",
         }
+    if schedule_optimization:
+        payload["workflow"]["neqti"]["schedule_optimization"] = {
+            "enabled": True,
+            "pilot_samples": 10,
+            "subdivisions_per_stage": 10,
+            "min_segment_steps": 250,
+            "max_segment_steps": 15000,
+        }
     if convergence:
         payload["workflow"]["neqti"]["convergence"] = {
             "enabled": True,
             "min_samples_per_direction": 30,
             "min_overlap_score_per_leg": 0.05,
-            "max_ddg_error_kcal_per_mol": 0.5,
+            "max_dg_error_kcal_per_mol": 0.5,
             "consecutive_checks": 3,
-            "max_ddg_range_kcal_per_mol": 0.25,
+            "max_dg_range_kcal_per_mol": 0.25,
         }
     if (ligand_a, ligand_b) == ("30", "31"):
         payload["workflow"]["setup"]["allow_undefined_stereo"] = True

@@ -410,9 +410,9 @@ workflow:
       enabled: true
       min_samples_per_direction: 30
       min_overlap_score_per_leg: 0.05
-      max_ddg_error_kcal_per_mol: 0.5
+      max_dg_error_kcal_per_mol: 0.5
       consecutive_checks: 3
-      max_ddg_range_kcal_per_mol: 0.25
+      max_dg_range_kcal_per_mol: 0.25
 ```
 
 All candidate durations replay the same bank of endpoint snapshots. Rejected
@@ -423,11 +423,14 @@ schedule optimization is enabled, its frozen allocation is scaled instead.
 Selection state and candidate statistics are stored in
 `neqti_adaptive_switching.yaml`.
 
-After both environments have selected durations, convergence uses matched
-complex and solvent prefixes. The first check is made at the configured minimum
-sample count. Reaching `n_snapshots` without satisfying all overlap,
-uncertainty, and stability criteria records `max_samples` and a partial result.
-Because selection and estimation reuse the same pilot work, `result.yaml`
+After each environment selects its duration, its BAR estimate converges
+independently. Complex and solvent may therefore stop with different sample
+counts. The first per-environment check is made at the configured minimum sample
+count and requires its own overlap, bootstrap uncertainty, and DG stability
+criteria. Reaching `n_snapshots` without satisfying those criteria records
+`max_samples` for that environment and a partial overall result. The combined
+DDG history is diagnostic and does not force matched prefixes. Because selection
+and estimation reuse the selected pilot work, `result.yaml`
 records this provenance and emits a quality warning.
 
 ## ATM-AWH with endpoint REST2

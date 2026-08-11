@@ -34,10 +34,25 @@ def _test_hybrid_cdk2_generator_uses_adaptive_production_protocol():
         "enabled": True,
         "min_samples_per_direction": 30,
         "min_overlap_score_per_leg": 0.05,
-        "max_ddg_error_kcal_per_mol": 0.5,
+        "max_dg_error_kcal_per_mol": 0.5,
         "consecutive_checks": 3,
-        "max_ddg_range_kcal_per_mol": 0.25,
+        "max_dg_range_kcal_per_mol": 0.25,
     }
+
+    extended = generator._workflow(
+        "1oiy",
+        "32",
+        schedule_optimization=True,
+        unrestrained_npt_steps=1000000,
+        random_seed=3031,
+    )["workflow"]
+    assert extended["neqti"]["schedule_optimization"]["pilot_samples"] == 10
+    assert extended["neqti"]["schedule_optimization"]["subdivisions_per_stage"] == 10
+    assert extended["neqti"]["random_seed"] == 3031
+    assert (
+        extended["equilibration"]["neqti"]["complex_endpoint"]["steps"][-1]["n_steps"]
+        == 1000000
+    )
 
 
 def _write_synthetic_benchmark(tmp_path):

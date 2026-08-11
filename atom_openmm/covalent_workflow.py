@@ -2764,14 +2764,20 @@ def _normalized_settings(workflow):
             "min_overlap_score_per_leg": float(
                 convergence_raw.get("min_overlap_score_per_leg", 0.05)
             ),
-            "max_ddg_error_kcal_per_mol": float(
-                convergence_raw.get("max_ddg_error_kcal_per_mol", 0.5)
+            "max_dg_error_kcal_per_mol": float(
+                convergence_raw.get(
+                    "max_dg_error_kcal_per_mol",
+                    convergence_raw.get("max_ddg_error_kcal_per_mol", 0.5),
+                )
             ),
             "consecutive_checks": int(
                 convergence_raw.get("consecutive_checks", 3)
             ),
-            "max_ddg_range_kcal_per_mol": float(
-                convergence_raw.get("max_ddg_range_kcal_per_mol", 0.25)
+            "max_dg_range_kcal_per_mol": float(
+                convergence_raw.get(
+                    "max_dg_range_kcal_per_mol",
+                    convergence_raw.get("max_ddg_range_kcal_per_mol", 0.25),
+                )
             ),
         },
         "failed_switch_policy": str(

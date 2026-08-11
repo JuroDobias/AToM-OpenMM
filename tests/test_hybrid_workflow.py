@@ -197,14 +197,13 @@ def _test_hybrid_accepts_only_balanced_concerted_ssc2_coulomb(tmp_path):
         raise AssertionError("SSC(2) Coulomb accepted a non-concerted path")
 
 
-def _test_hybrid_convergence_uses_matched_prefix_and_truncates_extra_work(tmp_path):
+def _test_hybrid_convergence_stops_environments_independently(tmp_path):
     from atom_openmm.covalent_workflow import _read_work, _rewrite_work
     from atom_openmm.hybrid_workflow import (
         _hybrid_convergence_callback,
-        _normalize_converged_work_prefix,
     )
 
-    for environment, samples in (("complex", 32), ("solvent", 100)):
+    for environment, samples in (("complex", 32), ("solvent", 40)):
         _rewrite_work(tmp_path / f"{environment}_forward.csv", [1.0] * samples)
         _rewrite_work(tmp_path / f"{environment}_reverse.csv", [-1.0] * samples)
     config = {
@@ -215,21 +214,26 @@ def _test_hybrid_convergence_uses_matched_prefix_and_truncates_extra_work(tmp_pa
             "enabled": True,
             "min_samples_per_direction": 30,
             "min_overlap_score_per_leg": 0.05,
-            "max_ddg_error_kcal_per_mol": 0.5,
+            "max_dg_error_kcal_per_mol": 0.5,
             "consecutive_checks": 3,
-            "max_ddg_range_kcal_per_mol": 0.25,
+            "max_dg_range_kcal_per_mol": 0.25,
         },
     }
     callback, state = _hybrid_convergence_callback(tmp_path, config)
     assert callback("complex", 32, [1.0] * 32, [-1.0] * 32)
+    assert state["termination_reason"] is None
+    assert callback("solvent", 40, [1.0] * 40, [-1.0] * 40)
     assert state["termination_reason"] == "converged"
-    assert [row["sample_count_per_direction"] for row in state["history"]] == [30, 31, 32]
-    assert len(_read_work(tmp_path / "solvent_forward.csv")) == 32
-    assert len(_read_work(tmp_path / "solvent_reverse.csv")) == 32
-
-    _rewrite_work(tmp_path / "solvent_forward.csv", [1.0] * 40)
-    _normalize_converged_work_prefix(tmp_path, state)
-    assert len(_read_work(tmp_path / "solvent_forward.csv")) == 32
+    assert [
+        row["sample_count_per_direction"]
+        for row in state["environments"]["complex"]["history"]
+    ] == [30, 31, 32]
+    assert [
+        row["sample_count_per_direction"]
+        for row in state["environments"]["solvent"]["history"]
+    ] == [30, 31, 32]
+    assert len(_read_work(tmp_path / "complex_forward.csv")) == 32
+    assert len(_read_work(tmp_path / "solvent_forward.csv")) == 40
 
 
 def _test_hybrid_result_reports_adaptive_selection_and_max_samples(tmp_path):
@@ -298,11 +302,10 @@ def _test_hybrid_result_reports_adaptive_selection_and_max_samples(tmp_path):
     assert len(result["quality"]["warnings"]) == 2
 
 
-def _test_hybrid_environment_iterators_advance_in_matched_cycles(tmp_path):
+def _test_hybrid_environment_iterators_stop_at_different_counts(tmp_path):
     from atom_openmm.covalent_workflow import _append_work, _read_work, _rewrite_work
     from atom_openmm.hybrid_workflow import (
-        _hybrid_convergence_callback,
-        _run_matched_environment_iterators,
+        _run_independent_environment_iterators,
     )
 
     for environment in ("complex", "solvent"):
@@ -315,27 +318,15 @@ def _test_hybrid_environment_iterators_advance_in_matched_cycles(tmp_path):
             _append_work(tmp_path / f"{environment}_reverse.csv", sample, -4.184)
             yield [1.0] * sample, [-1.0] * sample, {"sample": sample}
 
-    config = {
-        "temperature_k": 300.0,
-        "bootstrap_samples": 20,
-        "random_seed": 2026,
-        "convergence": {
-            "enabled": True,
-            "min_samples_per_direction": 30,
-            "min_overlap_score_per_leg": 0.05,
-            "max_ddg_error_kcal_per_mol": 0.5,
-            "consecutive_checks": 3,
-            "max_ddg_range_kcal_per_mol": 0.25,
-        },
-    }
-    callback, state = _hybrid_convergence_callback(tmp_path, config)
-    summaries = _run_matched_environment_iterators(
+    def callback(environment, _sample, _forward, _reverse):
+        count = len(_read_work(tmp_path / f"{environment}_forward.csv"))
+        return count >= {"complex": 22, "solvent": 25}[environment]
+
+    summaries = _run_independent_environment_iterators(
         {"complex": iterator("complex"), "solvent": iterator("solvent")},
-        tmp_path,
         callback,
     )
-    assert state["termination_reason"] == "converged"
-    assert summaries["complex"] == {"sample": 32}
-    assert summaries["solvent"] == {"sample": 32}
-    assert len(_read_work(tmp_path / "complex_forward.csv")) == 32
-    assert len(_read_work(tmp_path / "solvent_forward.csv")) == 32
+    assert summaries["complex"] == {"sample": 22}
+    assert summaries["solvent"] == {"sample": 25}
+    assert len(_read_work(tmp_path / "complex_forward.csv")) == 22
+    assert len(_read_work(tmp_path / "solvent_forward.csv")) == 25

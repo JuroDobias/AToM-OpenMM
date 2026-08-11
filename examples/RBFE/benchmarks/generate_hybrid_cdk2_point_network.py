@@ -194,7 +194,7 @@ def _network_payload():
     }
 
 
-def generate(source_cohort, benchmark_root, output, source_dir_name):
+def generate(source_cohort, benchmark_root, output, source_dir_name, random_seed=2026):
     source_cohort = Path(source_cohort).resolve()
     benchmark_root = Path(benchmark_root).resolve()
     output = Path(output).resolve()
@@ -226,7 +226,14 @@ def generate(source_cohort, benchmark_root, output, source_dir_name):
             adaptive_switching=True,
             convergence=True,
             dummy_core_nonbonded="off",
+            schedule_optimization=True,
+            unrestrained_npt_steps=1000000,
+            random_seed=random_seed,
         )
+        workflow["workflow"]["alchemy"]["mapping"] = {"method": "mcs"}
+        scales = workflow["workflow"]["setup"]["dummy_bonded_scales"]
+        scales["junction_rotatable_torsion"] = 0.1
+        scales["internal_rotatable_torsion"] = 0.1
         (target / "workflow.yaml").write_text(yaml.safe_dump(workflow, sort_keys=False))
         run = target / "run.sh"
         run.write_text(_run_script(edge, source_dir_name=source_dir_name))
@@ -259,7 +266,13 @@ def generate(source_cohort, benchmark_root, output, source_dir_name):
         "from aligned 1oiy and 32 coordinates. Two cycles test amide and sulfonamide "
         "substituent additivity. Each edge uses REST2 endpoint sampling, 20 reusable "
         "adaptive pilot samples at 100/300/1000 ps, up to 100 samples, and BAR "
-        "convergence stopping. Run ./analyze_network.sh after or during the cohort.\n"
+        "independent environment convergence stopping. Each complex endpoint gets "
+        "2 ns of final unrestrained NPT. Ten schedule-optimization samples per "
+        "environment add 1 ns per REST2 replica before production and freeze an "
+        "environment-specific switching schedule. Mapping uses the unrestricted "
+        "whole-ligand MCS, while rotatable dummy and junction torsions are scaled "
+        f"to 0.1. The independent random seed is {int(random_seed)}. Run "
+        "./analyze_network.sh after or during the cohort.\n"
     )
 
 
@@ -269,12 +282,14 @@ def main():
     parser.add_argument("--benchmark-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-dir-name", default="AToM-OpenMM-hybrid-dummy-core")
+    parser.add_argument("--random-seed", type=int, default=2026)
     args = parser.parse_args()
     generate(
         args.source_cohort,
         args.benchmark_root,
         args.output,
         args.source_dir_name,
+        args.random_seed,
     )
 
 

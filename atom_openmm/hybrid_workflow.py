@@ -37,8 +37,10 @@ from atom_openmm.hybrid_mapping import build_hybrid_atom_map
 from atom_openmm.hybrid_parameters import parameterize_ligand
 from atom_openmm.hybrid_systems import create_physical_ligand_environment
 from atom_openmm.neqti import (
+    _bar_overlap_score,
     _convergence_reached,
     _convergence_record,
+    analyze_neqti_work,
     analyze_two_leg_work,
 )
 
@@ -247,12 +249,12 @@ def _validate_settings(workflow):
             )
         if convergence["min_overlap_score_per_leg"] <= 0:
             raise HybridWorkflowError("convergence overlap threshold must be positive")
-        if convergence["max_ddg_error_kcal_per_mol"] <= 0:
+        if convergence["max_dg_error_kcal_per_mol"] <= 0:
             raise HybridWorkflowError("convergence uncertainty threshold must be positive")
         if convergence["consecutive_checks"] < 1:
             raise HybridWorkflowError("convergence.consecutive_checks must be positive")
-        if convergence["max_ddg_range_kcal_per_mol"] < 0:
-            raise HybridWorkflowError("convergence DDG range must be non-negative")
+        if convergence["max_dg_range_kcal_per_mol"] < 0:
+            raise HybridWorkflowError("convergence DG range must be non-negative")
     return config
 
 
@@ -482,23 +484,113 @@ def _convergence_state(workdir, config):
     path = workdir / "neqti_convergence.yaml"
     if path.exists():
         state = yaml.safe_load(path.read_text()) or {}
-        if state.get("settings") != config["convergence"]:
+        settings = state.get("settings") or {}
+        expected = config["convergence"]
+        legacy_expected = {
+            **expected,
+            "max_ddg_error_kcal_per_mol": expected["max_dg_error_kcal_per_mol"],
+            "max_ddg_range_kcal_per_mol": expected["max_dg_range_kcal_per_mol"],
+        }
+        legacy_expected.pop("max_dg_error_kcal_per_mol")
+        legacy_expected.pop("max_dg_range_kcal_per_mol")
+        if settings != expected and settings != legacy_expected:
             raise HybridWorkflowError(
                 "existing hybrid convergence state uses different settings"
             )
         return state
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "settings": config["convergence"],
-        "history": [],
+        "environments": {
+            environment: {"history": [], "termination_reason": None}
+            for environment in ("complex", "solvent")
+        },
+        "combined_history": [],
         "termination_reason": None,
     }
 
 
-def _hybrid_convergence_callback(workdir, config):
-    path = workdir / "neqti_convergence.yaml"
-    state = _convergence_state(workdir, config)
+def _environment_convergence_record(forward, reverse, config, environment):
+    analysis = analyze_neqti_work(
+        forward,
+        reverse,
+        config["temperature_k"],
+        config["bootstrap_samples"],
+        config["random_seed"] + (0 if environment == "complex" else 100000),
+    )
+    dg = None if analysis is None else analysis["bar_dg_kcal_per_mol"]
+    error = (
+        None if analysis is None
+        else analysis["bar_bootstrap_std_kcal_per_mol"]
+    )
+    overlap = _bar_overlap_score(
+        forward, reverse, dg, config["temperature_k"]
+    )
     settings = config["convergence"]
+    sample_count = min(len(forward), len(reverse))
+    return {
+        "sample_count_per_direction": sample_count,
+        "dg_kcal_per_mol": dg,
+        "dg_error_kcal_per_mol": error,
+        "overlap_score": overlap,
+        "thresholds_pass": bool(
+            sample_count >= settings["min_samples_per_direction"]
+            and overlap is not None
+            and overlap >= settings["min_overlap_score_per_leg"]
+            and error is not None
+            and error <= settings["max_dg_error_kcal_per_mol"]
+        ),
+    }
+
+
+def _environment_convergence_reached(history, settings):
+    required = settings["consecutive_checks"]
+    if len(history) < required:
+        return False
+    recent = history[-required:]
+    if not all(record["thresholds_pass"] for record in recent):
+        return False
+    estimates = [record["dg_kcal_per_mol"] for record in recent]
+    return max(estimates) - min(estimates) <= settings["max_dg_range_kcal_per_mol"]
+
+
+def _append_combined_convergence_record(state, workdir, config):
+    work = {
+        "leg_a_forward": _read_work(workdir / "complex_forward.csv"),
+        "leg_a_reverse": _read_work(workdir / "complex_reverse.csv"),
+        "leg_b_forward": _read_work(workdir / "solvent_forward.csv"),
+        "leg_b_reverse": _read_work(workdir / "solvent_reverse.csv"),
+    }
+    if any(not values for values in work.values()):
+        return
+    counts = {
+        "complex": min(len(work["leg_a_forward"]), len(work["leg_a_reverse"])),
+        "solvent": min(len(work["leg_b_forward"]), len(work["leg_b_reverse"])),
+    }
+    previous = state.get("combined_history") or []
+    if previous and previous[-1].get("sample_counts") == counts:
+        return
+    analysis = analyze_two_leg_work(
+        work,
+        config["temperature_k"],
+        bootstrap_samples=0,
+        random_seed=config["random_seed"],
+    )
+    state.setdefault("combined_history", []).append({
+        "sample_counts": counts,
+        "ddg_kcal_per_mol": (
+            None if analysis is None else analysis["bar_dg_kcal_per_mol"]
+        ),
+        "ddg_error_kcal_per_mol": (
+            None if analysis is None
+            else analysis["bar_bootstrap_std_kcal_per_mol"]
+        ),
+    })
+
+
+def _legacy_hybrid_convergence_callback(workdir, config, state):
+    path = workdir / "neqti_convergence.yaml"
+    legacy_settings = state["settings"]
 
     def callback(environment, _sample, _forward, _reverse):
         if environment != "complex":
@@ -513,22 +605,18 @@ def _hybrid_convergence_callback(workdir, config):
         }
         available = min(len(values) for values in work.values())
         previous = max(
-            (
-                int(record["sample_count_per_direction"])
-                for record in state.get("history", [])
-            ),
+            (int(record["sample_count_per_direction"]) for record in state.get("history", [])),
             default=0,
         )
-        first = max(previous + 1, settings["min_samples_per_direction"])
+        first = max(previous + 1, legacy_settings["min_samples_per_direction"])
         for sample_count in range(first, available + 1):
-            prefix = {
-                name: values[:sample_count] for name, values in work.items()
-            }
+            prefix = {name: values[:sample_count] for name, values in work.items()}
             analysis = _analysis_payload(prefix, config)
-            counts = {name: sample_count for name in prefix}
-            record = _convergence_record(analysis, counts, settings)
+            record = _convergence_record(
+                analysis, {name: sample_count for name in prefix}, legacy_settings
+            )
             state["history"].append(record)
-            reached = _convergence_reached(state["history"], settings)
+            reached = _convergence_reached(state["history"], legacy_settings)
             if reached:
                 state["termination_reason"] = "converged"
             _write_yaml_atomic(path, state)
@@ -543,10 +631,62 @@ def _hybrid_convergence_callback(workdir, config):
                 return True
         return False
 
+    return callback
+
+
+def _hybrid_convergence_callback(workdir, config):
+    path = workdir / "neqti_convergence.yaml"
+    state = _convergence_state(workdir, config)
+    settings = config["convergence"]
+
+    if int(state.get("schema_version", 1)) < 2:
+        return _legacy_hybrid_convergence_callback(workdir, config, state), state
+
+    def callback(environment, _sample, _forward, _reverse):
+        environment_state = state["environments"][environment]
+        if environment_state.get("termination_reason") is not None:
+            return True
+        forward = _read_work(workdir / f"{environment}_forward.csv")
+        reverse = _read_work(workdir / f"{environment}_reverse.csv")
+        available = min(len(forward), len(reverse))
+        previous = max(
+            (
+                int(record["sample_count_per_direction"])
+                for record in environment_state.get("history", [])
+            ),
+            default=0,
+        )
+        first = max(previous + 1, settings["min_samples_per_direction"])
+        for sample_count in range(first, available + 1):
+            record = _environment_convergence_record(
+                forward[:sample_count], reverse[:sample_count], config, environment
+            )
+            environment_state["history"].append(record)
+            reached = _environment_convergence_reached(
+                environment_state["history"], settings
+            )
+            if reached:
+                environment_state["termination_reason"] = "converged"
+            _append_combined_convergence_record(state, workdir, config)
+            reasons = [
+                item.get("termination_reason")
+                for item in state["environments"].values()
+            ]
+            if all(reason is not None for reason in reasons):
+                state["termination_reason"] = (
+                    "converged" if set(reasons) == {"converged"} else "max_samples"
+                )
+            _write_yaml_atomic(path, state)
+            if reached:
+                return True
+        return False
+
     return callback, state
 
 
 def _normalize_converged_work_prefix(workdir, convergence_state):
+    if int(convergence_state.get("schema_version", 1)) >= 2:
+        return
     if convergence_state.get("termination_reason") != "converged":
         return
     history = convergence_state.get("history") or []
@@ -568,8 +708,11 @@ def _normalize_converged_work_prefix(workdir, convergence_state):
                 _rewrite_work(path, values[:sample_count])
 
 
-def _run_matched_environment_iterators(iterators, workdir, convergence_callback):
-    completed = {environment: False for environment in iterators}
+def _run_independent_environment_iterators(iterators, convergence_callback):
+    completed = {
+        environment: bool(convergence_callback(environment, 0, None, None))
+        for environment in iterators
+    }
     summaries = {environment: None for environment in iterators}
 
     def advance(environment):
@@ -580,32 +723,41 @@ def _run_matched_environment_iterators(iterators, workdir, convergence_callback)
             latest = stopped.value
         if latest is not None:
             summaries[environment] = latest[2]
+        return convergence_callback(environment, 0, None, None)
 
     try:
         while not all(completed.values()):
-            counts = {
-                environment: min(
-                    len(_read_work(workdir / f"{environment}_forward.csv")),
-                    len(_read_work(workdir / f"{environment}_reverse.csv")),
-                )
-                for environment in iterators
-            }
-            if not completed["solvent"] and counts["solvent"] <= counts["complex"]:
-                advance("solvent")
-            counts["solvent"] = min(
-                len(_read_work(workdir / "solvent_forward.csv")),
-                len(_read_work(workdir / "solvent_reverse.csv")),
-            )
-            if not completed["complex"] and counts["complex"] < counts["solvent"]:
-                advance("complex")
-            elif completed["solvent"] and not completed["complex"]:
-                advance("complex")
-            if convergence_callback("complex", 0, None, None):
-                break
+            for environment in iterators:
+                if not completed[environment] and advance(environment):
+                    completed[environment] = True
     finally:
         for iterator in iterators.values():
             iterator.close()
     return summaries
+
+
+def _finalize_independent_convergence(workdir, config, state):
+    if int(state.get("schema_version", 1)) < 2:
+        return state
+    for environment, environment_state in state["environments"].items():
+        if environment_state.get("termination_reason") is not None:
+            continue
+        count = min(
+            len(_read_work(workdir / f"{environment}_forward.csv")),
+            len(_read_work(workdir / f"{environment}_reverse.csv")),
+        )
+        if count >= config["n_snapshots"]:
+            environment_state["termination_reason"] = "max_samples"
+    reasons = [
+        item.get("termination_reason") for item in state["environments"].values()
+    ]
+    if all(reason is not None for reason in reasons):
+        state["termination_reason"] = (
+            "converged" if set(reasons) == {"converged"} else "max_samples"
+        )
+    _append_combined_convergence_record(state, workdir, config)
+    _write_yaml_atomic(workdir / "neqti_convergence.yaml", state)
+    return state
 
 
 def _result(
@@ -875,17 +1027,28 @@ def run_noncovalent_hybrid_workflow(path):
                         properties, config["random_seed"] + 100000,
                     ),
                 }
-                summaries = _run_matched_environment_iterators(
-                    iterators, workdir, convergence_callback
+                summaries = _run_independent_environment_iterators(
+                    iterators, convergence_callback
                 )
                 complex_forward = _read_work(workdir / "complex_forward.csv")
                 complex_reverse = _read_work(workdir / "complex_reverse.csv")
                 solvent_forward = _read_work(workdir / "solvent_forward.csv")
                 solvent_reverse = _read_work(workdir / "solvent_reverse.csv")
-                complex_rest2 = summaries["complex"]
-                solvent_rest2 = summaries["solvent"]
+                existing_rest2 = (
+                    previous_result.get("quality", {}).get("rest2") or {}
+                )
+                complex_rest2 = (
+                    summaries["complex"] or existing_rest2.get("complex")
+                )
+                solvent_rest2 = (
+                    summaries["solvent"] or existing_rest2.get("solvent")
+                )
                 convergence_state = _convergence_state(workdir, config)
-                if convergence_state.get("termination_reason") is None:
+                if int(convergence_state.get("schema_version", 1)) >= 2:
+                    convergence_state = _finalize_independent_convergence(
+                        workdir, config, convergence_state
+                    )
+                elif convergence_state.get("termination_reason") is None:
                     counts = [
                         len(_read_work(workdir / f"{environment}_{direction}.csv"))
                         for environment in ("complex", "solvent")
