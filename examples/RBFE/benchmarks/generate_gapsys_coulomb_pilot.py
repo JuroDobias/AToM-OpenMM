@@ -56,6 +56,8 @@ cd "${{SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")}}"
 [[ -f results/result.yaml ]] && exit 0
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate myatom
+export LD_LIBRARY_PATH="$HOME/myAToM/openmm-build-env/lib:$HOME/myAToM/openmm-endpoint-gates-install/lib:${{LD_LIBRARY_PATH:-}}"
+export OPENMM_PLUGIN_DIR="$HOME/myAToM/openmm-endpoint-gates-install/lib/plugins"
 export PYTHONPATH="$HOME/myAToM/{source_dir_name}${{PYTHONPATH:+:$PYTHONPATH}}"
 python -m atom_openmm.hybrid_switch_benchmark run benchmark.yaml
 """
