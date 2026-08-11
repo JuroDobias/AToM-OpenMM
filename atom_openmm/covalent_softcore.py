@@ -25,10 +25,15 @@ RECIPROCAL_A_CHARGE_PARAMETER = "COVALENT_RECIPROCAL_A_CHARGE"
 RECIPROCAL_B_CHARGE_PARAMETER = "COVALENT_RECIPROCAL_B_CHARGE"
 RECIPROCAL_A_EXCEPTION_PARAMETER = "COVALENT_RECIPROCAL_A_EXCEPTION"
 RECIPROCAL_B_EXCEPTION_PARAMETER = "COVALENT_RECIPROCAL_B_EXCEPTION"
+GAPSYS_RECIPROCAL_A_CHARGE_PARAMETER = "COVALENT_GAPSYS_RECIPROCAL_A_CHARGE"
+GAPSYS_RECIPROCAL_B_CHARGE_PARAMETER = "COVALENT_GAPSYS_RECIPROCAL_B_CHARGE"
+GAPSYS_RECIPROCAL_A_EXCEPTION_PARAMETER = "COVALENT_GAPSYS_RECIPROCAL_A_EXCEPTION"
+GAPSYS_RECIPROCAL_B_EXCEPTION_PARAMETER = "COVALENT_GAPSYS_RECIPROCAL_B_EXCEPTION"
 SOFTCORE_NONBONDED_FORCE_GROUP = 31
 ONE_4PI_EPS0 = 138.935456
 AMBER_SSC2_IMPLEMENTATION = "amber_gti_ssc2_v1"
 LEGACY_SSC2_IMPLEMENTATION = "effective_distance_ssc2_v1"
+GROMACS_GAPSYS_IMPLEMENTATION = "gromacs_gapsys_2026_v1"
 
 
 @dataclass(frozen=True)
@@ -331,6 +336,22 @@ def _gapsys_energy_expression(scale, *, mixing):
         "-(168*C12/rsc^13-48*C6/rsc^7)*r"
         "+91*C12/rsc^12-28*C6/rsc^6;"
         + definitions
+    )
+
+
+def _gapsys_coulomb_correction_expression(scale, *, mixing):
+    definitions = (
+        "Vquadratic=rSafe^2/rQSafe^3-3*rSafe/rQSafe^2+3/rQSafe;"
+        "rSafe=max(r,1e-6);"
+        "rQSafe=max(rQ,1e-6);"
+        "rQ=min(CUTOFF,GAPSYS_SCALE_LINPOINT_Q"
+        f"*(max(0,1-({scale})))^(1.0/6.0)*(1+abs(chargeprod)))"
+    )
+    if mixing:
+        definitions += ";chargeprod=charge1*charge2"
+    return (
+        f"({scale})*ONE_4PI_EPS0*chargeprod*step(rQ-r)"
+        "*(Vquadratic-1/rSafe);" + definitions
     )
 
 
@@ -752,25 +773,39 @@ def _new_environment_exception_force(*, include_coulomb=True):
     return force
 
 
-def _new_endpoint_reciprocal_force(source, label, exception_pairs):
-    """Build one Amber-style weighted endpoint electrostatic Hamiltonian.
+def _new_endpoint_reciprocal_force(source, label, exception_pairs, *, model="amber"):
+    """Build one weighted endpoint electrostatic Hamiltonian.
 
     PME energies are quadratic in particle charges, so particle charges use
     sqrt(weight), while exception charge products use weight directly. Lennard-
-    Jones terms are omitted and evaluated entirely by the SSC2 custom forces.
+    Jones terms are omitted and evaluated by separate custom forces.
     """
-    charge_parameter = (
-        RECIPROCAL_A_CHARGE_PARAMETER
-        if label == "A"
-        else RECIPROCAL_B_CHARGE_PARAMETER
-    )
-    exception_parameter = (
-        RECIPROCAL_A_EXCEPTION_PARAMETER
-        if label == "A"
-        else RECIPROCAL_B_EXCEPTION_PARAMETER
-    )
+    if model == "gapsys":
+        charge_parameter = (
+            GAPSYS_RECIPROCAL_A_CHARGE_PARAMETER
+            if label == "A"
+            else GAPSYS_RECIPROCAL_B_CHARGE_PARAMETER
+        )
+        exception_parameter = (
+            GAPSYS_RECIPROCAL_A_EXCEPTION_PARAMETER
+            if label == "A"
+            else GAPSYS_RECIPROCAL_B_EXCEPTION_PARAMETER
+        )
+        force_name = f"CovalentGromacsGapsysEndpointElectrostatics{label}"
+    else:
+        charge_parameter = (
+            RECIPROCAL_A_CHARGE_PARAMETER
+            if label == "A"
+            else RECIPROCAL_B_CHARGE_PARAMETER
+        )
+        exception_parameter = (
+            RECIPROCAL_A_EXCEPTION_PARAMETER
+            if label == "A"
+            else RECIPROCAL_B_EXCEPTION_PARAMETER
+        )
+        force_name = f"CovalentAmberGTIEndpointElectrostatics{label}"
     force = mm.NonbondedForce()
-    force.setName(f"CovalentAmberGTIEndpointElectrostatics{label}")
+    force.setName(force_name)
     _configure_nonbonded_like(source, force)
     force.addGlobalParameter(charge_parameter, 0.0)
     force.addGlobalParameter(exception_parameter, 0.0)
@@ -795,6 +830,40 @@ def _new_endpoint_reciprocal_force(source, label, exception_pairs):
     return force
 
 
+def _new_gapsys_coulomb_force(source, label, scale, scale_linpoint_q):
+    force = mm.CustomNonbondedForce(
+        _gapsys_coulomb_correction_expression(scale, mixing=True)
+    )
+    force.setName(f"CovalentGromacsGapsysCoulombCorrection{label}")
+    force.addGlobalParameter(scale, 0.0)
+    force.addGlobalParameter("ONE_4PI_EPS0", ONE_4PI_EPS0)
+    force.addGlobalParameter("GAPSYS_SCALE_LINPOINT_Q", float(scale_linpoint_q))
+    force.addGlobalParameter(
+        "CUTOFF", _float(source.getCutoffDistance(), unit.nanometer)
+    )
+    force.addPerParticleParameter("charge")
+    force.setForceGroup(SOFTCORE_NONBONDED_FORCE_GROUP)
+    _configure_custom_nonbonded_like(
+        source, force, use_long_range_correction=False
+    )
+    return force
+
+
+def _new_gapsys_coulomb_exception_force(label, scale, scale_linpoint_q, cutoff_nm):
+    force = mm.CustomBondForce(
+        _gapsys_coulomb_correction_expression(scale, mixing=False)
+    )
+    force.setName(f"CovalentGromacsGapsysCoulombExceptions{label}")
+    force.addGlobalParameter(scale, 0.0)
+    force.addGlobalParameter("ONE_4PI_EPS0", ONE_4PI_EPS0)
+    force.addGlobalParameter("GAPSYS_SCALE_LINPOINT_Q", float(scale_linpoint_q))
+    force.addGlobalParameter("CUTOFF", float(cutoff_nm))
+    force.addPerBondParameter("chargeprod")
+    force.setUsesPeriodicBoundaryConditions(True)
+    force.setForceGroup(SOFTCORE_NONBONDED_FORCE_GROUP)
+    return force
+
+
 def _add_nonbonded_forces(
     output,
     endpoint_a,
@@ -808,6 +877,7 @@ def _add_nonbonded_forces(
     sigma_nm,
     power,
     gapsys_scale_linpoint_lj,
+    gapsys_scale_linpoint_q,
     gapsys_sigma_nm,
     ssc2_alpha_lj,
     ssc2_alpha_coul,
@@ -825,12 +895,14 @@ def _add_nonbonded_forces(
         "amber_ssc2",
         "effective_distance_ssc2",
     }
+    use_gapsys_coulomb = coulomb_function == "gapsys"
     use_amber_reciprocal = coulomb_function == "amber_ssc2"
-    if use_ssc2_coulomb and source_a.getNonbondedMethod() not in {
+    use_endpoint_electrostatics = use_amber_reciprocal or use_gapsys_coulomb
+    if (use_ssc2_coulomb or use_gapsys_coulomb) and source_a.getNonbondedMethod() not in {
         mm.NonbondedForce.PME,
         mm.NonbondedForce.Ewald,
     }:
-        raise CovalentAlchemyError("Amber SSC(2) Coulomb requires PME or Ewald")
+        raise CovalentAlchemyError("softcore Coulomb requires PME or Ewald")
     unique_a = set(int(index) for index in unique_a)
     unique_b = set(int(index) for index in unique_b)
     if unique_a & unique_b:
@@ -845,20 +917,24 @@ def _add_nonbonded_forces(
         tuple(sorted((particle_a, particle_b)))
         for particle_a in unique_a for particle_b in unique_b
     )
-    if use_ssc2_coulomb:
+    if use_ssc2_coulomb or use_gapsys_coulomb:
         exception_pairs.update(combinations(sorted(unique_a), 2))
         exception_pairs.update(combinations(sorted(unique_b), 2))
 
-    if use_amber_reciprocal:
-        force = None
+    if use_endpoint_electrostatics:
+        model = "gapsys" if use_gapsys_coulomb else "amber"
         reciprocal_a = _new_endpoint_reciprocal_force(
-            source_a, "A", exception_pairs
+            source_a, "A", exception_pairs, model=model
         )
         reciprocal_b = _new_endpoint_reciprocal_force(
-            source_b, "B", exception_pairs
+            source_b, "B", exception_pairs, model=model
         )
     else:
         reciprocal_a = reciprocal_b = None
+
+    if use_amber_reciprocal:
+        force = None
+    else:
         force = mm.NonbondedForce()
         force.setName("CovalentInterpolatedPMENonbonded")
         _configure_nonbonded_like(source_a, force)
@@ -888,13 +964,16 @@ def _add_nonbonded_forces(
         if force is not None:
             if particle in unique_a:
                 force.addParticle(0.0, sa, 0.0)
-                _add_offset(force, CHARGE_A_PARAMETER, particle, charge=qa)
+                if not use_gapsys_coulomb:
+                    _add_offset(force, CHARGE_A_PARAMETER, particle, charge=qa)
             elif particle in unique_b:
                 force.addParticle(0.0, sb, 0.0)
-                _add_offset(force, CHARGE_B_PARAMETER, particle, charge=qb)
+                if not use_gapsys_coulomb:
+                    _add_offset(force, CHARGE_B_PARAMETER, particle, charge=qb)
             else:
-                force.addParticle(qa, sa, ea)
-                _add_offset(force, MAPPED_CHARGE_PARAMETER, particle, charge=qb - qa)
+                force.addParticle(0.0 if use_gapsys_coulomb else qa, sa, ea)
+                if not use_gapsys_coulomb:
+                    _add_offset(force, MAPPED_CHARGE_PARAMETER, particle, charge=qb - qa)
                 _add_offset(
                     force,
                     STERICS_PARAMETER,
@@ -904,6 +983,7 @@ def _add_nonbonded_forces(
                 )
 
     combined_direct = combined_lrc = None
+    gapsys_coulomb_a = gapsys_coulomb_b = None
     exception_coulomb_a = exception_coulomb_b = None
     reciprocal_exception_correction = environment_exceptions = None
     if use_ssc2_coulomb:
@@ -955,6 +1035,20 @@ def _add_nonbonded_forces(
             ssc2_switch_width_nm,
             use_long_range_correction=use_long_range_correction,
         )
+        if use_gapsys_coulomb:
+            cutoff_nm = _float(source_a.getCutoffDistance(), unit.nanometer)
+            gapsys_coulomb_a = _new_gapsys_coulomb_force(
+                source_a, "A", CHARGE_A_PARAMETER, gapsys_scale_linpoint_q
+            )
+            gapsys_coulomb_b = _new_gapsys_coulomb_force(
+                source_b, "B", CHARGE_B_PARAMETER, gapsys_scale_linpoint_q
+            )
+            exception_coulomb_a = _new_gapsys_coulomb_exception_force(
+                "A", CHARGE_A_PARAMETER, gapsys_scale_linpoint_q, cutoff_nm
+            )
+            exception_coulomb_b = _new_gapsys_coulomb_exception_force(
+                "B", CHARGE_B_PARAMETER, gapsys_scale_linpoint_q, cutoff_nm
+            )
         softcore_b = _new_softcore_force(
             source_b,
             "B",
@@ -997,11 +1091,18 @@ def _add_nonbonded_forces(
         else:
             softcore_a.addParticle([sigma_a, epsilon_a])
             softcore_b.addParticle([sigma_b, epsilon_b])
+            if use_gapsys_coulomb:
+                gapsys_coulomb_a.addParticle([charge_a])
+                gapsys_coulomb_b.addParticle([charge_b])
     if not use_ssc2_coulomb:
         if unique_a and environment:
             softcore_a.addInteractionGroup(unique_a, environment)
+            if use_gapsys_coulomb:
+                gapsys_coulomb_a.addInteractionGroup(unique_a, environment)
         if unique_b and environment:
             softcore_b.addInteractionGroup(unique_b, environment)
+            if use_gapsys_coulomb:
+                gapsys_coulomb_b.addInteractionGroup(unique_b, environment)
     exception_lj_a = _new_softcore_exception_force(
         "A",
         STERICS_A_PARAMETER,
@@ -1046,6 +1147,9 @@ def _add_nonbonded_forces(
             if use_ssc2_coulomb:
                 if q_a != 0.0:
                     exception_coulomb_a.addBond(p1, p2, [q_a, sigma_a])
+            elif use_gapsys_coulomb:
+                if q_a != 0.0:
+                    exception_coulomb_a.addBond(p1, p2, [q_a])
             else:
                 _add_exception_offset(force, CHARGE_A_PARAMETER, index, charge=q_a)
             if epsilon_a != 0.0:
@@ -1055,15 +1159,21 @@ def _add_nonbonded_forces(
             if use_ssc2_coulomb:
                 if q_b != 0.0:
                     exception_coulomb_b.addBond(p1, p2, [q_b, sigma_b])
+            elif use_gapsys_coulomb:
+                if q_b != 0.0:
+                    exception_coulomb_b.addBond(p1, p2, [q_b])
             else:
                 _add_exception_offset(force, CHARGE_B_PARAMETER, index, charge=q_b)
             if epsilon_b != 0.0:
                 exception_lj_b.addBond(p1, p2, [sigma_b, epsilon_b])
         else:
-            index = force.addException(p1, p2, q_a, sigma_a, epsilon_a)
-            _add_exception_offset(
-                force, MAPPED_CHARGE_PARAMETER, index, charge=q_b - q_a
+            index = force.addException(
+                p1, p2, 0.0 if use_gapsys_coulomb else q_a, sigma_a, epsilon_a
             )
+            if not use_gapsys_coulomb:
+                _add_exception_offset(
+                    force, MAPPED_CHARGE_PARAMETER, index, charge=q_b - q_a
+                )
             _add_exception_offset(
                 force,
                 STERICS_PARAMETER,
@@ -1108,10 +1218,13 @@ def _add_nonbonded_forces(
         else:
             softcore_a.addExclusion(p1, p2)
             softcore_b.addExclusion(p1, p2)
+            if use_gapsys_coulomb:
+                gapsys_coulomb_a.addExclusion(p1, p2)
+                gapsys_coulomb_b.addExclusion(p1, p2)
 
     if force is not None:
         output.addForce(force)
-    else:
+    if use_endpoint_electrostatics:
         output.addForce(reciprocal_a)
         output.addForce(reciprocal_b)
     if use_ssc2_coulomb:
@@ -1128,16 +1241,20 @@ def _add_nonbonded_forces(
     if unique_a:
         if not use_ssc2_coulomb:
             output.addForce(softcore_a)
+            if use_gapsys_coulomb:
+                output.addForce(gapsys_coulomb_a)
     if unique_b:
         if not use_ssc2_coulomb:
             output.addForce(softcore_b)
+            if use_gapsys_coulomb:
+                output.addForce(gapsys_coulomb_b)
     if exception_lj_a.getNumBonds():
         output.addForce(exception_lj_a)
     if exception_lj_b.getNumBonds():
         output.addForce(exception_lj_b)
-    if use_ssc2_coulomb and exception_coulomb_a.getNumBonds():
+    if (use_ssc2_coulomb or use_gapsys_coulomb) and exception_coulomb_a.getNumBonds():
         output.addForce(exception_coulomb_a)
-    if use_ssc2_coulomb and exception_coulomb_b.getNumBonds():
+    if (use_ssc2_coulomb or use_gapsys_coulomb) and exception_coulomb_b.getNumBonds():
         output.addForce(exception_coulomb_b)
 
 
@@ -1479,6 +1596,23 @@ def _add_amber_reciprocal_path(values, resolved):
     )
 
 
+def _add_gapsys_reciprocal_path(values, resolved):
+    weight_a = resolved["charge_a"]
+    weight_b = resolved["charge_b"]
+    values[GAPSYS_RECIPROCAL_A_CHARGE_PARAMETER] = _expand_node_values(
+        [math.sqrt(value) - 1.0 for value in weight_a], resolved
+    )
+    values[GAPSYS_RECIPROCAL_B_CHARGE_PARAMETER] = _expand_node_values(
+        [math.sqrt(value) - 1.0 for value in weight_b], resolved
+    )
+    values[GAPSYS_RECIPROCAL_A_EXCEPTION_PARAMETER] = _expand_node_values(
+        [value - 1.0 for value in weight_a], resolved
+    )
+    values[GAPSYS_RECIPROCAL_B_EXCEPTION_PARAMETER] = _expand_node_values(
+        [value - 1.0 for value in weight_b], resolved
+    )
+
+
 def create_softcore_hamiltonian(
     endpoint_a: mm.System,
     endpoint_b: mm.System,
@@ -1491,6 +1625,7 @@ def create_softcore_hamiltonian(
     sigma_nm: float = 0.25,
     power: int = 1,
     gapsys_scale_linpoint_lj: float = 0.85,
+    gapsys_scale_linpoint_q: float = 0.30,
     gapsys_sigma_nm: float = 0.30,
     ssc2_alpha_lj: float = 0.5,
     ssc2_alpha_coul: float = 1.0,
@@ -1524,12 +1659,13 @@ def create_softcore_hamiltonian(
         )
     if coulomb_function not in {
         "linear_pme",
+        "gapsys",
         "amber_ssc2",
         "effective_distance_ssc2",
     }:
         raise CovalentAlchemyError(
-            "softcore coulomb_function must be 'linear_pme', 'amber_ssc2', "
-            "or 'effective_distance_ssc2'"
+            "softcore coulomb_function must be 'linear_pme', 'gapsys', "
+            "'amber_ssc2', or 'effective_distance_ssc2'"
         )
     if stage_interpolation not in {"linear", "smoothstep2"}:
         raise CovalentAlchemyError(
@@ -1537,7 +1673,11 @@ def create_softcore_hamiltonian(
         )
     if alpha <= 0.0 or sigma_nm <= 0.0 or power < 1:
         raise CovalentAlchemyError("softcore alpha, sigma_nm, and power must be positive")
-    if gapsys_scale_linpoint_lj <= 0.0 or gapsys_sigma_nm <= 0.0:
+    if (
+        gapsys_scale_linpoint_lj <= 0.0
+        or gapsys_scale_linpoint_q <= 0.0
+        or gapsys_sigma_nm <= 0.0
+    ):
         raise CovalentAlchemyError(
             "Gapsys scale linearization point and sigma must be positive"
         )
@@ -1572,6 +1712,20 @@ def create_softcore_hamiltonian(
         segments_per_interval=segments_per_interval,
         path_mode=path_mode,
     )
+    if coulomb_function == "gapsys":
+        if function != "gapsys":
+            raise CovalentAlchemyError(
+                "Gapsys Coulomb requires function: gapsys"
+            )
+        if any(
+            not math.isclose(left + right, 1.0, abs_tol=1.0e-12)
+            for left, right in zip(
+                resolved_path["charge_a"], resolved_path["charge_b"]
+            )
+        ):
+            raise CovalentAlchemyError(
+                "Gapsys Coulomb requires complementary A/B charge schedules"
+            )
     output = _system_shell(endpoint_a)
     _add_bonded_forces(output, endpoint_a, endpoint_b)
     _add_nonbonded_forces(
@@ -1586,6 +1740,7 @@ def create_softcore_hamiltonian(
         sigma_nm=float(sigma_nm),
         power=int(power),
         gapsys_scale_linpoint_lj=float(gapsys_scale_linpoint_lj),
+        gapsys_scale_linpoint_q=float(gapsys_scale_linpoint_q),
         gapsys_sigma_nm=float(gapsys_sigma_nm),
         ssc2_alpha_lj=float(ssc2_alpha_lj),
         ssc2_alpha_coul=float(ssc2_alpha_coul),
@@ -1597,6 +1752,8 @@ def create_softcore_hamiltonian(
     values, steps = _expand_path(resolved_path)
     if coulomb_function == "amber_ssc2":
         _add_amber_reciprocal_path(values, resolved_path)
+    elif coulomb_function == "gapsys":
+        _add_gapsys_reciprocal_path(values, resolved_path)
     return CovalentSoftcoreHamiltonian(
         output,
         values,

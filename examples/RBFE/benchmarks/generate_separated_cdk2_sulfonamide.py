@@ -191,7 +191,9 @@ def _workflow(pairs, *, node_bank_path, receptor, ligands, workdir):
     }
 
 
-def _slurm_script(command, job_name, completion_file, source_dir_name):
+def _slurm_script(
+    command, job_name, completion_file, source_dir_name, script_name="run.sh"
+):
     return f"""#!/usr/bin/env bash
 #SBATCH -N 1
 #SBATCH --ntasks=1
@@ -207,7 +209,7 @@ def _slurm_script(command, job_name, completion_file, source_dir_name):
 
 set -euo pipefail
 RUN_DIR="${{SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")}}"
-SCRIPT="$RUN_DIR/$(basename "$0")"
+SCRIPT="$RUN_DIR/{script_name}"
 CHAIN_INDEX="${{ATOM_CHAIN_INDEX:-0}}"
 CHILD=""
 on_timeout() {{
@@ -277,7 +279,7 @@ def _bank_node_script(source_dir_name, node):
 
 set -euo pipefail
 RUN_DIR="${{SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")}}"
-SCRIPT="$RUN_DIR/$(basename "$0")"
+SCRIPT="$RUN_DIR/prepare_node_{node}.sh"
 CHAIN_INDEX="${{ATOM_CHAIN_INDEX:-0}}"
 CHILD=""
 on_timeout() {{
@@ -319,7 +321,7 @@ if [[ ! -f .node_bank.building/nodes/1h1q/manifest.yaml || \
       ! -f .node_bank.building/nodes/1h1s/manifest.yaml || \
       ! -f .node_bank.building/nodes/21/manifest.yaml || \
       ! -f .node_bank.building/nodes/32/manifest.yaml ]]; then
-    sbatch --begin=now+20minutes "$RUN_DIR/$(basename "$0")"
+    sbatch --begin=now+20minutes "$RUN_DIR/finalize_nodes.sh"
     exit 0
 fi
 {_runtime(source_dir_name)}

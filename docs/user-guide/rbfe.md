@@ -1230,6 +1230,44 @@ unique-branch/environment LJ interactions and their exceptions. Electrostatics
 continue to follow the configured staged PME charge path. `function: beutler`
 retains the `alpha`, `sigma_nm`, and `power` settings.
 
+GROMACS-style Gapsys Coulomb softcore is independently opt-in:
+
+```yaml
+softcore:
+  function: gapsys
+  coulomb_function: gapsys
+  gapsys_scale_linpoint_lj: 0.85
+  gapsys_scale_linpoint_q: 0.30
+  gapsys_sigma_nm: 0.30
+  total_steps: 50000
+  path:
+    mode: concerted
+```
+
+`gapsys_scale_linpoint_q` has implicit units of nm/e^2 and matches the GROMACS
+default. Below the charge- and coupling-dependent linearization radius, the
+Coulomb potential is replaced by the force-matched quadratic Gapsys
+continuation; ordinary PME is retained beyond it. The A and B electrostatic
+Hamiltonians are weighted linearly, so Gapsys Coulomb requires complementary
+charge schedules (`charge_a + charge_b = 1`) and PME or Ewald electrostatics.
+The explicit path below is therefore also valid and keeps both steric branches
+fully present at the midpoint:
+
+```yaml
+softcore:
+  function: gapsys
+  coulomb_function: gapsys
+  total_steps: 50000
+  path:
+    nodes: [0.5]
+    vdw_a: [1.0, 1.0, 0.0]
+    charge_a: [1.0, 0.5, 0.0]
+```
+
+The legacy staged decharge/sterics/recharge path is intentionally rejected for
+Gapsys Coulomb because both endpoint PME weights would be zero during its
+middle stage. Existing workflows retain `coulomb_function: linear_pme`.
+
 The Amber GTI SSC(2) LJ form uses a pair-specific contact radius, quadratic
 effective distance, and intrinsic second-order smoothstep coupling:
 

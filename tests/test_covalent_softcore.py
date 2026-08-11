@@ -7,6 +7,7 @@ from openmm import unit
 from atom_openmm.covalent_softcore import (
     CHARGE_A_PARAMETER,
     CHARGE_B_PARAMETER,
+    GAPSYS_RECIPROCAL_A_CHARGE_PARAMETER,
     MAPPED_CHARGE_PARAMETER,
     RECIPROCAL_A_CHARGE_PARAMETER,
     SOFTCORE_NONBONDED_FORCE_GROUP,
@@ -18,6 +19,7 @@ from atom_openmm.covalent_softcore import (
     _amber_ssc2_energy_expression,
     _effective_distance_ssc2_combined_direct_expression,
     _gapsys_energy_expression,
+    _gapsys_coulomb_correction_expression,
     create_softcore_hamiltonian,
     resolve_softcore_path,
 )
@@ -654,6 +656,96 @@ def _test_gapsys_pair_energy_matches_reference_equation():
         atol=1.0e-3,
         rtol=1.0e-4,
     )
+
+
+def _test_gapsys_coulomb_correction_matches_quadratic_reference():
+    scale = 0.35
+    chargeprod = -0.24
+    alpha_q = 0.30
+    cutoff = 1.0
+    r_q = min(
+        cutoff,
+        alpha_q * (1.0 - scale) ** (1.0 / 6.0) * (1.0 + abs(chargeprod)),
+    )
+    force = mm.CustomBondForce(
+        _gapsys_coulomb_correction_expression(
+            "COVALENT_CHARGE_A", mixing=False
+        )
+    )
+    force.addGlobalParameter("COVALENT_CHARGE_A", scale)
+    force.addGlobalParameter("ONE_4PI_EPS0", 138.935456)
+    force.addGlobalParameter("GAPSYS_SCALE_LINPOINT_Q", alpha_q)
+    force.addGlobalParameter("CUTOFF", cutoff)
+    force.addPerBondParameter("chargeprod")
+    force.addBond(0, 1, [chargeprod])
+    system = mm.System()
+    system.addParticle(12.0)
+    system.addParticle(12.0)
+    system.addForce(force)
+
+    observed_forces = []
+    for distance in (0.05, 0.8 * r_q, 0.999999 * r_q, r_q, 1.000001 * r_q, 0.8):
+        energy, forces = _energy_forces(
+            system,
+            np.asarray([[0.0, 0.0, 0.0], [distance, 0.0, 0.0]])
+            * unit.nanometer,
+        )
+        if distance < r_q:
+            quadratic = distance**2 / r_q**3 - 3 * distance / r_q**2 + 3 / r_q
+            expected = scale * 138.935456 * chargeprod * (quadratic - 1 / distance)
+        else:
+            expected = 0.0
+        assert np.isclose(energy, expected, atol=1.0e-8, rtol=1.0e-7)
+        assert np.all(np.isfinite(forces))
+        if 0.999998 < distance / r_q < 1.000002:
+            observed_forces.append(float(forces[1, 0]))
+    assert np.allclose(observed_forces, 0.0, atol=1.0e-3)
+
+
+def _test_concerted_gapsys_coulomb_reproduces_pme_endpoints():
+    endpoint_a = _endpoint("a")
+    endpoint_b = _endpoint("b")
+    hamiltonian = create_softcore_hamiltonian(
+        endpoint_a,
+        endpoint_b,
+        [2],
+        [3],
+        function="gapsys",
+        coulomb_function="gapsys",
+        total_steps=10,
+        path_mode="concerted",
+    )
+    positions = np.asarray(
+        [[0, 0, 0], [0.15, 0, 0], [0.28, 0.08, 0], [0.29, -0.09, 0.03], [0.7, 0.4, 0.3]]
+    ) * unit.nanometer
+    assert GAPSYS_RECIPROCAL_A_CHARGE_PARAMETER in hamiltonian.parameter_values
+    for endpoint, node in ((endpoint_a, 0), (endpoint_b, -1)):
+        expected_energy, expected_forces = _energy_forces(endpoint, positions)
+        parameters = {
+            name: values[node]
+            for name, values in hamiltonian.parameter_values.items()
+        }
+        observed_energy, observed_forces = _energy_forces(
+            hamiltonian.system, positions, parameters
+        )
+        assert np.isclose(observed_energy, expected_energy, atol=1.0e-5)
+        assert np.allclose(observed_forces, expected_forces, atol=1.0e-3)
+
+
+def _test_gapsys_coulomb_rejects_noncomplementary_charge_path():
+    try:
+        create_softcore_hamiltonian(
+            _endpoint("a"),
+            _endpoint("b"),
+            [2],
+            [3],
+            function="gapsys",
+            coulomb_function="gapsys",
+        )
+    except Exception as exc:
+        assert "complementary" in str(exc)
+    else:
+        raise AssertionError("staged Gapsys Coulomb path was accepted")
 
 
 def _test_gapsys_reproduces_endpoint_energies_and_forces():

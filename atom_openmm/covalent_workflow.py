@@ -38,6 +38,7 @@ from atom_openmm.covalent_softcore import (
     AMBER_SSC2_IMPLEMENTATION,
     CHARGE_A_PARAMETER,
     CHARGE_B_PARAMETER,
+    GROMACS_GAPSYS_IMPLEMENTATION,
     MAPPED_CHARGE_PARAMETER,
     LEGACY_SSC2_IMPLEMENTATION,
     SOFTCORE_NONBONDED_FORCE_GROUP,
@@ -376,12 +377,13 @@ def validate_covalent_workflow(path):
         )
     if config["softcore"]["coulomb_function"] not in {
         "linear_pme",
+        "gapsys",
         "amber_ssc2",
         "effective_distance_ssc2",
     }:
         raise CovalentWorkflowError(
             "workflow.neqti.softcore.coulomb_function must be "
-            "'linear_pme', 'amber_ssc2', or 'effective_distance_ssc2'"
+            "'linear_pme', 'gapsys', 'amber_ssc2', or 'effective_distance_ssc2'"
         )
     if config["softcore"]["stage_interpolation"] not in {
         "linear",
@@ -393,6 +395,7 @@ def validate_covalent_workflow(path):
         )
     if (
         config["softcore"]["gapsys_scale_linpoint_lj"] <= 0.0
+        or config["softcore"]["gapsys_scale_linpoint_q"] <= 0.0
         or config["softcore"]["gapsys_sigma_nm"] <= 0.0
     ):
         raise CovalentWorkflowError(
@@ -422,6 +425,21 @@ def validate_covalent_workflow(path):
         if config["softcore"].get("path_mode") != "concerted":
             raise CovalentWorkflowError(
                 "Amber SSC(2) Coulomb requires softcore.path.mode: concerted"
+            )
+    if config["softcore"]["coulomb_function"] == "gapsys":
+        if config["softcore"]["function"] != "gapsys":
+            raise CovalentWorkflowError(
+                "Gapsys Coulomb requires softcore.function: gapsys"
+            )
+        resolved = resolve_softcore_path(
+            **_softcore_path_options(config["softcore"])
+        )
+        if any(
+            not np.isclose(left + right, 1.0, atol=1.0e-12)
+            for left, right in zip(resolved["charge_a"], resolved["charge_b"])
+        ):
+            raise CovalentWorkflowError(
+                "Gapsys Coulomb requires complementary A/B charge schedules"
             )
     work_profile = config["switch_work_profile"]
     if work_profile["enabled"]:
@@ -2560,6 +2578,9 @@ def _normalized_settings(workflow):
         "gapsys_scale_linpoint_lj": float(
             softcore.get("gapsys_scale_linpoint_lj", 0.85)
         ),
+        "gapsys_scale_linpoint_q": float(
+            softcore.get("gapsys_scale_linpoint_q", 0.30)
+        ),
         "gapsys_sigma_nm": float(softcore.get("gapsys_sigma_nm", 0.30)),
         "ssc2_alpha_lj": float(softcore.get("ssc2_alpha_lj", 0.5)),
         "ssc2_alpha_coul": float(softcore.get("ssc2_alpha_coul", 1.0)),
@@ -3037,6 +3058,8 @@ def _switch_protocol(config, mapping_settings=None, mapping_label="covalent_mapp
             implementation = AMBER_SSC2_IMPLEMENTATION
         elif function == "effective_distance_ssc2":
             implementation = LEGACY_SSC2_IMPLEMENTATION
+        elif protocol["softcore"].get("coulomb_function") == "gapsys":
+            implementation = GROMACS_GAPSYS_IMPLEMENTATION
         else:
             implementation = function
         protocol["softcore"]["implementation"] = implementation
@@ -3107,6 +3130,7 @@ def _upgrade_legacy_switch_protocol(protocol, dummy_bonded_scales=None):
         softcore.setdefault("coulomb_function", "linear_pme")
         softcore.setdefault("stage_interpolation", "linear")
         softcore.setdefault("gapsys_scale_linpoint_lj", 0.85)
+        softcore.setdefault("gapsys_scale_linpoint_q", 0.30)
         softcore.setdefault("gapsys_sigma_nm", 0.30)
         softcore.setdefault("ssc2_alpha_lj", 0.5)
         if softcore.get("function") == "amber_ssc2" and "implementation" not in softcore:

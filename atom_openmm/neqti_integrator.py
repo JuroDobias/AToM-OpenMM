@@ -31,6 +31,22 @@ _AMBER_RECIPROCAL_TRANSFORMS = {
     ),
 }
 
+_GAPSYS_RECIPROCAL_TRANSFORMS = {
+    "COVALENT_GAPSYS_RECIPROCAL_A_CHARGE": (
+        "sqrt(max(0,COVALENT_CHARGE_A))-1"
+    ),
+    "COVALENT_GAPSYS_RECIPROCAL_B_CHARGE": (
+        "sqrt(max(0,COVALENT_CHARGE_B))-1"
+    ),
+    "COVALENT_GAPSYS_RECIPROCAL_A_EXCEPTION": "COVALENT_CHARGE_A-1",
+    "COVALENT_GAPSYS_RECIPROCAL_B_EXCEPTION": "COVALENT_CHARGE_B-1",
+}
+
+_RECIPROCAL_TRANSFORMS = {
+    **_AMBER_RECIPROCAL_TRANSFORMS,
+    **_GAPSYS_RECIPROCAL_TRANSFORMS,
+}
+
 
 def _apply_amber_reciprocal_transforms(values):
     for label in ("A", "B"):
@@ -44,6 +60,12 @@ def _apply_amber_reciprocal_transforms(values):
             values[charge_name] = math.sqrt(max(0.0, weight)) - 1.0
         if exception_name in values:
             values[exception_name] = weight - 1.0
+        gapsys_charge_name = f"COVALENT_GAPSYS_RECIPROCAL_{label}_CHARGE"
+        gapsys_exception_name = f"COVALENT_GAPSYS_RECIPROCAL_{label}_EXCEPTION"
+        if gapsys_charge_name in values:
+            values[gapsys_charge_name] = math.sqrt(max(0.0, charge)) - 1.0
+        if gapsys_exception_name in values:
+            values[gapsys_exception_name] = charge - 1.0
     return values
 
 
@@ -211,7 +233,7 @@ class ATMNonequilibriumLangevinIntegrator(mm.CustomIntegrator):
         for name, values in parameter_values.items():
             if len(values) != nsegments + 1:
                 raise ValueError("all switching parameter schedules must have the same length")
-            expression = _AMBER_RECIPROCAL_TRANSFORMS.get(name)
+            expression = _RECIPROCAL_TRANSFORMS.get(name)
             if expression is None:
                 expression = _piecewise_expression(
                     values,

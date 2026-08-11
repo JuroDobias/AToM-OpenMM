@@ -555,6 +555,34 @@ def _test_gapsys_and_work_profile_settings_are_recorded_in_protocol():
     assert protocol["switch_work_profile"]["interval_steps"] == 100
 
 
+def _test_gapsys_coulomb_midpoint_path_is_recorded_in_protocol():
+    config = _normalized_settings(
+        {
+            "neqti": {
+                "interpolation": "softcore_linear",
+                "softcore": {
+                    "function": "gapsys",
+                    "coulomb_function": "gapsys",
+                    "gapsys_scale_linpoint_q": 0.30,
+                    "total_steps": 50000,
+                    "path": {
+                        "nodes": [0.5],
+                        "vdw_a": [1.0, 1.0, 0.0],
+                        "charge_a": [1.0, 0.5, 0.0],
+                    },
+                },
+            }
+        }
+    )
+
+    assert config["softcore"]["gapsys_scale_linpoint_q"] == 0.30
+    protocol = _switch_protocol(config)
+    assert protocol["softcore"]["coulomb_function"] == "gapsys"
+    assert protocol["softcore"]["implementation"] == "gromacs_gapsys_2026_v1"
+    assert protocol["softcore"]["resolved_path"]["vdw_a"] == [1.0, 1.0, 0.0]
+    assert protocol["softcore"]["resolved_path"]["charge_b"] == [0.0, 0.5, 1.0]
+
+
 def _test_amber_ssc2_settings_are_recorded_in_protocol():
     config = _normalized_settings(
         {

@@ -28,6 +28,17 @@ The command resumes completed work observations, writes per-protocol BAR and
 overlap results, and reports paired work differences between each variant and the
 first protocol in the configuration.
 
+Generate the matched Gapsys Coulomb CDK2 replay jobs with:
+
+```bash
+python examples/RBFE/benchmarks/generate_gapsys_coulomb_pilot.py \
+  --snapshot-bank /path/to/hybrid_switch_snapshot_bank \
+  --output /path/to/gapsys_coulomb_pilot
+```
+
+The fixed-coordinate GROMACS 2026 cross-engine regression is documented in
+`gromacs_gapsys_cross_validation/README.md`.
+
 Generate jobs:
 
 ```bash

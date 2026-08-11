@@ -307,7 +307,20 @@ def _source_softcore(protocol, variant):
     softcore.update(variant["softcore"])
     path = softcore.pop("path", None)
     if path is not None:
-        softcore["path_mode"] = path.get("mode")
+        if path.get("mode") is not None:
+            softcore["path_mode"] = path["mode"]
+        for source, target in (
+            ("nodes", "path_nodes"),
+            ("vdw_a", "vdw_a"),
+            ("charge_a", "charge_a"),
+            ("segments_per_interval", "segments_per_interval"),
+        ):
+            if source in path:
+                softcore[target] = path[source]
+        if "path_nodes" in softcore and "segments_per_interval" not in softcore:
+            softcore["segments_per_interval"] = [1] * (
+                len(softcore["path_nodes"]) + 1
+            )
     if "path_mode" in softcore:
         for key in (
             "charge_steps_per_stage",
@@ -328,6 +341,7 @@ def _source_softcore(protocol, variant):
         "sigma_nm",
         "power",
         "gapsys_scale_linpoint_lj",
+        "gapsys_scale_linpoint_q",
         "gapsys_sigma_nm",
         "ssc2_alpha_lj",
         "ssc2_alpha_coul",

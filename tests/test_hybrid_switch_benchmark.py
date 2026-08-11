@@ -130,3 +130,29 @@ def _test_source_softcore_preserves_concerted_path_mode():
         )
         == "endpoint_correction"
     )
+
+
+def _test_source_softcore_preserves_explicit_gapsys_path():
+    protocol = {"softcore": {"function": "beutler"}}
+    variant = {
+        "stage_interpolation": "linear",
+        "softcore": {
+            "function": "gapsys",
+            "coulomb_function": "gapsys",
+            "gapsys_scale_linpoint_q": 0.30,
+            "total_steps": 50000,
+            "path": {
+                "nodes": [0.5],
+                "vdw_a": [1.0, 1.0, 0.0],
+                "charge_a": [1.0, 0.5, 0.0],
+            },
+        },
+    }
+
+    observed = _source_softcore(protocol, variant)
+
+    assert observed["path_nodes"] == [0.5]
+    assert observed["vdw_a"] == [1.0, 1.0, 0.0]
+    assert observed["charge_a"] == [1.0, 0.5, 0.0]
+    assert observed["segments_per_interval"] == [1, 1]
+    assert observed["gapsys_scale_linpoint_q"] == 0.30
