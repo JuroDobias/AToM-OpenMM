@@ -20,7 +20,7 @@ PATHS = {
         "gapsys_sigma_nm": 0.30,
         "total_steps": 50000,
         "path": {"mode": "concerted"},
-        "long_range_correction": "endpoint_correction",
+        "long_range_correction": "dynamic",
     },
     "ssc2_concerted_softcore_coulomb": {
         "function": "amber_ssc2",
