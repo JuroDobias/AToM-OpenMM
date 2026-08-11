@@ -11,6 +11,17 @@ import yaml
 
 
 PATHS = {
+    "gapsys_concerted_softcore_coulomb": {
+        "function": "gapsys",
+        "coulomb_function": "gapsys",
+        "stage_interpolation": "linear",
+        "gapsys_scale_linpoint_lj": 0.85,
+        "gapsys_scale_linpoint_q": 0.30,
+        "gapsys_sigma_nm": 0.30,
+        "total_steps": 50000,
+        "path": {"mode": "concerted"},
+        "long_range_correction": "endpoint_correction",
+    },
     "ssc2_concerted_softcore_coulomb": {
         "function": "amber_ssc2",
         "coulomb_function": "amber_ssc2",
@@ -154,8 +165,9 @@ def generate(base_workflow, output, source_dir_name, variants=None):
         "All selected 21--32 pilots reuse the same physical node bank, snapshot "
         "permutation, random seed, 20 samples per direction, and 100 ps switch "
         "duration. Adaptive duration selection is disabled. Available variants "
-        "include source-matched concerted Amber SSC2 Coulomb plus LJ, Amber SSC2 "
-        "LJ paths with ordinary PME charges, and a Beutler charged handoff. Sample "
+        "include concerted Gapsys or source-matched Amber SSC2 Coulomb plus LJ, "
+        "Amber SSC2 LJ paths with ordinary PME charges, and a Beutler charged "
+        "handoff. Sample "
         "1 writes start, path-node, and end PDBs plus three-anchor RMSDs for both "
         "directions and environments.\n"
     )
