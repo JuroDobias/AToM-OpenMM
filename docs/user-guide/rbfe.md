@@ -408,11 +408,19 @@ workflow:
       on_exhausted: use_longest
     convergence:
       enabled: true
-      min_samples_per_direction: 30
+      reopen_on_settings_change: true
+      min_samples_per_direction: 50
       min_overlap_score_per_leg: 0.05
       max_dg_error_kcal_per_mol: 0.5
+      check_interval_samples: 5
       consecutive_checks: 3
       max_dg_range_kcal_per_mol: 0.25
+      stationarity:
+        enabled: true
+        discard_fraction: 0.10
+        min_discard_samples: 5
+        max_discard_first_shift_kcal_per_mol: 0.30
+        max_discard_last_shift_kcal_per_mol: 0.20
 ```
 
 All candidate durations replay the same bank of endpoint snapshots. Rejected
@@ -427,7 +435,19 @@ After each environment selects its duration, its BAR estimate converges
 independently. Complex and solvent may therefore stop with different sample
 counts. The first per-environment check is made at the configured minimum sample
 count and requires its own overlap, bootstrap uncertainty, and DG stability
-criteria. Reaching `n_snapshots` without satisfying those criteria records
+criteria. `check_interval_samples` avoids treating adjacent estimates as
+independent checks. Optional stationarity checks recompute BAR after discarding
+the configured fraction from the beginning and from the end of each work series.
+The first-sample threshold can be looser because early drift may be equilibration;
+the last-sample threshold should normally be stricter because it detects ongoing
+drift. Samples are only omitted for these diagnostics, not from the final BAR
+estimate.
+
+Set `reopen_on_settings_change: true` to resume a run whose existing
+`neqti_convergence.yaml` used different criteria. Its work CSVs are retained,
+the old termination metadata is recorded under `reopened_from`, and convergence
+is evaluated again using the new settings. Reaching `n_snapshots` without
+satisfying the criteria records
 `max_samples` for that environment and a partial overall result. The combined
 DDG history is diagnostic and does not force matched prefixes. Because selection
 and estimation reuse the selected pilot work, `result.yaml`

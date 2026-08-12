@@ -255,6 +255,27 @@ def _validate_settings(workflow):
             raise HybridWorkflowError("convergence.consecutive_checks must be positive")
         if convergence["max_dg_range_kcal_per_mol"] < 0:
             raise HybridWorkflowError("convergence DG range must be non-negative")
+        if convergence["check_interval_samples"] < 1:
+            raise HybridWorkflowError(
+                "convergence.check_interval_samples must be positive"
+            )
+        stationarity = convergence["stationarity"]
+        if stationarity["enabled"]:
+            if not 0 < stationarity["discard_fraction"] < 0.5:
+                raise HybridWorkflowError(
+                    "convergence.stationarity.discard_fraction must be in (0, 0.5)"
+                )
+            if stationarity["min_discard_samples"] < 1:
+                raise HybridWorkflowError(
+                    "convergence.stationarity.min_discard_samples must be positive"
+                )
+            if (
+                stationarity["max_discard_first_shift_kcal_per_mol"] < 0
+                or stationarity["max_discard_last_shift_kcal_per_mol"] < 0
+            ):
+                raise HybridWorkflowError(
+                    "convergence stationarity shift thresholds must be non-negative"
+                )
     return config
 
 
@@ -494,9 +515,28 @@ def _convergence_state(workdir, config):
         legacy_expected.pop("max_dg_error_kcal_per_mol")
         legacy_expected.pop("max_dg_range_kcal_per_mol")
         if settings != expected and settings != legacy_expected:
-            raise HybridWorkflowError(
-                "existing hybrid convergence state uses different settings"
-            )
+            if not expected.get("reopen_on_settings_change", False):
+                raise HybridWorkflowError(
+                    "existing hybrid convergence state uses different settings"
+                )
+            return {
+                "schema_version": 2,
+                "settings": expected,
+                "environments": {
+                    environment: {"history": [], "termination_reason": None}
+                    for environment in ("complex", "solvent")
+                },
+                "combined_history": [],
+                "termination_reason": None,
+                "reopened_from": {
+                    "settings": settings,
+                    "termination_reason": state.get("termination_reason"),
+                    "environment_termination_reasons": {
+                        name: payload.get("termination_reason")
+                        for name, payload in (state.get("environments") or {}).items()
+                    },
+                },
+            }
         return state
     return {
         "schema_version": 2,
@@ -528,17 +568,71 @@ def _environment_convergence_record(forward, reverse, config, environment):
     )
     settings = config["convergence"]
     sample_count = min(len(forward), len(reverse))
+    stationarity_settings = settings["stationarity"]
+    stationarity = {
+        "enabled": stationarity_settings["enabled"],
+        "discard_fraction": stationarity_settings["discard_fraction"],
+        "discard_samples": 0,
+        "discard_first_dg_kcal_per_mol": None,
+        "discard_last_dg_kcal_per_mol": None,
+        "discard_first_shift_kcal_per_mol": None,
+        "discard_last_shift_kcal_per_mol": None,
+        "passed": not stationarity_settings["enabled"],
+    }
+    if stationarity_settings["enabled"] and dg is not None:
+        discard = int(sample_count * stationarity_settings["discard_fraction"])
+        stationarity["discard_samples"] = discard
+        if discard >= stationarity_settings["min_discard_samples"]:
+            first_analysis = analyze_neqti_work(
+                forward[discard:],
+                reverse[discard:],
+                config["temperature_k"],
+                0,
+                config["random_seed"],
+            )
+            last_analysis = analyze_neqti_work(
+                forward[:-discard],
+                reverse[:-discard],
+                config["temperature_k"],
+                0,
+                config["random_seed"],
+            )
+            if first_analysis is not None and last_analysis is not None:
+                first_dg = first_analysis["bar_dg_kcal_per_mol"]
+                last_dg = last_analysis["bar_dg_kcal_per_mol"]
+                first_shift = abs(first_dg - dg)
+                last_shift = abs(last_dg - dg)
+                stationarity.update(
+                    {
+                        "discard_first_dg_kcal_per_mol": first_dg,
+                        "discard_last_dg_kcal_per_mol": last_dg,
+                        "discard_first_shift_kcal_per_mol": first_shift,
+                        "discard_last_shift_kcal_per_mol": last_shift,
+                        "passed": bool(
+                            first_shift
+                            <= stationarity_settings[
+                                "max_discard_first_shift_kcal_per_mol"
+                            ]
+                            and last_shift
+                            <= stationarity_settings[
+                                "max_discard_last_shift_kcal_per_mol"
+                            ]
+                        ),
+                    }
+                )
     return {
         "sample_count_per_direction": sample_count,
         "dg_kcal_per_mol": dg,
         "dg_error_kcal_per_mol": error,
         "overlap_score": overlap,
+        "stationarity": stationarity,
         "thresholds_pass": bool(
             sample_count >= settings["min_samples_per_direction"]
             and overlap is not None
             and overlap >= settings["min_overlap_score_per_leg"]
             and error is not None
             and error <= settings["max_dg_error_kcal_per_mol"]
+            and stationarity["passed"]
         ),
     }
 
@@ -639,6 +733,9 @@ def _hybrid_convergence_callback(workdir, config):
     state = _convergence_state(workdir, config)
     settings = config["convergence"]
 
+    if state.get("reopened_from") is not None:
+        _write_yaml_atomic(path, state)
+
     if int(state.get("schema_version", 1)) < 2:
         return _legacy_hybrid_convergence_callback(workdir, config, state), state
 
@@ -658,6 +755,10 @@ def _hybrid_convergence_callback(workdir, config):
         )
         first = max(previous + 1, settings["min_samples_per_direction"])
         for sample_count in range(first, available + 1):
+            if (
+                sample_count - settings["min_samples_per_direction"]
+            ) % settings["check_interval_samples"]:
+                continue
             record = _environment_convergence_record(
                 forward[:sample_count], reverse[:sample_count], config, environment
             )

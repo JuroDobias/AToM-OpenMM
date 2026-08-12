@@ -2758,6 +2758,9 @@ def _normalized_settings(workflow):
         },
         "convergence": {
             "enabled": bool(convergence_raw.get("enabled", False)),
+            "reopen_on_settings_change": bool(
+                convergence_raw.get("reopen_on_settings_change", False)
+            ),
             "min_samples_per_direction": int(
                 convergence_raw.get("min_samples_per_direction", 30)
             ),
@@ -2779,6 +2782,36 @@ def _normalized_settings(workflow):
                     convergence_raw.get("max_ddg_range_kcal_per_mol", 0.25),
                 )
             ),
+            "check_interval_samples": int(
+                convergence_raw.get("check_interval_samples", 1)
+            ),
+            "stationarity": {
+                "enabled": bool(
+                    (convergence_raw.get("stationarity") or {}).get(
+                        "enabled", False
+                    )
+                ),
+                "discard_fraction": float(
+                    (convergence_raw.get("stationarity") or {}).get(
+                        "discard_fraction", 0.1
+                    )
+                ),
+                "min_discard_samples": int(
+                    (convergence_raw.get("stationarity") or {}).get(
+                        "min_discard_samples", 5
+                    )
+                ),
+                "max_discard_first_shift_kcal_per_mol": float(
+                    (convergence_raw.get("stationarity") or {}).get(
+                        "max_discard_first_shift_kcal_per_mol", 0.3
+                    )
+                ),
+                "max_discard_last_shift_kcal_per_mol": float(
+                    (convergence_raw.get("stationarity") or {}).get(
+                        "max_discard_last_shift_kcal_per_mol", 0.2
+                    )
+                ),
+            },
         },
         "failed_switch_policy": str(
             neqti.get("failed_switch_policy", "count_as_infinite")
