@@ -313,6 +313,62 @@ def _test_hybrid_convergence_reopens_with_stationarity_and_spaced_checks(tmp_pat
         assert all(row["stationarity"]["discard_samples"] >= 5 for row in history)
 
 
+def _test_reopened_convergence_uses_latest_available_checks(tmp_path):
+    from atom_openmm.covalent_workflow import _rewrite_work
+    from atom_openmm.hybrid_workflow import _hybrid_convergence_callback
+
+    old_settings = {
+        "enabled": True,
+        "min_samples_per_direction": 30,
+    }
+    (tmp_path / "neqti_convergence.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 2,
+                "settings": old_settings,
+                "environments": {
+                    name: {"history": [], "termination_reason": "converged"}
+                    for name in ("complex", "solvent")
+                },
+                "combined_history": [],
+                "termination_reason": "converged",
+            }
+        )
+    )
+    for environment in ("complex", "solvent"):
+        _rewrite_work(tmp_path / f"{environment}_forward.csv", [1.0] * 84)
+        _rewrite_work(tmp_path / f"{environment}_reverse.csv", [-1.0] * 84)
+    config = {
+        "temperature_k": 300.0,
+        "bootstrap_samples": 20,
+        "random_seed": 2026,
+        "convergence": {
+            "enabled": True,
+            "reopen_on_settings_change": True,
+            "min_samples_per_direction": 50,
+            "min_overlap_score_per_leg": 0.05,
+            "max_dg_error_kcal_per_mol": 0.5,
+            "consecutive_checks": 3,
+            "max_dg_range_kcal_per_mol": 0.25,
+            "check_interval_samples": 5,
+            "stationarity": {
+                "enabled": False,
+                "discard_fraction": 0.1,
+                "min_discard_samples": 5,
+                "max_discard_first_shift_kcal_per_mol": 0.3,
+                "max_discard_last_shift_kcal_per_mol": 0.2,
+            },
+        },
+    }
+
+    callback, state = _hybrid_convergence_callback(tmp_path, config)
+    assert callback("complex", 84, None, None)
+    assert [
+        row["sample_count_per_direction"]
+        for row in state["environments"]["complex"]["history"]
+    ] == [70, 75, 80]
+
+
 def _test_hybrid_result_reports_adaptive_selection_and_max_samples(tmp_path):
     from atom_openmm.covalent_workflow import _rewrite_work
     from atom_openmm.hybrid_workflow import _analysis_payload, _result

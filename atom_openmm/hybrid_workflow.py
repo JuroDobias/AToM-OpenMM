@@ -754,6 +754,19 @@ def _hybrid_convergence_callback(workdir, config):
             default=0,
         )
         first = max(previous + 1, settings["min_samples_per_direction"])
+        if (
+            state.get("reopened_from") is not None
+            and not environment_state.get("history")
+            and available >= settings["min_samples_per_direction"]
+        ):
+            interval = settings["check_interval_samples"]
+            latest = settings["min_samples_per_direction"] + (
+                (available - settings["min_samples_per_direction"]) // interval
+            ) * interval
+            first = max(
+                settings["min_samples_per_direction"],
+                latest - (settings["consecutive_checks"] - 1) * interval,
+            )
         for sample_count in range(first, available + 1):
             if (
                 sample_count - settings["min_samples_per_direction"]
