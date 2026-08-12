@@ -20,6 +20,9 @@ from atom_openmm.covalent_workflow import (
     _constrained_ligand_atom_map,
     _mapping_settings,
     _precompute_endpoint_lrc_corrections,
+    _promote_adaptive_pilot_work,
+    _read_work,
+    _rewrite_work,
     _switch_protocol,
     _validate_softcore_endpoint_charge,
     _load_prepared_pair_bundle,
@@ -68,6 +71,31 @@ def _write_3d_sdf(path, smiles, seed):
     writer = Chem.SDWriter(str(path))
     writer.write(molecule)
     writer.close()
+
+
+def _test_resumed_adaptive_pilot_preserves_canonical_production_work(tmp_path):
+    selected = tmp_path / "selected.csv"
+    production = tmp_path / "production.csv"
+    _rewrite_work(selected, [1.0, 2.0, 3.0])
+    _rewrite_work(production, [1.1, 2.1, 3.1, 4.0])
+
+    _promote_adaptive_pilot_work(
+        production, selected, 3, True, "solvent forward"
+    )
+
+    assert _read_work(production) == [1.1, 2.1, 3.1, 4.0]
+
+
+def _test_new_adaptive_selection_rejects_mismatched_production_work(tmp_path):
+    selected = tmp_path / "selected.csv"
+    production = tmp_path / "production.csv"
+    _rewrite_work(selected, [1.0, 2.0, 3.0])
+    _rewrite_work(production, [1.1, 2.1, 3.1])
+
+    with pytest.raises(CovalentResumeError, match="selected adaptive pilot"):
+        _promote_adaptive_pilot_work(
+            production, selected, 3, False, "solvent forward"
+        )
 
 
 def test_apply_state_accepts_positions_without_velocities():

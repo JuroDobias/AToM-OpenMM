@@ -1038,6 +1038,32 @@ def _read_work(path):
         return [float(row["work_kcal_per_mol"]) for row in csv.DictReader(handle)]
 
 
+def _promote_adaptive_pilot_work(
+    production_path,
+    selected_path,
+    pilot_samples,
+    selected_was_resumed,
+    label,
+):
+    selected_work = _read_work(selected_path)
+    production_work = _read_work(production_path)
+    if not production_work:
+        _rewrite_work(production_path, selected_work)
+        return
+    if production_work[:pilot_samples] == selected_work:
+        return
+    if not selected_was_resumed:
+        raise CovalentResumeError(
+            f"existing {label} production work does not match the selected "
+            "adaptive pilot"
+        )
+    LOGGER.warning(
+        "%s adaptive pilot diagnostics differ from canonical production work; "
+        "preserving the production CSV on resume",
+        label,
+    )
+
+
 def _rewrite_work(path, work_kcal):
     path = Path(path)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -2086,6 +2112,7 @@ def _iter_environment(
                 raise
 
         selected = environment_state.get("selected")
+        selected_was_resumed = selected is not None
         for time_ps, total_steps in zip(
             adaptive["candidate_times_ps"], adaptive["candidate_total_steps"]
         ):
@@ -2186,15 +2213,13 @@ def _iter_environment(
             )
         selected_dir = adaptive_dir / selected["candidate"]
         for direction in ("forward", "reverse"):
-            selected_work = _read_work(selected_dir / f"{name}_{direction}.csv")
-            production_work = _read_work(files[direction])
-            if not production_work:
-                _rewrite_work(files[direction], selected_work)
-            elif production_work[:pilot_samples] != selected_work:
-                raise CovalentResumeError(
-                    f"existing {name} {direction} production work does not match "
-                    "the selected adaptive pilot"
-                )
+            _promote_adaptive_pilot_work(
+                files[direction],
+                selected_dir / f"{name}_{direction}.csv",
+                pilot_samples,
+                selected_was_resumed,
+                f"{name} {direction}",
+            )
         forward = _read_work(files["forward"])
         reverse = _read_work(files["reverse"])
         segment_steps = [int(value) for value in selected["forward_segment_steps"]]
