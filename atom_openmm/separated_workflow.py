@@ -623,7 +623,34 @@ def _run_environment(
                 "history": history,
                 "work_included_in_bar": False,
             })
+        selection_path = base / "selection.yaml"
+        selection_state = (
+            yaml.safe_load(selection_path.read_text()) or {}
+            if selection_path.exists()
+            else {}
+        )
+        if selection_state:
+            stored_steps = selection_state.get("frozen_segment_steps")
+            if stored_steps != frozen_segment_steps:
+                raise SeparatedWorkflowError(
+                    f"stored {environment} duration selection uses a different "
+                    "frozen switching schedule"
+                )
+            selected = selection_state.get("selected")
+            diagnostics = list(selection_state.get("diagnostics") or [])
+
+        def persist_selection():
+            _write_yaml_atomic(selection_path, {
+                "schema_version": 1,
+                "selected": selected,
+                "diagnostics": diagnostics,
+                "frozen_segment_steps": frozen_segment_steps,
+                "optimizer_work_included_in_bar": False,
+            })
+
         for time_ps, total_steps in zip(candidate_times, candidate_steps):
+            if selected is not None:
+                break
             label = _candidate_label(time_ps)
             candidate_dir = base / label
             candidate_dir.mkdir(parents=True, exist_ok=True)
@@ -713,10 +740,11 @@ def _run_environment(
                         })
             forward_rows = _read_rows(candidate_dir / "forward.csv")
             reverse_rows = _read_rows(candidate_dir / "reverse.csv")
-            statistics = _adaptive_work_statistics(
-                [float(row["work_kcal_per_mol"]) for row in forward_rows],
-                [float(row["work_kcal_per_mol"]) for row in reverse_rows],
+            statistics = _pilot_adaptive_statistics(
+                forward_rows,
+                reverse_rows,
                 config,
+                pilot_count,
             )
             if selected is None and (statistics["passed"] or time_ps == candidate_times[-1]):
                 selected = {
@@ -725,6 +753,7 @@ def _run_environment(
                     "steps": int(total_steps),
                     "statistics": statistics,
                 }
+                persist_selection()
                 break
         if selected is None:
             raise SeparatedWorkflowError(f"no switching duration selected for {environment}")
@@ -773,13 +802,7 @@ def _run_environment(
                 workdir / f"{environment}_{direction}.csv",
                 final_rows[: config["n_snapshots"]],
             )
-        _write_yaml_atomic(base / "selection.yaml", {
-            "schema_version": 1,
-            "selected": selected,
-            "diagnostics": diagnostics,
-            "frozen_segment_steps": frozen_segment_steps,
-            "optimizer_work_included_in_bar": False,
-        })
+        persist_selection()
         return selected
     finally:
         for thermalizer in thermalizers.values():
@@ -790,6 +813,20 @@ def _run_environment(
 
 def _read_work(path):
     return [float(row["work_kcal_per_mol"]) for row in _read_rows(path)]
+
+
+def _pilot_adaptive_statistics(forward_rows, reverse_rows, config, pilot_count):
+    return _adaptive_work_statistics(
+        [
+            float(row["work_kcal_per_mol"])
+            for row in forward_rows[:pilot_count]
+        ],
+        [
+            float(row["work_kcal_per_mol"])
+            for row in reverse_rows[:pilot_count]
+        ],
+        config,
+    )
 
 
 def run_separated_workflow(path):

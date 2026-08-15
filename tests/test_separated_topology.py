@@ -137,6 +137,39 @@ def _test_workflow_schema_accepts_separated_neqti_only():
     assert axes.alchemy_model == "separated_topology"
 
 
+def _test_adaptive_duration_statistics_use_only_paired_pilot_prefix(monkeypatch):
+    from atom_openmm import separated_workflow as module
+
+    observed = {}
+
+    def statistics(forward, reverse, config):
+        observed["forward"] = forward
+        observed["reverse"] = reverse
+        observed["config"] = config
+        return {"passed": True}
+
+    monkeypatch.setattr(module, "_adaptive_work_statistics", statistics)
+    forward = [
+        {"work_kcal_per_mol": str(value)}
+        for value in (1, 2, 3, 100, 200)
+    ]
+    reverse = [
+        {"work_kcal_per_mol": str(value)}
+        for value in (-1, -2, -3, -100)
+    ]
+
+    result = module._pilot_adaptive_statistics(
+        forward, reverse, {"name": "config"}, 3
+    )
+
+    assert result == {"passed": True}
+    assert observed == {
+        "forward": [1.0, 2.0, 3.0],
+        "reverse": [-1.0, -2.0, -3.0],
+        "config": {"name": "config"},
+    }
+
+
 def _test_separated_workflow_plan_exposes_node_bank(tmp_path):
     from atom_openmm.rbfe_workflow import plan_workflow
 
