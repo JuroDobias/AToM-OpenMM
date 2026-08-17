@@ -201,7 +201,7 @@ def _workflow(
             "consecutive_checks": 3,
             "max_dg_range_kcal_per_mol": 0.25,
         }
-    if (ligand_a, ligand_b) == ("30", "31"):
+    if {ligand_a, ligand_b} & {"30", "31"}:
         payload["workflow"]["setup"]["allow_undefined_stereo"] = True
     return payload
 
