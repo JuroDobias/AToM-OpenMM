@@ -7,35 +7,13 @@ import shutil
 from pathlib import Path
 
 import yaml
-from rdkit import Chem
+
+from atom_openmm.rbfe_graph_proposal import discover_ligand_file
 
 try:
     from .generate_hybrid_cdk2_cohort import _run_script, _workflow
 except ImportError:
     from generate_hybrid_cdk2_cohort import _run_script, _workflow
-
-
-def _identity(path):
-    supplier = Chem.SDMolSupplier(str(path), removeHs=False)
-    molecule = supplier[0] if supplier and len(supplier) else None
-    if molecule is None:
-        raise ValueError(f"could not read ligand {path}")
-    return Chem.MolToSmiles(Chem.RemoveHs(molecule), isomericSmiles=True)
-
-
-def _source_ligand(source, node, graph_root):
-    if node.get("file"):
-        path = (graph_root / node["file"]).resolve()
-        if not path.is_file():
-            raise FileNotFoundError(path)
-        return path
-    matches = sorted(Path(source).rglob(f"alignment_structures/{node['id']}-p.sdf"))
-    if not matches:
-        raise FileNotFoundError(f"could not locate {node['id']}-p.sdf below {source}")
-    identities = {_identity(path) for path in matches}
-    if len(identities) != 1:
-        raise ValueError(f"source structures disagree chemically for node {node['id']}")
-    return matches[0]
 
 
 def _reference_datasets(csv_path):
@@ -83,7 +61,7 @@ def generate(graph_path, source_cohort, benchmark_root, output, source_dir_name)
         str(node["id"]): {**node, "id": str(node["id"])} for node in graph["nodes"]
     }
     sources = {
-        identifier: _source_ligand(source_cohort, node, graph_path.parent)
+        identifier: discover_ligand_file(source_cohort, node, graph_path.parent)
         for identifier, node in nodes.items()
     }
     edges = graph.get("simulated_edges", graph.get("edges", []))

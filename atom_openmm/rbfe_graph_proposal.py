@@ -27,6 +27,28 @@ def _load_molecule(path):
     return normalize_mapping_aromaticity(molecule)
 
 
+def discover_ligand_file(source, node, graph_root):
+    if node.get("file"):
+        path = (Path(graph_root) / node["file"]).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        return path
+    source = Path(source)
+    matches = sorted({
+        *source.rglob(f"alignment_structures/{node['id']}-p.sdf"),
+        *source.rglob(f"ligands/{node['id']}-p.sdf"),
+    })
+    if not matches:
+        raise FileNotFoundError(f"could not locate {node['id']}-p.sdf below {source}")
+    identities = {
+        Chem.MolToSmiles(Chem.RemoveHs(_load_molecule(path)), isomericSmiles=True)
+        for path in matches
+    }
+    if len(identities) != 1:
+        raise ValueError(f"source structures disagree chemically for node {node['id']}")
+    return matches[0]
+
+
 def _heavy_atoms(molecule):
     return {
         atom.GetIdx() for atom in molecule.GetAtoms() if atom.GetAtomicNum() != 1

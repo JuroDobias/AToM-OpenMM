@@ -4,7 +4,7 @@ import yaml
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
-from atom_openmm.rbfe_graph_proposal import propose_graph
+from atom_openmm.rbfe_graph_proposal import discover_ligand_file, propose_graph
 from atom_openmm.rbfe_repeat_network import generate_repeats
 
 
@@ -34,6 +34,16 @@ def _test_graph_proposal_connects_single_attachment_changes(tmp_path):
     assert result["targets"][0]["status"] == "connected"
     assert result["suggested_path_edges"]
     assert all(edge["attachment_site_count"] == 1 for edge in result["suggested_path_edges"])
+
+
+def _test_cdk2_generator_discovers_ligand_directory_layout(tmp_path):
+    ligand = tmp_path / "edge" / "ligands" / "A-p.sdf"
+    ligand.parent.mkdir(parents=True)
+    _write_sdf(ligand, "CCO")
+
+    selected = discover_ligand_file(tmp_path, {"id": "A"}, tmp_path)
+
+    assert selected == ligand
 
 
 def _test_repeat_generator_preserves_existing_repeat_files(tmp_path):
