@@ -1440,3 +1440,45 @@ energy change at every lambda update. `switch_protocol.yaml` prevents incompatib
 resume, and `switch_timing.csv` records elapsed time and ns/day for every switch.
 Use `interpolation: envelope` with `switch_steps` to reproduce the original
 two-endpoint log-envelope implementation.
+
+## Independent network repeats
+
+Do not pool protocol-work samples from nominally independent calculations. Each
+repeat must independently equilibrate and sample its endpoints, produce one edge
+DDG and uncertainty, and remain visible in the final analysis. Immutable prepared
+systems may be reused when their preparation fingerprint matches.
+
+Generate three repeat directories from an approved network template with:
+
+```bash
+atom-rbfe-generate-repeats TEMPLATE_DIR REPEAT_DIR --repeats 3 --seed-base 20260817
+```
+
+The command writes `repeat_network.yaml`, uniquely seeds every edge repeat, and is
+incremental: adding an edge to the template adds it to existing repeat directories
+without deleting runtime data.
+
+Use `--reuse-repeats-from PREVIOUS_DIR` to import matching finite edge results
+from an older `replicate_N` cohort. Reused edge directories are linked read-only,
+recorded in the root manifest, and omitted from generated submission scripts. All
+remaining edge repeats are independent Slurm jobs and have no ordering dependency.
+
+Analyze available repeats with:
+
+```bash
+python -m atom_openmm.rbfe_network REPEAT_DIR/repeat_network.yaml
+```
+
+Repeat edges are combined with a DerSimonian-Laird random-effects model before
+weighted graph fitting. `network_result.yaml` reports individual repeats,
+fixed/random edge estimates, `tau_squared`, `I_squared`, graph chi-squared,
+cycle closures, node energies, and all requested indirect targets. Primary node
+errors are inflated when reduced graph chi-squared exceeds one; unscaled model
+covariance errors are retained separately. CSV tables mirror the YAML output.
+
+Use `atom-rbfe-propose-network INPUT.yaml` to score possible same-charge,
+single-attachment-site edges among supplied ligand SDFs. Its output is a proposal,
+not an executable graph: mappings, disconnected targets, and cycle candidates must
+be reviewed before cohort generation. Generated intermediate ligands must be added
+explicitly with provenance and can be marked `generated: true` so they are excluded
+from experimental node correlations.

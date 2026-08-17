@@ -168,3 +168,72 @@ def _test_separated_network_uses_node_correlated_cycle_bootstrap(tmp_path):
     assert bootstrap["binding"]["samples"] == 20
     assert bootstrap["complex"]["std_kcal_per_mol"] >= 0.0
     assert bootstrap["solvent"]["std_kcal_per_mol"] >= 0.0
+
+
+def _test_repeat_network_aggregates_before_graph_fit(tmp_path):
+    values = [0.8, 1.0, 1.8]
+    for index, value in enumerate(values, 1):
+        root = tmp_path / f"replicate_{index}"
+        _write_result(root, "A", "B", value, error=0.1)
+        (root / "network.yaml").write_text(yaml.safe_dump({
+            "reference_node": "A",
+            "target": ["A", "B"],
+            "nodes": ["A", "B"],
+            "edges": [{
+                "ligand_a": "A", "ligand_b": "B", "directory": "A--B",
+            }],
+        }))
+    config = {
+        "schema_version": 2,
+        "replicate_networks": [
+            {"id": f"r{index}", "path": f"replicate_{index}/network.yaml"}
+            for index in range(1, 4)
+        ],
+    }
+    path = tmp_path / "repeat_network.yaml"
+    path.write_text(yaml.safe_dump(config))
+
+    result = analyze_network(path)
+
+    edge = result["edges"][0]
+    assert edge["replicate_count"] == 3
+    assert edge["tau_squared_kcal2_per_mol2"] > 0.0
+    assert edge["ddg_kcal_per_mol"] == pytest.approx(sum(values) / len(values))
+    assert result["target"]["ddg_kcal_per_mol"] == pytest.approx(edge["ddg_kcal_per_mol"])
+    assert Path(tmp_path / "edge_replicates.csv").is_file()
+    assert Path(tmp_path / "node_free_energies.csv").is_file()
+
+
+def _test_repeat_network_reports_reference_node_metrics(tmp_path):
+    for index in range(1, 4):
+        root = tmp_path / f"replicate_{index}"
+        _write_result(root, "A", "B", 1.0 + 0.05 * index, error=0.2)
+        _write_result(root, "B", "C", 2.0 - 0.05 * index, error=0.2)
+        (root / "network.yaml").write_text(yaml.safe_dump({
+            "reference_node": "A",
+            "targets": [{"id": "A--C", "ligand_a": "A", "ligand_b": "C"}],
+            "nodes": ["A", "B", "C"],
+            "edges": [
+                {"ligand_a": "A", "ligand_b": "B", "directory": "A--B"},
+                {"ligand_a": "B", "ligand_b": "C", "directory": "B--C"},
+            ],
+        }))
+    path = tmp_path / "repeat_network.yaml"
+    path.write_text(yaml.safe_dump({
+        "replicate_networks": [f"replicate_{index}/network.yaml" for index in range(1, 4)],
+        "reference_datasets": {
+            "experiment": {
+                "reference_node": "A",
+                "edges": [
+                    {"ligand_a": "A", "ligand_b": "B", "ddg_kcal_per_mol": 1.0},
+                    {"ligand_a": "B", "ligand_b": "C", "ddg_kcal_per_mol": 2.0},
+                ],
+            }
+        },
+    }))
+
+    result = analyze_network(path)
+
+    comparison = result["reference_comparisons"][0]
+    assert comparison["metrics_excluding_anchor"]["node_count"] == 2
+    assert comparison["metrics_excluding_anchor"]["rmse_kcal_per_mol"] < 0.2

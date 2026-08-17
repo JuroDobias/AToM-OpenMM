@@ -1,0 +1,59 @@
+schema_version: 1
+reference_node: 1h1q
+nodes:
+- {id: '17'}
+- {id: 1h1q}
+- {id: 1h1r}
+- {id: 1h1s}
+- {id: 1oi9}
+- {id: 1oiu}
+- {id: 1oiy}
+- {id: '20'}
+- {id: '21'}
+- {id: '22'}
+- {id: '26'}
+- {id: '28'}
+- {id: '29'}
+- {id: '30'}
+- {id: '31'}
+- {id: '32'}
+targets:
+- {id: 17--21, ligand_a: '17', ligand_b: '21'}
+- {id: 17--22, ligand_a: '17', ligand_b: '22'}
+- {id: 1h1r--1oi9, ligand_a: 1h1r, ligand_b: 1oi9}
+- {id: 1h1s--1oiy, ligand_a: 1h1s, ligand_b: 1oiy}
+- {id: 1oiu--26, ligand_a: 1oiu, ligand_b: '26'}
+- {id: 1oiy--29, ligand_a: 1oiy, ligand_b: '29'}
+- {id: 1oiy--32, ligand_a: 1oiy, ligand_b: '32'}
+- {id: 20--1h1q, ligand_a: '20', ligand_b: 1h1q}
+- {id: 28--26, ligand_a: '28', ligand_b: '26'}
+- {id: 30--31, ligand_a: '30', ligand_b: '31'}
+simulated_edges:
+# Shortest single-attachment paths for the ten published targets.
+- [17, 21]
+- [17, 22]
+- [1h1q, 1h1r]
+- [1h1q, 1oi9]
+- [1h1s, 1oiy]
+- [1h1q, 1oiu]
+- [1h1q, 26]
+- [1oiy, 29]
+- [1h1s, 32]
+- [1h1q, 20]
+- [26, 28]
+- [30, 31]
+# Connect components and provide independent cycle paths.
+- [17, 1h1q]
+- [1h1q, 21]
+- [1h1q, 22]
+- [1h1q, 1oiy]
+- [1h1q, 1h1s]
+- [1oi9, 26]
+- [1h1s, 28]
+- [28, 29]
+- [1h1s, 30]
+- [28, 30]
+- [1h1q, 31]
+- [1oiu, 20]
+- [21, 32]
+auto_cycles: true
