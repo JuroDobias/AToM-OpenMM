@@ -195,11 +195,20 @@ def _workflow(
     if convergence:
         payload["workflow"]["neqti"]["convergence"] = {
             "enabled": True,
-            "min_samples_per_direction": 30,
+            "reopen_on_settings_change": True,
+            "min_samples_per_direction": 50,
             "min_overlap_score_per_leg": 0.05,
             "max_dg_error_kcal_per_mol": 0.5,
+            "check_interval_samples": 5,
             "consecutive_checks": 3,
             "max_dg_range_kcal_per_mol": 0.25,
+            "stationarity": {
+                "enabled": True,
+                "discard_fraction": 0.1,
+                "min_discard_samples": 5,
+                "max_discard_first_shift_kcal_per_mol": 0.3,
+                "max_discard_last_shift_kcal_per_mol": 0.2,
+            },
         }
     if {ligand_a, ligand_b} & {"30", "31"}:
         payload["workflow"]["setup"]["allow_undefined_stereo"] = True
@@ -224,6 +233,7 @@ set -euo pipefail
 MAX_CHAIN_JOBS="${{ATOM_MAX_CHAIN_JOBS:-10}}"
 CHAIN_INDEX="${{ATOM_CHAIN_INDEX:-0}}"
 ROOT_JOB_ID="${{ATOM_ROOT_JOB_ID:-${{SLURM_JOB_ID:-manual}}}}"
+FORCE_REOPEN="${{ATOM_FORCE_REOPEN:-0}}"
 RUN_DIR="${{SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")}}"
 SCRIPT_PATH="$RUN_DIR/run.sh"
 CHAIN_LOG="$RUN_DIR/slurm-chain.log"
@@ -238,7 +248,7 @@ log_chain() {{
         "${{SLURM_JOB_ID:-manual}}" "$CHAIN_INDEX" "$*" >> "$CHAIN_LOG"
 }}
 
-completed() {{
+result_completed() {{
     [[ -f "$RESULT_FILE" ]] && grep -q '^status: completed$' "$RESULT_FILE"
 }}
 
@@ -250,7 +260,7 @@ on_timeout() {{
         kill -TERM "$CHILD_PID" 2>/dev/null || true
         wait "$CHILD_PID" 2>/dev/null || true
     fi
-    if completed; then
+    if result_completed; then
         log_chain "workflow completed during shutdown; no successor submitted"
     elif (( CHAIN_INDEX + 1 >= MAX_CHAIN_JOBS )); then
         log_chain "automatic resubmission cap reached; no successor submitted"
@@ -266,9 +276,12 @@ on_timeout() {{
 trap on_timeout USR1
 cd "$RUN_DIR"
 log_chain "started"
-if completed; then
+if result_completed && [[ "$FORCE_REOPEN" != "1" ]]; then
     log_chain "workflow already completed; exiting"
     exit 0
+fi
+if [[ "$FORCE_REOPEN" == "1" ]]; then
+    log_chain "forcing convergence reopen with existing production samples"
 fi
 
 source "$HOME/miniconda3/etc/profile.d/conda.sh"

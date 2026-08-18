@@ -32,12 +32,24 @@ def _test_hybrid_cdk2_generator_uses_adaptive_production_protocol():
     assert neqti["adaptive_switching"]["reuse_selected_pilot_samples"]
     assert neqti["convergence"] == {
         "enabled": True,
-        "min_samples_per_direction": 30,
+        "reopen_on_settings_change": True,
+        "min_samples_per_direction": 50,
         "min_overlap_score_per_leg": 0.05,
         "max_dg_error_kcal_per_mol": 0.5,
+        "check_interval_samples": 5,
         "consecutive_checks": 3,
         "max_dg_range_kcal_per_mol": 0.25,
+        "stationarity": {
+            "enabled": True,
+            "discard_fraction": 0.1,
+            "min_discard_samples": 5,
+            "max_discard_first_shift_kcal_per_mol": 0.3,
+            "max_discard_last_shift_kcal_per_mol": 0.2,
+        },
     }
+    run_script = generator._run_script("1oiy--32")
+    assert 'FORCE_REOPEN="${ATOM_FORCE_REOPEN:-0}"' in run_script
+    assert 'result_completed && [[ "$FORCE_REOPEN" != "1" ]]' in run_script
 
     extended = generator._workflow(
         "1oiy",
