@@ -534,8 +534,128 @@ def _write_state(path, state):
 def _write_yaml_atomic(path, payload):
     path = Path(path)
     temporary = Path(str(path) + ".tmp")
-    temporary.write_text(yaml.safe_dump(payload, sort_keys=False))
+    with temporary.open("w") as handle:
+        handle.write(yaml.safe_dump(payload, sort_keys=False))
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(temporary, path)
+    try:
+        directory_fd = os.open(
+            path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+    except OSError:
+        return
+    try:
+        os.fsync(directory_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(directory_fd)
+
+
+def _adaptive_environment_checkpoint_path(adaptive_dir, name):
+    return Path(adaptive_dir) / "state" / f"{name}.yaml"
+
+
+def _new_adaptive_state(settings):
+    return {
+        "schema_version": 1,
+        "status": "running",
+        "settings": settings,
+        "environments": {},
+    }
+
+
+def _load_adaptive_environment_state(
+    adaptive_path,
+    adaptive_dir,
+    settings,
+    name,
+    default_environment_state,
+):
+    adaptive_path = Path(adaptive_path)
+    if adaptive_path.exists():
+        adaptive_state = yaml.safe_load(adaptive_path.read_text()) or {}
+    else:
+        adaptive_state = _new_adaptive_state(settings)
+    if adaptive_state.get("settings") != settings:
+        raise CovalentResumeError(
+            "existing adaptive switching uses different settings"
+        )
+
+    checkpoint_path = _adaptive_environment_checkpoint_path(adaptive_dir, name)
+    if checkpoint_path.exists():
+        checkpoint = yaml.safe_load(checkpoint_path.read_text()) or {}
+        if checkpoint.get("settings") != settings or checkpoint.get("name") != name:
+            raise CovalentResumeError(
+                f"existing {name} adaptive checkpoint uses different settings"
+            )
+        environment_state = checkpoint.get("state")
+        if not isinstance(environment_state, dict):
+            raise CovalentResumeError(
+                f"existing {name} adaptive checkpoint is incomplete"
+            )
+    else:
+        environment_state = adaptive_state.setdefault("environments", {}).get(name)
+        if environment_state is None:
+            environment_state = default_environment_state
+    return adaptive_state, environment_state
+
+
+def _checkpoint_adaptive_environment(
+    adaptive_path,
+    adaptive_dir,
+    settings,
+    name,
+    environment_state,
+):
+    checkpoint_path = _adaptive_environment_checkpoint_path(adaptive_dir, name)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_yaml_atomic(
+        checkpoint_path,
+        {
+            "schema_version": 1,
+            "name": name,
+            "settings": settings,
+            "state": environment_state,
+        },
+    )
+
+    adaptive_path = Path(adaptive_path)
+    if adaptive_path.exists():
+        adaptive_state = yaml.safe_load(adaptive_path.read_text()) or {}
+    else:
+        adaptive_state = _new_adaptive_state(settings)
+    if adaptive_state.get("settings") != settings:
+        raise CovalentResumeError(
+            "existing adaptive switching uses different settings"
+        )
+    environments = adaptive_state.setdefault("environments", {})
+    for environment_path in checkpoint_path.parent.glob("*.yaml"):
+        checkpoint = yaml.safe_load(environment_path.read_text()) or {}
+        checkpoint_name = checkpoint.get("name")
+        checkpoint_state = checkpoint.get("state")
+        if (
+            checkpoint.get("settings") != settings
+            or not isinstance(checkpoint_name, str)
+            or not isinstance(checkpoint_state, dict)
+        ):
+            raise CovalentResumeError(
+                f"existing adaptive checkpoint is incomplete: {environment_path}"
+            )
+        environments[checkpoint_name] = checkpoint_state
+    environments[name] = environment_state
+    adaptive_state["status"] = (
+        "complete"
+        if set(environments) >= {"complex", "solvent"}
+        and all(
+            environments[environment].get("status") == "complete"
+            for environment in ("complex", "solvent")
+        )
+        else "running"
+    )
+    _write_yaml_atomic(adaptive_path, adaptive_state)
+    return adaptive_state
 
 
 def _file_sha256(path):
@@ -1999,20 +2119,10 @@ def _iter_environment(
         adaptive_dir = workdir / "neqti_adaptive_switching"
         snapshot_dir = adaptive_dir / "snapshots" / name
         snapshot_dir.mkdir(parents=True, exist_ok=True)
-        if adaptive_path.exists():
-            adaptive_state = yaml.safe_load(adaptive_path.read_text()) or {}
-        else:
-            adaptive_state = {
-                "schema_version": 1,
-                "status": "running",
-                "settings": adaptive,
-                "environments": {},
-            }
-        if adaptive_state.get("settings") != adaptive:
-            raise CovalentResumeError(
-                "existing adaptive switching uses different settings"
-            )
-        environment_state = adaptive_state["environments"].setdefault(
+        adaptive_state, environment_state = _load_adaptive_environment_state(
+            adaptive_path,
+            adaptive_dir,
+            adaptive,
             name,
             {
                 "status": "collecting_snapshots",
@@ -2022,6 +2132,13 @@ def _iter_environment(
                 "selected": None,
                 "rest2": {},
             },
+        )
+        adaptive_state = _checkpoint_adaptive_environment(
+            adaptive_path,
+            adaptive_dir,
+            adaptive,
+            name,
+            environment_state,
         )
         base_segment_steps = [
             int(value) for value in environment_state["base_segment_steps"]
@@ -2069,7 +2186,13 @@ def _iter_environment(
             environment_state["status"] = (
                 "evaluating" if cycle + 1 == pilot_samples else "collecting_snapshots"
             )
-            _write_yaml_atomic(adaptive_path, adaptive_state)
+            adaptive_state = _checkpoint_adaptive_environment(
+                adaptive_path,
+                adaptive_dir,
+                adaptive,
+                name,
+                environment_state,
+            )
 
         def run_adaptive_switch(direction, endpoint, state, direction_steps, cycle):
             cached = softcore_contexts.get(direction)
@@ -2164,7 +2287,13 @@ def _iter_environment(
                     )
                     _append_work(candidate_files[direction], cycle + 1, work_kj)
                 candidate["completed_cycles"] = cycle + 1
-                _write_yaml_atomic(adaptive_path, adaptive_state)
+                adaptive_state = _checkpoint_adaptive_environment(
+                    adaptive_path,
+                    adaptive_dir,
+                    adaptive,
+                    name,
+                    environment_state,
+                )
             statistics = _adaptive_work_statistics(
                 _read_work(candidate_files["forward"]),
                 _read_work(candidate_files["reverse"]),
@@ -2190,7 +2319,13 @@ def _iter_environment(
                     "pilot_samples_reused": True,
                 }
                 environment_state["selected"] = selected
-            _write_yaml_atomic(adaptive_path, adaptive_state)
+            adaptive_state = _checkpoint_adaptive_environment(
+                adaptive_path,
+                adaptive_dir,
+                adaptive,
+                name,
+                environment_state,
+            )
         if selected is None:
             time_ps = adaptive["candidate_times_ps"][-1]
             total_steps = adaptive["candidate_total_steps"][-1]
@@ -2224,16 +2359,13 @@ def _iter_environment(
         reverse = _read_work(files["reverse"])
         segment_steps = [int(value) for value in selected["forward_segment_steps"]]
         environment_state["status"] = "complete"
-        adaptive_state["status"] = (
-            "complete"
-            if set(adaptive_state["environments"]) >= {"complex", "solvent"}
-            and all(
-                item.get("status") == "complete"
-                for item in adaptive_state["environments"].values()
-            )
-            else "running"
+        adaptive_state = _checkpoint_adaptive_environment(
+            adaptive_path,
+            adaptive_dir,
+            adaptive,
+            name,
+            environment_state,
         )
-        _write_yaml_atomic(adaptive_path, adaptive_state)
         LOGGER.info(
             "%s adaptive switching selected %.3g ps and reused %d pilot samples",
             name,

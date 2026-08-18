@@ -18,6 +18,8 @@ from atom_openmm.covalent_workflow import (
     _write_switch_pdb,
     _ensure_switch_protocol,
     _constrained_ligand_atom_map,
+    _checkpoint_adaptive_environment,
+    _load_adaptive_environment_state,
     _mapping_settings,
     _precompute_endpoint_lrc_corrections,
     _promote_adaptive_pilot_work,
@@ -96,6 +98,68 @@ def _test_new_adaptive_selection_rejects_mismatched_production_work(tmp_path):
         _promote_adaptive_pilot_work(
             production, selected, 3, False, "solvent forward"
         )
+
+
+def _test_adaptive_environment_checkpoints_merge_stale_generator_state(tmp_path):
+    adaptive_path = tmp_path / "neqti_adaptive_switching.yaml"
+    adaptive_dir = tmp_path / "neqti_adaptive_switching"
+    settings = {"enabled": True, "candidate_times_ps": [100.0]}
+    solvent_state = {"status": "complete", "selected": {"candidate": "100ps"}}
+    complex_state = {"status": "running", "selected": {"candidate": "300ps"}}
+
+    _checkpoint_adaptive_environment(
+        adaptive_path, adaptive_dir, settings, "solvent", solvent_state
+    )
+    adaptive_path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "status": "running",
+                "settings": settings,
+                "environments": {},
+            },
+            sort_keys=False,
+        )
+    )
+    _checkpoint_adaptive_environment(
+        adaptive_path, adaptive_dir, settings, "complex", complex_state
+    )
+
+    aggregate = yaml.safe_load(adaptive_path.read_text())
+    assert aggregate["environments"]["solvent"] == solvent_state
+    assert aggregate["environments"]["complex"] == complex_state
+
+
+def _test_adaptive_environment_checkpoint_recovers_missing_aggregate_state(tmp_path):
+    adaptive_path = tmp_path / "neqti_adaptive_switching.yaml"
+    adaptive_dir = tmp_path / "neqti_adaptive_switching"
+    settings = {"enabled": True, "candidate_times_ps": [100.0]}
+    solvent_state = {"status": "complete", "selected": {"candidate": "100ps"}}
+
+    _checkpoint_adaptive_environment(
+        adaptive_path, adaptive_dir, settings, "solvent", solvent_state
+    )
+    adaptive_path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "status": "running",
+                "settings": settings,
+                "environments": {},
+            },
+            sort_keys=False,
+        )
+    )
+
+    _, recovered = _load_adaptive_environment_state(
+        adaptive_path,
+        adaptive_dir,
+        settings,
+        "solvent",
+        {"status": "collecting_snapshots"},
+    )
+
+    assert recovered == solvent_state
 
 
 def test_apply_state_accepts_positions_without_velocities():
