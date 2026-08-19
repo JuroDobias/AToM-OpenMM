@@ -858,6 +858,41 @@ def _write_state_pdb(path, topology, state):
         app.PDBFile.writeFile(topology, state.getPositions(), handle, keepIds=True)
 
 
+def _endpoint_topology(prepared, endpoint):
+    replacements = (
+        prepared.provenance.get("ENDPOINT_ELEMENTS", {}).get(str(endpoint), {})
+    )
+    if not replacements:
+        return prepared.topology
+    replacements = {int(index): int(number) for index, number in replacements.items()}
+    output = app.Topology()
+    chains = {}
+    residues = {}
+    atoms = {}
+    for chain in prepared.topology.chains():
+        chains[chain.index] = output.addChain(chain.id)
+        for residue in chain.residues():
+            new_residue = output.addResidue(
+                residue.name, chains[chain.index], residue.id, residue.insertionCode
+            )
+            residues[residue.index] = new_residue
+            for atom in residue.atoms():
+                element = atom.element
+                if atom.index in replacements:
+                    element = app.Element.getByAtomicNumber(replacements[atom.index])
+                atoms[atom.index] = output.addAtom(
+                    atom.name, element, new_residue, atom.id, atom.formalCharge
+                )
+    for bond in prepared.topology.bonds():
+        output.addBond(
+            atoms[bond.atom1.index], atoms[bond.atom2.index], bond.type, bond.order
+        )
+    box = prepared.topology.getPeriodicBoxVectors()
+    if box is not None:
+        output.setPeriodicBoxVectors(box)
+    return output
+
+
 def _write_switch_pdb(path, topology, state, *, endpoint, dummy_atom_indices):
     path = Path(path)
     temporary = Path(str(path) + ".tmp")
@@ -1704,6 +1739,17 @@ def _apply_state(context, state):
         context.setVelocities(velocities)
 
 
+def _apply_switch_state(context, state, temperature_k, seed):
+    box = state.getPeriodicBoxVectors()
+    if box is not None:
+        context.setPeriodicBoxVectors(*box)
+    context.setPositions(state.getPositions())
+    context.setVelocitiesToTemperature(
+        float(temperature_k) * unit.kelvin,
+        int(seed),
+    )
+
+
 def _sample_endpoint(
     system,
     topology,
@@ -1786,12 +1832,19 @@ def _iter_environment(
         config.get("equilibration_protocol"), protocol_environment
     )
     selection_metadata = prepared.provenance.get("SELECTION_METADATA")
+    endpoint_topologies = {
+        endpoint: _endpoint_topology(prepared, endpoint) for endpoint in ("a", "b")
+    }
+    for endpoint, topology in endpoint_topologies.items():
+        topology_path = workdir / f"{name}_endpoint_{endpoint}_topology.cif"
+        with topology_path.open("w") as handle:
+            app.PDBxFile.writeFile(topology, prepared.positions, handle, keepIds=True)
     _equilibrate_endpoint(
         prepared.endpoint_a, prepared.positions, state_files["a"],
         protocol=config["endpoint_equilibration"], temperature_k=temperature,
         pressure_bar=config["pressure_bar"], platform=platform, properties=properties, seed=seed,
         label=f"{name} endpoint A",
-        topology=prepared.topology,
+        topology=endpoint_topologies["a"],
         custom_steps=custom_steps,
         custom_output_dir=workdir / "equilibration" / name / "endpoint_a",
         selection_metadata=selection_metadata,
@@ -1802,7 +1855,7 @@ def _iter_environment(
         protocol=config["endpoint_equilibration"], temperature_k=temperature,
         pressure_bar=config["pressure_bar"], platform=platform, properties=properties, seed=seed + 10,
         label=f"{name} endpoint B",
-        topology=prepared.topology,
+        topology=endpoint_topologies["b"],
         custom_steps=custom_steps,
         custom_output_dir=workdir / "equilibration" / name / "endpoint_b",
         selection_metadata=selection_metadata,
@@ -1810,12 +1863,12 @@ def _iter_environment(
     )
     _write_state_pdb(
         workdir / f"{name}_endpoint_a_equilibrated.pdb",
-        prepared.topology,
+        endpoint_topologies["a"],
         _load_state(state_files["a"]),
     )
     _write_state_pdb(
         workdir / f"{name}_endpoint_b_equilibrated.pdb",
-        prepared.topology,
+        endpoint_topologies["b"],
         _load_state(state_files["b"]),
     )
     files = {
@@ -1951,7 +2004,7 @@ def _iter_environment(
             ):
                 state, rest2_summary = _sample_endpoint(
                     system,
-                    prepared.topology,
+                    endpoint_topologies[endpoint],
                     state_files[endpoint],
                     prepared.hot_atom_indices,
                     ensemble=endpoint,
@@ -1986,7 +2039,12 @@ def _iter_environment(
                 )
                 integrator.set_segment_steps(direction_steps)
                 _reset_softcore_context(context, integrator, parameter_values)
-                _apply_state(context, state)
+                _apply_switch_state(
+                    context,
+                    state,
+                    temperature,
+                    seed + 800001 + cycle * 1000 + offset,
+                )
                 profile_rows = []
                 profile_enabled = (
                     work_profile["enabled"]
@@ -2165,7 +2223,7 @@ def _iter_environment(
             ):
                 state, rest2_summary = _sample_endpoint(
                     system,
-                    prepared.topology,
+                    endpoint_topologies[endpoint],
                     state_files[endpoint],
                     prepared.hot_atom_indices,
                     ensemble=endpoint,
@@ -2210,7 +2268,12 @@ def _iter_environment(
             context, integrator, parameter_values = cached
             integrator.set_segment_steps(direction_steps)
             _reset_softcore_context(context, integrator, parameter_values)
-            _apply_state(context, state)
+            _apply_switch_state(
+                context,
+                state,
+                temperature,
+                seed + 710001 + cycle * 1000 + (0 if endpoint == "a" else 100),
+            )
             try:
                 raw_work, _ = _run_segmented_protocol(integrator, direction_steps)
                 if lrc_corrections is not None:
@@ -2383,7 +2446,7 @@ def _iter_environment(
             if len(existing) > sample:
                 continue
             state, rest2_summary = _sample_endpoint(
-                system, prepared.topology, state_files[endpoint], prepared.hot_atom_indices,
+                system, endpoint_topologies[endpoint], state_files[endpoint], prepared.hot_atom_indices,
                 ensemble=endpoint,
                 steps=config["decorrelation_steps"],
                 rest2_config=config["rest2"],
@@ -2399,7 +2462,7 @@ def _iter_environment(
                     _write_yaml_atomic(adaptive_path, adaptive_state)
             _write_state_pdb(
                 workdir / f"{name}_endpoint_{endpoint}_equilibrated.pdb",
-                prepared.topology,
+                endpoint_topologies[endpoint],
                 state,
             )
             pre_switch_path = workdir / (
@@ -2411,7 +2474,7 @@ def _iter_environment(
             if config["write_switch_pdbs"]:
                 _write_switch_pdb(
                     pre_switch_path,
-                    prepared.topology,
+                    endpoint_topologies[endpoint],
                     state,
                     endpoint=endpoint,
                     dummy_atom_indices=_dummy_particles(prepared, endpoint),
@@ -2463,7 +2526,12 @@ def _iter_environment(
                     )
                     integrator.set_segment_steps(direction_steps)
                     _reset_softcore_context(context, integrator, parameter_values)
-                _apply_state(context, state)
+                _apply_switch_state(
+                    context,
+                    state,
+                    temperature,
+                    seed + sample * 1000 + offset + 2,
+                )
                 if lrc_corrections is not None:
                     correction = lrc_corrections[direction]
                     initial_lrc_kj = correction["initial"]
@@ -2520,7 +2588,7 @@ def _iter_environment(
                 if config["write_switch_pdbs"]:
                     _write_switch_pdb(
                         post_switch_path,
-                        prepared.topology,
+                        endpoint_topologies[final_endpoint],
                         post_switch_state,
                         endpoint=final_endpoint,
                         dummy_atom_indices=_dummy_particles(prepared, final_endpoint),
@@ -2591,7 +2659,7 @@ def _iter_environment(
                         )
                         _write_switch_pdb(
                             post_switch_path,
-                            prepared.topology,
+                            endpoint_topologies[final_endpoint],
                             post_switch_state,
                             endpoint=final_endpoint,
                             dummy_atom_indices=_dummy_particles(prepared, final_endpoint),

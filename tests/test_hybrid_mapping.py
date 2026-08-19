@@ -38,3 +38,27 @@ def _test_mapping_restores_openff_kekule_purine_aromaticity():
         "ligand_b": 15,
     }
     assert metadata["mapped_heavy_atom_count"] == 24
+
+
+def test_paired_smarts_maps_amide_to_sulfonamide_transmutation():
+    ligand_a = _parameters("CC(=O)NC1=CC=CC=C1")
+    ligand_b = _parameters("CS(=O)(=O)NC1=CC=CC=C1")
+
+    mapping, metadata = build_hybrid_atom_map(
+        ligand_a,
+        ligand_b,
+        {
+            "method": "paired_smarts_transmutation",
+            "ligand_a_smarts": "[C:1]-[C:2](=[O:3])-[NH:4]",
+            "ligand_b_smarts": "[C:1]-[S:2](=[O:3])(=[O:5])-[NH:4]",
+            "inactive_bonded_labels": {"ligand_b": [5]},
+        },
+    )
+
+    assert metadata["method"] == "paired_smarts_transmutation"
+    assert len(metadata["transmuted_pairs_0based"]) == 1
+    atom_a, atom_b = metadata["transmuted_pairs_0based"][0]
+    assert ligand_a.molecule.atoms[atom_a].atomic_number == 6
+    assert ligand_b.molecule.atoms[atom_b].atomic_number == 16
+    assert mapping[atom_a] == atom_b
+    assert len(metadata["inactive_bonded_atoms_b_0based"]) == 1

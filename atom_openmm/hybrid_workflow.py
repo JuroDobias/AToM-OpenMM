@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import yaml
+from openmm import unit
 from openff.toolkit import Molecule
 from openff.units import unit as offunit
 
@@ -63,14 +64,30 @@ def _sha256(path):
 def _mapping_settings(workflow):
     settings = dict((workflow.get("alchemy") or {}).get("mapping") or {})
     method = settings.get("method", "mcs")
-    if method not in {"mcs", "mcs_core_smarts"}:
+    if method not in {"mcs", "mcs_core_smarts", "paired_smarts_transmutation"}:
         raise HybridWorkflowError(
-            "workflow.alchemy.mapping.method must be 'mcs' or 'mcs_core_smarts'"
+            "workflow.alchemy.mapping.method must be 'mcs', 'mcs_core_smarts', "
+            "or 'paired_smarts_transmutation'"
         )
     settings["method"] = method
     if method == "mcs_core_smarts" and not settings.get("smarts"):
         raise HybridWorkflowError(
             "mcs_core_smarts requires workflow.alchemy.mapping.smarts"
+        )
+    if method == "paired_smarts_transmutation":
+        if not settings.get("ligand_a_smarts") or not settings.get("ligand_b_smarts"):
+            raise HybridWorkflowError(
+                "paired_smarts_transmutation requires ligand_a_smarts and ligand_b_smarts"
+            )
+    geometry = str(settings.get("inactive_bonded_geometry", "bond_only")).lower()
+    if geometry not in {"bond_only", "terminal_z_matrix"}:
+        raise HybridWorkflowError(
+            "workflow.alchemy.mapping.inactive_bonded_geometry must be "
+            "'bond_only' or 'terminal_z_matrix'"
+        )
+    if geometry == "terminal_z_matrix" and method != "paired_smarts_transmutation":
+        raise HybridWorkflowError(
+            "terminal_z_matrix currently requires paired_smarts_transmutation"
         )
     if "max_mapped_rmsd_a" in settings:
         settings["max_mapped_rmsd_a"] = float(settings["max_mapped_rmsd_a"])
@@ -280,7 +297,11 @@ def _validate_settings(workflow):
 
 
 def validate_noncovalent_hybrid_workflow(path):
-    from atom_openmm.rbfe_workflow import build_small_molecule_plan, load_workflow_config
+    from atom_openmm.rbfe_workflow import (
+        build_small_molecule_plan,
+        load_workflow_config,
+        normalize_workflow_axes,
+    )
 
     config = load_workflow_config(path)
     plan = build_small_molecule_plan(config)
@@ -289,7 +310,14 @@ def validate_noncovalent_hybrid_workflow(path):
             "allow_undefined_stereo", False
         )
     )
-    _mapping_settings(config["workflow"])
+    mapping = _mapping_settings(config["workflow"])
+    if (
+        mapping["method"] == "paired_smarts_transmutation"
+        and normalize_workflow_axes(config["workflow"]).sampling_method != "neqti"
+    ):
+        raise HybridWorkflowError(
+            "paired_smarts_transmutation currently supports only NEQTI sampling"
+        )
     _validate_settings(config["workflow"])
     for pair in plan["pairs"]:
         charge_a = _formal_charge(
@@ -438,6 +466,31 @@ def _prepare_pair(pair, receptor, workflow, workdir):
     atom_map, mapping_payload = build_hybrid_atom_map(
         parameters_a, parameters_b, mapping_settings
     )
+    mapping_payload["transmutations"] = [
+        {
+            "ligand_a_atom_0based": int(atom_a),
+            "ligand_b_atom_0based": int(atom_b),
+            "ligand_a_element": parameters_a.molecule.atoms[atom_a].symbol,
+            "ligand_b_element": parameters_b.molecule.atoms[atom_b].symbol,
+            "ligand_a_mass_da": float(
+                parameters_a.system.getParticleMass(atom_a).value_in_unit(
+                    unit.dalton
+                )
+            ),
+            "ligand_b_mass_da": float(
+                parameters_b.system.getParticleMass(atom_b).value_in_unit(
+                    unit.dalton
+                )
+            ),
+            "switching_mass_da": max(
+                parameters_a.system.getParticleMass(atom_a).value_in_unit(unit.dalton),
+                parameters_b.system.getParticleMass(atom_b).value_in_unit(unit.dalton),
+            ),
+        }
+        for atom_a, atom_b in (
+            tuple(pair) for pair in mapping_payload["transmuted_pairs_0based"]
+        )
+    ]
     hybrid = build_hybrid_molecule(
         parameters_a,
         parameters_b,
@@ -448,7 +501,44 @@ def _prepare_pair(pair, receptor, workflow, workdir):
         dummy_core_nonbonded=_normalized_settings(workflow)[
             "dummy_core_nonbonded"
         ],
+        transmuted_pairs={
+            tuple(pair) for pair in mapping_payload["transmuted_pairs_0based"]
+        },
+        inactive_bonded_atoms_a=set(
+            mapping_payload["inactive_bonded_atoms_a_0based"]
+        ),
+        inactive_bonded_atoms_b=set(
+            mapping_payload["inactive_bonded_atoms_b_0based"]
+        ),
+        inactive_bonded_geometry=mapping_payload["inactive_bonded_geometry"],
     )
+    mapping_payload["inactive_z_matrix_terms"] = [
+        {
+            "endpoint": term.endpoint,
+            "dummy_atom_0based": term.dummy_atom,
+            "dummy_atom_1based": term.dummy_atom + 1,
+            "angle_atoms_0based": list(term.angle_atoms),
+            "angle_atoms_1based": [atom + 1 for atom in term.angle_atoms],
+            "torsion_atoms_0based": list(term.torsion_atoms),
+            "torsion_atoms_1based": [atom + 1 for atom in term.torsion_atoms],
+            "hybrid_dummy_atom_0based": term.hybrid_dummy_atom,
+            "hybrid_dummy_atom_1based": term.hybrid_dummy_atom + 1,
+            "hybrid_angle_atoms_0based": list(term.hybrid_angle_atoms),
+            "hybrid_torsion_atoms_0based": list(term.hybrid_torsion_atoms),
+            "angle_degrees": term.angle_degrees,
+            "angle_k_kj_mol_rad2": term.angle_k_kj_mol_rad2,
+            "torsion_barrier_kj_mol": term.torsion_barrier_kj_mol,
+            "torsion_terms": [
+                {
+                    "periodicity": periodicity,
+                    "phase_radians": phase,
+                    "k_kj_per_mol": k,
+                }
+                for periodicity, phase, k in term.torsion_terms
+            ],
+        }
+        for term in hybrid.inactive_z_matrix_terms
+    ]
     seed = int(setup.get("solvation_seed", _normalized_settings(workflow)["random_seed"]))
     physical_complex = create_physical_ligand_environment(
         parameters_a, receptor=receptor, setup=setup, solvation_seed=seed
@@ -474,8 +564,20 @@ def _prepare_pair(pair, receptor, workflow, workdir):
             ],
         },
     }
+    endpoint_elements = {
+        "a": {
+            int(hybrid.map_a_to_hybrid[index]): int(atom.atomic_number)
+            for index, atom in enumerate(parameters_a.molecule.atoms)
+        },
+        "b": {
+            int(hybrid.map_b_to_hybrid[index]): int(atom.atomic_number)
+            for index, atom in enumerate(parameters_b.molecule.atoms)
+        },
+    }
     complex_system.provenance["SELECTION_METADATA"] = selection_metadata
     solvent_system.provenance["SELECTION_METADATA"] = selection_metadata
+    complex_system.provenance["ENDPOINT_ELEMENTS"] = endpoint_elements
+    solvent_system.provenance["ENDPOINT_ELEMENTS"] = endpoint_elements
     _validate_prepared_endpoint_charges(complex_system, "complex")
     _validate_prepared_endpoint_charges(solvent_system, "solvent")
     manifest = {
@@ -484,10 +586,16 @@ def _prepare_pair(pair, receptor, workflow, workdir):
         "fingerprint_inputs": fingerprint_inputs,
         "mapping": mapping_payload,
         "dummy_core_nonbonded": hybrid.dummy_core_nonbonded,
+        "inactive_bonded_geometry": hybrid.inactive_bonded_geometry,
         "vacuum_nonbonded_pair_counts": vacuum_nonbonded_pair_counts(hybrid),
         "parameterization": {
             "ligand_a": parameters_a.provenance,
             "ligand_b": parameters_b.provenance,
+        },
+        "mass_policy": {
+            "endpoint_equilibration": "physical",
+            "switching": "heavier_endpoint",
+            "switch_velocities": "maxwell_boltzmann_resampled",
         },
     }
     manifest = _write_bundle(workdir, complex_system, solvent_system, manifest)

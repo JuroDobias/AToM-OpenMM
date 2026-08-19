@@ -13,6 +13,8 @@ from atom_openmm.covalent_hybrid import (
     build_covalent_hybrid_molecule,
 )
 from atom_openmm.covalent_parameters import CovalentParameterBundle
+from atom_openmm.covalent_softcore import create_softcore_hamiltonian
+from atom_openmm.hybrid_mapping import build_hybrid_atom_map
 
 
 def _bundle(smiles):
@@ -68,6 +70,151 @@ def test_endpoint_excludes_all_cross_branch_nonbonded_pairs():
     }
 
     assert expected <= exceptions
+
+
+def test_transmutation_uses_physical_endpoint_and_heavier_switching_masses():
+    left = _bundle("CC(=O)NC1=CC=CC=C1")
+    right = _bundle("CS(=O)(=O)NC1=CC=CC=C1")
+    mapping, metadata = build_hybrid_atom_map(
+        left,
+        right,
+        {
+            "method": "paired_smarts_transmutation",
+            "ligand_a_smarts": "[C:1]-[C:2](=[O:3])-[NH:4]",
+            "ligand_b_smarts": "[C:1]-[S:2](=[O:3])(=[O:5])-[NH:4]",
+            "inactive_bonded_labels": {"ligand_b": [5]},
+        },
+    )
+    transmuted = {tuple(pair) for pair in metadata["transmuted_pairs_0based"]}
+    inactive_b = set(metadata["inactive_bonded_atoms_b_0based"])
+    hybrid = build_covalent_hybrid_molecule(
+        left,
+        right,
+        atom_map=mapping,
+        transmuted_pairs=transmuted,
+        inactive_bonded_atoms_b=inactive_b,
+    )
+    atom_a, atom_b = next(iter(transmuted))
+    center = hybrid.map_a_to_hybrid[atom_a]
+    assert np.isclose(
+        hybrid.endpoint_a.getParticleMass(center).value_in_unit(unit.dalton), 12.01078
+    )
+    assert np.isclose(
+        hybrid.endpoint_b.getParticleMass(center).value_in_unit(unit.dalton), 32.0655
+    )
+
+    unique_a = [hybrid.map_a_to_hybrid[index] for index in hybrid.unique_a]
+    unique_b = [hybrid.map_b_to_hybrid[index] for index in hybrid.unique_b]
+    switching = create_softcore_hamiltonian(
+        hybrid.endpoint_a,
+        hybrid.endpoint_b,
+        unique_a,
+        unique_b,
+        total_steps=100,
+        path_mode="concerted",
+    )
+    assert np.isclose(
+        switching.system.getParticleMass(center).value_in_unit(unit.dalton), 32.0655
+    )
+
+    oxygen = hybrid.map_b_to_hybrid[next(iter(inactive_b))]
+    bonds = next(
+        force for force in hybrid.endpoint_a.getForces()
+        if isinstance(force, mm.HarmonicBondForce)
+    )
+    assert any(
+        oxygen in map(int, bonds.getBondParameters(index)[:2])
+        and bonds.getBondParameters(index)[3].value_in_unit(
+            unit.kilojoule_per_mole / unit.nanometer**2
+        ) > 0
+        for index in range(bonds.getNumBonds())
+    )
+    angles = next(
+        force for force in hybrid.endpoint_a.getForces()
+        if isinstance(force, mm.HarmonicAngleForce)
+    )
+    assert all(
+        angles.getAngleParameters(index)[4].value_in_unit(
+            unit.kilojoule_per_mole / unit.radian**2
+        ) == 0
+        for index in range(angles.getNumAngles())
+        if oxygen in map(int, angles.getAngleParameters(index)[:3])
+    )
+
+
+def test_terminal_z_matrix_retains_one_angle_and_one_proper_torsion_group():
+    left = _bundle("NC(=O)c1ccccc1")
+    right = _bundle("NS(=O)(=O)c1ccccc1")
+    mapping, metadata = build_hybrid_atom_map(
+        left,
+        right,
+        {
+            "method": "paired_smarts_transmutation",
+            "ligand_a_smarts": "[c:1]-[C:2](=[O:3])-[NH2:4]",
+            "ligand_b_smarts": "[c:1]-[S:2](=[O:3])(=[O:5])-[NH2:4]",
+            "inactive_bonded_labels": {"ligand_b": [5]},
+            "inactive_bonded_geometry": "terminal_z_matrix",
+        },
+    )
+    inactive_b = set(metadata["inactive_bonded_atoms_b_0based"])
+    hybrid = build_covalent_hybrid_molecule(
+        left,
+        right,
+        atom_map=mapping,
+        transmuted_pairs={
+            tuple(pair) for pair in metadata["transmuted_pairs_0based"]
+        },
+        inactive_bonded_atoms_b=inactive_b,
+        inactive_bonded_geometry="terminal_z_matrix",
+    )
+
+    assert hybrid.inactive_bonded_geometry == "terminal_z_matrix"
+    assert len(hybrid.inactive_z_matrix_terms) == 1
+    selected = hybrid.inactive_z_matrix_terms[0]
+    assert selected.endpoint == "b"
+    assert selected.dummy_atom == next(iter(inactive_b))
+    assert selected.torsion_barrier_kj_mol > 0.0
+    rdkit = right.molecule.to_rdkit()
+    assert all(
+        rdkit.GetAtomWithIdx(atom).GetAtomicNum() > 1
+        for atom in selected.torsion_atoms[:3]
+    )
+    assert rdkit.GetBondBetweenAtoms(*selected.torsion_atoms[:2]).IsInRing()
+
+    oxygen = selected.hybrid_dummy_atom
+    angles = next(
+        force for force in hybrid.endpoint_a.getForces()
+        if isinstance(force, mm.HarmonicAngleForce)
+    )
+    nonzero_angles = [
+        tuple(map(int, angles.getAngleParameters(index)[:3]))
+        for index in range(angles.getNumAngles())
+        if oxygen in map(int, angles.getAngleParameters(index)[:3])
+        and angles.getAngleParameters(index)[4].value_in_unit(
+            unit.kilojoule_per_mole / unit.radian**2
+        ) > 0.0
+    ]
+    assert len(nonzero_angles) == 1
+    assert set(nonzero_angles[0]) == set(selected.hybrid_angle_atoms)
+
+    torsions = next(
+        force for force in hybrid.endpoint_a.getForces()
+        if isinstance(force, mm.PeriodicTorsionForce)
+    )
+    nonzero_torsions = [
+        tuple(map(int, torsions.getTorsionParameters(index)[:4]))
+        for index in range(torsions.getNumTorsions())
+        if oxygen in map(int, torsions.getTorsionParameters(index)[:4])
+        and torsions.getTorsionParameters(index)[6].value_in_unit(
+            unit.kilojoule_per_mole
+        ) > 0.0
+    ]
+    assert len(nonzero_torsions) == len(selected.torsion_terms)
+    assert all(
+        atoms == selected.hybrid_torsion_atoms
+        or atoms[::-1] == selected.hybrid_torsion_atoms
+        for atoms in nonzero_torsions
+    )
 
 
 def _test_hybrid_molecule_has_identical_endpoint_particles():

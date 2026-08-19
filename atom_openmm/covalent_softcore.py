@@ -82,6 +82,23 @@ def _system_shell(endpoint_a: mm.System) -> mm.System:
     return output
 
 
+def _common_mass_endpoint_copies(endpoint_a: mm.System, endpoint_b: mm.System):
+    if endpoint_a.getNumParticles() != endpoint_b.getNumParticles():
+        raise CovalentAlchemyError("endpoint systems must contain identical particle counts")
+    copied_a = mm.XmlSerializer.deserialize(mm.XmlSerializer.serialize(endpoint_a))
+    copied_b = mm.XmlSerializer.deserialize(mm.XmlSerializer.serialize(endpoint_b))
+    for index in range(endpoint_a.getNumParticles()):
+        mass_a = endpoint_a.getParticleMass(index)
+        mass_b = endpoint_b.getParticleMass(index)
+        common = max(
+            mass_a.value_in_unit(unit.dalton),
+            mass_b.value_in_unit(unit.dalton),
+        ) * unit.dalton
+        copied_a.setParticleMass(index, common)
+        copied_b.setParticleMass(index, common)
+    return copied_a, copied_b
+
+
 def _canonical_angle(particles):
     particles = tuple(int(value) for value in particles)
     reverse = tuple(reversed(particles))
@@ -1643,6 +1660,7 @@ def create_softcore_hamiltonian(
     stage_interpolation: str = "linear",
     use_long_range_correction: bool = True,
 ) -> CovalentSoftcoreHamiltonian:
+    endpoint_a, endpoint_b = _common_mass_endpoint_copies(endpoint_a, endpoint_b)
     _assert_compatible_endpoints(endpoint_a, endpoint_b)
     function = str(function).lower()
     coulomb_function = str(coulomb_function).lower()

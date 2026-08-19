@@ -382,6 +382,43 @@ otherwise common aromatic atoms. This initial implementation requires equal liga
 charges, Espaloma parameters with NN charges, and `softcore_linear` switching.
 See `examples/RBFE/cdk2/workflow.hybrid.yaml` for a complete input.
 
+Element-changing common atoms can be represented directly in NEQTI with paired,
+atom-mapped SMARTS. Labels present in both patterns define forced pairs; labels
+present on only one side remain endpoint-unique:
+
+```yaml
+workflow:
+  alchemy:
+    model: hybrid_topology
+    cycle: complex_solvent
+    mapping:
+      method: paired_smarts_transmutation
+      ligand_a_smarts: "[c:1]-[C:2](=[O:3])-[NH:4]"
+      ligand_b_smarts: "[c:1]-[S:2](=[O:3])(=[O:5])-[NH:4]"
+      inactive_bonded_labels:
+        ligand_b: [5]
+      inactive_bonded_geometry: terminal_z_matrix
+  sampling:
+    method: neqti
+```
+
+This maps the amide carbon to sulfonamide sulfur and maps one oxygen and the
+nitrogen conventionally. The second sulfonyl oxygen is unique to ligand B. With
+`terminal_z_matrix`, the inactive A endpoint retains its radial bond, one
+automatically selected angle, and all Fourier components of one proper torsion.
+The references are mapped heavy atoms selected from the most rigid available
+graph chain, followed by the largest parameter-derived torsional barrier. This
+nonredundant internal-coordinate set localizes the inactive oxygen without
+retaining redundant bonded terms that could bias the physical amide. The
+selected atoms, parameters, and torsional barrier are recorded in
+`hybrid_mapping.yaml`. The backward-compatible `bond_only` mode retains only
+the radial bond and allows free angular motion. Changed mapped bonded and
+nonbonded parameters are interpolated by the configured softcore
+path. Endpoint equilibration and REST2 use the physical A and B masses. The
+switching system uses the heavier endpoint mass for every mapped particle and
+resamples velocities before each switch, so masses remain fixed during protocol
+work accumulation. This mapping mode currently supports NEQTI only.
+
 For large flexible transformations, `alchemy.dummy_core_nonbonded: retain`
 also preserves inactive unique-common electrostatics, Lennard-Jones terms,
 exclusions, and 1-4 interactions. This prevents a large vacuum branch from

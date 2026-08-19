@@ -29,6 +29,26 @@ class CovalentHybridMolecule:
     attachment_pairs: tuple[tuple[int, int], tuple[int, int]] | None
     dummy_bonded_scales: "DummyBondedScales"
     dummy_core_nonbonded: str
+    transmuted_pairs: tuple[tuple[int, int], ...] = ()
+    inactive_bonded_atoms_a: tuple[int, ...] = ()
+    inactive_bonded_atoms_b: tuple[int, ...] = ()
+    inactive_bonded_geometry: str = "bond_only"
+    inactive_z_matrix_terms: tuple["InactiveZMatrixTerm", ...] = ()
+
+
+@dataclass(frozen=True)
+class InactiveZMatrixTerm:
+    endpoint: str
+    dummy_atom: int
+    angle_atoms: tuple[int, int, int]
+    torsion_atoms: tuple[int, int, int, int]
+    hybrid_dummy_atom: int
+    hybrid_angle_atoms: tuple[int, int, int]
+    hybrid_torsion_atoms: tuple[int, int, int, int]
+    angle_degrees: float
+    angle_k_kj_mol_rad2: float
+    torsion_barrier_kj_mol: float
+    torsion_terms: tuple[tuple[int, float, float], ...]
 
 
 @dataclass(frozen=True)
@@ -67,16 +87,20 @@ def complete_covalent_atom_map(
     mapping: dict[int, int],
     *,
     required_pairs: list[tuple[int, int]] | None = None,
+    transmuted_pairs: set[tuple[int, int]] | None = None,
 ) -> dict[int, int]:
     """Complete mapped heavy atoms with compatible hydrogens and validate the map."""
     molecule_a = normalize_mapping_aromaticity(molecule_a)
     molecule_b = normalize_mapping_aromaticity(molecule_b)
     mapping = {int(atom_a): int(atom_b) for atom_a, atom_b in mapping.items()}
     required = set(required_pairs or [])
+    transmuted = set(transmuted_pairs or ())
     if len(required) != len(required_pairs or ()):
         raise CovalentAlchemyError("required covalent atom pairs contain duplicates")
     if len(set(mapping.values())) != len(mapping):
         raise CovalentAlchemyError("covalent atom map must be one-to-one")
+    if not transmuted.issubset(mapping.items()):
+        raise CovalentAlchemyError("transmuted atom pairs must be present in the atom map")
     if any(
         atom_a < 0 or atom_a >= molecule_a.GetNumAtoms()
         or atom_b < 0 or atom_b >= molecule_b.GetNumAtoms()
@@ -138,7 +162,7 @@ def complete_covalent_atom_map(
     for atom_a, atom_b in mapping.items():
         left = molecule_a.GetAtomWithIdx(atom_a)
         right = molecule_b.GetAtomWithIdx(atom_b)
-        if (
+        if (atom_a, atom_b) not in transmuted and (
             left.GetAtomicNum() != right.GetAtomicNum()
             or left.GetFormalCharge() != right.GetFormalCharge()
             or left.GetIsAromatic() != right.GetIsAromatic()
@@ -159,7 +183,12 @@ def complete_covalent_atom_map(
             other_b = mapping[other_a]
             bond_a = molecule_a.GetBondBetweenAtoms(atom_a, other_a)
             bond_b = molecule_b.GetBondBetweenAtoms(atom_b, other_b)
-            if bond_b is None or _bond_signature(bond_a) != _bond_signature(bond_b):
+            changed_atom = (atom_a, atom_b) in transmuted or (
+                other_a, other_b
+            ) in transmuted
+            if bond_b is None or (
+                not changed_atom and _bond_signature(bond_a) != _bond_signature(bond_b)
+            ):
                 raise CovalentAlchemyError(
                     f"mapped bond {atom_a}:{other_a} is incompatible with {atom_b}:{other_b}"
                 )
@@ -174,7 +203,12 @@ def complete_covalent_atom_map(
             other_a = reverse_mapping[other_b]
             bond_b = molecule_b.GetBondBetweenAtoms(atom_b, other_b)
             bond_a = molecule_a.GetBondBetweenAtoms(atom_a, other_a)
-            if bond_a is None or _bond_signature(bond_a) != _bond_signature(bond_b):
+            changed_atom = (atom_a, atom_b) in transmuted or (
+                other_a, other_b
+            ) in transmuted
+            if bond_a is None or (
+                not changed_atom and _bond_signature(bond_a) != _bond_signature(bond_b)
+            ):
                 raise CovalentAlchemyError(
                     f"mapped bond {atom_b}:{other_b} is incompatible with {atom_a}:{other_a}"
                 )
@@ -410,6 +444,141 @@ def _inactive_scales(molecule, unique, scales):
     return angle, torsion
 
 
+def _canonical_torsion(atoms):
+    atoms = tuple(int(atom) for atom in atoms)
+    reverse = atoms[::-1]
+    return min(atoms, reverse)
+
+
+def _torsion_barrier_kj_mol(terms):
+    phi = np.linspace(-np.pi, np.pi, 4097)
+    energy = np.zeros_like(phi)
+    for periodicity, phase, k in terms:
+        energy += k * (1.0 + np.cos(periodicity * phi - phase))
+    return float(np.max(energy) - np.min(energy))
+
+
+def _select_inactive_z_matrix_terms(
+    molecule,
+    system,
+    selected,
+    unique,
+    mapping,
+    endpoint,
+):
+    """Select one nonredundant bond-angle-torsion frame per terminal dummy."""
+    if not selected:
+        return {}
+    angle_force = _source_force(system, mm.HarmonicAngleForce)
+    torsion_force = _source_force(system, mm.PeriodicTorsionForce)
+    if angle_force is None or torsion_force is None:
+        raise CovalentAlchemyError(
+            "terminal_z_matrix requires harmonic angles and periodic torsions"
+        )
+    angles = {}
+    for index in range(angle_force.getNumAngles()):
+        atom1, center, atom3, theta, k = angle_force.getAngleParameters(index)
+        key = (min(int(atom1), int(atom3)), int(center), max(int(atom1), int(atom3)))
+        angles[key] = (theta, k)
+    torsions = {}
+    for index in range(torsion_force.getNumTorsions()):
+        atom1, atom2, atom3, atom4, periodicity, phase, k = (
+            torsion_force.getTorsionParameters(index)
+        )
+        key = _canonical_torsion((atom1, atom2, atom3, atom4))
+        torsions.setdefault(key, []).append((periodicity, phase, k))
+
+    canonical_ranks = list(Chem.CanonicalRankAtoms(molecule, breakTies=True))
+    result = {}
+    for dummy in sorted(selected):
+        atom_d = molecule.GetAtomWithIdx(dummy)
+        neighbors = [atom.GetIdx() for atom in atom_d.GetNeighbors()]
+        if len(neighbors) != 1:
+            raise CovalentAlchemyError(
+                f"terminal_z_matrix atom {dummy} in endpoint {endpoint} must have "
+                "exactly one bonded neighbor"
+            )
+        center = neighbors[0]
+        if center in unique:
+            raise CovalentAlchemyError(
+                f"terminal_z_matrix atom {dummy} in endpoint {endpoint} must attach "
+                "directly to a mapped atom"
+            )
+        candidates = []
+        for atom_b_obj in molecule.GetAtomWithIdx(center).GetNeighbors():
+            atom_b = atom_b_obj.GetIdx()
+            if atom_b == dummy or atom_b in unique or atom_b_obj.GetAtomicNum() == 1:
+                continue
+            angle_key = (min(atom_b, dummy), center, max(atom_b, dummy))
+            if angle_key not in angles:
+                continue
+            theta, angle_k = angles[angle_key]
+            for atom_a_obj in atom_b_obj.GetNeighbors():
+                atom_a = atom_a_obj.GetIdx()
+                if atom_a == center or atom_a in unique or atom_a_obj.GetAtomicNum() == 1:
+                    continue
+                quartet = (atom_a, atom_b, center, dummy)
+                key = _canonical_torsion(quartet)
+                grouped = torsions.get(key)
+                if not grouped:
+                    continue
+                numeric_terms = tuple(
+                    (
+                        int(periodicity),
+                        float(phase.value_in_unit(unit.radian)),
+                        float(k.value_in_unit(unit.kilojoule_per_mole)),
+                    )
+                    for periodicity, phase, k in grouped
+                )
+                barrier = _torsion_barrier_kj_mol(numeric_terms)
+                bond_ab = molecule.GetBondBetweenAtoms(atom_a, atom_b)
+                rigid_ab = int(
+                    bond_ab.IsInRing()
+                    or bond_ab.GetIsAromatic()
+                    or bond_ab.GetBondType() != Chem.BondType.SINGLE
+                )
+                score = (
+                    rigid_ab,
+                    int(bond_ab.IsInRing()),
+                    barrier,
+                    float(
+                        angle_k.value_in_unit(
+                            unit.kilojoule_per_mole / unit.radian**2
+                        )
+                    ),
+                    -canonical_ranks[atom_a],
+                    -canonical_ranks[atom_b],
+                    -atom_a,
+                    -atom_b,
+                )
+                candidates.append((score, quartet, theta, angle_k, numeric_terms, barrier))
+        if not candidates:
+            raise CovalentAlchemyError(
+                f"terminal_z_matrix atom {dummy} in endpoint {endpoint} has no "
+                "mapped heavy-atom proper-torsion reference chain"
+            )
+        _, quartet, theta, angle_k, numeric_terms, barrier = max(
+            candidates, key=lambda item: item[0]
+        )
+        atom_a, atom_b, center, dummy = quartet
+        result[dummy] = InactiveZMatrixTerm(
+            endpoint=endpoint,
+            dummy_atom=dummy,
+            angle_atoms=(atom_b, center, dummy),
+            torsion_atoms=quartet,
+            hybrid_dummy_atom=mapping[dummy],
+            hybrid_angle_atoms=_mapped_indices((atom_b, center, dummy), mapping),
+            hybrid_torsion_atoms=_mapped_indices(quartet, mapping),
+            angle_degrees=float(theta.value_in_unit(unit.degree)),
+            angle_k_kj_mol_rad2=float(
+                angle_k.value_in_unit(unit.kilojoule_per_mole / unit.radian**2)
+            ),
+            torsion_barrier_kj_mol=barrier,
+            torsion_terms=numeric_terms,
+        )
+    return result
+
+
 def _exception_parameters(force: mm.NonbondedForce):
     return {
         tuple(sorted((int(force.getExceptionParameters(index)[0]), int(force.getExceptionParameters(index)[1])))):
@@ -499,13 +668,21 @@ def _build_endpoint(
     molecule_b: Chem.Mol,
     dummy_bonded_scales: DummyBondedScales,
     dummy_core_nonbonded: str,
+    inactive_bonded_atoms_a: set[int],
+    inactive_bonded_atoms_b: set[int],
+    inactive_z_matrix_a: dict[int, InactiveZMatrixTerm],
+    inactive_z_matrix_b: dict[int, InactiveZMatrixTerm],
 ) -> mm.System:
     output = mm.System()
     reverse_a = {hybrid: atom for atom, hybrid in map_a_to_hybrid.items()}
     reverse_b = {hybrid: atom for atom, hybrid in map_b_to_hybrid.items()}
     particle_count = max(max(reverse_a), max(reverse_b)) + 1
     for hybrid in range(particle_count):
-        if hybrid in reverse_a:
+        if state == "a" and hybrid in reverse_a:
+            mass = system_a.getParticleMass(reverse_a[hybrid])
+        elif state == "b" and hybrid in reverse_b:
+            mass = system_b.getParticleMass(reverse_b[hybrid])
+        elif hybrid in reverse_a:
             mass = system_a.getParticleMass(reverse_a[hybrid])
         else:
             mass = system_b.getParticleMass(reverse_b[hybrid])
@@ -530,22 +707,49 @@ def _build_endpoint(
     angle_scale_b, torsion_scale_b = _inactive_scales(
         molecule_b, unique_b, dummy_bonded_scales
     )
+
+    def local_angle_scale(base, atoms, selected, z_matrix):
+        selected_atoms = set(atoms) & selected
+        if not selected_atoms:
+            return base(atoms)
+        if len(selected_atoms) == 1:
+            term = z_matrix.get(next(iter(selected_atoms)))
+            if term is not None and (
+                atoms == term.angle_atoms or atoms[::-1] == term.angle_atoms
+            ):
+                return 1.0
+        return 0.0
+
+    def local_torsion_scale(base, atoms, selected, z_matrix):
+        selected_atoms = set(atoms) & selected
+        if not selected_atoms:
+            return base(atoms)
+        if len(selected_atoms) == 1:
+            term = z_matrix.get(next(iter(selected_atoms)))
+            if term is not None and _canonical_torsion(atoms) == _canonical_torsion(
+                term.torsion_atoms
+            ):
+                return 1.0
+        return 0.0
+
+    def local_bond_scale(atoms, selected):
+        return 1.0 if any(atom in selected for atom in atoms) else dummy_bonded_scales.bond
     if state == "a":
         _add_bonds(bonds, force_a_bond, map_a_to_hybrid, lambda _: True)
         _add_angles(angles, force_a_angle, map_a_to_hybrid, lambda _: True)
         _add_torsions(torsions, force_a_torsion, map_a_to_hybrid, lambda _: True)
         include = lambda atoms: any(i in unique_b for i in atoms)
-        _add_bonds(bonds, force_b_bond, map_b_to_hybrid, include, lambda _: dummy_bonded_scales.bond)
-        _add_angles(angles, force_b_angle, map_b_to_hybrid, include, angle_scale_b)
-        _add_torsions(torsions, force_b_torsion, map_b_to_hybrid, include, torsion_scale_b)
+        _add_bonds(bonds, force_b_bond, map_b_to_hybrid, include, lambda atoms: local_bond_scale(atoms, inactive_bonded_atoms_b))
+        _add_angles(angles, force_b_angle, map_b_to_hybrid, include, lambda atoms: local_angle_scale(angle_scale_b, atoms, inactive_bonded_atoms_b, inactive_z_matrix_b))
+        _add_torsions(torsions, force_b_torsion, map_b_to_hybrid, include, lambda atoms: local_torsion_scale(torsion_scale_b, atoms, inactive_bonded_atoms_b, inactive_z_matrix_b))
     else:
         _add_bonds(bonds, force_b_bond, map_b_to_hybrid, lambda _: True)
         _add_angles(angles, force_b_angle, map_b_to_hybrid, lambda _: True)
         _add_torsions(torsions, force_b_torsion, map_b_to_hybrid, lambda _: True)
         include = lambda atoms: any(i in unique_a for i in atoms)
-        _add_bonds(bonds, force_a_bond, map_a_to_hybrid, include, lambda _: dummy_bonded_scales.bond)
-        _add_angles(angles, force_a_angle, map_a_to_hybrid, include, angle_scale_a)
-        _add_torsions(torsions, force_a_torsion, map_a_to_hybrid, include, torsion_scale_a)
+        _add_bonds(bonds, force_a_bond, map_a_to_hybrid, include, lambda atoms: local_bond_scale(atoms, inactive_bonded_atoms_a))
+        _add_angles(angles, force_a_angle, map_a_to_hybrid, include, lambda atoms: local_angle_scale(angle_scale_a, atoms, inactive_bonded_atoms_a, inactive_z_matrix_a))
+        _add_torsions(torsions, force_a_torsion, map_a_to_hybrid, include, lambda atoms: local_torsion_scale(torsion_scale_a, atoms, inactive_bonded_atoms_a, inactive_z_matrix_a))
     for force in (bonds, angles, torsions):
         if (hasattr(force, "getNumBonds") and force.getNumBonds()) or (
             hasattr(force, "getNumAngles") and force.getNumAngles()
@@ -694,6 +898,10 @@ def build_covalent_hybrid_molecule(
     attachment_pairs: tuple[tuple[int, int], tuple[int, int]] | None = None,
     dummy_bonded_scales: DummyBondedScales | None = None,
     dummy_core_nonbonded: str = "off",
+    transmuted_pairs: set[tuple[int, int]] | None = None,
+    inactive_bonded_atoms_a: set[int] | None = None,
+    inactive_bonded_atoms_b: set[int] | None = None,
+    inactive_bonded_geometry: str = "bond_only",
 ) -> CovalentHybridMolecule:
     molecule_a = _rdkit_molecule(parameters_a)
     molecule_b = _rdkit_molecule(parameters_b)
@@ -713,6 +921,14 @@ def build_covalent_hybrid_molecule(
             molecule_b,
             atom_map,
             required_pairs=required_pairs,
+            transmuted_pairs=transmuted_pairs,
+        )
+    inactive_bonded_atoms_a = set(inactive_bonded_atoms_a or ())
+    inactive_bonded_atoms_b = set(inactive_bonded_atoms_b or ())
+    inactive_bonded_geometry = str(inactive_bonded_geometry).lower()
+    if inactive_bonded_geometry not in {"bond_only", "terminal_z_matrix"}:
+        raise CovalentAlchemyError(
+            "inactive_bonded_geometry must be 'bond_only' or 'terminal_z_matrix'"
         )
     if attachment_pairs is not None:
         sulfur_pair, ligand_pair = attachment_pairs
@@ -733,6 +949,34 @@ def build_covalent_hybrid_molecule(
             next_index += 1
     unique_a = set(range(molecule_a.GetNumAtoms())) - set(map_a_to_b)
     unique_b = set(range(molecule_b.GetNumAtoms())) - set(map_a_to_b.values())
+    if not inactive_bonded_atoms_a <= unique_a:
+        raise CovalentAlchemyError("inactive ligand-A bonded atoms must be endpoint-unique")
+    if not inactive_bonded_atoms_b <= unique_b:
+        raise CovalentAlchemyError("inactive ligand-B bonded atoms must be endpoint-unique")
+    inactive_z_matrix_a = (
+        _select_inactive_z_matrix_terms(
+            molecule_a,
+            parameters_a.system,
+            inactive_bonded_atoms_a,
+            unique_a,
+            map_a_to_hybrid,
+            "a",
+        )
+        if inactive_bonded_geometry == "terminal_z_matrix"
+        else {}
+    )
+    inactive_z_matrix_b = (
+        _select_inactive_z_matrix_terms(
+            molecule_b,
+            parameters_b.system,
+            inactive_bonded_atoms_b,
+            unique_b,
+            map_b_to_hybrid,
+            "b",
+        )
+        if inactive_bonded_geometry == "terminal_z_matrix"
+        else {}
+    )
     endpoint_a = _build_endpoint(
         parameters_a.system,
         parameters_b.system,
@@ -745,6 +989,10 @@ def build_covalent_hybrid_molecule(
         molecule_b,
         scales,
         dummy_core_nonbonded,
+        inactive_bonded_atoms_a,
+        inactive_bonded_atoms_b,
+        inactive_z_matrix_a,
+        inactive_z_matrix_b,
     )
     endpoint_b = _build_endpoint(
         parameters_a.system,
@@ -758,6 +1006,10 @@ def build_covalent_hybrid_molecule(
         molecule_b,
         scales,
         dummy_core_nonbonded,
+        inactive_bonded_atoms_a,
+        inactive_bonded_atoms_b,
+        inactive_z_matrix_a,
+        inactive_z_matrix_b,
     )
     positions = np.zeros((next_index, 3), dtype=float)
     conformer_a = molecule_a.GetConformer()
@@ -768,19 +1020,28 @@ def build_covalent_hybrid_molecule(
         positions[map_b_to_hybrid[atom]] = np.asarray(conformer_b.GetAtomPosition(atom))
     topology = _hybrid_topology(molecule_a, molecule_b, map_a_to_hybrid, map_b_to_hybrid)
     return CovalentHybridMolecule(
-        topology,
-        positions * unit.angstrom,
-        endpoint_a,
-        endpoint_b,
-        map_a_to_b,
-        map_a_to_hybrid,
-        map_b_to_hybrid,
-        tuple(sorted(unique_a)),
-        tuple(sorted(unique_b)),
-        tuple(required_pairs or ()),
-        attachment_pairs,
-        scales,
-        dummy_core_nonbonded,
+        topology=topology,
+        positions=positions * unit.angstrom,
+        endpoint_a=endpoint_a,
+        endpoint_b=endpoint_b,
+        map_a_to_b=map_a_to_b,
+        map_a_to_hybrid=map_a_to_hybrid,
+        map_b_to_hybrid=map_b_to_hybrid,
+        unique_a=tuple(sorted(unique_a)),
+        unique_b=tuple(sorted(unique_b)),
+        anchor_pairs=tuple(required_pairs or ()),
+        attachment_pairs=attachment_pairs,
+        dummy_bonded_scales=scales,
+        dummy_core_nonbonded=dummy_core_nonbonded,
+        transmuted_pairs=tuple(sorted(transmuted_pairs or ())),
+        inactive_bonded_atoms_a=tuple(sorted(inactive_bonded_atoms_a)),
+        inactive_bonded_atoms_b=tuple(sorted(inactive_bonded_atoms_b)),
+        inactive_bonded_geometry=inactive_bonded_geometry,
+        inactive_z_matrix_terms=tuple(
+            inactive_z_matrix_a[index] for index in sorted(inactive_z_matrix_a)
+        ) + tuple(
+            inactive_z_matrix_b[index] for index in sorted(inactive_z_matrix_b)
+        ),
     )
 
 
