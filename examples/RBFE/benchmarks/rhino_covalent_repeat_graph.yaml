@@ -1,0 +1,24 @@
+schema_version: 1
+reference_node: I79DJ_543
+nodes:
+- {id: I79DJ_543}
+- {id: I79DJ_644}
+- {id: I79DJ_675}
+- {id: I79DJ_733}
+- {id: I79DJ_734}
+- {id: I79DJ_736}
+- {id: I79DJ_793}
+- {id: I79DJ_820}
+- {id: I79DJ_866}
+simulated_edges:
+- [I79DJ_543, I79DJ_644]
+- [I79DJ_543, I79DJ_675]
+- [I79DJ_644, I79DJ_675]
+- [I79DJ_543, I79DJ_733]
+- [I79DJ_543, I79DJ_734]
+- [I79DJ_733, I79DJ_734]
+- [I79DJ_543, I79DJ_820]
+- [I79DJ_820, I79DJ_866]
+- [I79DJ_543, I79DJ_736]
+- [I79DJ_736, I79DJ_793]
+auto_cycles: true
