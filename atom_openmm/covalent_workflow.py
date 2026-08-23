@@ -54,6 +54,7 @@ from atom_openmm.covalent_systems import (
     solvate_capped_reference_hybrid,
     write_prepared_hybrid_bundle,
 )
+from atom_openmm.hybrid_mapping import _paired_smarts_transmutation_map
 from atom_openmm.equilibration import (
     neqti_hybrid_endpoint_steps,
     normalize_equilibration_protocol,
@@ -135,9 +136,12 @@ def _mapping_settings(workflow, pair):
     if method is None:
         method = "mcs_core_smarts" if settings.get("smarts") else "dataset_core"
     method = str(method)
-    if method not in {"dataset_core", "mcs_core_smarts"}:
+    if method not in {
+        "dataset_core", "mcs_core_smarts", "paired_smarts_transmutation"
+    }:
         raise CovalentWorkflowError(
-            "covalent mapping.method must be 'dataset_core' or 'mcs_core_smarts'"
+            "covalent mapping.method must be 'dataset_core', 'mcs_core_smarts', "
+            "or 'paired_smarts_transmutation'"
         )
     normalized = {"method": method}
     if method == "mcs_core_smarts":
@@ -149,6 +153,32 @@ def _mapping_settings(workflow, pair):
         if Chem.MolFromSmarts(smarts) is None:
             raise CovalentWorkflowError("covalent mapping.smarts is invalid")
         normalized["smarts"] = smarts.strip()
+    elif method == "paired_smarts_transmutation":
+        for key in ("ligand_a_smarts", "ligand_b_smarts"):
+            smarts = settings.get(key)
+            if not isinstance(smarts, str) or not smarts.strip():
+                raise CovalentWorkflowError(
+                    f"covalent paired_smarts_transmutation requires {key}"
+                )
+            if Chem.MolFromSmarts(smarts) is None:
+                raise CovalentWorkflowError(f"covalent mapping.{key} is invalid")
+            normalized[key] = smarts.strip()
+        inactive = settings.get("inactive_bonded_labels") or {}
+        if not isinstance(inactive, dict):
+            raise CovalentWorkflowError(
+                "covalent mapping.inactive_bonded_labels must be a mapping"
+            )
+        normalized["inactive_bonded_labels"] = {
+            side: [int(value) for value in inactive.get(side, [])]
+            for side in ("ligand_a", "ligand_b")
+        }
+        geometry = str(settings.get("inactive_bonded_geometry", "bond_only")).lower()
+        if geometry not in {"bond_only", "terminal_z_matrix"}:
+            raise CovalentWorkflowError(
+                "covalent mapping.inactive_bonded_geometry must be 'bond_only' "
+                "or 'terminal_z_matrix'"
+            )
+        normalized["inactive_bonded_geometry"] = geometry
     return normalized
 
 
@@ -225,7 +255,9 @@ def validate_covalent_workflow(path):
             product = settings["dataset_root"] / ligands[name]["capped_product_sdf"]
             if not product.exists():
                 raise CovalentWorkflowError(f"missing capped product: {product}")
-            if mapping["method"] == "mcs_core_smarts":
+            if mapping["method"] in {
+                "mcs_core_smarts", "paired_smarts_transmutation"
+            }:
                 aldehyde = settings["dataset_root"] / ligands[name].get(
                     "aldehyde_sdf", ""
                 )
@@ -277,16 +309,6 @@ def validate_covalent_workflow(path):
             "schedule_optimization.subdivisions_per_stage"
         )
     config = _normalized_settings(workflow)
-    if config["adaptive_switching"]["enabled"]:
-        raise CovalentWorkflowError(
-            "adaptive_switching is currently implemented only for noncovalent "
-            "hybrid-topology workflows"
-        )
-    if config["convergence"]["enabled"]:
-        raise CovalentWorkflowError(
-            "automatic convergence stopping is currently implemented only for "
-            "noncovalent hybrid-topology workflows"
-        )
     if config["interpolation"] == "softcore_linear":
         for pair in settings["pairs"]:
             charge_a = ligands[pair["ligand_a"]].get("formal_charge")
@@ -305,6 +327,84 @@ def validate_covalent_workflow(path):
         raise CovalentWorkflowError(
             "covalent NEQTI interpolation must be 'envelope', 'linear', or 'softcore_linear'"
         )
+    adaptive = config["adaptive_switching"]
+    if adaptive["enabled"]:
+        candidates = adaptive["candidate_times_ps"]
+        candidate_steps = adaptive["candidate_total_steps"]
+        if not candidates or any(value <= 0 for value in candidates):
+            raise CovalentWorkflowError(
+                "adaptive_switching.candidate_times_ps must contain positive values"
+            )
+        if any(right <= left for left, right in zip(candidates, candidates[1:])):
+            raise CovalentWorkflowError(
+                "adaptive_switching.candidate_times_ps must be strictly increasing"
+            )
+        if candidate_steps[0] != config["switch_steps"]:
+            base_ps = config["switch_steps"] * config["timestep_fs"] / 1000.0
+            raise CovalentWorkflowError(
+                "the first adaptive switching candidate must match the base "
+                f"protocol duration ({base_ps:g} ps)"
+            )
+        for time_ps, steps in zip(candidates, candidate_steps):
+            represented = steps * config["timestep_fs"] / 1000.0
+            if not np.isclose(represented, time_ps, atol=1.0e-9, rtol=0.0):
+                raise CovalentWorkflowError(
+                    f"adaptive switching time {time_ps:g} ps is not divisible by "
+                    f"the {config['timestep_fs']:g} fs timestep"
+                )
+        if not 2 <= adaptive["pilot_samples_per_direction"] <= config["n_snapshots"]:
+            raise CovalentWorkflowError(
+                "adaptive switching pilot samples must be between 2 and n_snapshots"
+            )
+        if adaptive["min_overlap_score_per_leg"] <= 0:
+            raise CovalentWorkflowError(
+                "adaptive switching overlap threshold must be positive"
+            )
+        if not 0 <= adaptive["max_failed_fraction_per_direction"] < 1:
+            raise CovalentWorkflowError(
+                "adaptive switching failed fraction must be in [0, 1)"
+            )
+        if adaptive["on_exhausted"] != "use_longest":
+            raise CovalentWorkflowError(
+                "adaptive_switching.on_exhausted currently supports only use_longest"
+            )
+        if not adaptive["reuse_selected_pilot_samples"]:
+            raise CovalentWorkflowError(
+                "covalent adaptive switching requires reuse_selected_pilot_samples: true"
+            )
+    convergence = config["convergence"]
+    if convergence["enabled"]:
+        if not 2 <= convergence["min_samples_per_direction"] <= config["n_snapshots"]:
+            raise CovalentWorkflowError(
+                "convergence minimum samples must be between 2 and n_snapshots"
+            )
+        if convergence["min_overlap_score_per_leg"] <= 0:
+            raise CovalentWorkflowError("convergence overlap threshold must be positive")
+        if convergence["max_dg_error_kcal_per_mol"] <= 0:
+            raise CovalentWorkflowError("convergence uncertainty threshold must be positive")
+        if convergence["consecutive_checks"] < 1:
+            raise CovalentWorkflowError("convergence.consecutive_checks must be positive")
+        if convergence["max_dg_range_kcal_per_mol"] < 0:
+            raise CovalentWorkflowError("convergence DG range must be non-negative")
+        if convergence["check_interval_samples"] < 1:
+            raise CovalentWorkflowError("convergence check interval must be positive")
+        stationarity = convergence["stationarity"]
+        if stationarity["enabled"]:
+            if not 0 < stationarity["discard_fraction"] < 0.5:
+                raise CovalentWorkflowError(
+                    "convergence stationarity discard fraction must be in (0, 0.5)"
+                )
+            if stationarity["min_discard_samples"] < 1:
+                raise CovalentWorkflowError(
+                    "convergence stationarity minimum discard must be positive"
+                )
+            if (
+                stationarity["max_discard_first_shift_kcal_per_mol"] < 0
+                or stationarity["max_discard_last_shift_kcal_per_mol"] < 0
+            ):
+                raise CovalentWorkflowError(
+                    "convergence stationarity shift thresholds must be non-negative"
+                )
     if config["interpolation"] == "softcore_linear" and config["legacy_switch_steps_set"]:
         raise CovalentWorkflowError(
             "workflow.neqti.switch_steps cannot be combined with softcore_linear; "
@@ -2738,6 +2838,273 @@ def _run_environment(
             )
 
 
+def _covalent_convergence_state(workdir, config):
+    path = Path(workdir) / "neqti_convergence.yaml"
+    expected = config["convergence"]
+    if path.exists():
+        state = yaml.safe_load(path.read_text()) or {}
+        if state.get("settings") != expected:
+            if not expected.get("reopen_on_settings_change", False):
+                raise CovalentResumeError(
+                    "existing covalent convergence state uses different settings"
+                )
+            return {
+                "schema_version": 2,
+                "settings": expected,
+                "environments": {
+                    name: {"history": [], "termination_reason": None}
+                    for name in ("protein", "reference")
+                },
+                "combined_history": [],
+                "termination_reason": None,
+                "reopened_from": {
+                    "settings": state.get("settings"),
+                    "termination_reason": state.get("termination_reason"),
+                },
+            }
+        return state
+    return {
+        "schema_version": 2,
+        "settings": expected,
+        "environments": {
+            name: {"history": [], "termination_reason": None}
+            for name in ("protein", "reference")
+        },
+        "combined_history": [],
+        "termination_reason": None,
+    }
+
+
+def _covalent_environment_convergence_record(forward, reverse, config, environment):
+    analysis = analyze_neqti_work(
+        forward,
+        reverse,
+        config["temperature_k"],
+        config["bootstrap_samples"],
+        config["random_seed"] + (0 if environment == "protein" else 100000),
+    )
+    dg = None if analysis is None else analysis["bar_dg_kcal_per_mol"]
+    error = None if analysis is None else analysis["bar_bootstrap_std_kcal_per_mol"]
+    overlap = _bar_overlap_score(forward, reverse, dg, config["temperature_k"])
+    settings = config["convergence"]
+    sample_count = min(len(forward), len(reverse))
+    stationarity_settings = settings["stationarity"]
+    stationarity = {
+        "enabled": stationarity_settings["enabled"],
+        "discard_fraction": stationarity_settings["discard_fraction"],
+        "discard_samples": 0,
+        "discard_first_dg_kcal_per_mol": None,
+        "discard_last_dg_kcal_per_mol": None,
+        "discard_first_shift_kcal_per_mol": None,
+        "discard_last_shift_kcal_per_mol": None,
+        "passed": not stationarity_settings["enabled"],
+    }
+    if stationarity_settings["enabled"] and dg is not None:
+        discard = int(sample_count * stationarity_settings["discard_fraction"])
+        stationarity["discard_samples"] = discard
+        if discard >= stationarity_settings["min_discard_samples"]:
+            first = analyze_neqti_work(
+                forward[discard:], reverse[discard:], config["temperature_k"], 0,
+                config["random_seed"],
+            )
+            last = analyze_neqti_work(
+                forward[:-discard], reverse[:-discard], config["temperature_k"], 0,
+                config["random_seed"],
+            )
+            if first is not None and last is not None:
+                first_dg = first["bar_dg_kcal_per_mol"]
+                last_dg = last["bar_dg_kcal_per_mol"]
+                first_shift = abs(first_dg - dg)
+                last_shift = abs(last_dg - dg)
+                stationarity.update(
+                    {
+                        "discard_first_dg_kcal_per_mol": first_dg,
+                        "discard_last_dg_kcal_per_mol": last_dg,
+                        "discard_first_shift_kcal_per_mol": first_shift,
+                        "discard_last_shift_kcal_per_mol": last_shift,
+                        "passed": bool(
+                            first_shift
+                            <= stationarity_settings[
+                                "max_discard_first_shift_kcal_per_mol"
+                            ]
+                            and last_shift
+                            <= stationarity_settings[
+                                "max_discard_last_shift_kcal_per_mol"
+                            ]
+                        ),
+                    }
+                )
+    return {
+        "sample_count_per_direction": sample_count,
+        "dg_kcal_per_mol": dg,
+        "dg_error_kcal_per_mol": error,
+        "overlap_score": overlap,
+        "stationarity": stationarity,
+        "thresholds_pass": bool(
+            sample_count >= settings["min_samples_per_direction"]
+            and overlap is not None
+            and overlap >= settings["min_overlap_score_per_leg"]
+            and error is not None
+            and error <= settings["max_dg_error_kcal_per_mol"]
+            and stationarity["passed"]
+        ),
+    }
+
+
+def _covalent_environment_converged(history, settings):
+    recent = history[-settings["consecutive_checks"] :]
+    return bool(
+        len(recent) == settings["consecutive_checks"]
+        and all(record["thresholds_pass"] for record in recent)
+        and max(record["dg_kcal_per_mol"] for record in recent)
+        - min(record["dg_kcal_per_mol"] for record in recent)
+        <= settings["max_dg_range_kcal_per_mol"]
+    )
+
+
+def _append_covalent_combined_convergence(state, workdir, config):
+    work = {
+        "leg_a_forward": _read_work(Path(workdir) / "protein_forward.csv"),
+        "leg_a_reverse": _read_work(Path(workdir) / "protein_reverse.csv"),
+        "leg_b_forward": _read_work(Path(workdir) / "reference_forward.csv"),
+        "leg_b_reverse": _read_work(Path(workdir) / "reference_reverse.csv"),
+    }
+    if any(not values for values in work.values()):
+        return
+    counts = {
+        "protein": min(len(work["leg_a_forward"]), len(work["leg_a_reverse"])),
+        "reference": min(len(work["leg_b_forward"]), len(work["leg_b_reverse"])),
+    }
+    history = state.setdefault("combined_history", [])
+    if history and history[-1].get("sample_counts") == counts:
+        return
+    analysis = analyze_two_leg_work(
+        work, config["temperature_k"], 0, config["random_seed"]
+    )
+    history.append(
+        {
+            "sample_counts": counts,
+            "ddg_kcal_per_mol": (
+                None if analysis is None else analysis["bar_dg_kcal_per_mol"]
+            ),
+        }
+    )
+
+
+def _covalent_convergence_callback(workdir, config):
+    path = Path(workdir) / "neqti_convergence.yaml"
+    state = _covalent_convergence_state(workdir, config)
+    settings = config["convergence"]
+    _write_yaml_atomic(path, state)
+
+    def callback(environment, _sample, _forward, _reverse):
+        environment_state = state["environments"][environment]
+        if environment_state.get("termination_reason") is not None:
+            return True
+        forward = _read_work(Path(workdir) / f"{environment}_forward.csv")
+        reverse = _read_work(Path(workdir) / f"{environment}_reverse.csv")
+        available = min(len(forward), len(reverse))
+        previous = max(
+            (
+                int(record["sample_count_per_direction"])
+                for record in environment_state.get("history", [])
+            ),
+            default=0,
+        )
+        first = max(previous + 1, settings["min_samples_per_direction"])
+        if (
+            state.get("reopened_from") is not None
+            and not environment_state.get("history")
+            and available >= settings["min_samples_per_direction"]
+        ):
+            interval = settings["check_interval_samples"]
+            latest = settings["min_samples_per_direction"] + (
+                (available - settings["min_samples_per_direction"]) // interval
+            ) * interval
+            first = max(
+                settings["min_samples_per_direction"],
+                latest - (settings["consecutive_checks"] - 1) * interval,
+            )
+        for sample_count in range(first, available + 1):
+            if (
+                sample_count - settings["min_samples_per_direction"]
+            ) % settings["check_interval_samples"]:
+                continue
+            record = _covalent_environment_convergence_record(
+                forward[:sample_count], reverse[:sample_count], config, environment
+            )
+            environment_state.setdefault("history", []).append(record)
+            if _covalent_environment_converged(
+                environment_state["history"], settings
+            ):
+                environment_state["termination_reason"] = "converged"
+            _append_covalent_combined_convergence(state, workdir, config)
+            reasons = [
+                item.get("termination_reason")
+                for item in state["environments"].values()
+            ]
+            if all(reason is not None for reason in reasons):
+                state["termination_reason"] = (
+                    "converged" if set(reasons) == {"converged"} else "max_samples"
+                )
+            _write_yaml_atomic(path, state)
+            if environment_state.get("termination_reason") == "converged":
+                return True
+        return False
+
+    return callback, state
+
+
+def _run_covalent_environment_iterators(iterators, convergence_callback):
+    completed = {
+        environment: bool(convergence_callback(environment, 0, None, None))
+        for environment in iterators
+    }
+    summaries = {environment: None for environment in iterators}
+
+    def advance(environment):
+        try:
+            latest = next(iterators[environment])
+        except StopIteration as stopped:
+            completed[environment] = True
+            latest = stopped.value
+        if latest is not None:
+            summaries[environment] = latest[2]
+        return convergence_callback(environment, 0, None, None)
+
+    try:
+        while not all(completed.values()):
+            for environment in iterators:
+                if not completed[environment] and advance(environment):
+                    completed[environment] = True
+    finally:
+        for iterator in iterators.values():
+            iterator.close()
+    return summaries
+
+
+def _finalize_covalent_convergence(workdir, config, state):
+    for environment, environment_state in state["environments"].items():
+        if environment_state.get("termination_reason") is not None:
+            continue
+        count = min(
+            len(_read_work(Path(workdir) / f"{environment}_forward.csv")),
+            len(_read_work(Path(workdir) / f"{environment}_reverse.csv")),
+        )
+        if count >= config["n_snapshots"]:
+            environment_state["termination_reason"] = "max_samples"
+    reasons = [
+        item.get("termination_reason") for item in state["environments"].values()
+    ]
+    if all(reason is not None for reason in reasons):
+        state["termination_reason"] = (
+            "converged" if set(reasons) == {"converged"} else "max_samples"
+        )
+    _append_covalent_combined_convergence(state, workdir, config)
+    _write_yaml_atomic(Path(workdir) / "neqti_convergence.yaml", state)
+    return state
+
+
 def _normalized_settings(workflow):
     setup = workflow.get("setup") or {}
     alchemy = workflow.get("alchemy") or {}
@@ -3222,6 +3589,10 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
         },
     }
     atom_map = None
+    transmuted_pairs = set()
+    inactive_a = set()
+    inactive_b = set()
+    inactive_geometry = "bond_only"
     if mapping_settings["method"] == "dataset_core":
         core_a = inputs["ligand_a"]["info"]["core_match_atom_indices_1based"]
         core_b = inputs["ligand_b"]["info"]["core_match_atom_indices_1based"]
@@ -3239,7 +3610,7 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
                 core_b,
             )
         )
-    else:
+    elif mapping_settings["method"] == "mcs_core_smarts":
         ligand_map, constrained = _constrained_ligand_atom_map(
             inputs, mapping_settings["smarts"]
         )
@@ -3265,6 +3636,70 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
         provenance["transferred_ligand_pairs_0based"] = {
             int(atom_a): int(atom_b) for atom_a, atom_b in sorted(transferred.items())
         }
+    else:
+        raw_a = _load_covalent_sdf(
+            inputs["ligand_a"]["aldehyde"], inputs["ligand_a"]["name"]
+        )
+        raw_b = _load_covalent_sdf(
+            inputs["ligand_b"]["aldehyde"], inputs["ligand_b"]["name"]
+        )
+        (
+            ligand_map,
+            ligand_transmuted,
+            ligand_inactive_a,
+            ligand_inactive_b,
+            matched_labels_a,
+            matched_labels_b,
+        ) = _paired_smarts_transmutation_map(raw_a, raw_b, mapping_settings)
+        product_a = {
+            int(atom): int(product)
+            for atom, product in meta_a["ligand_to_product_atom_indices"].items()
+        }
+        product_b = {
+            int(atom): int(product)
+            for atom, product in meta_b["ligand_to_product_atom_indices"].items()
+        }
+        transferred = {
+            product_a[atom_a]: product_b[atom_b]
+            for atom_a, atom_b in ligand_map.items()
+        }
+        transmuted_pairs = {
+            (product_a[atom_a], product_b[atom_b])
+            for atom_a, atom_b in ligand_transmuted
+        }
+        inactive_a = {product_a[atom] for atom in ligand_inactive_a}
+        inactive_b = {product_b[atom] for atom in ligand_inactive_b}
+        inactive_geometry = mapping_settings["inactive_bonded_geometry"]
+        atom_map = dict(required)
+        if set(atom_map).intersection(transferred):
+            raise CovalentWorkflowError(
+                "paired-SMARTS ligand map overlaps capped cysteine atoms"
+            )
+        atom_map.update(transferred)
+        provenance.update(
+            {
+                "ligand_a_smarts": mapping_settings["ligand_a_smarts"],
+                "ligand_b_smarts": mapping_settings["ligand_b_smarts"],
+                "matched_smarts_labels_a_0based": {
+                    int(label): product_a[int(atom)]
+                    for label, atom in matched_labels_a.items()
+                },
+                "matched_smarts_labels_b_0based": {
+                    int(label): product_b[int(atom)]
+                    for label, atom in matched_labels_b.items()
+                },
+                "transferred_ligand_pairs_0based": {
+                    int(atom_a): int(atom_b)
+                    for atom_a, atom_b in sorted(transferred.items())
+                },
+                "transmuted_pairs_0based": [
+                    list(pair) for pair in sorted(transmuted_pairs)
+                ],
+                "inactive_bonded_atoms_a_0based": sorted(inactive_a),
+                "inactive_bonded_atoms_b_0based": sorted(inactive_b),
+                "inactive_bonded_geometry": inactive_geometry,
+            }
+        )
     attachment_pairs = (
         (
             int(meta_a["cys_sulfur_atom_index"]),
@@ -3288,8 +3723,18 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
             product_molecule_b,
             atom_map,
             required_pairs=required,
+            transmuted_pairs=transmuted_pairs,
         )
-    return required, attachment_pairs, atom_map, provenance
+    return (
+        required,
+        attachment_pairs,
+        atom_map,
+        provenance,
+        transmuted_pairs,
+        inactive_a,
+        inactive_b,
+        inactive_geometry,
+    )
 
 
 def _validate_softcore_endpoint_charge(config, parameters_a, parameters_b):
@@ -3559,7 +4004,16 @@ def run_covalent_pair(settings, pair):
                 "resume_incompatible: existing covalent states or work lack the "
                 "persistent prepared-system bundle; use a new workdir"
             )
-        required, attachment_pairs, atom_map, mapping_provenance = (
+        (
+            required,
+            attachment_pairs,
+            atom_map,
+            mapping_provenance,
+            transmuted_pairs,
+            inactive_a,
+            inactive_b,
+            inactive_geometry,
+        ) = (
             _prepare_covalent_atom_map(inputs, mapping_settings)
         )
         cache = workroot / "forcefield_cache"
@@ -3589,6 +4043,10 @@ def run_covalent_pair(settings, pair):
             attachment_pairs=attachment_pairs,
             dummy_bonded_scales=DummyBondedScales(**config["dummy_bonded_scales"]),
             dummy_core_nonbonded=config["dummy_core_nonbonded"],
+            transmuted_pairs=transmuted_pairs,
+            inactive_bonded_atoms_a=inactive_a,
+            inactive_bonded_atoms_b=inactive_b,
+            inactive_bonded_geometry=inactive_geometry,
         )
         physical_reference_a = create_solvated_capped_reference(
             parameters_a,
@@ -3610,6 +4068,35 @@ def run_covalent_pair(settings, pair):
             ionic_strength_molar=ionic_strength,
             solvation_seed=solvation_seed,
         )
+        selection_metadata = {
+            "ligand_a": {
+                "structure_file": str(inputs["ligand_a"]["product"].resolve()),
+                "system_atom_indices": protein.provenance[
+                    "ligand_a_system_atom_indices"
+                ],
+            },
+            "ligand_b": {
+                "structure_file": str(inputs["ligand_b"]["product"].resolve()),
+                "system_atom_indices": protein.provenance[
+                    "ligand_b_system_atom_indices"
+                ],
+            },
+        }
+        protein.provenance["SELECTION_METADATA"] = selection_metadata
+        reference.provenance["SELECTION_METADATA"] = {
+            "ligand_a": {
+                "structure_file": str(inputs["ligand_a"]["product"].resolve()),
+                "system_atom_indices": reference.provenance[
+                    "ligand_a_system_atom_indices"
+                ],
+            },
+            "ligand_b": {
+                "structure_file": str(inputs["ligand_b"]["product"].resolve()),
+                "system_atom_indices": reference.provenance[
+                    "ligand_b_system_atom_indices"
+                ],
+            },
+        }
         _validate_prepared_endpoint_charges(protein, "protein")
         _validate_prepared_endpoint_charges(reference, "reference")
         mapping_payload = {
@@ -3622,6 +4109,16 @@ def run_covalent_pair(settings, pair):
             "attachment_pairs_0based": [list(pair) for pair in attachment_pairs],
             "unique_a_0based": list(hybrid.unique_a),
             "unique_b_0based": list(hybrid.unique_b),
+            "transmuted_pairs_0based": [
+                list(pair) for pair in hybrid.transmuted_pairs
+            ],
+            "inactive_bonded_atoms_a_0based": list(
+                hybrid.inactive_bonded_atoms_a
+            ),
+            "inactive_bonded_atoms_b_0based": list(
+                hybrid.inactive_bonded_atoms_b
+            ),
+            "inactive_bonded_geometry": hybrid.inactive_bonded_geometry,
             "dummy_bonded_scales": config["dummy_bonded_scales"],
             "dummy_nonbonded": "full_unique_branch_vacuum",
             "dummy_core_nonbonded": config["dummy_core_nonbonded"],
@@ -3650,21 +4147,63 @@ def run_covalent_pair(settings, pair):
     _write_yaml_atomic(workdir / "covalent_mapping.yaml", mapping_payload)
     platform, properties = _platform(workflow)
     running = yaml.safe_load((workdir / "result.yaml").read_text()) or {}
-    running["progress"] = {"stage": "production", "environment": "protein"}
+    running["progress"] = {
+        "stage": "production",
+        "environments": ["protein", "reference"],
+    }
     _write_yaml_atomic(workdir / "result.yaml", running)
-    protein_forward, protein_reverse, protein_rest2 = _run_environment(
-        "protein", protein, config, workdir, platform, properties, config["random_seed"]
-    )
-    running["progress"] = {"stage": "production", "environment": "reference"}
-    _write_yaml_atomic(workdir / "result.yaml", running)
-    reference_forward, reference_reverse, reference_rest2 = _run_environment(
-        "reference", reference, config, workdir, platform, properties, config["random_seed"] + 100000
-    )
+    convergence_state = None
+    if config["convergence"]["enabled"]:
+        convergence_callback, convergence_state = _covalent_convergence_callback(
+            workdir, config
+        )
+        terminal = convergence_state.get("termination_reason") in {
+            "converged", "max_samples"
+        }
+        if not terminal:
+            summaries = _run_covalent_environment_iterators(
+                {
+                    "protein": _iter_environment(
+                        "protein", protein, config, workdir, platform, properties,
+                        config["random_seed"],
+                    ),
+                    "reference": _iter_environment(
+                        "reference", reference, config, workdir, platform, properties,
+                        config["random_seed"] + 100000,
+                    ),
+                },
+                convergence_callback,
+            )
+            convergence_state = _finalize_covalent_convergence(
+                workdir, config, _covalent_convergence_state(workdir, config)
+            )
+        else:
+            summaries = {"protein": None, "reference": None}
+        protein_forward = _read_work(workdir / "protein_forward.csv")
+        protein_reverse = _read_work(workdir / "protein_reverse.csv")
+        reference_forward = _read_work(workdir / "reference_forward.csv")
+        reference_reverse = _read_work(workdir / "reference_reverse.csv")
+        previous_rest2 = running.get("quality", {}).get("rest2") or {}
+        protein_rest2 = summaries["protein"] or previous_rest2.get("protein")
+        reference_rest2 = summaries["reference"] or previous_rest2.get("reference")
+    else:
+        protein_forward, protein_reverse, protein_rest2 = _run_environment(
+            "protein", protein, config, workdir, platform, properties,
+            config["random_seed"],
+        )
+        reference_forward, reference_reverse, reference_rest2 = _run_environment(
+            "reference", reference, config, workdir, platform, properties,
+            config["random_seed"] + 100000,
+        )
     optimizer_summary = None
     if config["schedule_optimization"]["enabled"]:
         optimizer_summary = yaml.safe_load(
             (workdir / "covalent_schedule_optimization.yaml").read_text()
         )
+    adaptive_summary = None
+    adaptive_path = workdir / "neqti_adaptive_switching.yaml"
+    if adaptive_path.exists():
+        adaptive_summary = yaml.safe_load(adaptive_path.read_text()) or {}
     work = {
         "leg_a_forward": protein_forward,
         "leg_a_reverse": protein_reverse,
@@ -3678,6 +4217,25 @@ def run_covalent_pair(settings, pair):
         int(np.count_nonzero(~np.isfinite(np.asarray(values, dtype=float))))
         for values in work.values()
     )
+    warnings = []
+    if adaptive_summary is not None:
+        environments = adaptive_summary.get("environments", {}).values()
+        if any(
+            (item.get("selected") or {}).get("selection_reason")
+            == "candidate_list_exhausted"
+            for item in environments
+        ):
+            warnings.append(
+                "At least one covalent environment exhausted all adaptive "
+                "switching candidates; production used the longest duration."
+            )
+        if any(
+            (item.get("selected") or {}).get("pilot_samples_reused")
+            for item in adaptive_summary.get("environments", {}).values()
+        ):
+            warnings.append(
+                "Selected adaptive pilot work was reused in the production BAR estimate."
+            )
     result = {
         "schema_version": 1,
         "tool": "atom_openmm_rbfe",
@@ -3691,6 +4249,10 @@ def run_covalent_pair(settings, pair):
         "ligand_a": pair["ligand_a"],
         "ligand_b": pair["ligand_b"],
         "workdir": str(workdir.resolve()),
+        "termination_reason": (
+            None if convergence_state is None
+            else convergence_state.get("termination_reason")
+        ),
         "convention": {
             "ddg_definition": "G(ligand_b)-G(ligand_a)",
             "positive_value_meaning": "ligand_b binds weaker than ligand_a",
@@ -3715,10 +4277,27 @@ def run_covalent_pair(settings, pair):
             },
         },
         "quality": {
-            "convergence_status": "usable" if analysis and analysis["overlap_score"] >= 0.01 else "partial",
+            "convergence_status": (
+                "usable"
+                if config["convergence"]["enabled"]
+                and convergence_state is not None
+                and convergence_state.get("termination_reason") == "converged"
+                else (
+                    "partial"
+                    if config["convergence"]["enabled"]
+                    else (
+                        "usable"
+                        if analysis and analysis["overlap_score"] >= 0.01
+                        else "partial"
+                    )
+                )
+            ),
             "overlap_score": None if analysis is None else analysis["overlap_score"],
-            "warnings": [],
+            "warnings": warnings,
             "rest2": {"protein": protein_rest2, "reference": reference_rest2},
+            "convergence": convergence_state,
+            "adaptive_switching": adaptive_summary,
+            "schedule_optimization": optimizer_summary,
         },
         "inputs": {
             "dataset": str(settings["dataset_path"]),
@@ -3736,10 +4315,34 @@ def run_covalent_pair(settings, pair):
             "long_range_correction": config["softcore"]["long_range_correction"],
             "switching": _switch_timing_summary(workdir / "switch_timing.csv"),
         },
+        "progress": {
+            "stage": "completed" if analysis is not None else "production",
+            "sample_counts": {
+                "protein_forward": len(protein_forward),
+                "protein_reverse": len(protein_reverse),
+                "reference_forward": len(reference_forward),
+                "reference_reverse": len(reference_reverse),
+            },
+            "target_sample_counts": {
+                name: config["n_snapshots"]
+                for name in (
+                    "protein_forward", "protein_reverse",
+                    "reference_forward", "reference_reverse",
+                )
+            },
+        },
         "artifacts": {
             "covalent_mapping": "covalent_mapping.yaml",
             "switch_protocol": "switch_protocol.yaml",
             "switch_timing_csv": "switch_timing.csv",
+            "adaptive_switching": (
+                "neqti_adaptive_switching.yaml"
+                if config["adaptive_switching"]["enabled"] else None
+            ),
+            "neqti_convergence": (
+                "neqti_convergence.yaml"
+                if config["convergence"]["enabled"] else None
+            ),
             "prepared_manifest": "prepared/manifest.yaml",
             "protein_topology": "prepared/protein_topology.pdb",
             "protein_endpoint_a_system": "prepared/protein_endpoint_a.xml",

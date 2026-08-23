@@ -1027,3 +1027,60 @@ def _test_covalent_validation_rejects_incompatible_rest2_steps(tmp_path):
         assert "divisible" in str(exc)
     else:
         raise AssertionError("incompatible REST2 steps were accepted")
+
+
+def _test_covalent_mapping_settings_accept_paired_smarts_transmutation():
+    from atom_openmm.covalent_workflow import _mapping_settings
+
+    settings = _mapping_settings(
+        {
+            "alchemy": {
+                "mapping": {
+                    "method": "paired_smarts_transmutation",
+                    "ligand_a_smarts": "[c:1]-[Br:2]",
+                    "ligand_b_smarts": "[c:1]-[Cl:2]",
+                }
+            }
+        },
+        {},
+    )
+
+    assert settings["method"] == "paired_smarts_transmutation"
+    assert settings["inactive_bonded_labels"] == {
+        "ligand_a": [], "ligand_b": []
+    }
+    assert settings["inactive_bonded_geometry"] == "bond_only"
+
+
+def _test_covalent_convergence_stops_environments_independently(tmp_path):
+    from atom_openmm.covalent_workflow import (
+        _covalent_convergence_callback,
+        _normalized_settings,
+        _rewrite_work,
+    )
+
+    config = _normalized_settings(
+        {
+            "neqti": {
+                "n_snapshots": 100,
+                "bootstrap_samples": 20,
+                "convergence": {
+                    "enabled": True,
+                    "min_samples_per_direction": 10,
+                    "min_overlap_score_per_leg": 0.01,
+                    "max_dg_error_kcal_per_mol": 1.0,
+                    "check_interval_samples": 1,
+                    "consecutive_checks": 1,
+                    "max_dg_range_kcal_per_mol": 0.0,
+                },
+            }
+        }
+    )
+    _rewrite_work(tmp_path / "protein_forward.csv", [1.0] * 10)
+    _rewrite_work(tmp_path / "protein_reverse.csv", [-1.0] * 10)
+    callback, state = _covalent_convergence_callback(tmp_path, config)
+
+    assert callback("protein", 10, None, None)
+    assert state["environments"]["protein"]["termination_reason"] == "converged"
+    assert state["environments"]["reference"]["termination_reason"] is None
+    assert state["termination_reason"] is None

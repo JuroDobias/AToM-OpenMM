@@ -556,6 +556,14 @@ def prepare_protein_covalent_hybrid(
         "unique_b_particle_indices": sorted(
             int(source_to_global_b[index]) for index in unique_b
         ),
+        "ligand_a_system_atom_indices": [
+            int(source_to_global_a[index])
+            for index in range(len(hybrid.map_a_to_hybrid))
+        ],
+        "ligand_b_system_atom_indices": [
+            int(source_to_global_b[index])
+            for index in range(len(hybrid.map_b_to_hybrid))
+        ],
         "anchor_pairs": [list(pair) for pair in hybrid.anchor_pairs],
         "attachment_pairs": None if hybrid.attachment_pairs is None else [
             list(pair) for pair in hybrid.attachment_pairs
