@@ -58,3 +58,4 @@ def test_run_script_uses_slurm_submission_directory():
     )
 
     assert 'RUN_DIR="${SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")}"' in script
+    assert 'export OPENMM_PLUGIN_DIR="$CONDA_PREFIX/lib/plugins"' in script

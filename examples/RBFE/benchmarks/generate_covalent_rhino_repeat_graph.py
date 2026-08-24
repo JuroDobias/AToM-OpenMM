@@ -265,6 +265,9 @@ if [[ -f "$RESULT_FILE" ]] && grep -q '^status: completed$' "$RESULT_FILE"; then
 fi
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate myatom
+if [[ -d "$CONDA_PREFIX/lib/plugins" ]]; then
+    export OPENMM_PLUGIN_DIR="$CONDA_PREFIX/lib/plugins"
+fi
 export PYTHONPATH="$SOURCE_DIR${{PYTHONPATH:+:$PYTHONPATH}}"
 git -C "$SOURCE_DIR" rev-parse HEAD > source_commit.txt
 python -m atom_openmm.rbfe_workflow --validate workflow.yaml
