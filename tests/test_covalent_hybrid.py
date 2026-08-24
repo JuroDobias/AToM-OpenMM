@@ -4,6 +4,7 @@ from openmm import unit
 from openff.toolkit import ForceField, Molecule
 from openff.units import unit as offunit
 from rdkit import Chem
+from rdkit.Chem import AllChem
 
 from atom_openmm.covalent_hybrid import (
     DummyBondedScales,
@@ -11,6 +12,7 @@ from atom_openmm.covalent_hybrid import (
     _hybrid_topology,
     _inactive_scales,
     build_covalent_hybrid_molecule,
+    complete_covalent_atom_map,
 )
 from atom_openmm.covalent_parameters import CovalentParameterBundle
 from atom_openmm.covalent_softcore import create_softcore_hamiltonian
@@ -252,6 +254,28 @@ def test_explicit_atom_map_does_not_expand_to_unrestricted_mcs():
     assert 2 not in hybrid.map_a_to_b
     assert 2 in hybrid.unique_a
     assert 2 in hybrid.unique_b
+
+
+def test_required_hydrogens_are_checked_after_mapping_completion():
+    left = Chem.AddHs(Chem.MolFromSmiles("CO"))
+    right = Chem.Mol(left)
+    AllChem.EmbedMolecule(left, randomSeed=1)
+    AllChem.EmbedMolecule(right, randomSeed=2)
+    carbon = 0
+    hydrogen = next(
+        atom.GetIdx()
+        for atom in left.GetAtomWithIdx(carbon).GetNeighbors()
+        if atom.GetAtomicNum() == 1
+    )
+
+    mapping = complete_covalent_atom_map(
+        left,
+        right,
+        {0: 0, 1: 1},
+        required_pairs=[(0, 0), (hydrogen, hydrogen)],
+    )
+
+    assert mapping[hydrogen] == hydrogen
 
 
 def _test_retained_dummy_core_adds_only_state_specific_vacuum_pairs():

@@ -50,3 +50,11 @@ def _test_rhino_workflow_enables_mature_sampling_controls():
     assert payload["alchemy"]["mapping"]["method"] == (
         "paired_smarts_transmutation"
     )
+
+
+def test_run_script_uses_slurm_submission_directory():
+    script = _module()._run_script(
+        "I79DJ_543--I79DJ_644", "AToM-OpenMM-covalent-repeat"
+    )
+
+    assert 'RUN_DIR="${SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")}"' in script

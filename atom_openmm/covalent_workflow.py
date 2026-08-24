@@ -4070,13 +4070,13 @@ def run_covalent_pair(settings, pair):
         )
         selection_metadata = {
             "ligand_a": {
-                "structure_file": str(inputs["ligand_a"]["product"].resolve()),
+                "structure_file": str(inputs["ligand_a"]["aldehyde"].resolve()),
                 "system_atom_indices": protein.provenance[
                     "ligand_a_system_atom_indices"
                 ],
             },
             "ligand_b": {
-                "structure_file": str(inputs["ligand_b"]["product"].resolve()),
+                "structure_file": str(inputs["ligand_b"]["aldehyde"].resolve()),
                 "system_atom_indices": protein.provenance[
                     "ligand_b_system_atom_indices"
                 ],

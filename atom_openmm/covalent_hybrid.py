@@ -107,7 +107,13 @@ def complete_covalent_atom_map(
         for atom_a, atom_b in set(mapping.items()) | required
     ):
         raise CovalentAlchemyError("covalent atom pair is outside the molecule")
-    if not required.issubset(mapping.items()):
+    required_heavy = {
+        (atom_a, atom_b)
+        for atom_a, atom_b in required
+        if molecule_a.GetAtomWithIdx(atom_a).GetAtomicNum() != 1
+        and molecule_b.GetAtomWithIdx(atom_b).GetAtomicNum() != 1
+    }
+    if not required_heavy.issubset(mapping.items()):
         raise CovalentAlchemyError("covalent atom map does not contain all required pairs")
 
     required_by_a = dict(required)

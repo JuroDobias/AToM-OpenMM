@@ -234,7 +234,7 @@ set -euo pipefail
 MAX_CHAIN_JOBS="${{ATOM_MAX_CHAIN_JOBS:-10}}"
 CHAIN_INDEX="${{ATOM_CHAIN_INDEX:-0}}"
 ROOT_JOB_ID="${{ATOM_ROOT_JOB_ID:-${{SLURM_JOB_ID:-manual}}}}"
-RUN_DIR="$(dirname "$(readlink -f "$0")")"
+RUN_DIR="${{SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")}}"
 RESULT_FILE="$RUN_DIR/run/{edge_id}/result.yaml"
 SOURCE_DIR="$HOME/myAToM/{source_dir_name}"
 CHILD_PID=""
