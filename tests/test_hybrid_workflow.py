@@ -64,6 +64,47 @@ def _test_hybrid_workflow_validates_and_plans_two_environments(tmp_path):
     assert plan["pairs"][0]["environments"] == ["complex", "solvent"]
 
 
+def _test_explicit_mapping_requires_single_edge(tmp_path):
+    from atom_openmm.hybrid_workflow import HybridWorkflowError
+    from atom_openmm.rbfe_workflow import validate_workflow
+
+    path = _workflow(tmp_path)
+    payload = yaml.safe_load(path.read_text())
+    payload["workflow"]["alchemy"]["mapping"] = {
+        "method": "explicit_pairs",
+        "pairs_0based": [[0, 0]],
+    }
+    payload["workflow"]["pairs"].append(["A.sdf", "B.sdf"])
+    path.write_text(yaml.safe_dump(payload))
+
+    try:
+        validate_workflow(path)
+    except HybridWorkflowError as exc:
+        assert "exactly one edge" in str(exc)
+    else:
+        raise AssertionError("multi-edge explicit mapping was accepted")
+
+
+def _test_element_transmutation_requires_neqti():
+    from atom_openmm.hybrid_workflow import (
+        HybridWorkflowError,
+        _validate_mapping_sampling,
+    )
+
+    mapping = {"transmuted_pairs_0based": [[1, 1]]}
+    try:
+        _validate_mapping_sampling(mapping, {"sampling": {"method": "awh"}})
+    except HybridWorkflowError as exc:
+        assert "only NEQTI" in str(exc)
+    else:
+        raise AssertionError("non-NEQTI mapped-atom transmutation was accepted")
+
+    _validate_mapping_sampling(mapping, {"sampling": {"method": "neqti"}})
+    _validate_mapping_sampling(
+        {"transmuted_pairs_0based": []}, {"sampling": {"method": "awh"}}
+    )
+
+
 def _test_hybrid_dummy_core_nonbonded_defaults_off_and_accepts_retain(tmp_path):
     from atom_openmm.hybrid_workflow import HybridWorkflowError, _validate_settings
 

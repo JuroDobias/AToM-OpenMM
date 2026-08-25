@@ -34,7 +34,11 @@ from atom_openmm.covalent_workflow import (
     _validate_prepared_endpoint_charges,
     _write_yaml_atomic,
 )
-from atom_openmm.hybrid_mapping import build_hybrid_atom_map
+from atom_openmm.hybrid_mapping import (
+    _strict_explicit_pairs,
+    _strict_nonnegative_indices,
+    build_hybrid_atom_map,
+)
 from atom_openmm.hybrid_parameters import parameterize_ligand
 from atom_openmm.hybrid_systems import create_physical_ligand_environment
 from atom_openmm.neqti import (
@@ -64,10 +68,10 @@ def _sha256(path):
 def _mapping_settings(workflow):
     settings = dict((workflow.get("alchemy") or {}).get("mapping") or {})
     method = settings.get("method", "mcs")
-    if method not in {"mcs", "mcs_core_smarts", "paired_smarts_transmutation"}:
+    if method not in {"mcs", "mcs_core_smarts", "paired_smarts_transmutation", "explicit_pairs"}:
         raise HybridWorkflowError(
             "workflow.alchemy.mapping.method must be 'mcs', 'mcs_core_smarts', "
-            "or 'paired_smarts_transmutation'"
+            "'paired_smarts_transmutation', or 'explicit_pairs'"
         )
     settings["method"] = method
     if method == "mcs_core_smarts" and not settings.get("smarts"):
@@ -79,16 +83,44 @@ def _mapping_settings(workflow):
             raise HybridWorkflowError(
                 "paired_smarts_transmutation requires ligand_a_smarts and ligand_b_smarts"
             )
+    if method == "explicit_pairs":
+        try:
+            pairs = _strict_explicit_pairs(settings.get("pairs_0based"))
+            inactive_a = _strict_nonnegative_indices(
+                settings.get("inactive_bonded_atoms_a_0based", []),
+                "workflow.alchemy.mapping.inactive_bonded_atoms_a_0based",
+            )
+            inactive_b = _strict_nonnegative_indices(
+                settings.get("inactive_bonded_atoms_b_0based", []),
+                "workflow.alchemy.mapping.inactive_bonded_atoms_b_0based",
+            )
+        except ValueError as exc:
+            raise HybridWorkflowError(str(exc)) from exc
+        settings["pairs_0based"] = [list(pair) for pair in pairs]
+        settings["inactive_bonded_atoms_a_0based"] = inactive_a
+        settings["inactive_bonded_atoms_b_0based"] = inactive_b
     geometry = str(settings.get("inactive_bonded_geometry", "bond_only")).lower()
     if geometry not in {"bond_only", "terminal_z_matrix"}:
         raise HybridWorkflowError(
             "workflow.alchemy.mapping.inactive_bonded_geometry must be "
             "'bond_only' or 'terminal_z_matrix'"
         )
-    if geometry == "terminal_z_matrix" and method != "paired_smarts_transmutation":
+    if geometry == "terminal_z_matrix" and method not in {"paired_smarts_transmutation", "explicit_pairs"}:
         raise HybridWorkflowError(
-            "terminal_z_matrix currently requires paired_smarts_transmutation"
+            "terminal_z_matrix requires paired_smarts_transmutation or explicit_pairs"
         )
+    if (
+        method == "explicit_pairs"
+        and geometry == "terminal_z_matrix"
+        and not (
+            settings["inactive_bonded_atoms_a_0based"]
+            or settings["inactive_bonded_atoms_b_0based"]
+        )
+    ):
+        raise HybridWorkflowError(
+            "explicit_pairs terminal_z_matrix requires at least one inactive bonded atom"
+        )
+    settings["inactive_bonded_geometry"] = geometry
     if "max_mapped_rmsd_a" in settings:
         settings["max_mapped_rmsd_a"] = float(settings["max_mapped_rmsd_a"])
     return settings
@@ -99,6 +131,15 @@ def _formal_charge(path, *, allow_undefined_stereo=False):
         str(path), allow_undefined_stereo=bool(allow_undefined_stereo)
     )
     return int(round(molecule.total_charge.m_as(offunit.elementary_charge)))
+
+
+def _validate_mapping_sampling(mapping_payload, workflow):
+    if not mapping_payload.get("transmuted_pairs_0based"):
+        return
+    if (workflow.get("sampling") or {}).get("method") != "neqti":
+        raise HybridWorkflowError(
+            "mapped-atom element transmutations currently support only NEQTI sampling"
+        )
 
 
 def _validate_settings(workflow):
@@ -311,6 +352,10 @@ def validate_noncovalent_hybrid_workflow(path):
         )
     )
     mapping = _mapping_settings(config["workflow"])
+    if mapping["method"] == "explicit_pairs" and len(plan["pairs"]) != 1:
+        raise HybridWorkflowError(
+            "explicit_pairs mapping requires a workflow containing exactly one edge"
+        )
     if (
         mapping["method"] == "paired_smarts_transmutation"
         and normalize_workflow_axes(config["workflow"]).sampling_method != "neqti"
@@ -466,6 +511,7 @@ def _prepare_pair(pair, receptor, workflow, workdir):
     atom_map, mapping_payload = build_hybrid_atom_map(
         parameters_a, parameters_b, mapping_settings
     )
+    _validate_mapping_sampling(mapping_payload, workflow)
     mapping_payload["transmutations"] = [
         {
             "ligand_a_atom_0based": int(atom_a),

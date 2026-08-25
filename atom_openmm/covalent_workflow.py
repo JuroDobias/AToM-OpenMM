@@ -54,7 +54,12 @@ from atom_openmm.covalent_systems import (
     solvate_capped_reference_hybrid,
     write_prepared_hybrid_bundle,
 )
-from atom_openmm.hybrid_mapping import _paired_smarts_transmutation_map
+from atom_openmm.hybrid_mapping import (
+    _explicit_pairs_map,
+    _paired_smarts_transmutation_map,
+    _strict_explicit_pairs,
+    _strict_nonnegative_indices,
+)
 from atom_openmm.equilibration import (
     neqti_hybrid_endpoint_steps,
     normalize_equilibration_protocol,
@@ -137,11 +142,11 @@ def _mapping_settings(workflow, pair):
         method = "mcs_core_smarts" if settings.get("smarts") else "dataset_core"
     method = str(method)
     if method not in {
-        "dataset_core", "mcs_core_smarts", "paired_smarts_transmutation"
+        "dataset_core", "mcs_core_smarts", "paired_smarts_transmutation", "explicit_pairs"
     }:
         raise CovalentWorkflowError(
             "covalent mapping.method must be 'dataset_core', 'mcs_core_smarts', "
-            "or 'paired_smarts_transmutation'"
+            "'paired_smarts_transmutation', or 'explicit_pairs'"
         )
     normalized = {"method": method}
     if method == "mcs_core_smarts":
@@ -179,6 +184,38 @@ def _mapping_settings(workflow, pair):
                 "or 'terminal_z_matrix'"
             )
         normalized["inactive_bonded_geometry"] = geometry
+    elif method == "explicit_pairs":
+        try:
+            pairs = _strict_explicit_pairs(settings.get("pairs_0based"))
+            inactive_a = _strict_nonnegative_indices(
+                settings.get("inactive_bonded_atoms_a_0based", []),
+                "covalent mapping.inactive_bonded_atoms_a_0based",
+            )
+            inactive_b = _strict_nonnegative_indices(
+                settings.get("inactive_bonded_atoms_b_0based", []),
+                "covalent mapping.inactive_bonded_atoms_b_0based",
+            )
+        except ValueError as exc:
+            raise CovalentWorkflowError(str(exc)) from exc
+        geometry = str(settings.get("inactive_bonded_geometry", "bond_only")).lower()
+        if geometry not in {"bond_only", "terminal_z_matrix"}:
+            raise CovalentWorkflowError(
+                "covalent mapping.inactive_bonded_geometry must be 'bond_only' "
+                "or 'terminal_z_matrix'"
+            )
+        if geometry == "terminal_z_matrix" and not (inactive_a or inactive_b):
+            raise CovalentWorkflowError(
+                "covalent explicit_pairs terminal_z_matrix requires at least one "
+                "inactive bonded atom"
+            )
+        normalized.update(
+            {
+                "pairs_0based": [list(pair) for pair in pairs],
+                "inactive_bonded_atoms_a_0based": inactive_a,
+                "inactive_bonded_atoms_b_0based": inactive_b,
+                "inactive_bonded_geometry": geometry,
+            }
+        )
     return normalized
 
 
@@ -245,9 +282,17 @@ def plan_covalent_workflow(path):
 
 def validate_covalent_workflow(path):
     _, settings = load_covalent_workflow(path)
+    resolved_mappings = [
+        _mapping_settings(settings["workflow"], pair) for pair in settings["pairs"]
+    ]
+    if len(settings["pairs"]) != 1 and any(
+        mapping["method"] == "explicit_pairs" for mapping in resolved_mappings
+    ):
+        raise CovalentWorkflowError(
+            "explicit_pairs mapping requires a workflow containing exactly one edge"
+        )
     ligands = {item["ligand_id"]: item for item in settings["dataset"].get("ligands", [])}
-    for pair in settings["pairs"]:
-        mapping = _mapping_settings(settings["workflow"], pair)
+    for pair, mapping in zip(settings["pairs"], resolved_mappings):
         for key in ("ligand_a", "ligand_b"):
             name = pair.get(key)
             if name not in ligands:
@@ -256,7 +301,7 @@ def validate_covalent_workflow(path):
             if not product.exists():
                 raise CovalentWorkflowError(f"missing capped product: {product}")
             if mapping["method"] in {
-                "mcs_core_smarts", "paired_smarts_transmutation"
+                "mcs_core_smarts", "paired_smarts_transmutation", "explicit_pairs"
             }:
                 aldehyde = settings["dataset_root"] / ligands[name].get(
                     "aldehyde_sdf", ""
@@ -3643,14 +3688,28 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
         raw_b = _load_covalent_sdf(
             inputs["ligand_b"]["aldehyde"], inputs["ligand_b"]["name"]
         )
-        (
-            ligand_map,
-            ligand_transmuted,
-            ligand_inactive_a,
-            ligand_inactive_b,
-            matched_labels_a,
-            matched_labels_b,
-        ) = _paired_smarts_transmutation_map(raw_a, raw_b, mapping_settings)
+        if mapping_settings["method"] == "explicit_pairs":
+            (
+                ligand_map,
+                ligand_transmuted,
+                ligand_inactive_a,
+                ligand_inactive_b,
+                matched_labels_a,
+                matched_labels_b,
+                requested_pairs,
+                completed_hydrogen_pairs,
+            ) = _explicit_pairs_map(raw_a, raw_b, mapping_settings)
+        else:
+            (
+                ligand_map,
+                ligand_transmuted,
+                ligand_inactive_a,
+                ligand_inactive_b,
+                matched_labels_a,
+                matched_labels_b,
+            ) = _paired_smarts_transmutation_map(raw_a, raw_b, mapping_settings)
+            requested_pairs = ()
+            completed_hydrogen_pairs = set()
         product_a = {
             int(atom): int(product)
             for atom, product in meta_a["ligand_to_product_atom_indices"].items()
@@ -3669,17 +3728,25 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
         }
         inactive_a = {product_a[atom] for atom in ligand_inactive_a}
         inactive_b = {product_b[atom] for atom in ligand_inactive_b}
-        inactive_geometry = mapping_settings["inactive_bonded_geometry"]
+        requested_product_pairs = [
+            (product_a[atom_a], product_b[atom_b])
+            for atom_a, atom_b in requested_pairs
+        ]
+        completed_product_hydrogen_pairs = {
+            (product_a[atom_a], product_b[atom_b])
+            for atom_a, atom_b in completed_hydrogen_pairs
+        }
+        inactive_geometry = mapping_settings.get("inactive_bonded_geometry", "bond_only")
         atom_map = dict(required)
         if set(atom_map).intersection(transferred):
             raise CovalentWorkflowError(
-                "paired-SMARTS ligand map overlaps capped cysteine atoms"
+                "ligand atom map overlaps capped cysteine atoms"
             )
         atom_map.update(transferred)
         provenance.update(
             {
-                "ligand_a_smarts": mapping_settings["ligand_a_smarts"],
-                "ligand_b_smarts": mapping_settings["ligand_b_smarts"],
+                "ligand_a_smarts": mapping_settings.get("ligand_a_smarts", ""),
+                "ligand_b_smarts": mapping_settings.get("ligand_b_smarts", ""),
                 "matched_smarts_labels_a_0based": {
                     int(label): product_a[int(atom)]
                     for label, atom in matched_labels_a.items()
@@ -3692,6 +3759,19 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
                     int(atom_a): int(atom_b)
                     for atom_a, atom_b in sorted(transferred.items())
                 },
+                "requested_ligand_pairs_0based": [
+                    list(pair) for pair in requested_pairs
+                ],
+                "auto_completed_ligand_hydrogen_pairs_0based": [
+                    list(pair) for pair in sorted(completed_hydrogen_pairs)
+                ],
+                "requested_product_pairs_0based": [
+                    list(pair) for pair in requested_product_pairs
+                ],
+                "auto_completed_product_hydrogen_pairs_0based": [
+                    list(pair)
+                    for pair in sorted(completed_product_hydrogen_pairs)
+                ],
                 "transmuted_pairs_0based": [
                     list(pair) for pair in sorted(transmuted_pairs)
                 ],
@@ -3716,7 +3796,7 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
     if atom_map is not None:
         if attachment_pairs[1] not in atom_map.items():
             raise CovalentWorkflowError(
-                "SMARTS-constrained MCS must contain the ligand electrophile carbon"
+                "ligand atom map must contain the ligand electrophile carbon"
             )
         atom_map = complete_covalent_atom_map(
             product_molecule_a,

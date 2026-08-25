@@ -15,6 +15,46 @@ from atom_openmm.covalent_hybrid import (
 HybridMappingError = CovalentAlchemyError
 
 
+def _strict_nonnegative_indices(raw, field, *, allow_empty=True):
+    if not isinstance(raw, list) or (not raw and not allow_empty):
+        qualifier = "a list" if allow_empty else "a non-empty list"
+        raise HybridMappingError(f"{field} must be {qualifier}")
+    indices = []
+    for position, value in enumerate(raw, start=1):
+        if type(value) is not int or value < 0:
+            raise HybridMappingError(
+                f"{field} entry {position} must be a non-negative integer"
+            )
+        indices.append(value)
+    if len(set(indices)) != len(indices):
+        raise HybridMappingError(f"{field} must not contain duplicate indices")
+    return indices
+
+
+def _strict_explicit_pairs(raw_pairs):
+    if not isinstance(raw_pairs, list) or not raw_pairs:
+        raise HybridMappingError(
+            "explicit_pairs mapping requires non-empty pairs_0based"
+        )
+    pairs = []
+    for index, raw in enumerate(raw_pairs, start=1):
+        if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+            raise HybridMappingError(
+                f"explicit_pairs pairs_0based entry {index} must contain two indices"
+            )
+        if any(type(value) is not int or value < 0 for value in raw):
+            raise HybridMappingError(
+                f"explicit_pairs pairs_0based entry {index} must contain "
+                "non-negative integers"
+            )
+        pairs.append((raw[0], raw[1]))
+    if len({atom_a for atom_a, _atom_b in pairs}) != len(pairs) or len(
+        {atom_b for _atom_a, atom_b in pairs}
+    ) != len(pairs):
+        raise HybridMappingError("explicit_pairs atom map must be one-to-one")
+    return pairs
+
+
 def _direct_rmsd(molecule_a, molecule_b, mapping):
     conformer_a = molecule_a.GetConformer()
     conformer_b = molecule_b.GetConformer()
@@ -138,6 +178,78 @@ def _paired_smarts_transmutation_map(molecule_a, molecule_b, settings):
     return min(candidates, key=lambda item: item[:3])[3:]
 
 
+def _explicit_pairs_map(molecule_a, molecule_b, settings):
+    pairs = _strict_explicit_pairs(settings.get("pairs_0based"))
+    inactive_a = set(
+        _strict_nonnegative_indices(
+            settings.get("inactive_bonded_atoms_a_0based", []),
+            "explicit_pairs inactive_bonded_atoms_a_0based",
+        )
+    )
+    inactive_b = set(
+        _strict_nonnegative_indices(
+            settings.get("inactive_bonded_atoms_b_0based", []),
+            "explicit_pairs inactive_bonded_atoms_b_0based",
+        )
+    )
+    geometry = str(settings.get("inactive_bonded_geometry", "bond_only")).lower()
+    if geometry not in {"bond_only", "terminal_z_matrix"}:
+        raise HybridMappingError(
+            "explicit_pairs inactive_bonded_geometry must be 'bond_only' or "
+            "'terminal_z_matrix'"
+        )
+    if geometry == "terminal_z_matrix" and not (inactive_a or inactive_b):
+        raise HybridMappingError(
+            "explicit_pairs terminal_z_matrix requires at least one inactive bonded atom"
+        )
+    mapping = dict(pairs)
+    transmuted = {
+        (atom_a, atom_b) for atom_a, atom_b in pairs
+        if 0 <= atom_a < molecule_a.GetNumAtoms()
+        and 0 <= atom_b < molecule_b.GetNumAtoms()
+        and molecule_a.GetAtomWithIdx(atom_a).GetAtomicNum()
+        != molecule_b.GetAtomWithIdx(atom_b).GetAtomicNum()
+    }
+    requested_pairs = tuple(pairs)
+    requested = set(requested_pairs)
+    mapping = complete_covalent_atom_map(
+        molecule_a,
+        molecule_b,
+        mapping,
+        required_pairs=pairs,
+        transmuted_pairs=transmuted,
+    )
+    if any(atom >= molecule_a.GetNumAtoms() for atom in inactive_a):
+        raise HybridMappingError(
+            "explicit_pairs inactive ligand-A atom is outside the molecule"
+        )
+    if any(atom >= molecule_b.GetNumAtoms() for atom in inactive_b):
+        raise HybridMappingError(
+            "explicit_pairs inactive ligand-B atom is outside the molecule"
+        )
+    unique_a = set(range(molecule_a.GetNumAtoms())) - set(mapping)
+    unique_b = set(range(molecule_b.GetNumAtoms())) - set(mapping.values())
+    if not inactive_a <= unique_a:
+        raise HybridMappingError(
+            "explicit_pairs inactive ligand-A atoms must be endpoint-unique"
+        )
+    if not inactive_b <= unique_b:
+        raise HybridMappingError(
+            "explicit_pairs inactive ligand-B atoms must be endpoint-unique"
+        )
+    completed_hydrogens = set(mapping.items()) - requested
+    return (
+        mapping,
+        transmuted,
+        inactive_a,
+        inactive_b,
+        {},
+        {},
+        requested_pairs,
+        completed_hydrogens,
+    )
+
+
 def build_hybrid_atom_map(parameters_a, parameters_b, settings):
     raw_a = parameters_a.molecule.to_rdkit()
     raw_b = parameters_b.molecule.to_rdkit()
@@ -152,6 +264,8 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
         "ligand_b": sum(atom.GetIsAromatic() for atom in molecule_b.GetAtoms()),
     }
     method = settings.get("method", "mcs")
+    requested_pairs = ()
+    completed_hydrogen_pairs = set()
     if method == "mcs":
         mapping = find_covalent_atom_map(molecule_a, molecule_b)
     elif method == "mcs_core_smarts":
@@ -175,10 +289,21 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
             matched_labels_a,
             matched_labels_b,
         ) = _paired_smarts_transmutation_map(molecule_a, molecule_b, settings)
+    elif method == "explicit_pairs":
+        (
+            mapping,
+            transmuted,
+            inactive_a,
+            inactive_b,
+            matched_labels_a,
+            matched_labels_b,
+            requested_pairs,
+            completed_hydrogen_pairs,
+        ) = _explicit_pairs_map(molecule_a, molecule_b, settings)
     else:
         raise HybridMappingError(
             "workflow.alchemy.mapping.method must be 'mcs', 'mcs_core_smarts', "
-            "or 'paired_smarts_transmutation'"
+            "'paired_smarts_transmutation', or 'explicit_pairs'"
         )
     if method == "mcs":
         transmuted = set()
@@ -201,6 +326,12 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
         "smarts": settings.get("smarts") if method == "mcs_core_smarts" else None,
         "ligand_a_smarts": settings.get("ligand_a_smarts") if method == "paired_smarts_transmutation" else None,
         "ligand_b_smarts": settings.get("ligand_b_smarts") if method == "paired_smarts_transmutation" else None,
+        "requested_pairs_0based": [
+            list(pair) for pair in requested_pairs
+        ],
+        "auto_completed_hydrogen_pairs_0based": [
+            list(pair) for pair in sorted(completed_hydrogen_pairs)
+        ],
         "transmuted_pairs_0based": [list(pair) for pair in sorted(transmuted)],
         "transmuted_pairs_1based": [[a + 1, b + 1] for a, b in sorted(transmuted)],
         "inactive_bonded_atoms_a_0based": sorted(inactive_a),

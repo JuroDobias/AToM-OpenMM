@@ -1052,6 +1052,46 @@ def _test_covalent_mapping_settings_accept_paired_smarts_transmutation():
     assert settings["inactive_bonded_geometry"] == "bond_only"
 
 
+def _test_covalent_mapping_settings_accept_explicit_pairs():
+    settings = _mapping_settings(
+        {"alchemy": {"mapping": {"method": "explicit_pairs", "pairs_0based": [[0, 1], [2, 3]]}}},
+        {},
+    )
+    assert settings == {
+        "method": "explicit_pairs",
+        "pairs_0based": [[0, 1], [2, 3]],
+        "inactive_bonded_atoms_a_0based": [],
+        "inactive_bonded_atoms_b_0based": [],
+        "inactive_bonded_geometry": "bond_only",
+    }
+
+
+def _test_covalent_explicit_mapping_requires_single_edge(monkeypatch):
+    import atom_openmm.covalent_workflow as module
+
+    settings = {
+        "workflow": {
+            "alchemy": {
+                "mapping": {
+                    "method": "explicit_pairs",
+                    "pairs_0based": [[0, 0]],
+                }
+            }
+        },
+        "pairs": [
+            {"ligand_a": "A", "ligand_b": "B"},
+            {"ligand_a": "B", "ligand_b": "C"},
+        ],
+        "dataset": {"ligands": []},
+    }
+    monkeypatch.setattr(
+        module, "load_covalent_workflow", lambda _path: (None, settings)
+    )
+
+    with pytest.raises(module.CovalentWorkflowError, match="exactly one edge"):
+        module.validate_covalent_workflow("workflow.yaml")
+
+
 def _test_covalent_convergence_stops_environments_independently(tmp_path):
     from atom_openmm.covalent_workflow import (
         _covalent_convergence_callback,

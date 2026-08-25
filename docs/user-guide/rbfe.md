@@ -419,6 +419,40 @@ switching system uses the heavier endpoint mass for every mapped particle and
 resamples velocities before each switch, so masses remain fixed during protocol
 work accumulation. This mapping mode currently supports NEQTI only.
 
+For a single edge, an external GUI may instead provide the complete intended
+atom map directly:
+
+```yaml
+workflow:
+  alchemy:
+    model: hybrid_topology
+    cycle: complex_solvent
+    mapping:
+      method: explicit_pairs
+      pairs_0based:
+        - [0, 0]
+        - [1, 1]
+        - [2, 2]
+      inactive_bonded_atoms_b_0based: [12]
+      inactive_bonded_geometry: terminal_z_matrix
+  sampling:
+    method: neqti
+```
+
+`pairs_0based` uses zero-based atom indices from the input ligand files and is
+authoritative: no MCS atoms are added. The list must contain every intended
+common heavy-atom pair and form a connected heavy-atom core in both ligands.
+Compatible hydrogens attached to mapped parent atoms are completed
+automatically, but explicitly requested pairs always take precedence. Input
+SDF/MOL files must contain explicit hydrogens when a requested pair references
+one. Element-changing pairs are detected as mapped-atom transmutations and
+currently require NEQTI. The optional inactive atom lists also use input-file
+indices and must identify endpoint-unique atoms. `terminal_z_matrix` requires at
+least one such atom. The mapping output records requested pairs, automatically
+completed hydrogen pairs, the final map, and detected transmutations separately.
+Explicit numeric maps are rejected for multi-edge workflows because atom indices
+are specific to one ligand pair.
+
 For large flexible transformations, `alchemy.dummy_core_nonbonded: retain`
 also preserves inactive unique-common electrostatics, Lennard-Jones terms,
 exclusions, and 1-4 interactions. This prevents a large vacuum branch from
@@ -1237,6 +1271,12 @@ noninteracting with the environment when inactive but retain full unique-unique
 vacuum electrostatics, Lennard-Jones, exclusions, and 1-4 interactions. The input
 core, generated MCS, selected match/RMSD, resolved map, and atom roles are recorded
 in `covalent_mapping.yaml`.
+
+Single-edge covalent workflows may also use `method: explicit_pairs` with the
+same authoritative input-ligand index contract described above. Requested pairs
+and inactive bonded atom indices refer to the aldehyde ligand SDF files and are
+translated to capped-product indices during preparation. Both input and
+translated mappings are retained in `covalent_mapping.yaml`.
 
 The same `dummy_core_nonbonded: retain` option is available for large covalent
 mutations. It additionally keeps inactive unique-common vacuum terms and couples

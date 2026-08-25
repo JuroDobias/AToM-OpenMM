@@ -219,6 +219,45 @@ def test_terminal_z_matrix_retains_one_angle_and_one_proper_torsion_group():
     )
 
 
+def _test_explicit_mapping_builds_terminal_z_matrix_endpoint_systems():
+    left = _bundle("NC(=O)c1ccccc1")
+    right = _bundle("NS(=O)(=O)c1ccccc1")
+    seed_mapping, seed_metadata = build_hybrid_atom_map(
+        left,
+        right,
+        {
+            "method": "paired_smarts_transmutation",
+            "ligand_a_smarts": "[c:1]-[C:2](=[O:3])-[NH2:4]",
+            "ligand_b_smarts": "[c:1]-[S:2](=[O:3])(=[O:5])-[NH2:4]",
+            "inactive_bonded_labels": {"ligand_b": [5]},
+        },
+    )
+    inactive_b = seed_metadata["inactive_bonded_atoms_b_0based"]
+    mapping, metadata = build_hybrid_atom_map(
+        left,
+        right,
+        {
+            "method": "explicit_pairs",
+            "pairs_0based": [list(pair) for pair in seed_mapping.items()],
+            "inactive_bonded_atoms_b_0based": inactive_b,
+            "inactive_bonded_geometry": "terminal_z_matrix",
+        },
+    )
+    hybrid = build_covalent_hybrid_molecule(
+        left,
+        right,
+        atom_map=mapping,
+        transmuted_pairs={
+            tuple(pair) for pair in metadata["transmuted_pairs_0based"]
+        },
+        inactive_bonded_atoms_b=set(inactive_b),
+        inactive_bonded_geometry="terminal_z_matrix",
+    )
+
+    assert hybrid.inactive_bonded_geometry == "terminal_z_matrix"
+    assert len(hybrid.inactive_z_matrix_terms) == 1
+
+
 def _test_hybrid_molecule_has_identical_endpoint_particles():
     hybrid = build_covalent_hybrid_molecule(_bundle("CCO"), _bundle("CCCO"))
     assert hybrid.endpoint_a.getNumParticles() == hybrid.endpoint_b.getNumParticles()

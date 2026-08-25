@@ -116,7 +116,6 @@ def complete_covalent_atom_map(
     if not required_heavy.issubset(mapping.items()):
         raise CovalentAlchemyError("covalent atom map does not contain all required pairs")
 
-    required_by_a = dict(required)
     conformer_a = molecule_a.GetConformer()
     conformer_b = molecule_b.GetConformer()
     for atom_a, atom_b in list(mapping.items()):
@@ -130,19 +129,11 @@ def complete_covalent_atom_map(
             atom.GetIdx() for atom in molecule_b.GetAtomWithIdx(atom_b).GetNeighbors()
             if atom.GetAtomicNum() == 1
         )
-        if len(hydrogens_a) != len(hydrogens_b):
-            continue
-        fixed = {
-            hydrogen_a: required_by_a[hydrogen_a]
-            for hydrogen_a in hydrogens_a if hydrogen_a in required_by_a
-        }
-        if any(hydrogen_b not in hydrogens_b for hydrogen_b in fixed.values()):
-            continue
         remaining_a = [
             atom for atom in hydrogens_a
-            if atom not in fixed and atom not in mapping
+            if atom not in mapping
         ]
-        mapped_b = set(mapping.values()) | set(fixed.values())
+        mapped_b = set(mapping.values())
         remaining_b = [atom for atom in hydrogens_b if atom not in mapped_b]
         if len(remaining_a) != len(remaining_b):
             continue
@@ -157,7 +148,6 @@ def complete_covalent_atom_map(
             candidate = (squared, ordered_b)
             if best is None or candidate < best:
                 best = candidate
-        mapping.update(fixed)
         if best is not None:
             mapping.update(zip(remaining_a, best[1]))
 
@@ -177,8 +167,9 @@ def complete_covalent_atom_map(
             raise CovalentAlchemyError(f"invalid mapped atom pair {atom_a}:{atom_b}")
 
     mapped_heavy = {
-        atom_a for atom_a in mapping
+        atom_a for atom_a, atom_b in mapping.items()
         if molecule_a.GetAtomWithIdx(atom_a).GetAtomicNum() != 1
+        and molecule_b.GetAtomWithIdx(atom_b).GetAtomicNum() != 1
     }
     for atom_a in mapped_heavy:
         atom_b = mapping[atom_a]
@@ -218,8 +209,10 @@ def complete_covalent_atom_map(
                 raise CovalentAlchemyError(
                     f"mapped bond {atom_b}:{other_b} is incompatible with {atom_a}:{other_a}"
                 )
-    if mapped_heavy:
-        pending = [next(iter(mapped_heavy))]
+    def _connected(molecule, atoms):
+        if not atoms:
+            return True
+        pending = [next(iter(atoms))]
         visited = set()
         while pending:
             atom = pending.pop()
@@ -228,13 +221,18 @@ def complete_covalent_atom_map(
             visited.add(atom)
             pending.extend(
                 neighbor.GetIdx()
-                for neighbor in molecule_a.GetAtomWithIdx(atom).GetNeighbors()
-                if neighbor.GetIdx() in mapped_heavy
+                for neighbor in molecule.GetAtomWithIdx(atom).GetNeighbors()
+                if neighbor.GetIdx() in atoms
             )
-        if visited != mapped_heavy:
-            raise CovalentAlchemyError(
-                "covalent common atom map must be a connected protein-linked subgraph"
-            )
+        return visited == atoms
+
+    mapped_heavy_b = {mapping[atom_a] for atom_a in mapped_heavy}
+    if not _connected(molecule_a, mapped_heavy) or not _connected(
+        molecule_b, mapped_heavy_b
+    ):
+        raise CovalentAlchemyError(
+            "mapped heavy-atom core must be connected in both ligands"
+        )
     return mapping
 
 
