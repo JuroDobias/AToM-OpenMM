@@ -1,1 +1,7 @@
 run_*/
+!run_openmm86_native_production/
+run_openmm86_native_production/*
+!run_openmm86_native_production/README.md
+!run_openmm86_native_production/compare.py
+!run_openmm86_native_production/run.sh
+!run_openmm86_native_production/workflow.yaml

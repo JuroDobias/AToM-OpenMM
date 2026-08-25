@@ -1,7 +1,52 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+
+
+def test_native_rest2_states_set_scale_and_square_root():
+    from atom_openmm.rest2_validation import _native_rest2_states
+
+    rest2 = SimpleNamespace(
+        scale_parameter="REST2_SCALE",
+        sqrt_scale_parameter="REST2_SQRT_SCALE",
+    )
+    states = _native_rest2_states([1.0, 0.25], rest2)
+
+    assert states == [
+        {"REST2_SCALE": 1.0, "REST2_SQRT_SCALE": 1.0},
+        {"REST2_SCALE": 0.25, "REST2_SQRT_SCALE": 0.5},
+    ]
+
+
+def test_native_backend_requires_openmm_sampler(monkeypatch):
+    from atom_openmm import rest2_validation
+
+    monkeypatch.delattr(rest2_validation.app, "ReplicaExchangeSampler", raising=False)
+    with pytest.raises(
+        rest2_validation.REST2ValidationError, match="OpenMM 8.6 or newer"
+    ):
+        rest2_validation._rest2_sampler_backend({
+            "rest2": {"sampler_backend": "openmm_native"}
+        })
+
+
+def test_native_transition_diagnostics_count_neighbor_and_global_moves(tmp_path):
+    from atom_openmm.rest2_validation import _native_transition_diagnostics
+
+    trace = tmp_path / "state_trace.csv"
+    trace.write_text(
+        "cycle,walker_0,walker_1,walker_2\n"
+        "1,0,1,2\n"
+        "2,1,0,2\n"
+        "3,2,0,1\n"
+    )
+
+    diagnostics = _native_transition_diagnostics(trace, 3)
+
+    assert diagnostics["total_state_changes"] == 4
+    assert diagnostics["neighbor_transition_counts"] == [2, 2]
 
 
 def _test_torsion_angle_degrees_distinguishes_rotamers():

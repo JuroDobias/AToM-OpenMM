@@ -21,3 +21,7 @@ python -m atom_openmm.rest2_validation production.yaml --stage all --resume
 
 Stages may be scheduled separately. With `--resume`, existing preparation and
 completed checkpoints are preserved.
+
+An OpenMM 8.6 native `ReplicaExchangeSampler` comparison using the same
+prepared system and production length is available in
+`run_openmm86_native_production/`.

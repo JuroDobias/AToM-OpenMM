@@ -11,6 +11,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import random
 import shutil
 import subprocess
 import sys
@@ -330,6 +331,138 @@ def _append_csv(path, header, row):
         writer.writerow(row)
 
 
+def _rest2_sampler_backend(config):
+    backend = str(config.get("rest2", {}).get("sampler_backend", "custom")).strip().lower()
+    aliases = {"native": "openmm_native", "openmm": "openmm_native"}
+    backend = aliases.get(backend, backend)
+    if backend not in {"custom", "openmm_native"}:
+        raise REST2ValidationError(
+            "rest2.sampler_backend must be 'custom' or 'openmm_native'"
+        )
+    if backend == "openmm_native" and not hasattr(app, "ReplicaExchangeSampler"):
+        raise REST2ValidationError(
+            "rest2.sampler_backend=openmm_native requires OpenMM 8.6 or newer"
+        )
+    return backend
+
+
+def _native_rest2_states(scales, rest2_system):
+    return [
+        {
+            rest2_system.scale_parameter: float(scale),
+            rest2_system.sqrt_scale_parameter: math.sqrt(float(scale)),
+        }
+        for scale in scales
+    ]
+
+
+def _truncate_csv_after_cycle(path, cycle):
+    path = Path(path)
+    if not path.exists():
+        return
+    with path.open(newline="") as handle:
+        rows = list(csv.reader(handle))
+    if not rows:
+        return
+    kept = [rows[0]]
+    kept.extend(row for row in rows[1:] if row and int(row[0]) <= int(cycle))
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", newline="") as handle:
+        csv.writer(handle).writerows(kept)
+    os.replace(temporary, path)
+
+
+class _NativeREST2CompatibilityReporter:
+    """Write the established validation outputs from OpenMM's native sampler."""
+
+    def __init__(
+        self, output, topology, sampler, scales, temperatures, torsion_indices,
+        basin_limits, exchange_interval, timestep, resume,
+    ):
+        self.output = Path(output)
+        self.sampler = sampler
+        self.scales = list(scales)
+        self.temperatures = list(temperatures)
+        self.torsion_indices = torsion_indices
+        self.basin_limits = basin_limits
+        self.exchange_interval = int(exchange_interval)
+        self.timestep = timestep
+        self.state_csv = self.output / "state_trace.csv"
+        self.torsion_csv = self.output / "physical_torsion.csv"
+        self.heated_torsion_csv = self.output / "state_torsions.csv"
+        start_cycle = int(sampler.currentIteration)
+        if resume:
+            for path in (self.state_csv, self.torsion_csv, self.heated_torsion_csv):
+                _truncate_csv_after_cycle(path, start_cycle)
+        self.previous_angles = [
+            torsion_angle_degrees(_positions_nm(state), torsion_indices)
+            for state in sampler.replicaConformation
+        ]
+        trajectory = self.output / "physical.dcd"
+        append = bool(resume and trajectory.exists())
+        self.trajectory_handle = trajectory.open("r+b" if append else "wb")
+        self.dcd = app.DCDFile(
+            self.trajectory_handle, topology, timestep * self.exchange_interval,
+            firstStep=start_cycle * self.exchange_interval, interval=1, append=append,
+        )
+
+    def close(self):
+        if self.trajectory_handle is not None:
+            self.trajectory_handle.close()
+            self.trajectory_handle = None
+
+    def __call__(self, sampler):
+        cycle = int(sampler.currentIteration)
+        step = cycle * self.exchange_interval
+        assignments = [int(value) for value in sampler.replicaStateIndex]
+        end_angles = [
+            torsion_angle_degrees(_positions_nm(state), self.torsion_indices)
+            for state in sampler.replicaConformation
+        ]
+        for walker, state_index in enumerate(assignments):
+            before = self.previous_angles[walker]
+            after = end_angles[walker]
+            _append_csv(
+                self.heated_torsion_csv,
+                [
+                    "cycle", "step", "walker", "state_index", "scale",
+                    "effective_temperature_k", "start_torsion_deg", "end_torsion_deg",
+                    "basin_a_before", "basin_a_after", "basin_changed",
+                ],
+                [
+                    cycle, step, walker, state_index, self.scales[state_index],
+                    self.temperatures[state_index], before, after,
+                    int(_in_basin_a(before, self.basin_limits)),
+                    int(_in_basin_a(after, self.basin_limits)),
+                    int(
+                        _in_basin_a(before, self.basin_limits)
+                        != _in_basin_a(after, self.basin_limits)
+                    ),
+                ],
+            )
+        _append_csv(
+            self.state_csv,
+            ["cycle", *[f"walker_{i}" for i in range(len(assignments))]],
+            [cycle, *assignments],
+        )
+        physical_walker = assignments.index(0)
+        physical_state = sampler.replicaConformation[physical_walker]
+        self.dcd.writeModel(
+            physical_state.getPositions(),
+            periodicBoxVectors=physical_state.getPeriodicBoxVectors(),
+        )
+        energy = sampler.replicaStateEnergy[physical_walker][0]
+        _append_csv(
+            self.torsion_csv,
+            ["cycle", "step", "walker", "torsion_deg", "potential_kj_mol"],
+            [
+                cycle, step, physical_walker, end_angles[physical_walker],
+                energy.value_in_unit(unit.kilojoule_per_mole),
+            ],
+        )
+        self.previous_angles = end_angles
+
+
 def run_md(config, resume=False):
     topology, _, system = _load_amber(config, barostat=False)
     initial = _load_equilibrated_state(config)
@@ -424,11 +557,156 @@ def _rest2_checkpoint(output, contexts, assignments, cycle, attempts, accepts, r
     os.replace(temporary, checkpoint_dir / "state.json")
 
 
+def _native_transition_diagnostics(state_csv, replicas):
+    with Path(state_csv).open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    columns = [f"walker_{index}" for index in range(replicas)]
+    trace = np.asarray(
+        [[int(row[name]) for name in columns] for row in rows], dtype=int
+    )
+    counts = np.zeros(max(0, replicas - 1), dtype=int)
+    total_changes = 0
+    if len(trace) > 1:
+        for previous, current in zip(trace[:-1], trace[1:]):
+            for old_state, new_state in zip(previous, current):
+                if old_state == new_state:
+                    continue
+                total_changes += 1
+                lower = min(old_state, new_state)
+                upper = max(old_state, new_state)
+                if upper - lower == 1:
+                    counts[lower] += 1
+    denominator = max(1, (len(trace) - 1) * replicas)
+    return {
+        "metric": "observed_state_transitions",
+        "total_state_changes": int(total_changes),
+        "neighbor_transition_counts": counts.tolist(),
+        "neighbor_transitions_per_replica_iteration": (counts / denominator).tolist(),
+        "note": "OpenMM's global exchange sampler does not expose proposal acceptance counters.",
+    }
+
+
+def _run_rest2_native(
+    config, topology, rest2, initial, output, temperatures, scales,
+    exchange_interval, steps_per_replica, cycles, seed0, platform, properties,
+    resume, ensemble_metadata,
+):
+    states = _native_rest2_states(scales, rest2)
+    integrator = _integrator(config, seed0 + 2000)
+    simulation = app.Simulation(topology, rest2.system, integrator, platform, properties)
+    _set_state(simulation.context, initial, set_velocities=False)
+    simulation.context.setVelocitiesToTemperature(
+        _simulation_settings(config)["temperature"], seed0 + 3000
+    )
+    sampler = app.ReplicaExchangeSampler(states, simulation, exchange_interval)
+    for index in range(len(scales)):
+        _set_state(simulation.context, initial, set_velocities=False)
+        simulation.context.setVelocitiesToTemperature(
+            _simulation_settings(config)["temperature"], seed0 + 3000 + index
+        )
+        sampler.replicaConformation[index] = simulation.context.getState(
+            getPositions=True, getVelocities=True, parameters=True,
+            integratorParameters=True, enforcePeriodicBox=True,
+        )
+
+    checkpoint_interval = int(
+        config.get("rest2", {}).get("checkpoint_interval_cycles", 10)
+    )
+    native_dir = output / "native_sampler"
+    checkpoint_files_exist = (
+        native_dir.joinpath("log.csv").exists()
+        and all(
+            native_dir.joinpath(f"checkpoint_{index}.xml").exists()
+            for index in range(len(scales))
+        )
+    )
+    native_resume = bool(resume and checkpoint_files_exist)
+    if not native_resume and native_dir.exists():
+        shutil.rmtree(native_dir)
+    checkpoint_reporter = app.ReplicaExchangeReporter(
+        str(native_dir), checkpoint_interval, sampler,
+        checkpoints=True, resume=native_resume,
+    )
+    if native_resume:
+        LOGGER.info(
+            "Native OpenMM REST2 continuing from exchange cycle %d/%d",
+            sampler.currentIteration, cycles,
+        )
+    elif resume:
+        for path in (
+            output / "state_trace.csv", output / "physical_torsion.csv",
+            output / "state_torsions.csv", output / "physical.dcd",
+        ):
+            path.unlink(missing_ok=True)
+
+    torsion_indices = _torsion_indices(topology, config)
+    basin_limits = config.get("torsion", {}).get("basin_a_deg", [-90.0, 90.0])
+    compatibility_reporter = _NativeREST2CompatibilityReporter(
+        output, topology, sampler, scales, temperatures, torsion_indices,
+        basin_limits, exchange_interval, _simulation_settings(config)["timestep"],
+        native_resume,
+    )
+    sampler.reporters.extend([compatibility_reporter, checkpoint_reporter])
+    random.seed(seed0 + 4000 + int(sampler.currentIteration))
+    remaining = cycles - int(sampler.currentIteration)
+    if remaining < 0:
+        raise REST2ValidationError(
+            f"native checkpoint cycle {sampler.currentIteration} exceeds requested {cycles}"
+        )
+    existing_summary = output / "summary.yaml"
+    if remaining == 0 and existing_summary.exists():
+        compatibility_reporter.close()
+        LOGGER.info("Native OpenMM REST2 already complete at cycle %d/%d", cycles, cycles)
+        return yaml.safe_load(existing_summary.read_text())
+    LOGGER.info(
+        "Running native OpenMM REST2 from cycle %d/%d with %d replicas",
+        sampler.currentIteration, cycles, len(scales),
+    )
+    started = monotonic()
+    try:
+        sampler.simulate(remaining)
+    finally:
+        compatibility_reporter.close()
+    elapsed = monotonic() - started
+    integrated_ns = (
+        remaining * exchange_interval * len(scales)
+        * float(config.get("simulation", {}).get("timestep_ps", 0.002)) / 1000.0
+    )
+    performance = {
+        "wall_seconds_this_run": float(elapsed),
+        "integrated_ns_this_run": float(integrated_ns),
+        "aggregate_ns_per_day_this_run": (
+            float(integrated_ns * 86400.0 / elapsed) if elapsed > 0 else None
+        ),
+    }
+    summary = {
+        "sampler_backend": "openmm_native",
+        "openmm_version": mm.__version__,
+        "effective_temperatures_k": temperatures,
+        "scales": scales,
+        "acceptance_rates": [],
+        "exchange_diagnostics": _native_transition_diagnostics(
+            output / "state_trace.csv", len(scales)
+        ),
+        "completed_cycles": cycles,
+        "performance": performance,
+    }
+    if ensemble_metadata:
+        summary["ensemble"] = dict(ensemble_metadata)
+    _atomic_yaml(output / "summary.yaml", summary)
+    LOGGER.info(
+        "Native OpenMM REST2 complete: %d cycles, %.3f aggregate ns/day",
+        cycles, performance["aggregate_ns_per_day_this_run"] or 0.0,
+    )
+    return summary
+
+
 def run_rest2(
     config, resume=False, _output=None, _initial_state=None,
     _seed_offset=0, _ensemble_metadata=None,
 ):
     rest_config = config.get("rest2", {})
+    backend = _rest2_sampler_backend(config)
     ensembles = rest_config.get("ensembles", [])
     if _output is None and ensembles:
         if not isinstance(ensembles, list) or not ensembles:
@@ -453,8 +731,13 @@ def run_rest2(
             seen.add(ensemble_id)
             target = float(ensemble["initial_torsion_deg"])
             output = root / ensemble_id
-            checkpoint = output / "checkpoints" / "state.json"
-            if resume and checkpoint.exists():
+            custom_checkpoint = output / "checkpoints" / "state.json"
+            native_checkpoint = output / "native_sampler" / "log.csv"
+            checkpoint_exists = (
+                custom_checkpoint.exists() if backend == "custom"
+                else native_checkpoint.exists()
+            )
+            if resume and checkpoint_exists:
                 initial = equilibrated
             else:
                 initial = _initialize_rotamer(
@@ -494,6 +777,12 @@ def run_rest2(
     output.mkdir(parents=True, exist_ok=True)
     platform, properties = _platform(config)
     seed0 = _simulation_settings(config)["seed"] + int(_seed_offset)
+    if backend == "openmm_native":
+        return _run_rest2_native(
+            config, topology, rest2, initial, output, temperatures, scales,
+            exchange_interval, steps_per_replica, cycles, seed0, platform, properties,
+            resume, _ensemble_metadata,
+        )
     contexts = []
     integrators = []
     for index, scale in enumerate(scales):
@@ -533,6 +822,7 @@ def run_rest2(
     basin_limits = config.get("torsion", {}).get("basin_a_deg", [-90.0, 90.0])
     trajectory = output / "physical.dcd"
     append_trajectory = bool(resume and trajectory.exists())
+    started = monotonic()
     with trajectory.open("r+b" if append_trajectory else "wb") as trajectory_handle:
         dcd = app.DCDFile(
             trajectory_handle, topology,
@@ -608,13 +898,27 @@ def run_rest2(
                 _rest2_checkpoint(output, contexts, assignments, cycle + 1, attempts, accepts, rng)
                 rates = np.divide(accepts, attempts, out=np.zeros_like(accepts, dtype=float), where=attempts > 0)
                 LOGGER.info("REST2 cycle %d/%d, neighbor acceptance %s", cycle + 1, cycles, np.round(rates, 3).tolist())
+    elapsed = monotonic() - started
+    integrated_ns = (
+        (cycles - start_cycle) * exchange_interval * len(scales)
+        * float(config.get("simulation", {}).get("timestep_ps", 0.002)) / 1000.0
+    )
     summary = {
+        "sampler_backend": "custom",
+        "openmm_version": mm.__version__,
         "effective_temperatures_k": temperatures,
         "scales": scales,
         "attempts": attempts.tolist(),
         "accepts": accepts.tolist(),
         "acceptance_rates": np.divide(accepts, attempts, out=np.zeros_like(accepts, dtype=float), where=attempts > 0).tolist(),
         "completed_cycles": cycles,
+        "performance": {
+            "wall_seconds_this_run": float(elapsed),
+            "integrated_ns_this_run": float(integrated_ns),
+            "aggregate_ns_per_day_this_run": (
+                float(integrated_ns * 86400.0 / elapsed) if elapsed > 0 else None
+            ),
+        },
     }
     if _ensemble_metadata:
         summary["ensemble"] = dict(_ensemble_metadata)
@@ -944,6 +1248,7 @@ def _analyze_rest2_output(config, directory, limits, bootstrap_samples, rng):
         [int(row[name]) for name in walker_columns] for row in trace_rows
     ], dtype=int)
     summary = yaml.safe_load((directory / "summary.yaml").read_text())
+    acceptance_rates = summary.get("acceptance_rates", [])
     analysis = {
         "samples": len(angles),
         "burn_in_steps": burn_in_steps,
@@ -951,10 +1256,16 @@ def _analyze_rest2_output(config, directory, limits, bootstrap_samples, rng):
         "basin_a_fraction_95ci": _block_bootstrap_fraction(
             angles, limits, bootstrap_samples, rng
         ),
-        "acceptance_rates": summary["acceptance_rates"],
+        "sampler_backend": summary.get("sampler_backend", "custom"),
+        "openmm_version": summary.get("openmm_version"),
+        "acceptance_rates": acceptance_rates,
         "round_trips": _round_trips(trace, len(walker_columns)) if len(trace) else 0,
         "basin_transitions": _basin_transition_count(angles, limits),
     }
+    if summary.get("exchange_diagnostics"):
+        analysis["exchange_diagnostics"] = summary["exchange_diagnostics"]
+    if summary.get("performance"):
+        analysis["performance"] = summary["performance"]
     if summary.get("ensemble"):
         analysis["initial_torsion_deg"] = summary["ensemble"]["initial_torsion_deg"]
     state_torsions = directory / "state_torsions.csv"
@@ -1040,6 +1351,18 @@ def analyze(config):
         if ensemble_results:
             combined = np.concatenate(all_angles)
             values = list(ensemble_results.values())
+            rate_sets = [value["acceptance_rates"] for value in values]
+            performances = [
+                value["performance"] for value in values if value.get("performance")
+            ]
+            total_wall_seconds = sum(
+                float(value.get("wall_seconds_this_run", 0.0))
+                for value in performances
+            )
+            total_integrated_ns = sum(
+                float(value.get("integrated_ns_this_run", 0.0))
+                for value in performances
+            )
             result["rest2"] = {
                 "samples": len(combined),
                 "burn_in_steps": int(config.get("analysis", {}).get("rest2_burn_in_steps", 0)),
@@ -1047,9 +1370,12 @@ def analyze(config):
                 "basin_a_fraction_95ci": _block_bootstrap_fraction(
                     combined, limits, bootstrap_samples, rng
                 ),
-                "acceptance_rates": np.mean(
-                    [value["acceptance_rates"] for value in values], axis=0
-                ).tolist(),
+                "sampler_backend": values[0].get("sampler_backend", "custom"),
+                "openmm_version": values[0].get("openmm_version"),
+                "acceptance_rates": (
+                    np.mean(rate_sets, axis=0).tolist()
+                    if rate_sets and all(len(rates) for rates in rate_sets) else []
+                ),
                 "round_trips": min(value["round_trips"] for value in values),
                 "basin_transitions": sum(value["basin_transitions"] for value in values),
                 "ensembles": ensemble_results,
@@ -1058,6 +1384,15 @@ def analyze(config):
                     max(value["basin_a_fraction"] for value in values),
                 ],
             }
+            if performances:
+                result["rest2"]["performance"] = {
+                    "wall_seconds_this_run": total_wall_seconds,
+                    "integrated_ns_this_run": total_integrated_ns,
+                    "aggregate_ns_per_day_this_run": (
+                        total_integrated_ns * 86400.0 / total_wall_seconds
+                        if total_wall_seconds > 0.0 else None
+                    ),
+                }
     window_files = sorted((workdir / "umbrella").glob("window_*.csv"))
     if window_files:
         series = [_read_column(path, "torsion_deg") for path in window_files]
@@ -1104,7 +1439,7 @@ def analyze(config):
     warnings = result["quality"]["warnings"]
     if result["rest2"]:
         rates = result["rest2"]["acceptance_rates"]
-        if any(rate < 0.15 or rate > 0.50 for rate in rates):
+        if rates and any(rate < 0.15 or rate > 0.50 for rate in rates):
             warnings.append("One or more neighboring REST2 acceptance rates are outside 0.15-0.50.")
         if result["rest2"]["round_trips"] < 3:
             warnings.append("Fewer than three complete REST2 ladder round trips were observed.")
