@@ -2,8 +2,199 @@ import json
 import csv
 
 import openmm as mm
+import pytest
 from openmm import unit
 from openmm.app import Topology, element
+
+
+def _simple_rest2_fixture(tmp_path):
+    from atom_openmm.rest2 import create_rest2_system
+
+    physical = mm.System()
+    for _ in range(2):
+        physical.addParticle(12.0)
+    bonds = mm.HarmonicBondForce()
+    bonds.addBond(0, 1, 0.1, 100.0)
+    physical.addForce(bonds)
+    nonbonded = mm.NonbondedForce()
+    for _ in range(2):
+        nonbonded.addParticle(0.0, 0.3, 0.0)
+    physical.addForce(nonbonded)
+    rest2 = create_rest2_system(physical, [0, 1])
+    topology = Topology()
+    residue = topology.addResidue("LIG", topology.addChain())
+    atoms = [
+        topology.addAtom(f"C{index}", element.carbon, residue)
+        for index in range(2)
+    ]
+    topology.addBond(*atoms)
+    context = mm.Context(rest2.system, mm.VerletIntegrator(0.001))
+    context.setPositions([[0, 0, 0], [0.2, 0, 0]])
+    context.setVelocitiesToTemperature(300 * unit.kelvin, 1)
+    state_file = tmp_path / "a.xml"
+    state_file.write_text(
+        mm.XmlSerializer.serialize(
+            context.getState(getPositions=True, getVelocities=True)
+        )
+    )
+    del context
+    return rest2, topology, state_file
+
+
+def _test_rest2_factory_defaults_to_custom_and_rejects_native_on_old_openmm(tmp_path):
+    from atom_openmm.rest2_exchange import (
+        REST2ExchangeSampler,
+        create_rest2_exchange_sampler,
+    )
+
+    rest2, topology, state_file = _simple_rest2_fixture(tmp_path)
+    kwargs = {
+        "system": rest2.system,
+        "topology": topology,
+        "base_integrator": mm.LangevinMiddleIntegrator(300, 1, 0.001),
+        "rest2_system": rest2,
+        "state_files": {"a": state_file},
+        "config": {
+            "effective_temperatures_k": [300, 600],
+            "exchange_interval_steps": 1,
+            "execution": "serial",
+        },
+        "platform": mm.Platform.getPlatformByName("Reference"),
+        "platform_properties": {},
+        "output_dir": tmp_path / "factory",
+        "resume": False,
+    }
+    sampler = create_rest2_exchange_sampler(**kwargs)
+    assert isinstance(sampler, REST2ExchangeSampler)
+    sampler.close()
+
+    if not hasattr(__import__("openmm.app", fromlist=["app"]), "ReplicaExchangeSampler"):
+        kwargs["config"] = {**kwargs["config"], "sampler_backend": "openmm_native"}
+        with pytest.raises(ValueError, match="OpenMM 8.6"):
+            create_rest2_exchange_sampler(**kwargs)
+
+
+def _test_rest2_bank_backend_mismatch_is_rejected(tmp_path):
+    from atom_openmm.rest2_exchange import _validate_bank_backend
+
+    bank = tmp_path / "state.json"
+    bank.write_text(json.dumps({"sampler_backend": "custom"}))
+    with pytest.raises(ValueError, match="cannot be resumed"):
+        _validate_bank_backend(bank, "openmm_native")
+
+
+@pytest.mark.skipif(
+    not hasattr(__import__("openmm.app", fromlist=["app"]), "ReplicaExchangeSampler"),
+    reason="OpenMM native replica exchange requires OpenMM 8.6",
+)
+def _test_openmm_native_rest2_sampler_resumes_and_returns_physical_state(tmp_path):
+    from atom_openmm.rest2_exchange import create_rest2_exchange_sampler
+
+    rest2, topology, state_file = _simple_rest2_fixture(tmp_path)
+    config = {
+        "sampler_backend": "openmm_native",
+        "effective_temperatures_k": [300, 600],
+        "exchange_interval_steps": 1,
+        "checkpoint_interval_cycles": 1,
+        "execution": "serial",
+        "coordinate_reporter": {
+            "enabled": True,
+            "interval_cycles": 1,
+            "state_indices": "all",
+        },
+    }
+
+    def sampler():
+        return create_rest2_exchange_sampler(
+            system=rest2.system,
+            topology=topology,
+            base_integrator=mm.LangevinMiddleIntegrator(300, 1, 0.001),
+            rest2_system=rest2,
+            state_files={"a": state_file},
+            config=config,
+            platform=mm.Platform.getPlatformByName("Reference"),
+            platform_properties={},
+            output_dir=tmp_path / "native",
+            resume=True,
+        )
+
+    first = sampler()
+    first.run_steps("a", 2)
+    state = first.physical_state("a")
+    assert state.getPositions() is not None
+    assert first.summary()["sampler_backend"] == "openmm_native"
+    first.close()
+    metadata = json.loads((tmp_path / "native/a/state.json").read_text())
+    assert metadata["cycle"] == 2
+    assert "previous_assignments" in metadata
+
+    resumed = sampler()
+    resumed.run_steps("a", 1)
+    assert resumed.resources["a"]["sampler"].currentIteration == 3
+    resumed.close()
+    with (tmp_path / "native/a/coordinates/frames.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 6
+    assert {int(row["state_index"]) for row in rows} == {0, 1}
+
+
+@pytest.mark.skipif(
+    not hasattr(__import__("openmm.app", fromlist=["app"]), "ReplicaExchangeSampler"),
+    reason="OpenMM native replica exchange requires OpenMM 8.6",
+)
+def _test_openmm_native_rest2_sampler_applies_fixed_atm_parameters(tmp_path):
+    from atom_openmm.rest2_exchange import create_rest2_exchange_sampler
+
+    rest2, topology, state_file = _simple_rest2_fixture(tmp_path)
+    parameters = mm.CustomExternalForce("0")
+    for name, value in (
+        ("Lambda1", 0), ("Lambda2", 0), ("Alpha", 0.1), ("Uh", 0),
+        ("W0", 0), ("Direction", 1), ("Umax", 200), ("Ubcore", 100),
+        ("Acore", 0.0625), ("UOffset", 0),
+    ):
+        parameters.addGlobalParameter(name, value)
+    parameters.addParticle(0, [])
+    rest2.system.addForce(parameters)
+    atm_state = {
+        "lambda1": 0.25, "lambda2": 0.5,
+        "alpha": 0.1 / unit.kilocalorie_per_mole,
+        "uh": 0 * unit.kilocalorie_per_mole,
+        "w0": 0 * unit.kilocalorie_per_mole,
+        "atmdirection": 1.0,
+        "Umax": 200 * unit.kilocalorie_per_mole,
+        "Ubcore": 100 * unit.kilocalorie_per_mole,
+        "Acore": 0.0625,
+        "uoffset": 0 * unit.kilocalorie_per_mole,
+        "temperature": 300 * unit.kelvin,
+    }
+    ommsystem = type("FakeSystem", (), {
+        "atmforce": _ATMNames(), "multisoftplus": False, "rest2_system": rest2,
+    })()
+    sampler = create_rest2_exchange_sampler(
+        system=rest2.system,
+        topology=topology,
+        base_integrator=mm.LangevinMiddleIntegrator(300, 1, 0.001),
+        ommsystem=ommsystem,
+        state_files={"a": state_file},
+        atm_states={"a": atm_state},
+        config={
+            "sampler_backend": "openmm_native",
+            "effective_temperatures_k": [300, 600],
+            "exchange_interval_steps": 1,
+            "execution": "serial",
+        },
+        platform=mm.Platform.getPlatformByName("Reference"),
+        platform_properties={},
+        output_dir=tmp_path / "native_atm",
+        resume=False,
+    )
+    sampler.activate("a")
+    states = sampler.resources["a"]["sampler"].states
+    assert states[0]["Lambda1"] == pytest.approx(0.25)
+    assert states[0]["Lambda2"] == pytest.approx(0.5)
+    sampler.run_steps("a", 1)
+    assert sampler.physical_state("a").getPositions() is not None
+    sampler.close()
 
 
 class _ATMNames:

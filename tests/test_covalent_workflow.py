@@ -1017,6 +1017,8 @@ def _test_covalent_mode_routes_through_atom_rbfe(tmp_path):
     assert routed == direct
     assert routed["chemistry"] == "covalent"
     assert routed["pairs"][0]["ligand_a"] == "A"
+    workflow = yaml.safe_load(path.read_text())["workflow"]
+    assert _normalized_settings(workflow)["rest2"]["sampler_backend"] == "custom"
 
 
 def _test_covalent_validation_rejects_incompatible_rest2_steps(tmp_path):

@@ -69,10 +69,35 @@ def _test_normalize_neqti_options_accepts_rest2_sampling():
     )
 
     assert settings["rest2"]["enabled"] is True
+    assert settings["rest2"]["sampler_backend"] == "custom"
     assert settings["rest2"]["solute"] == '#ligand:"*"'
     assert settings["rest2"]["effective_temperatures_k"] == [300.0, 450.0, 700.0]
     assert settings["rest2"]["ensembles"] == ["a", "m", "b"]
     assert settings["endpoint_system"] == "atm"
+
+
+@pytest.mark.skipif(
+    not hasattr(__import__("openmm.app", fromlist=["app"]), "ReplicaExchangeSampler"),
+    reason="OpenMM native replica exchange requires OpenMM 8.6",
+)
+def _test_normalize_neqti_options_accepts_openmm_native_rest2():
+    from atom_openmm.neqti import normalize_neqti_options
+
+    settings = normalize_neqti_options(
+        {"neqti": {
+            "initial_equilibration_steps": 1000,
+            "decorrelation_steps": 1000,
+            "rest2": {
+                "enabled": True,
+                "sampler_backend": "openmm_native",
+                "execution": "serial",
+                "effective_temperatures_k": [300, 450],
+                "exchange_interval_steps": 500,
+            },
+        }},
+        _atom_options(),
+    )
+    assert settings["rest2"]["sampler_backend"] == "openmm_native"
 
 
 def _test_normalize_neqti_options_accepts_work_diagnostic_intervals():

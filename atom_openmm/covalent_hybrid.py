@@ -33,7 +33,19 @@ class CovalentHybridMolecule:
     inactive_bonded_atoms_a: tuple[int, ...] = ()
     inactive_bonded_atoms_b: tuple[int, ...] = ()
     inactive_bonded_geometry: str = "bond_only"
+    inactive_branch_components: tuple["InactiveBranchComponent", ...] = ()
     inactive_z_matrix_terms: tuple["InactiveZMatrixTerm", ...] = ()
+
+
+@dataclass(frozen=True)
+class InactiveBranchComponent:
+    endpoint: str
+    atoms: tuple[int, ...]
+    root_atom: int
+    core_atom: int
+    hybrid_atoms: tuple[int, ...]
+    hybrid_root_atom: int
+    hybrid_core_atom: int
 
 
 @dataclass(frozen=True)
@@ -49,6 +61,10 @@ class InactiveZMatrixTerm:
     angle_k_kj_mol_rad2: float
     torsion_barrier_kj_mol: float
     torsion_terms: tuple[tuple[int, float, float], ...]
+    branch_atoms: tuple[int, ...] = ()
+    hybrid_branch_atoms: tuple[int, ...] = ()
+    boundary_atoms: tuple[int, int] = ()
+    hybrid_boundary_atoms: tuple[int, int] = ()
 
 
 @dataclass(frozen=True)
@@ -462,6 +478,72 @@ def _torsion_barrier_kj_mol(terms):
     return float(np.max(energy) - np.min(energy))
 
 
+def _inactive_branch_components(molecule, selected, unique, endpoint):
+    """Return validated selected components and their unique mapped boundary."""
+    selected = set(selected)
+    if not selected:
+        return []
+    components = []
+    remaining = set(selected)
+    while remaining:
+        seed = min(remaining)
+        component = {seed}
+        stack = [seed]
+        remaining.remove(seed)
+        while stack:
+            atom = stack.pop()
+            for neighbor in molecule.GetAtomWithIdx(atom).GetNeighbors():
+                index = neighbor.GetIdx()
+                if index in remaining:
+                    remaining.remove(index)
+                    component.add(index)
+                    stack.append(index)
+
+        boundaries = []
+        for atom in component:
+            for bond in molecule.GetAtomWithIdx(atom).GetBonds():
+                neighbor = bond.GetOtherAtomIdx(atom)
+                if neighbor not in component:
+                    boundaries.append((atom, neighbor, bond))
+        if any(center in unique for _, center, _ in boundaries):
+            raise CovalentAlchemyError(
+                f"inactive bonded branch {sorted(component)} in endpoint {endpoint} "
+                "is a partial endpoint-unique branch; include all unique heavy atoms "
+                "up to its mapped attachment"
+            )
+        if len(boundaries) != 1:
+            raise CovalentAlchemyError(
+                f"inactive bonded branch {sorted(component)} in endpoint {endpoint} "
+                f"must have exactly one boundary bond; observed {len(boundaries)}"
+            )
+        root, center, boundary_bond = boundaries[0]
+        if boundary_bond.IsInRing():
+            raise CovalentAlchemyError(
+                f"inactive bonded branch {sorted(component)} in endpoint {endpoint} "
+                "crosses a ring boundary and is not supported"
+            )
+        components.append(
+            {
+                "atoms": tuple(sorted(component)),
+                "root": int(root),
+                "center": int(center),
+            }
+        )
+    return sorted(components, key=lambda item: item["atoms"])
+
+
+def _expand_inactive_branch_hydrogens(molecule, selected, unique):
+    """Include endpoint-unique hydrogens attached to explicitly selected atoms."""
+    expanded = set(selected)
+    for atom in sorted(unique):
+        atom_object = molecule.GetAtomWithIdx(atom)
+        if atom_object.GetAtomicNum() != 1:
+            continue
+        if any(neighbor.GetIdx() in expanded for neighbor in atom_object.GetNeighbors()):
+            expanded.add(atom)
+    return expanded
+
+
 def _select_inactive_z_matrix_terms(
     molecule,
     system,
@@ -469,10 +551,14 @@ def _select_inactive_z_matrix_terms(
     unique,
     mapping,
     endpoint,
+    components=None,
 ):
-    """Select one nonredundant bond-angle-torsion frame per terminal dummy."""
+    """Select one nonredundant junction frame per inactive branch."""
     if not selected:
         return {}
+    components = components or _inactive_branch_components(
+        molecule, selected, unique, endpoint
+    )
     angle_force = _source_force(system, mm.HarmonicAngleForce)
     torsion_force = _source_force(system, mm.PeriodicTorsionForce)
     if angle_force is None or torsion_force is None:
@@ -494,20 +580,9 @@ def _select_inactive_z_matrix_terms(
 
     canonical_ranks = list(Chem.CanonicalRankAtoms(molecule, breakTies=True))
     result = {}
-    for dummy in sorted(selected):
-        atom_d = molecule.GetAtomWithIdx(dummy)
-        neighbors = [atom.GetIdx() for atom in atom_d.GetNeighbors()]
-        if len(neighbors) != 1:
-            raise CovalentAlchemyError(
-                f"terminal_z_matrix atom {dummy} in endpoint {endpoint} must have "
-                "exactly one bonded neighbor"
-            )
-        center = neighbors[0]
-        if center in unique:
-            raise CovalentAlchemyError(
-                f"terminal_z_matrix atom {dummy} in endpoint {endpoint} must attach "
-                "directly to a mapped atom"
-            )
+    for component in components:
+        dummy = component["root"]
+        center = component["center"]
         candidates = []
         for atom_b_obj in molecule.GetAtomWithIdx(center).GetNeighbors():
             atom_b = atom_b_obj.GetIdx()
@@ -579,6 +654,10 @@ def _select_inactive_z_matrix_terms(
             ),
             torsion_barrier_kj_mol=barrier,
             torsion_terms=numeric_terms,
+            branch_atoms=component["atoms"],
+            hybrid_branch_atoms=tuple(mapping[atom] for atom in component["atoms"]),
+            boundary_atoms=(center, dummy),
+            hybrid_boundary_atoms=(mapping[center], mapping[dummy]),
         )
     return result
 
@@ -716,28 +795,32 @@ def _build_endpoint(
         selected_atoms = set(atoms) & selected
         if not selected_atoms:
             return base(atoms)
+        if selected_atoms == set(atoms):
+            return base(atoms)
         if len(selected_atoms) == 1:
             term = z_matrix.get(next(iter(selected_atoms)))
             if term is not None and (
                 atoms == term.angle_atoms or atoms[::-1] == term.angle_atoms
             ):
-                return 1.0
+                return base(atoms)
         return 0.0
 
     def local_torsion_scale(base, atoms, selected, z_matrix):
         selected_atoms = set(atoms) & selected
         if not selected_atoms:
             return base(atoms)
+        if selected_atoms == set(atoms):
+            return base(atoms)
         if len(selected_atoms) == 1:
             term = z_matrix.get(next(iter(selected_atoms)))
             if term is not None and _canonical_torsion(atoms) == _canonical_torsion(
                 term.torsion_atoms
             ):
-                return 1.0
+                return base(atoms)
         return 0.0
 
     def local_bond_scale(atoms, selected):
-        return 1.0 if any(atom in selected for atom in atoms) else dummy_bonded_scales.bond
+        return dummy_bonded_scales.bond
     if state == "a":
         _add_bonds(bonds, force_a_bond, map_a_to_hybrid, lambda _: True)
         _add_angles(angles, force_a_angle, map_a_to_hybrid, lambda _: True)
@@ -893,6 +976,68 @@ def vacuum_nonbonded_pair_counts(hybrid: CovalentHybridMolecule):
     }
 
 
+def inactive_z_matrix_metadata(hybrid: CovalentHybridMolecule):
+    """Serialize resolved inactive-branch frames for workflow provenance."""
+    return [
+        {
+            "endpoint": term.endpoint,
+            "dummy_atom_0based": term.dummy_atom,
+            "dummy_atom_1based": term.dummy_atom + 1,
+            "branch_atoms_0based": list(term.branch_atoms),
+            "branch_atoms_1based": [atom + 1 for atom in term.branch_atoms],
+            "boundary_atoms_0based": list(term.boundary_atoms),
+            "boundary_atoms_1based": [atom + 1 for atom in term.boundary_atoms],
+            "angle_atoms_0based": list(term.angle_atoms),
+            "angle_atoms_1based": [atom + 1 for atom in term.angle_atoms],
+            "torsion_atoms_0based": list(term.torsion_atoms),
+            "torsion_atoms_1based": [atom + 1 for atom in term.torsion_atoms],
+            "hybrid_dummy_atom_0based": term.hybrid_dummy_atom,
+            "hybrid_dummy_atom_1based": term.hybrid_dummy_atom + 1,
+            "hybrid_branch_atoms_0based": list(term.hybrid_branch_atoms),
+            "hybrid_boundary_atoms_0based": list(term.hybrid_boundary_atoms),
+            "hybrid_angle_atoms_0based": list(term.hybrid_angle_atoms),
+            "hybrid_torsion_atoms_0based": list(term.hybrid_torsion_atoms),
+            "angle_degrees": term.angle_degrees,
+            "angle_k_kj_mol_rad2": term.angle_k_kj_mol_rad2,
+            "torsion_barrier_kj_mol": term.torsion_barrier_kj_mol,
+            "torsion_terms": [
+                {
+                    "periodicity": periodicity,
+                    "phase_radians": phase,
+                    "k_kj_per_mol": k,
+                }
+                for periodicity, phase, k in term.torsion_terms
+            ],
+        }
+        for term in hybrid.inactive_z_matrix_terms
+    ]
+
+
+def inactive_branch_metadata(hybrid: CovalentHybridMolecule):
+    """Serialize validated inactive branch components for provenance."""
+    return [
+        {
+            "endpoint": component.endpoint,
+            "atoms_0based": list(component.atoms),
+            "atoms_1based": [atom + 1 for atom in component.atoms],
+            "root_atom_0based": component.root_atom,
+            "root_atom_1based": component.root_atom + 1,
+            "core_atom_0based": component.core_atom,
+            "core_atom_1based": component.core_atom + 1,
+            "boundary_atoms_0based": [
+                component.core_atom, component.root_atom
+            ],
+            "boundary_atoms_1based": [
+                component.core_atom + 1, component.root_atom + 1
+            ],
+            "hybrid_atoms_0based": list(component.hybrid_atoms),
+            "hybrid_root_atom_0based": component.hybrid_root_atom,
+            "hybrid_core_atom_0based": component.hybrid_core_atom,
+        }
+        for component in hybrid.inactive_branch_components
+    ]
+
+
 def build_covalent_hybrid_molecule(
     parameters_a: CovalentParameterBundle,
     parameters_b: CovalentParameterBundle,
@@ -957,6 +1102,18 @@ def build_covalent_hybrid_molecule(
         raise CovalentAlchemyError("inactive ligand-A bonded atoms must be endpoint-unique")
     if not inactive_bonded_atoms_b <= unique_b:
         raise CovalentAlchemyError("inactive ligand-B bonded atoms must be endpoint-unique")
+    inactive_bonded_atoms_a = _expand_inactive_branch_hydrogens(
+        molecule_a, inactive_bonded_atoms_a, unique_a
+    )
+    inactive_bonded_atoms_b = _expand_inactive_branch_hydrogens(
+        molecule_b, inactive_bonded_atoms_b, unique_b
+    )
+    inactive_components_a = _inactive_branch_components(
+        molecule_a, inactive_bonded_atoms_a, unique_a, "a"
+    )
+    inactive_components_b = _inactive_branch_components(
+        molecule_b, inactive_bonded_atoms_b, unique_b, "b"
+    )
     inactive_z_matrix_a = (
         _select_inactive_z_matrix_terms(
             molecule_a,
@@ -965,6 +1122,7 @@ def build_covalent_hybrid_molecule(
             unique_a,
             map_a_to_hybrid,
             "a",
+            inactive_components_a,
         )
         if inactive_bonded_geometry == "terminal_z_matrix"
         else {}
@@ -977,6 +1135,7 @@ def build_covalent_hybrid_molecule(
             unique_b,
             map_b_to_hybrid,
             "b",
+            inactive_components_b,
         )
         if inactive_bonded_geometry == "terminal_z_matrix"
         else {}
@@ -1041,6 +1200,22 @@ def build_covalent_hybrid_molecule(
         inactive_bonded_atoms_a=tuple(sorted(inactive_bonded_atoms_a)),
         inactive_bonded_atoms_b=tuple(sorted(inactive_bonded_atoms_b)),
         inactive_bonded_geometry=inactive_bonded_geometry,
+        inactive_branch_components=tuple(
+            InactiveBranchComponent(
+                endpoint=endpoint,
+                atoms=component["atoms"],
+                root_atom=component["root"],
+                core_atom=component["center"],
+                hybrid_atoms=tuple(mapping[atom] for atom in component["atoms"]),
+                hybrid_root_atom=mapping[component["root"]],
+                hybrid_core_atom=mapping[component["center"]],
+            )
+            for endpoint, components, mapping in (
+                ("a", inactive_components_a, map_a_to_hybrid),
+                ("b", inactive_components_b, map_b_to_hybrid),
+            )
+            for component in components
+        ),
         inactive_z_matrix_terms=tuple(
             inactive_z_matrix_a[index] for index in sorted(inactive_z_matrix_a)
         ) + tuple(

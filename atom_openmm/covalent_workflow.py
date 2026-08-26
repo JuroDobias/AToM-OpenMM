@@ -24,6 +24,8 @@ from atom_openmm.covalent_hybrid import (
     DummyBondedScales,
     build_covalent_hybrid_molecule,
     complete_covalent_atom_map,
+    inactive_branch_metadata,
+    inactive_z_matrix_metadata,
     normalize_mapping_aromaticity,
     vacuum_nonbonded_pair_counts,
 )
@@ -79,7 +81,10 @@ from atom_openmm.neqti import (
 from atom_openmm.neqti_integrator import ATMNonequilibriumLangevinIntegrator
 from atom_openmm.neqti_integrator import parameter_values_at_step
 from atom_openmm.rest2 import create_rest2_system
-from atom_openmm.rest2_exchange import REST2ExchangeSampler
+from atom_openmm.rest2_exchange import (
+    create_rest2_exchange_sampler,
+    normalize_rest2_sampler_backend,
+)
 from atom_openmm.workflow_schema import WorkflowAxesError, normalize_workflow_axes
 
 
@@ -626,6 +631,7 @@ def validate_covalent_workflow(path):
         raise CovalentWorkflowError("covalent endpoint equilibration tolerances and timesteps must be positive")
     rest2 = config["rest2"]
     if rest2["enabled"]:
+        backend = rest2.get("sampler_backend", "custom")
         if rest2["execution"] not in {"serial", "process"}:
             raise CovalentWorkflowError(
                 "REST2 execution must be 'serial' or 'process'"
@@ -634,6 +640,22 @@ def validate_covalent_workflow(path):
             rest2["device_indices"], list
         ):
             raise CovalentWorkflowError("REST2 device_indices must be a list")
+        if backend == "openmm_native":
+            if not hasattr(app, "ReplicaExchangeSampler"):
+                raise CovalentWorkflowError(
+                    "REST2 sampler_backend=openmm_native requires OpenMM 8.6 or newer"
+                )
+            if rest2["execution"] != "serial":
+                raise CovalentWorkflowError(
+                    "REST2 sampler_backend=openmm_native requires execution: serial"
+                )
+            if (
+                rest2["device_indices"] is not None
+                and len(rest2["device_indices"]) > 1
+            ):
+                raise CovalentWorkflowError(
+                    "REST2 sampler_backend=openmm_native accepts at most one device index"
+                )
         temperatures = rest2["effective_temperatures_k"]
         if len(temperatures) < 2 or temperatures[0] != config["temperature_k"]:
             raise CovalentWorkflowError(
@@ -1918,7 +1940,7 @@ def _sample_endpoint(
             1.0 / unit.picosecond,
             float(timestep_fs) * unit.femtosecond,
         )
-        sampler = REST2ExchangeSampler(
+        sampler = create_rest2_exchange_sampler(
             system=rest2.system,
             topology=topology,
             base_integrator=base_integrator,
@@ -3166,6 +3188,10 @@ def _normalized_settings(workflow):
     neqti = workflow.get("neqti") or {}
     equilibration = neqti.get("endpoint_equilibration") or {}
     rest2 = neqti.get("rest2") or {}
+    try:
+        rest2_sampler_backend = normalize_rest2_sampler_backend(rest2)
+    except ValueError as exc:
+        raise CovalentWorkflowError(f"workflow.neqti.rest2.{exc}") from exc
     softcore = neqti.get("softcore") or {}
     work_profile_raw = neqti.get("switch_work_profile") or {}
     optimization_raw = neqti.get("schedule_optimization") or {}
@@ -3472,6 +3498,7 @@ def _normalized_settings(workflow):
         ).lower(),
         "rest2": {
             "enabled": enabled,
+            "sampler_backend": rest2_sampler_backend,
             "effective_temperatures_k": [float(value) for value in temperatures],
             "exchange_interval_steps": int(rest2.get("exchange_interval_steps", 500)),
             "checkpoint_interval_cycles": int(rest2.get("checkpoint_interval_cycles", 10)),
@@ -4192,10 +4219,12 @@ def run_covalent_pair(settings, pair):
             "transmuted_pairs_0based": [
                 list(pair) for pair in hybrid.transmuted_pairs
             ],
-            "inactive_bonded_atoms_a_0based": list(
+            "inactive_bonded_atoms_a_0based": sorted(inactive_a),
+            "inactive_bonded_atoms_b_0based": sorted(inactive_b),
+            "resolved_inactive_bonded_atoms_a_0based": list(
                 hybrid.inactive_bonded_atoms_a
             ),
-            "inactive_bonded_atoms_b_0based": list(
+            "resolved_inactive_bonded_atoms_b_0based": list(
                 hybrid.inactive_bonded_atoms_b
             ),
             "inactive_bonded_geometry": hybrid.inactive_bonded_geometry,
@@ -4203,6 +4232,8 @@ def run_covalent_pair(settings, pair):
             "dummy_nonbonded": "full_unique_branch_vacuum",
             "dummy_core_nonbonded": config["dummy_core_nonbonded"],
             "vacuum_nonbonded_pair_counts": vacuum_nonbonded_pair_counts(hybrid),
+            "inactive_z_matrix_terms": inactive_z_matrix_metadata(hybrid),
+            "inactive_bonded_branches": inactive_branch_metadata(hybrid),
         }
         parameterization = {
             "ligand_a": parameters_a.provenance,

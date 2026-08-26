@@ -246,6 +246,7 @@ workflow:
     failed_switch_policy: count_as_infinite
     rest2:
       enabled: true
+      sampler_backend: custom
       solute: '#ligand:"*"'
       effective_temperatures_k: [300, 351, 411, 481, 563, 658, 770, 900]
       exchange_interval_steps: 500
@@ -285,6 +286,22 @@ For the example above, the execution order is:
 | `schedule_optimization` | Optional excluded pilot that redistributes a fixed total switch time among ATM schedule segments independently for the A and B legs. |
 | `convergence` | Optional per-cycle BAR overlap, bootstrap uncertainty, and estimate-stability stopping criteria. |
 
+`rest2.sampler_backend` is independent of `endpoint_system`:
+
+| Backend | Requirements and behavior |
+| --- | --- |
+| `custom` | Default. Uses neighboring synchronous exchanges and supports `execution: serial` or `process`. |
+| `openmm_native` | Requires OpenMM 8.6 or newer. Uses OpenMM's global replica-exchange sampler, including non-neighbor swaps, with `execution: serial` and at most one `device_indices` entry. |
+
+Both backends expose the same physical-state sampling interface. Native banks
+store post-exchange assignments and the pre-exchange assignments that identify
+which Hamiltonian generated each conformation. Resume restores coordinates,
+velocities, assignments, exchange RNG state, and round-trip counters. It is
+statistically reproducible but not guaranteed to be bitwise identical across an
+interruption. A bank created by one backend cannot be resumed by the other; use
+a new work directory or explicitly remove the old REST2 bank when changing
+backend.
+
 When `rest2.enabled: true`, the additional NEQTI sampling at A, M, and B uses a synchronous REST2 ladder instead of ordinary MD. `initial_equilibration_steps` and `decorrelation_steps` are steps per replica and must be divisible by `rest2.exchange_interval_steps`. All replicas use the physical thermostat temperature; the effective temperatures define REST2 Hamiltonian scales. `solute` accepts the selection syntax described below. Legacy `both_ligands` remains accepted and is equivalent to `'#ligand:"*"'`.
 
 REST2 coordinates can be recorded independently of the physical snapshots used
@@ -315,6 +332,7 @@ workflow:
     preparation_annealing_steps_per_segment: 10000
     rest2:
       enabled: true
+      sampler_backend: openmm_native
       ensembles: [a, b]
       solute: '#unbound:"*"'
       effective_temperatures_k: [300, 357, 424, 505, 600]
@@ -335,7 +353,7 @@ workflow:
 
 This mode retains the current convention: A has L1 bound and L2 unbound; B has L2 bound and L1 unbound. M uses ordinary ATM MD. After ATM M-to-A/B preparation annealing, endpoint coordinates are converted to role-aware physical systems. Site, orientation, alignment, and optional receptor-exclusion restraints follow the bound/unbound roles. Endpoint equilibration and REST2 run without `ATMForce`. Native positions are converted back to the canonical ATM representation only for A/B-to-M switching; box vectors and per-atom velocities are preserved.
 
-Native endpoint mode requires REST2, `rest2.ensembles: [a, b]`, and positive preparation annealing. Interleaved mode keeps both endpoint ladders resident for the full run. With five REST2 replicas this uses ten endpoint contexts plus one ATM context, so it is intended for high-memory GPUs such as the L40S. Batched mode keeps only one endpoint ladder resident and remains the lower-memory alternative.
+Native endpoint mode requires REST2, `rest2.ensembles: [a, b]`, and positive preparation annealing. Interleaved mode keeps both endpoint ladders resident for the full run. With the default custom backend and five REST2 replicas this uses ten endpoint contexts plus one ATM context, so it is intended for high-memory GPUs such as the L40S. The OpenMM-native sampler backend uses one context per active endpoint ladder. Batched mode keeps only one endpoint ladder resident and remains the lower-memory alternative.
 
 The physical `s=1` replica supplies positions, velocities, and box vectors for each NEQTI switch. Switching itself always uses `s=1`, so work values and BAR analysis retain the standard ATM Hamiltonian. Legacy ATM endpoint REST2 requires interleaved sampling. Native endpoint REST2 supports interleaved and batched sampling. Both require the common/variable-region ATM coordinate-swap setup.
 
@@ -419,6 +437,75 @@ switching system uses the heavier endpoint mass for every mapped particle and
 resamples velocities before each switch, so masses remain fixed during protocol
 work accumulation. This mapping mode currently supports NEQTI only.
 
+The same two geometry modes support complete multi-atom inactive branches. Each
+selected branch must be endpoint-unique, connected, and joined directly to the
+mapped core by exactly one non-ring bond. Endpoint-unique hydrogens attached to
+selected atoms are included automatically. Omitted unique heavy atoms, two core
+attachments, and ring-crossing selections are rejected.
+
+| Inactive bonded term | `bond_only` | `terminal_z_matrix` |
+| --- | --- | --- |
+| Inside the selected branch | Retained with configured dummy bonded scaling | Retained with configured dummy bonded scaling |
+| Branch/core boundary bond | Retained | Retained |
+| Mixed branch/core angles | Disabled | One deterministic root-frame angle retained |
+| Mixed proper torsions | Disabled | One complete root-frame Fourier group retained |
+| Mixed impropers and remaining mixed terms | Disabled | Disabled |
+
+Thus, `bond_only` means that only the bond is retained *across the branch
+boundary*; it does not remove internal angles or torsions from a multi-atom
+branch. `terminal_z_matrix` adds the minimum mapped-heavy-atom frame needed to
+localize the branch root. The resolved branch components, automatically included
+hydrogens, boundary bonds, reference atoms, and retained parameters are written
+to `hybrid_mapping.yaml` or `covalent_mapping.yaml`.
+
+One useful internal edit is amide N-substitution while preserving large mapped
+groups on both sides:
+
+```yaml
+workflow:
+  alchemy:
+    mapping:
+      method: paired_smarts_transmutation
+      ligand_a_smarts: "[c:1]-[NH:2]-[C:3](=[O:4])"
+      ligand_b_smarts: "[c:1]-[N:2](-[CH2:5]-[CH2:6]-[OH:7])-[C:3](=[O:4])"
+      inactive_bonded_labels:
+        ligand_b: [5, 6, 7]
+      inactive_bonded_geometry: bond_only
+```
+
+The hydroxyethyl branch keeps its internal bonds, angles, and torsions at the
+inactive A endpoint, but its junction angle, torsions, and impropers do not
+perturb the physical secondary-amide geometry. `terminal_z_matrix` can replace
+`bond_only` when free rotation of the inactive branch produces poor switching
+starting geometries.
+
+A planar-to-tetrahedral internal edit can similarly keep both ligand flanks
+mapped while selecting only the added branch:
+
+```yaml
+workflow:
+  alchemy:
+    mapping:
+      method: paired_smarts_transmutation
+      ligand_a_smarts: "[c:1]-[C:2](=[O:3])-[c:4]"
+      ligand_b_smarts: "[c:1]-[C:2]([OH:3])(-[CH2:5]-[OH:6])-[c:4]"
+      inactive_bonded_labels:
+        ligand_b: [5, 6]
+      inactive_bonded_geometry: terminal_z_matrix
+```
+
+At endpoint A, physical ketone terms control the common center. The inactive
+hydroxymethyl branch remains internally valid without applying the complete
+tetrahedral B geometry to that center. During switching, endpoint-B bonded and
+nonbonded terms are restored through the configured hybrid path.
+
+For a terminal substituent, duplicating the complete substituent is generally
+simpler and more conservative. Multi-atom inactive branches are primarily useful
+for local valence or geometry changes in the middle of a ligand, where duplicating
+one side of the edit would unnecessarily enlarge the alchemical region. Ring
+annulation, linker insertion between two mapped atoms, and other two-anchor
+changes require a different mapping or a dual-topology/ATM treatment.
+
 For a single edge, an external GUI may instead provide the complete intended
 atom map directly:
 
@@ -447,8 +534,9 @@ automatically, but explicitly requested pairs always take precedence. Input
 SDF/MOL files must contain explicit hydrogens when a requested pair references
 one. Element-changing pairs are detected as mapped-atom transmutations and
 currently require NEQTI. The optional inactive atom lists also use input-file
-indices and must identify endpoint-unique atoms. `terminal_z_matrix` requires at
-least one such atom. The mapping output records requested pairs, automatically
+indices and must identify complete endpoint-unique branches; attached unique
+hydrogens are included automatically. `terminal_z_matrix` requires at least one
+such branch. The mapping output records requested pairs, automatically
 completed hydrogen pairs, the final map, and detected transmutations separately.
 Explicit numeric maps are rejected for multi-edge workflows because atom indices
 are specific to one ligand pair.
@@ -1242,6 +1330,14 @@ barrier. `device_indices` may contain one device reused by every replica or one
 device index per replica. CUDA MPS can improve same-GPU process concurrency when
 it is available; checkpoint and exchange files are compatible between execution
 modes.
+
+Set `sampler_backend: openmm_native` with OpenMM 8.6+ to use OpenMM's native
+global replica exchange instead. This backend evaluates all thermodynamic states
+from one serial context and permits non-neighbor exchanges, so it can improve
+round trips while using less GPU memory, although its aggregate MD throughput may
+be lower. It does not support `execution: process` or multiple device indices.
+Native diagnostics report observed state transitions and round trips rather than
+proposal acceptance counters, which OpenMM does not expose.
 
 Covalent atom mapping defaults to `method: dataset_core`, which uses the prepared
 dataset scaffold to anchor a connected heavy-atom MCS through the

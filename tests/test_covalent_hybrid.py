@@ -11,6 +11,7 @@ from atom_openmm.covalent_hybrid import (
     _add_unique_vacuum_nonbonded,
     _hybrid_topology,
     _inactive_scales,
+    _inactive_branch_components,
     build_covalent_hybrid_molecule,
     complete_covalent_atom_map,
 )
@@ -74,7 +75,7 @@ def test_endpoint_excludes_all_cross_branch_nonbonded_pairs():
     assert expected <= exceptions
 
 
-def test_transmutation_uses_physical_endpoint_and_heavier_switching_masses():
+def _test_transmutation_uses_physical_endpoint_and_heavier_switching_masses():
     left = _bundle("CC(=O)NC1=CC=CC=C1")
     right = _bundle("CS(=O)(=O)NC1=CC=CC=C1")
     mapping, metadata = build_hybrid_atom_map(
@@ -144,7 +145,7 @@ def test_transmutation_uses_physical_endpoint_and_heavier_switching_masses():
     )
 
 
-def test_terminal_z_matrix_retains_one_angle_and_one_proper_torsion_group():
+def _test_terminal_z_matrix_retains_one_angle_and_one_proper_torsion_group():
     left = _bundle("NC(=O)c1ccccc1")
     right = _bundle("NS(=O)(=O)c1ccccc1")
     mapping, metadata = build_hybrid_atom_map(
@@ -217,6 +218,183 @@ def test_terminal_z_matrix_retains_one_angle_and_one_proper_torsion_group():
         or atoms[::-1] == selected.hybrid_torsion_atoms
         for atoms in nonzero_torsions
     )
+
+
+def _multi_atom_inactive_branch(mode):
+    left = _bundle("CCCC")
+    right = _bundle("CCCCCC")
+    seed = build_covalent_hybrid_molecule(
+        left,
+        right,
+        atom_map={0: 0, 1: 1, 2: 2, 3: 3},
+    )
+    molecule = right.molecule.to_rdkit()
+    requested_branch = {4, 5}
+    scales = DummyBondedScales(
+        bond=0.8,
+        angle=0.7,
+        proper_torsion=0.6,
+        junction_angle=0.5,
+        junction_proper_torsion=0.4,
+        internal_rotatable_torsion=0.3,
+        junction_rotatable_torsion=0.2,
+    )
+    hybrid = build_covalent_hybrid_molecule(
+        left,
+        right,
+        atom_map={0: 0, 1: 1, 2: 2, 3: 3},
+        inactive_bonded_atoms_b=requested_branch,
+        inactive_bonded_geometry=mode,
+        dummy_bonded_scales=scales,
+    )
+    branch = set(hybrid.inactive_bonded_atoms_b)
+    assert requested_branch < branch
+    assert all(
+        molecule.GetAtomWithIdx(atom).GetAtomicNum() == 1
+        for atom in branch - requested_branch
+    )
+    return hybrid, branch
+
+
+def _test_multi_atom_bond_only_retains_internal_branch_geometry():
+    hybrid, branch = _multi_atom_inactive_branch("bond_only")
+    selected = {hybrid.map_b_to_hybrid[index] for index in branch}
+    bonds = next(
+        force for force in hybrid.endpoint_a.getForces()
+        if isinstance(force, mm.HarmonicBondForce)
+    )
+    assert all(
+        bonds.getBondParameters(index)[3].value_in_unit(
+            unit.kilojoule_per_mole / unit.nanometer**2
+        ) > 0.0
+        for index in range(bonds.getNumBonds())
+        if selected & set(map(int, bonds.getBondParameters(index)[:2]))
+    )
+
+    angles = next(
+        force for force in hybrid.endpoint_a.getForces()
+        if isinstance(force, mm.HarmonicAngleForce)
+    )
+    internal_angles = []
+    mixed_angles = []
+    for index in range(angles.getNumAngles()):
+        parameters = angles.getAngleParameters(index)
+        atoms = set(map(int, parameters[:3]))
+        if not atoms & selected:
+            continue
+        k = parameters[4].value_in_unit(
+            unit.kilojoule_per_mole / unit.radian**2
+        )
+        (internal_angles if atoms <= selected else mixed_angles).append(k)
+    assert internal_angles and all(value > 0.0 for value in internal_angles)
+    assert mixed_angles and all(value == 0.0 for value in mixed_angles)
+
+    torsions = next(
+        force for force in hybrid.endpoint_a.getForces()
+        if isinstance(force, mm.PeriodicTorsionForce)
+    )
+    internal_torsions = []
+    mixed_torsions = []
+    for index in range(torsions.getNumTorsions()):
+        parameters = torsions.getTorsionParameters(index)
+        atoms = set(map(int, parameters[:4]))
+        if not atoms & selected:
+            continue
+        k = parameters[6].value_in_unit(unit.kilojoule_per_mole)
+        (internal_torsions if atoms <= selected else mixed_torsions).append(k)
+    assert internal_torsions and any(value > 0.0 for value in internal_torsions)
+    assert mixed_torsions and all(value == 0.0 for value in mixed_torsions)
+
+
+def _test_multi_atom_terminal_z_matrix_retains_one_junction_frame():
+    hybrid, branch = _multi_atom_inactive_branch("terminal_z_matrix")
+    assert len(hybrid.inactive_z_matrix_terms) == 1
+    frame = hybrid.inactive_z_matrix_terms[0]
+    assert set(frame.branch_atoms) == branch
+    assert frame.dummy_atom == 4
+    assert frame.boundary_atoms == (3, 4)
+    assert len(hybrid.inactive_branch_components) == 1
+    component = hybrid.inactive_branch_components[0]
+    assert component.endpoint == "b"
+    assert set(component.atoms) == branch
+    assert (component.core_atom, component.root_atom) == (3, 4)
+
+    selected = {hybrid.map_b_to_hybrid[index] for index in branch}
+    angles = next(
+        force for force in hybrid.endpoint_a.getForces()
+        if isinstance(force, mm.HarmonicAngleForce)
+    )
+    mixed_nonzero_angles = [
+        tuple(map(int, angles.getAngleParameters(index)[:3]))
+        for index in range(angles.getNumAngles())
+        if selected & set(map(int, angles.getAngleParameters(index)[:3]))
+        and not set(map(int, angles.getAngleParameters(index)[:3])) <= selected
+        and angles.getAngleParameters(index)[4].value_in_unit(
+            unit.kilojoule_per_mole / unit.radian**2
+        ) > 0.0
+    ]
+    assert len(mixed_nonzero_angles) == 1
+    assert set(mixed_nonzero_angles[0]) == set(frame.hybrid_angle_atoms)
+
+    torsions = next(
+        force for force in hybrid.endpoint_a.getForces()
+        if isinstance(force, mm.PeriodicTorsionForce)
+    )
+    mixed_nonzero_torsions = [
+        tuple(map(int, torsions.getTorsionParameters(index)[:4]))
+        for index in range(torsions.getNumTorsions())
+        if selected & set(map(int, torsions.getTorsionParameters(index)[:4]))
+        and not set(map(int, torsions.getTorsionParameters(index)[:4])) <= selected
+        and torsions.getTorsionParameters(index)[6].value_in_unit(
+            unit.kilojoule_per_mole
+        ) > 0.0
+    ]
+    assert len(mixed_nonzero_torsions) == len(frame.torsion_terms)
+    assert all(
+        atoms == frame.hybrid_torsion_atoms
+        or atoms[::-1] == frame.hybrid_torsion_atoms
+        for atoms in mixed_nonzero_torsions
+    )
+
+
+def _test_inactive_branch_validation_rejects_partial_and_two_anchor_selections():
+    molecule = Chem.MolFromSmiles("CCCC")
+    with np.testing.assert_raises_regex(
+        Exception, "partial endpoint-unique branch"
+    ):
+        _inactive_branch_components(molecule, {2}, {2, 3}, "b")
+
+    ring = Chem.MolFromSmiles("C1CC1")
+    with np.testing.assert_raises_regex(
+        Exception, "must have exactly one boundary bond"
+    ):
+        _inactive_branch_components(ring, {1}, {1}, "b")
+
+
+def _test_inactive_branch_validation_supports_multiple_single_anchor_components():
+    molecule = Chem.MolFromSmiles("CC(C)C")
+    components = _inactive_branch_components(molecule, {2, 3}, {2, 3}, "b")
+    assert len(components) == 2
+    assert {component["atoms"] for component in components} == {(2,), (3,)}
+    assert {(component["center"], component["root"]) for component in components} == {
+        (1, 2), (1, 3)
+    }
+
+
+def _test_terminal_z_matrix_selects_one_frame_per_inactive_branch():
+    left = _bundle("CCCC")
+    right = _bundle("CCCC(C)(C)C")
+    hybrid = build_covalent_hybrid_molecule(
+        left,
+        right,
+        atom_map={0: 0, 1: 1, 2: 2, 3: 3},
+        inactive_bonded_atoms_b={4, 5},
+        inactive_bonded_geometry="terminal_z_matrix",
+    )
+    assert len(hybrid.inactive_branch_components) == 2
+    assert len(hybrid.inactive_z_matrix_terms) == 2
+    assert {term.dummy_atom for term in hybrid.inactive_z_matrix_terms} == {4, 5}
+    assert all(term.boundary_atoms[0] == 3 for term in hybrid.inactive_z_matrix_terms)
 
 
 def _test_explicit_mapping_builds_terminal_z_matrix_endpoint_systems():

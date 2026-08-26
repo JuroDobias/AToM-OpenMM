@@ -16,6 +16,13 @@ torsion umbrellas. Exchanges use exact cross-evaluation of both configurations a
 both proposed REST scales. Only samples from the walker currently assigned to
 `s=1` enter the physical REST2 population.
 
+The validation and production workflows accept `rest2.sampler_backend: custom`
+or `openmm_native`. The latter requires OpenMM 8.6+ and uses its global
+`ReplicaExchangeSampler`, which can exchange non-neighboring states. Production
+keeps `custom` as the compatibility default; validation output identifies the
+backend and reports observed transitions when native proposal counters are not
+available.
+
 See `examples/REST2/1oiy-solvated` for pilot and production configurations.
 The `examples/REST2/tertiary-amide` stress test instead parameterizes an SDF
 with GAFF2/AM1-BCC and extends the REST ladder to 900 K for a high-barrier amide

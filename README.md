@@ -127,6 +127,7 @@ workflow:
     failed_switch_policy: count_as_infinite
     rest2:
       enabled: true
+      sampler_backend: custom  # or openmm_native with OpenMM 8.6+
       solute: '#ligand:"*"'
       effective_temperatures_k: [300, 351, 411, 481, 563, 658, 770, 900]
       exchange_interval_steps: 500
@@ -166,6 +167,13 @@ By default, ATM parameter switching and protocol-work accumulation run inside a 
 
 Optional NEQTI REST2 sampling replaces ordinary endpoint decorrelation with synchronous solute-tempering exchange. Its hot region can use role-aware SMARTS selectors such as `'#unbound:"*"'`; physical snapshots are taken only from the `s=1` replica, and all nonequilibrium switches remain at `s=1`. The existing equilibration and decorrelation counts are interpreted as steps per REST2 replica.
 
+`rest2.sampler_backend` selects the exchange engine independently of the endpoint
+Hamiltonian. `custom` remains the default and supports serial contexts or
+process workers. `openmm_native` uses OpenMM 8.6's global replica exchange,
+including non-neighbor state swaps, through one serial OpenMM context. Native
+sampler banks are deliberately incompatible with custom-sampler banks; start a
+new work directory when changing backend.
+
 Role-aware SMARTS leaves can also be embedded in Amber masks used by custom equilibration, for example `'!:HOH,WAT & #bound:"c1ncnc2ncnc12"'`. The RBFE guide defines the canonical ligand and endpoint role semantics. Diagnostic work intervals produce additional BAR estimates from the same switching trajectories; exact per-step work remains the primary result and the diagnostics do not reduce energy-evaluation cost.
 
 Experimental native endpoint sampling removes `ATMForce` from A/B equilibration and REST2 while retaining ATM for M and all switches. Select `endpoint_system: native` and `rest2.ensembles: [a, b]`. With `sampling_order: interleaved`, both endpoint REST2 ladders remain resident and adaptive pilot scheduling plus automatic convergence stopping are available. Use `sampling_order: batched` when GPU memory permits only one resident ladder. Endpoint ligand roles and restraints are exchanged consistently in B. Existing workflows continue to use ATM endpoints by default.
@@ -173,6 +181,13 @@ Experimental native endpoint sampling removes `ATMForce` from A/B equilibration 
 See the [RBFE user guide](docs/user-guide/rbfe.md) for the complete YAML schema, force-field examples, custom equilibration, restart behavior, outputs, and swapped-coordinate diagnostics.
 
 For a conventional noncovalent dual-topology comparison, use [`examples/RBFE/cdk2/workflow.hybrid.yaml`](examples/RBFE/cdk2/workflow.hybrid.yaml). It maps the ligands by MCS or SMARTS-constrained MCS, preserves inactive-branch intramolecular interactions, and combines complex and solvent BAR estimates. Hybrid NEQTI can independently select switching durations and stop production for the complex and solvent environments using per-environment overlap, uncertainty, and DG-stability criteria. The covalent hybrid-topology workflow is documented in [`examples/RBFE/covalent-rhino`](examples/RBFE/covalent-rhino).
+
+Mapped transmutations can mark a complete endpoint-unique branch with
+`inactive_bonded_atoms_*_0based` or paired-SMARTS labels. `bond_only` preserves
+the branch's internal bonded geometry while removing mixed branch/core angular
+terms; `terminal_z_matrix` additionally retains one deterministic junction angle
+and torsion frame. This is intended for local internal valence changes where
+duplicating a large downstream ligand region would be inefficient.
 
 Every ligand-pair directory also contains an atomically updated `result.yaml` for integration with workflow managers and databases. It uses the same schema for asynchronous replica exchange and NEQTI, reports DDG in kcal/mol and kJ/mol, records input provenance and artifacts, and exposes `prepared`, `running`, `partial`, `completed`, or `failed` status.
 

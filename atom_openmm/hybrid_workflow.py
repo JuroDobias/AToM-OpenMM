@@ -14,6 +14,8 @@ from openff.units import unit as offunit
 from atom_openmm.covalent_hybrid import (
     HybridBondedScales,
     build_hybrid_molecule,
+    inactive_branch_metadata,
+    inactive_z_matrix_metadata,
     vacuum_nonbonded_pair_counts,
 )
 from atom_openmm.covalent_softcore import resolve_softcore_path
@@ -558,33 +560,14 @@ def _prepare_pair(pair, receptor, workflow, workdir):
         ),
         inactive_bonded_geometry=mapping_payload["inactive_bonded_geometry"],
     )
-    mapping_payload["inactive_z_matrix_terms"] = [
-        {
-            "endpoint": term.endpoint,
-            "dummy_atom_0based": term.dummy_atom,
-            "dummy_atom_1based": term.dummy_atom + 1,
-            "angle_atoms_0based": list(term.angle_atoms),
-            "angle_atoms_1based": [atom + 1 for atom in term.angle_atoms],
-            "torsion_atoms_0based": list(term.torsion_atoms),
-            "torsion_atoms_1based": [atom + 1 for atom in term.torsion_atoms],
-            "hybrid_dummy_atom_0based": term.hybrid_dummy_atom,
-            "hybrid_dummy_atom_1based": term.hybrid_dummy_atom + 1,
-            "hybrid_angle_atoms_0based": list(term.hybrid_angle_atoms),
-            "hybrid_torsion_atoms_0based": list(term.hybrid_torsion_atoms),
-            "angle_degrees": term.angle_degrees,
-            "angle_k_kj_mol_rad2": term.angle_k_kj_mol_rad2,
-            "torsion_barrier_kj_mol": term.torsion_barrier_kj_mol,
-            "torsion_terms": [
-                {
-                    "periodicity": periodicity,
-                    "phase_radians": phase,
-                    "k_kj_per_mol": k,
-                }
-                for periodicity, phase, k in term.torsion_terms
-            ],
-        }
-        for term in hybrid.inactive_z_matrix_terms
-    ]
+    mapping_payload["inactive_z_matrix_terms"] = inactive_z_matrix_metadata(hybrid)
+    mapping_payload["inactive_bonded_branches"] = inactive_branch_metadata(hybrid)
+    mapping_payload["resolved_inactive_bonded_atoms_a_0based"] = list(
+        hybrid.inactive_bonded_atoms_a
+    )
+    mapping_payload["resolved_inactive_bonded_atoms_b_0based"] = list(
+        hybrid.inactive_bonded_atoms_b
+    )
     seed = int(setup.get("solvation_seed", _normalized_settings(workflow)["random_seed"]))
     physical_complex = create_physical_ligand_environment(
         parameters_a, receptor=receptor, setup=setup, solvation_seed=seed

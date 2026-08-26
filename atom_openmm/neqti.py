@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import openmm as mm
+import openmm.app as app
 import yaml
 from openmm.app import PDBFile
 from openmm.unit import kelvin, kilocalories_per_mole, kilojoules_per_mole, picosecond
@@ -32,7 +33,11 @@ from atom_openmm.neqti_endpoints import (
     write_converted_state,
 )
 from atom_openmm.rest2 import set_rest2_scale
-from atom_openmm.rest2_exchange import REST2ExchangeSampler
+from atom_openmm.rest2_exchange import (
+    create_rest2_exchange_sampler,
+    normalize_rest2_sampler_backend,
+    observed_transition_diagnostics,
+)
 
 
 KCAL_TO_KJ = 4.184
@@ -302,7 +307,13 @@ def normalize_neqti_options(workflow, atom_options):
     exchange_interval = int(rest2_raw.get("exchange_interval_steps", 500))
     checkpoint_interval = int(rest2_raw.get("checkpoint_interval_cycles", 10))
     rest2_execution = str(rest2_raw.get("execution", "serial"))
+    try:
+        rest2_sampler_backend = normalize_rest2_sampler_backend(rest2_raw)
+    except ValueError as exc:
+        raise NEQTIConfigError(f"workflow.neqti.rest2.{exc}") from exc
     rest2_device_indices = rest2_raw.get("device_indices")
+    if rest2_device_indices is not None and not isinstance(rest2_device_indices, list):
+        raise NEQTIConfigError("workflow.neqti.rest2.device_indices must be a list")
     solute = str(rest2_raw.get("solute", "both_ligands")).strip()
     if solute == "both_ligands":
         solute = '#ligand:"*"'
@@ -328,6 +339,22 @@ def normalize_neqti_options(workflow, atom_options):
             raise NEQTIConfigError("REST2 exchange and checkpoint intervals must be positive")
         if rest2_execution not in {"serial", "process"}:
             raise NEQTIConfigError("REST2 execution must be 'serial' or 'process'")
+        if rest2_sampler_backend == "openmm_native":
+            if not hasattr(app, "ReplicaExchangeSampler"):
+                raise NEQTIConfigError(
+                    "workflow.neqti.rest2.sampler_backend=openmm_native requires "
+                    "OpenMM 8.6 or newer"
+                )
+            if rest2_execution != "serial":
+                raise NEQTIConfigError(
+                    "workflow.neqti.rest2.sampler_backend=openmm_native requires "
+                    "execution: serial"
+                )
+            if rest2_device_indices is not None and len(rest2_device_indices) > 1:
+                raise NEQTIConfigError(
+                    "workflow.neqti.rest2.sampler_backend=openmm_native accepts "
+                    "at most one device index"
+                )
         for name, value in (
             ("initial_equilibration_steps", initial_steps),
             ("decorrelation_steps", decorrelation_steps),
@@ -351,6 +378,7 @@ def normalize_neqti_options(workflow, atom_options):
             )
     rest2 = {
         "enabled": rest2_enabled,
+        "sampler_backend": rest2_sampler_backend,
         "ensembles": rest2_ensembles,
         "solute": solute,
         "effective_temperatures_k": temperatures,
@@ -1273,6 +1301,9 @@ def summarize_existing_neqti_work(options, neqti_options, paths, *, bootstrap_sa
     rest2_summary = None
     if neqti_options.get("rest2", {}).get("enabled", False):
         rest2_summary = {
+            "sampler_backend": neqti_options["rest2"].get(
+                "sampler_backend", "custom"
+            ),
             "states": {},
             "sampled_ensembles": list(neqti_options["rest2"].get("ensembles", ["a", "m", "b"])),
         }
@@ -1281,6 +1312,7 @@ def summarize_existing_neqti_work(options, neqti_options, paths, *, bootstrap_sa
             if not metadata_path.exists():
                 continue
             metadata = json.loads(metadata_path.read_text())
+            backend = str(metadata.get("sampler_backend", "custom"))
             attempts = np.asarray(metadata.get("attempts", []), dtype=int)
             accepts = np.asarray(metadata.get("accepts", []), dtype=int)
             rates = np.divide(
@@ -1289,11 +1321,20 @@ def summarize_existing_neqti_work(options, neqti_options, paths, *, bootstrap_sa
             )
             rest2_summary["states"][ensemble] = {
                 "completed_cycles": int(metadata.get("cycle", 0)),
+                "sampler_backend": backend,
+                "openmm_version": metadata.get("openmm_version"),
                 "attempts": attempts.tolist(),
                 "accepts": accepts.tolist(),
                 "acceptance_rates": rates.tolist(),
                 "round_trips": [int(value) for value in metadata.get("round_trips", [])],
             }
+            if backend == "openmm_native":
+                rest2_summary["states"][ensemble]["exchange_diagnostics"] = (
+                    observed_transition_diagnostics(
+                        metadata_path.parent / "state_trace.csv",
+                        len(metadata.get("assignments", [])),
+                    )
+                )
         rest2_summary["effective_temperatures_k"] = neqti_options["rest2"]["effective_temperatures_k"]
         rest2_summary["exchange_interval_steps"] = neqti_options["rest2"]["exchange_interval_steps"]
         low_acceptance = []
@@ -1650,7 +1691,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
     native_endpoint_resources = {}
     if atm_rest2_enabled:
         set_rest2_scale(worker.context, 1.0, ommsystem.rest2_system)
-        rest2_sampler = REST2ExchangeSampler(
+        rest2_sampler = create_rest2_exchange_sampler(
             system=worker.system,
             topology=worker.topology,
             base_integrator=worker.equilibrium_integrator if use_custom_worker else worker.integrator,
@@ -1677,7 +1718,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                 native_system = create_native_endpoint_system(
                     ommsystem, ensemble, rest2=True, logger=logger
                 )
-                sampler = REST2ExchangeSampler(
+                sampler = create_rest2_exchange_sampler(
                     system=native_system.system,
                     topology=native_system.topology,
                     base_integrator=native_system.integrator,
@@ -1692,9 +1733,17 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
                     logger=logger,
                 )
                 native_endpoint_resources[ensemble] = (native_system, sampler)
+            backend = neqti_options["rest2"].get("sampler_backend", "custom")
+            contexts_per_ladder = (
+                1 if backend == "openmm_native"
+                else len(neqti_options["rest2"]["effective_temperatures_k"])
+            )
             logger.info(
-                "Native interleaved NEQTI initialized two resident REST2 ladders (%d contexts each) and one ATM worker context",
-                len(neqti_options["rest2"]["effective_temperatures_k"]),
+                "Native interleaved NEQTI initialized two resident REST2 ladders "
+                "(%d context%s each, sampler backend %s) and one ATM worker context",
+                contexts_per_ladder,
+                "" if contexts_per_ladder == 1 else "s",
+                backend,
             )
         except Exception as exc:
             for _system, sampler in native_endpoint_resources.values():
@@ -1869,7 +1918,7 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
         native_system = create_native_endpoint_system(
             ommsystem, ensemble, rest2=True, logger=logger
         )
-        sampler = REST2ExchangeSampler(
+        sampler = create_rest2_exchange_sampler(
             system=native_system.system,
             topology=native_system.topology,
             base_integrator=native_system.integrator,
