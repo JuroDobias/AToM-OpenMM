@@ -413,9 +413,10 @@ workflow:
       method: paired_smarts_transmutation
       ligand_a_smarts: "[c:1]-[C:2](=[O:3])-[NH:4]"
       ligand_b_smarts: "[c:1]-[S:2](=[O:3])(=[O:5])-[NH:4]"
-      inactive_bonded_labels:
-        ligand_b: [5]
-      inactive_bonded_geometry: terminal_z_matrix
+      junction_bonds:
+        ligand_b:
+          - mapping_labels: [2, 5]
+            inactive_geometry: terminal_z_matrix
   sampling:
     method: neqti
 ```
@@ -437,11 +438,14 @@ switching system uses the heavier endpoint mass for every mapped particle and
 resamples velocities before each switch, so masses remain fixed during protocol
 work accumulation. This mapping mode currently supports NEQTI only.
 
-The same two geometry modes support complete multi-atom inactive branches. Each
-selected branch must be endpoint-unique, connected, and joined directly to the
-mapped core by exactly one non-ring bond. Endpoint-unique hydrogens attached to
-selected atoms are included automatically. Omitted unique heavy atoms, two core
-attachments, and ring-crossing selections are rejected.
+The junction bond, rather than the branch atoms, is the canonical input. It can
+be selected by an ordered `[mapped_core, unique_branch_root]` atom pair, by two
+labels from the resolved paired SMARTS mapping, or by a separately supplied
+uniquely matching labeled SMARTS. The complete endpoint-unique branch and its
+hydrogens are derived automatically. Each junction must be a non-ring bond and
+must isolate one unique component. Omitted unique heavy atoms, two core
+attachments, overlapping junctions, and ambiguous SMARTS are rejected. Different
+junctions in one edge may independently use either geometry mode.
 
 | Inactive bonded term | `bond_only` | `terminal_z_matrix` |
 | --- | --- | --- |
@@ -520,8 +524,10 @@ workflow:
         - [0, 0]
         - [1, 1]
         - [2, 2]
-      inactive_bonded_atoms_b_0based: [12]
-      inactive_bonded_geometry: terminal_z_matrix
+      junction_bonds:
+        ligand_b:
+          - atoms_0based: [8, 12]
+            inactive_geometry: terminal_z_matrix
   sampling:
     method: neqti
 ```
@@ -533,13 +539,44 @@ Compatible hydrogens attached to mapped parent atoms are completed
 automatically, but explicitly requested pairs always take precedence. Input
 SDF/MOL files must contain explicit hydrogens when a requested pair references
 one. Element-changing pairs are detected as mapped-atom transmutations and
-currently require NEQTI. The optional inactive atom lists also use input-file
-indices and must identify complete endpoint-unique branches; attached unique
-hydrogens are included automatically. `terminal_z_matrix` requires at least one
-such branch. The mapping output records requested pairs, automatically
+currently require NEQTI. Legacy inactive atom lists remain accepted but cannot
+be combined with `junction_bonds`. The mapping output records requested pairs, automatically
 completed hydrogen pairs, the final map, and detected transmutations separately.
 Explicit numeric maps are rejected for multi-edge workflows because atom indices
 are specific to one ligand pair.
+
+### Forming and breaking one bond
+
+NEQTI can represent one bond that exists in only one endpoint when both bond
+atoms are explicitly mapped:
+
+```yaml
+workflow:
+  alchemy:
+    mapping:
+      method: explicit_pairs
+      pairs_0based: [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5]]
+      alchemical_bonds:
+        ligand_b:
+          - atoms_0based: [0, 5]
+            mode: soft_bond
+  sampling:
+    method: neqti
+  neqti:
+    softcore:
+      soft_bond_alpha_nm2: 100.0
+```
+
+This closes a six-atom chain at endpoint B. The connected endpoint uses its
+physical harmonic bond and the open endpoint has no closure bond. Intermediate
+states use a bounded soft-bond stretch potential; angles and torsions containing
+the closure bond follow the existing sterics path. The changing bond may join
+two mapped atoms or a mapped atom to an endpoint-unique annulation branch. It
+must be an unconstrained ring bond whose removal leaves the molecule connected.
+Initial support is limited to one changing bond, authoritative `explicit_pairs`,
+and NEQTI. Annulations are accepted only when opening the selected bond does not
+change unique-dummy exclusion or 1-4 classes. Multi-bond linker contractions and
+aromatic bond-order rearrangements remain unsupported.
 
 For large flexible transformations, `alchemy.dummy_core_nonbonded: retain`
 also preserves inactive unique-common electrostatics, Lennard-Jones terms,

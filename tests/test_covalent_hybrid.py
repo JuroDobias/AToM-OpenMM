@@ -75,6 +75,58 @@ def test_endpoint_excludes_all_cross_branch_nonbonded_pairs():
     assert expected <= exceptions
 
 
+def test_annulation_closure_is_absent_only_from_open_dummy_endpoint():
+    left = _bundle("c1ccccc1")
+    right = _bundle("c1ccc2c(c1)CCC2")
+    mapping, metadata = build_hybrid_atom_map(
+        left,
+        right,
+        {
+            "method": "explicit_pairs",
+            "pairs_0based": [[index, index] for index in range(6)],
+            "alchemical_bonds": {
+                "ligand_b": [{"atoms_0based": [3, 8], "mode": "soft_bond"}]
+            },
+        },
+    )
+    hybrid = build_covalent_hybrid_molecule(
+        left,
+        right,
+        atom_map=mapping,
+        alchemical_bonds_b={(3, 8)},
+    )
+    closure = tuple(sorted((hybrid.map_b_to_hybrid[3], hybrid.map_b_to_hybrid[8])))
+    anchor = tuple(sorted((hybrid.map_b_to_hybrid[4], hybrid.map_b_to_hybrid[6])))
+
+    def bonds(system):
+        force = next(
+            force for force in system.getForces()
+            if isinstance(force, mm.HarmonicBondForce)
+        )
+        return {
+            tuple(sorted(map(int, force.getBondParameters(index)[:2])))
+            for index in range(force.getNumBonds())
+        }
+
+    assert closure not in bonds(hybrid.endpoint_a)
+    assert closure in bonds(hybrid.endpoint_b)
+    assert anchor in bonds(hybrid.endpoint_a)
+    switching = create_softcore_hamiltonian(
+        hybrid.endpoint_a,
+        hybrid.endpoint_b,
+        [hybrid.map_a_to_hybrid[index] for index in hybrid.unique_a],
+        [hybrid.map_b_to_hybrid[index] for index in hybrid.unique_b],
+        total_steps=100,
+        path_mode="concerted",
+        soft_bond_pairs=[closure],
+    )
+    soft_bonds = next(
+        force for force in switching.system.getForces()
+        if force.getName() == "CovalentSoftBonds"
+    )
+    assert soft_bonds.getNumBonds() == 1
+
+
 def _test_transmutation_uses_physical_endpoint_and_heavier_switching_masses():
     left = _bundle("CC(=O)NC1=CC=CC=C1")
     right = _bundle("CS(=O)(=O)NC1=CC=CC=C1")

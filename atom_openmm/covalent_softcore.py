@@ -162,7 +162,14 @@ def _split_identical(left, right):
     return list(common.elements()), list(only_left.elements()), list(only_right.elements())
 
 
-def _add_bonded_forces(output, endpoint_a, endpoint_b):
+def _add_bonded_forces(
+    output,
+    endpoint_a,
+    endpoint_b,
+    *,
+    soft_bond_alpha_nm2=100.0,
+    soft_bond_pairs=(),
+):
     bond_a = _force(endpoint_a, mm.HarmonicBondForce)
     bond_b = _force(endpoint_b, mm.HarmonicBondForce)
     bonds_a = _bond_terms(bond_a)
@@ -174,16 +181,34 @@ def _add_bonded_forces(output, endpoint_a, endpoint_b):
     changed_bonds.addGlobalParameter(STERICS_PARAMETER, 0.0)
     for name in ("rA", "kA", "rB", "kB"):
         changed_bonds.addPerBondParameter(name)
+    soft_bonds = mm.CustomBondForce(
+        "0.5*(wA*kA*drA^2/(1+SOFT_BOND_ALPHA*(1-wA)*drA^2)"
+        "+wB*kB*drB^2/(1+SOFT_BOND_ALPHA*(1-wB)*drB^2));"
+        "wA=1-COVALENT_STERICS;wB=COVALENT_STERICS;"
+        "drA=r-rA;drB=r-rB"
+    )
+    soft_bonds.addGlobalParameter(STERICS_PARAMETER, 0.0)
+    soft_bonds.addGlobalParameter("SOFT_BOND_ALPHA", float(soft_bond_alpha_nm2))
+    for name in ("rA", "kA", "rB", "kB"):
+        soft_bonds.addPerBondParameter(name)
+    soft_bond_pairs = {tuple(sorted(pair)) for pair in soft_bond_pairs}
     for particles in sorted(set(bonds_a) | set(bonds_b)):
         value_a = bonds_a.get(particles)
         value_b = bonds_b.get(particles)
         if value_a == value_b:
             common_bonds.addBond(*particles, value_a[0], value_a[1])
-        else:
+        elif (
+            value_a is not None and value_b is not None
+        ) or particles not in soft_bond_pairs:
             fallback = value_a or value_b
             r_a, k_a = value_a or (fallback[0], 0.0)
             r_b, k_b = value_b or (fallback[0], 0.0)
             changed_bonds.addBond(*particles, [r_a, k_a, r_b, k_b])
+        else:
+            fallback = value_a or value_b
+            r_a, k_a = value_a or (fallback[0], 0.0)
+            r_b, k_b = value_b or (fallback[0], 0.0)
+            soft_bonds.addBond(*particles, [r_a, k_a, r_b, k_b])
     if common_bonds.getNumBonds():
         if bond_a is not None:
             _copy_force_metadata(bond_a, common_bonds)
@@ -192,6 +217,9 @@ def _add_bonded_forces(output, endpoint_a, endpoint_b):
     if changed_bonds.getNumBonds():
         changed_bonds.setName("CovalentInterpolatedBonds")
         output.addForce(changed_bonds)
+    if soft_bonds.getNumBonds():
+        soft_bonds.setName("CovalentSoftBonds")
+        output.addForce(soft_bonds)
 
     angle_a = _force(endpoint_a, mm.HarmonicAngleForce)
     angle_b = _force(endpoint_b, mm.HarmonicAngleForce)
@@ -1648,6 +1676,8 @@ def create_softcore_hamiltonian(
     ssc2_alpha_coul: float = 1.0,
     ssc2_beta_coul: float = 1.0,
     ssc2_switch_width_nm: float = 0.2,
+    soft_bond_alpha_nm2: float = 100.0,
+    soft_bond_pairs=(),
     charge_steps_per_stage: int = 10000,
     sterics_steps: int = 30000,
     subdivisions_per_stage: int = 1,
@@ -1691,6 +1721,8 @@ def create_softcore_hamiltonian(
         )
     if alpha <= 0.0 or sigma_nm <= 0.0 or power < 1:
         raise CovalentAlchemyError("softcore alpha, sigma_nm, and power must be positive")
+    if soft_bond_alpha_nm2 <= 0.0:
+        raise CovalentAlchemyError("soft_bond_alpha_nm2 must be positive")
     if (
         gapsys_scale_linpoint_lj <= 0.0
         or gapsys_scale_linpoint_q <= 0.0
@@ -1745,7 +1777,13 @@ def create_softcore_hamiltonian(
                 "Gapsys Coulomb requires complementary A/B charge schedules"
             )
     output = _system_shell(endpoint_a)
-    _add_bonded_forces(output, endpoint_a, endpoint_b)
+    _add_bonded_forces(
+        output,
+        endpoint_a,
+        endpoint_b,
+        soft_bond_alpha_nm2=soft_bond_alpha_nm2,
+        soft_bond_pairs=soft_bond_pairs,
+    )
     _add_nonbonded_forces(
         output,
         endpoint_a,

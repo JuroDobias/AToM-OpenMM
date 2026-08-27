@@ -40,6 +40,8 @@ from atom_openmm.hybrid_mapping import (
     _strict_explicit_pairs,
     _strict_nonnegative_indices,
     build_hybrid_atom_map,
+    normalize_junction_bonds,
+    normalize_alchemical_bonds,
 )
 from atom_openmm.hybrid_parameters import parameterize_ligand
 from atom_openmm.hybrid_systems import create_physical_ligand_environment
@@ -76,6 +78,35 @@ def _mapping_settings(workflow):
             "'paired_smarts_transmutation', or 'explicit_pairs'"
         )
     settings["method"] = method
+    if "alchemical_bonds" in settings:
+        if method != "explicit_pairs":
+            raise HybridWorkflowError(
+                "workflow.alchemy.mapping.alchemical_bonds initially require explicit_pairs"
+            )
+        try:
+            settings["alchemical_bonds"] = normalize_alchemical_bonds(
+                settings["alchemical_bonds"]
+            )
+        except ValueError as exc:
+            raise HybridWorkflowError(str(exc)) from exc
+    if "junction_bonds" in settings:
+        legacy = {
+            "inactive_bonded_labels",
+            "inactive_bonded_atoms_a_0based",
+            "inactive_bonded_atoms_b_0based",
+            "inactive_bonded_geometry",
+        }
+        if legacy & set(settings):
+            raise HybridWorkflowError(
+                "workflow.alchemy.mapping.junction_bonds cannot be combined with "
+                "legacy inactive_bonded_* settings"
+            )
+        try:
+            settings["junction_bonds"] = normalize_junction_bonds(
+                settings["junction_bonds"]
+            )
+        except ValueError as exc:
+            raise HybridWorkflowError(str(exc)) from exc
     if method == "mcs_core_smarts" and not settings.get("smarts"):
         raise HybridWorkflowError(
             "mcs_core_smarts requires workflow.alchemy.mapping.smarts"
@@ -122,7 +153,8 @@ def _mapping_settings(workflow):
         raise HybridWorkflowError(
             "explicit_pairs terminal_z_matrix requires at least one inactive bonded atom"
         )
-    settings["inactive_bonded_geometry"] = geometry
+    if "junction_bonds" not in settings:
+        settings["inactive_bonded_geometry"] = geometry
     if "max_mapped_rmsd_a" in settings:
         settings["max_mapped_rmsd_a"] = float(settings["max_mapped_rmsd_a"])
     return settings
@@ -136,11 +168,14 @@ def _formal_charge(path, *, allow_undefined_stereo=False):
 
 
 def _validate_mapping_sampling(mapping_payload, workflow):
-    if not mapping_payload.get("transmuted_pairs_0based"):
+    if not (
+        mapping_payload.get("transmuted_pairs_0based")
+        or mapping_payload.get("alchemical_bonds")
+    ):
         return
     if (workflow.get("sampling") or {}).get("method") != "neqti":
         raise HybridWorkflowError(
-            "mapped-atom element transmutations currently support only NEQTI sampling"
+            "mapped-atom transmutations and alchemical bonds currently support only NEQTI sampling"
         )
 
 
@@ -559,6 +594,20 @@ def _prepare_pair(pair, receptor, workflow, workdir):
             mapping_payload["inactive_bonded_atoms_b_0based"]
         ),
         inactive_bonded_geometry=mapping_payload["inactive_bonded_geometry"],
+        inactive_z_matrix_root_atoms_a=set(
+            mapping_payload["inactive_z_matrix_root_atoms_a_0based"]
+        ),
+        inactive_z_matrix_root_atoms_b=set(
+            mapping_payload["inactive_z_matrix_root_atoms_b_0based"]
+        ),
+        alchemical_bonds_a={
+            tuple(entry["atoms_0based"])
+            for entry in (mapping_payload.get("alchemical_bonds") or {}).get("ligand_a", [])
+        },
+        alchemical_bonds_b={
+            tuple(entry["atoms_0based"])
+            for entry in (mapping_payload.get("alchemical_bonds") or {}).get("ligand_b", [])
+        },
     )
     mapping_payload["inactive_z_matrix_terms"] = inactive_z_matrix_metadata(hybrid)
     mapping_payload["inactive_bonded_branches"] = inactive_branch_metadata(hybrid)
@@ -607,6 +656,17 @@ def _prepare_pair(pair, receptor, workflow, workdir):
     solvent_system.provenance["SELECTION_METADATA"] = selection_metadata
     complex_system.provenance["ENDPOINT_ELEMENTS"] = endpoint_elements
     solvent_system.provenance["ENDPOINT_ELEMENTS"] = endpoint_elements
+    for prepared in (complex_system, solvent_system):
+        pairs = []
+        for endpoint, selected in (
+            ("ligand_a", hybrid.alchemical_bonds_a),
+            ("ligand_b", hybrid.alchemical_bonds_b),
+        ):
+            indices = prepared.provenance[f"{endpoint}_system_atom_indices"]
+            pairs.extend(
+                [indices[atom1], indices[atom2]] for atom1, atom2 in selected
+            )
+        prepared.provenance["soft_bond_system_pairs"] = pairs
     _validate_prepared_endpoint_charges(complex_system, "complex")
     _validate_prepared_endpoint_charges(solvent_system, "solvent")
     manifest = {
@@ -616,6 +676,9 @@ def _prepare_pair(pair, receptor, workflow, workdir):
         "mapping": mapping_payload,
         "dummy_core_nonbonded": hybrid.dummy_core_nonbonded,
         "inactive_bonded_geometry": hybrid.inactive_bonded_geometry,
+        "soft_bond_system_pairs": complex_system.provenance[
+            "soft_bond_system_pairs"
+        ],
         "vacuum_nonbonded_pair_counts": vacuum_nonbonded_pair_counts(hybrid),
         "parameterization": {
             "ligand_a": parameters_a.provenance,

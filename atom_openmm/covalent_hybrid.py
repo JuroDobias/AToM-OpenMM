@@ -33,8 +33,12 @@ class CovalentHybridMolecule:
     inactive_bonded_atoms_a: tuple[int, ...] = ()
     inactive_bonded_atoms_b: tuple[int, ...] = ()
     inactive_bonded_geometry: str = "bond_only"
+    inactive_z_matrix_root_atoms_a: tuple[int, ...] = ()
+    inactive_z_matrix_root_atoms_b: tuple[int, ...] = ()
     inactive_branch_components: tuple["InactiveBranchComponent", ...] = ()
     inactive_z_matrix_terms: tuple["InactiveZMatrixTerm", ...] = ()
+    alchemical_bonds_a: tuple[tuple[int, int], ...] = ()
+    alchemical_bonds_b: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -104,6 +108,8 @@ def complete_covalent_atom_map(
     *,
     required_pairs: list[tuple[int, int]] | None = None,
     transmuted_pairs: set[tuple[int, int]] | None = None,
+    alchemical_bonds_a: set[tuple[int, int]] | None = None,
+    alchemical_bonds_b: set[tuple[int, int]] | None = None,
 ) -> dict[int, int]:
     """Complete mapped heavy atoms with compatible hydrogens and validate the map."""
     molecule_a = normalize_mapping_aromaticity(molecule_a)
@@ -111,6 +117,8 @@ def complete_covalent_atom_map(
     mapping = {int(atom_a): int(atom_b) for atom_a, atom_b in mapping.items()}
     required = set(required_pairs or [])
     transmuted = set(transmuted_pairs or ())
+    alchemical_bonds_a = {tuple(sorted(pair)) for pair in (alchemical_bonds_a or ())}
+    alchemical_bonds_b = {tuple(sorted(pair)) for pair in (alchemical_bonds_b or ())}
     if len(required) != len(required_pairs or ()):
         raise CovalentAlchemyError("required covalent atom pairs contain duplicates")
     if len(set(mapping.values())) != len(mapping):
@@ -178,7 +186,10 @@ def complete_covalent_atom_map(
             left.GetAtomicNum() != right.GetAtomicNum()
             or left.GetFormalCharge() != right.GetFormalCharge()
             or left.GetIsAromatic() != right.GetIsAromatic()
-            or left.IsInRing() != right.IsInRing()
+            or (
+                not (alchemical_bonds_a or alchemical_bonds_b)
+                and left.IsInRing() != right.IsInRing()
+            )
         ):
             raise CovalentAlchemyError(f"invalid mapped atom pair {atom_a}:{atom_b}")
 
@@ -199,8 +210,16 @@ def complete_covalent_atom_map(
             changed_atom = (atom_a, atom_b) in transmuted or (
                 other_a, other_b
             ) in transmuted
-            if bond_b is None or (
-                not changed_atom and _bond_signature(bond_a) != _bond_signature(bond_b)
+            allowed_missing = tuple(sorted((atom_a, other_a))) in alchemical_bonds_a
+            signature_a = _bond_signature(bond_a)
+            signature_b = _bond_signature(bond_b) if bond_b is not None else None
+            incompatible_signature = signature_a != signature_b
+            if (alchemical_bonds_a or alchemical_bonds_b) and signature_b is not None:
+                incompatible_signature = signature_a[:2] != signature_b[:2]
+            if (bond_b is None and not allowed_missing) or (
+                bond_b is not None
+                and not changed_atom
+                and incompatible_signature
             ):
                 raise CovalentAlchemyError(
                     f"mapped bond {atom_a}:{other_a} is incompatible with {atom_b}:{other_b}"
@@ -219,8 +238,16 @@ def complete_covalent_atom_map(
             changed_atom = (atom_a, atom_b) in transmuted or (
                 other_a, other_b
             ) in transmuted
-            if bond_a is None or (
-                not changed_atom and _bond_signature(bond_a) != _bond_signature(bond_b)
+            allowed_missing = tuple(sorted((atom_b, other_b))) in alchemical_bonds_b
+            signature_b = _bond_signature(bond_b)
+            signature_a = _bond_signature(bond_a) if bond_a is not None else None
+            incompatible_signature = signature_a != signature_b
+            if (alchemical_bonds_a or alchemical_bonds_b) and signature_a is not None:
+                incompatible_signature = signature_a[:2] != signature_b[:2]
+            if (bond_a is None and not allowed_missing) or (
+                bond_a is not None
+                and not changed_atom
+                and incompatible_signature
             ):
                 raise CovalentAlchemyError(
                     f"mapped bond {atom_b}:{other_b} is incompatible with {atom_a}:{other_a}"
@@ -352,6 +379,64 @@ def _source_force(system: mm.System, cls):
 
 def _mapped_indices(indices, mapping):
     return tuple(mapping[int(index)] for index in indices)
+
+
+def _term_contains_bond(atoms, selected_bonds):
+    """Return whether a sequential bonded term contains a selected bond."""
+    return any(
+        tuple(sorted((int(atom1), int(atom2)))) in selected_bonds
+        for atom1, atom2 in zip(atoms, atoms[1:])
+    )
+
+
+def _graph_distance_class(molecule, atom1, atom2, excluded_bonds=()):
+    """Classify a pair as 1-2, 1-3, 1-4, or longer after bond removal."""
+    excluded = {tuple(sorted(pair)) for pair in excluded_bonds}
+    pending = [(int(atom1), 0)]
+    visited = set()
+    while pending:
+        atom, distance = pending.pop(0)
+        if atom == atom2:
+            return min(distance, 4)
+        if atom in visited or distance >= 4:
+            continue
+        visited.add(atom)
+        for neighbor in molecule.GetAtomWithIdx(atom).GetNeighbors():
+            other = neighbor.GetIdx()
+            if tuple(sorted((atom, other))) not in excluded:
+                pending.append((other, distance + 1))
+    return 4
+
+
+def _validate_alchemical_bonds(molecule, selected_bonds, unique, endpoint):
+    """Validate the initial one-ring-bond topology-changing implementation."""
+    selected = {tuple(sorted(pair)) for pair in selected_bonds}
+    for atom1, atom2 in selected:
+        bond = molecule.GetBondBetweenAtoms(atom1, atom2)
+        if bond is None:
+            raise CovalentAlchemyError(
+                f"ligand-{endpoint} alchemical bond {atom1}:{atom2} does not exist"
+            )
+        if not bond.IsInRing():
+            raise CovalentAlchemyError(
+                f"ligand-{endpoint} alchemical bond {atom1}:{atom2} is not a ring bond"
+            )
+        editable = Chem.RWMol(molecule)
+        editable.RemoveBond(atom1, atom2)
+        if len(Chem.GetMolFrags(editable.GetMol())) != 1:
+            raise CovalentAlchemyError(
+                f"ligand-{endpoint} alchemical bond {atom1}:{atom2} disconnects the molecule"
+            )
+    unique = sorted(unique)
+    for offset, atom1 in enumerate(unique):
+        for atom2 in unique[offset + 1:]:
+            closed = _graph_distance_class(molecule, atom1, atom2)
+            opened = _graph_distance_class(molecule, atom1, atom2, selected)
+            if closed != opened and min(closed, opened) <= 3:
+                raise CovalentAlchemyError(
+                    f"ligand-{endpoint} alchemical bond changes the nonbonded exclusion "
+                    f"class of dummy atoms {atom1}:{atom2}; this topology is not yet supported"
+                )
 
 
 def _add_union_constraints(output, systems_and_maps):
@@ -552,6 +637,7 @@ def _select_inactive_z_matrix_terms(
     mapping,
     endpoint,
     components=None,
+    selected_roots=None,
 ):
     """Select one nonredundant junction frame per inactive branch."""
     if not selected:
@@ -582,6 +668,8 @@ def _select_inactive_z_matrix_terms(
     result = {}
     for component in components:
         dummy = component["root"]
+        if selected_roots is not None and dummy not in selected_roots:
+            continue
         center = component["center"]
         candidates = []
         for atom_b_obj in molecule.GetAtomWithIdx(center).GetNeighbors():
@@ -755,6 +843,8 @@ def _build_endpoint(
     inactive_bonded_atoms_b: set[int],
     inactive_z_matrix_a: dict[int, InactiveZMatrixTerm],
     inactive_z_matrix_b: dict[int, InactiveZMatrixTerm],
+    alchemical_bonds_a: set[tuple[int, int]],
+    alchemical_bonds_b: set[tuple[int, int]],
 ) -> mm.System:
     output = mm.System()
     reverse_a = {hybrid: atom for atom, hybrid in map_a_to_hybrid.items()}
@@ -825,7 +915,10 @@ def _build_endpoint(
         _add_bonds(bonds, force_a_bond, map_a_to_hybrid, lambda _: True)
         _add_angles(angles, force_a_angle, map_a_to_hybrid, lambda _: True)
         _add_torsions(torsions, force_a_torsion, map_a_to_hybrid, lambda _: True)
-        include = lambda atoms: any(i in unique_b for i in atoms)
+        include = lambda atoms: (
+            any(i in unique_b for i in atoms)
+            and not _term_contains_bond(atoms, alchemical_bonds_b)
+        )
         _add_bonds(bonds, force_b_bond, map_b_to_hybrid, include, lambda atoms: local_bond_scale(atoms, inactive_bonded_atoms_b))
         _add_angles(angles, force_b_angle, map_b_to_hybrid, include, lambda atoms: local_angle_scale(angle_scale_b, atoms, inactive_bonded_atoms_b, inactive_z_matrix_b))
         _add_torsions(torsions, force_b_torsion, map_b_to_hybrid, include, lambda atoms: local_torsion_scale(torsion_scale_b, atoms, inactive_bonded_atoms_b, inactive_z_matrix_b))
@@ -833,7 +926,10 @@ def _build_endpoint(
         _add_bonds(bonds, force_b_bond, map_b_to_hybrid, lambda _: True)
         _add_angles(angles, force_b_angle, map_b_to_hybrid, lambda _: True)
         _add_torsions(torsions, force_b_torsion, map_b_to_hybrid, lambda _: True)
-        include = lambda atoms: any(i in unique_a for i in atoms)
+        include = lambda atoms: (
+            any(i in unique_a for i in atoms)
+            and not _term_contains_bond(atoms, alchemical_bonds_a)
+        )
         _add_bonds(bonds, force_a_bond, map_a_to_hybrid, include, lambda atoms: local_bond_scale(atoms, inactive_bonded_atoms_a))
         _add_angles(angles, force_a_angle, map_a_to_hybrid, include, lambda atoms: local_angle_scale(angle_scale_a, atoms, inactive_bonded_atoms_a, inactive_z_matrix_a))
         _add_torsions(torsions, force_a_torsion, map_a_to_hybrid, include, lambda atoms: local_torsion_scale(torsion_scale_a, atoms, inactive_bonded_atoms_a, inactive_z_matrix_a))
@@ -1051,6 +1147,10 @@ def build_covalent_hybrid_molecule(
     inactive_bonded_atoms_a: set[int] | None = None,
     inactive_bonded_atoms_b: set[int] | None = None,
     inactive_bonded_geometry: str = "bond_only",
+    inactive_z_matrix_root_atoms_a: set[int] | None = None,
+    inactive_z_matrix_root_atoms_b: set[int] | None = None,
+    alchemical_bonds_a: set[tuple[int, int]] | None = None,
+    alchemical_bonds_b: set[tuple[int, int]] | None = None,
 ) -> CovalentHybridMolecule:
     molecule_a = _rdkit_molecule(parameters_a)
     molecule_b = _rdkit_molecule(parameters_b)
@@ -1061,6 +1161,8 @@ def build_covalent_hybrid_molecule(
             "dummy_core_nonbonded must be 'off' or 'retain'"
         )
     if atom_map is None:
+        if alchemical_bonds_a or alchemical_bonds_b:
+            raise CovalentAlchemyError("alchemical bonds require an explicit atom map")
         map_a_to_b = find_covalent_atom_map(
             molecule_a, molecule_b, required_pairs=required_pairs
         )
@@ -1071,13 +1173,17 @@ def build_covalent_hybrid_molecule(
             atom_map,
             required_pairs=required_pairs,
             transmuted_pairs=transmuted_pairs,
+            alchemical_bonds_a=alchemical_bonds_a,
+            alchemical_bonds_b=alchemical_bonds_b,
         )
     inactive_bonded_atoms_a = set(inactive_bonded_atoms_a or ())
     inactive_bonded_atoms_b = set(inactive_bonded_atoms_b or ())
+    inactive_z_matrix_root_atoms_a = set(inactive_z_matrix_root_atoms_a or ())
+    inactive_z_matrix_root_atoms_b = set(inactive_z_matrix_root_atoms_b or ())
     inactive_bonded_geometry = str(inactive_bonded_geometry).lower()
-    if inactive_bonded_geometry not in {"bond_only", "terminal_z_matrix"}:
+    if inactive_bonded_geometry not in {"bond_only", "terminal_z_matrix", "mixed"}:
         raise CovalentAlchemyError(
-            "inactive_bonded_geometry must be 'bond_only' or 'terminal_z_matrix'"
+            "inactive_bonded_geometry must be 'bond_only', 'terminal_z_matrix', or 'mixed'"
         )
     if attachment_pairs is not None:
         sulfur_pair, ligand_pair = attachment_pairs
@@ -1098,6 +1204,20 @@ def build_covalent_hybrid_molecule(
             next_index += 1
     unique_a = set(range(molecule_a.GetNumAtoms())) - set(map_a_to_b)
     unique_b = set(range(molecule_b.GetNumAtoms())) - set(map_a_to_b.values())
+    alchemical_bonds_a = {tuple(sorted(pair)) for pair in (alchemical_bonds_a or ())}
+    alchemical_bonds_b = {tuple(sorted(pair)) for pair in (alchemical_bonds_b or ())}
+    _validate_alchemical_bonds(molecule_a, alchemical_bonds_a, unique_a, "a")
+    _validate_alchemical_bonds(molecule_b, alchemical_bonds_b, unique_b, "b")
+    for source, selected in (
+        (parameters_a.system, alchemical_bonds_a),
+        (parameters_b.system, alchemical_bonds_b),
+    ):
+        constrained = {
+            tuple(sorted((int(source.getConstraintParameters(index)[0]), int(source.getConstraintParameters(index)[1]))))
+            for index in range(source.getNumConstraints())
+        }
+        if selected & constrained:
+            raise CovalentAlchemyError("alchemical bond must not be constrained")
     if not inactive_bonded_atoms_a <= unique_a:
         raise CovalentAlchemyError("inactive ligand-A bonded atoms must be endpoint-unique")
     if not inactive_bonded_atoms_b <= unique_b:
@@ -1114,6 +1234,15 @@ def build_covalent_hybrid_molecule(
     inactive_components_b = _inactive_branch_components(
         molecule_b, inactive_bonded_atoms_b, unique_b, "b"
     )
+    roots_a = {component["root"] for component in inactive_components_a}
+    roots_b = {component["root"] for component in inactive_components_b}
+    if inactive_bonded_geometry == "terminal_z_matrix":
+        inactive_z_matrix_root_atoms_a = roots_a
+        inactive_z_matrix_root_atoms_b = roots_b
+    if not inactive_z_matrix_root_atoms_a <= roots_a:
+        raise CovalentAlchemyError("ligand-A Z-matrix root is not an inactive junction root")
+    if not inactive_z_matrix_root_atoms_b <= roots_b:
+        raise CovalentAlchemyError("ligand-B Z-matrix root is not an inactive junction root")
     inactive_z_matrix_a = (
         _select_inactive_z_matrix_terms(
             molecule_a,
@@ -1123,8 +1252,9 @@ def build_covalent_hybrid_molecule(
             map_a_to_hybrid,
             "a",
             inactive_components_a,
+            inactive_z_matrix_root_atoms_a,
         )
-        if inactive_bonded_geometry == "terminal_z_matrix"
+        if inactive_z_matrix_root_atoms_a
         else {}
     )
     inactive_z_matrix_b = (
@@ -1136,8 +1266,9 @@ def build_covalent_hybrid_molecule(
             map_b_to_hybrid,
             "b",
             inactive_components_b,
+            inactive_z_matrix_root_atoms_b,
         )
-        if inactive_bonded_geometry == "terminal_z_matrix"
+        if inactive_z_matrix_root_atoms_b
         else {}
     )
     endpoint_a = _build_endpoint(
@@ -1156,6 +1287,8 @@ def build_covalent_hybrid_molecule(
         inactive_bonded_atoms_b,
         inactive_z_matrix_a,
         inactive_z_matrix_b,
+        alchemical_bonds_a,
+        alchemical_bonds_b,
     )
     endpoint_b = _build_endpoint(
         parameters_a.system,
@@ -1173,6 +1306,8 @@ def build_covalent_hybrid_molecule(
         inactive_bonded_atoms_b,
         inactive_z_matrix_a,
         inactive_z_matrix_b,
+        alchemical_bonds_a,
+        alchemical_bonds_b,
     )
     positions = np.zeros((next_index, 3), dtype=float)
     conformer_a = molecule_a.GetConformer()
@@ -1200,6 +1335,8 @@ def build_covalent_hybrid_molecule(
         inactive_bonded_atoms_a=tuple(sorted(inactive_bonded_atoms_a)),
         inactive_bonded_atoms_b=tuple(sorted(inactive_bonded_atoms_b)),
         inactive_bonded_geometry=inactive_bonded_geometry,
+        inactive_z_matrix_root_atoms_a=tuple(sorted(inactive_z_matrix_root_atoms_a)),
+        inactive_z_matrix_root_atoms_b=tuple(sorted(inactive_z_matrix_root_atoms_b)),
         inactive_branch_components=tuple(
             InactiveBranchComponent(
                 endpoint=endpoint,
@@ -1221,6 +1358,8 @@ def build_covalent_hybrid_molecule(
         ) + tuple(
             inactive_z_matrix_b[index] for index in sorted(inactive_z_matrix_b)
         ),
+        alchemical_bonds_a=tuple(sorted(alchemical_bonds_a)),
+        alchemical_bonds_b=tuple(sorted(alchemical_bonds_b)),
     )
 
 

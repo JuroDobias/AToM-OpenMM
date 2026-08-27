@@ -6,6 +6,7 @@ from rdkit.Chem import rdFMCS
 
 from atom_openmm.covalent_alchemy import CovalentAlchemyError
 from atom_openmm.covalent_hybrid import (
+    _inactive_branch_components,
     complete_covalent_atom_map,
     find_covalent_atom_map,
     normalize_mapping_aromaticity,
@@ -13,6 +14,7 @@ from atom_openmm.covalent_hybrid import (
 
 
 HybridMappingError = CovalentAlchemyError
+INACTIVE_GEOMETRIES = {"bond_only", "terminal_z_matrix"}
 
 
 def _strict_nonnegative_indices(raw, field, *, allow_empty=True):
@@ -53,6 +55,238 @@ def _strict_explicit_pairs(raw_pairs):
     ) != len(pairs):
         raise HybridMappingError("explicit_pairs atom map must be one-to-one")
     return pairs
+
+
+def normalize_junction_bonds(raw):
+    """Validate the public per-endpoint junction selector structure."""
+    if raw is None:
+        return {"ligand_a": [], "ligand_b": []}
+    if not isinstance(raw, dict) or set(raw) - {"ligand_a", "ligand_b"}:
+        raise HybridMappingError(
+            "junction_bonds must contain only ligand_a and ligand_b lists"
+        )
+    normalized = {"ligand_a": [], "ligand_b": []}
+    for endpoint in normalized:
+        entries = raw.get(endpoint, [])
+        if not isinstance(entries, list):
+            raise HybridMappingError(f"junction_bonds.{endpoint} must be a list")
+        for position, entry in enumerate(entries, start=1):
+            field = f"junction_bonds.{endpoint} entry {position}"
+            if not isinstance(entry, dict):
+                raise HybridMappingError(f"{field} must be a mapping")
+            allowed = {
+                "atoms_0based",
+                "mapping_labels",
+                "smarts",
+                "bond_labels",
+                "inactive_geometry",
+            }
+            if set(entry) - allowed:
+                raise HybridMappingError(f"{field} contains unsupported fields")
+            geometry = str(entry.get("inactive_geometry", "bond_only")).lower()
+            if geometry not in INACTIVE_GEOMETRIES:
+                raise HybridMappingError(
+                    f"{field} inactive_geometry must be 'bond_only' or "
+                    "'terminal_z_matrix'"
+                )
+            has_atoms = "atoms_0based" in entry
+            has_smarts = "smarts" in entry or "bond_labels" in entry
+            has_mapping_labels = "mapping_labels" in entry
+            if sum((has_atoms, has_smarts, has_mapping_labels)) != 1:
+                raise HybridMappingError(
+                    f"{field} must define exactly one of atoms_0based, "
+                    "mapping_labels, or smarts with bond_labels"
+                )
+            if has_atoms:
+                atoms = entry["atoms_0based"]
+                if (
+                    not isinstance(atoms, (list, tuple))
+                    or len(atoms) != 2
+                    or any(type(value) is not int or value < 0 for value in atoms)
+                    or atoms[0] == atoms[1]
+                ):
+                    raise HybridMappingError(
+                        f"{field} atoms_0based must be two distinct non-negative integers"
+                    )
+                normalized[endpoint].append(
+                    {"atoms_0based": list(atoms), "inactive_geometry": geometry}
+                )
+            elif has_mapping_labels:
+                labels = entry["mapping_labels"]
+                if (
+                    not isinstance(labels, (list, tuple))
+                    or len(labels) != 2
+                    or any(type(value) is not int or value <= 0 for value in labels)
+                    or labels[0] == labels[1]
+                ):
+                    raise HybridMappingError(
+                        f"{field} mapping_labels must contain two distinct positive integers"
+                    )
+                normalized[endpoint].append(
+                    {"mapping_labels": list(labels), "inactive_geometry": geometry}
+                )
+            else:
+                smarts = entry.get("smarts")
+                labels = entry.get("bond_labels")
+                query = Chem.MolFromSmarts(str(smarts or ""))
+                if query is None:
+                    raise HybridMappingError(f"{field} smarts is invalid")
+                mapped_labels = _mapped_smarts_labels(query, f"{field} smarts")
+                if (
+                    not isinstance(labels, (list, tuple))
+                    or len(labels) != 2
+                    or any(type(value) is not int or value <= 0 for value in labels)
+                    or labels[0] == labels[1]
+                    or any(value not in mapped_labels for value in labels)
+                ):
+                    raise HybridMappingError(
+                        f"{field} bond_labels must identify two distinct SMARTS labels"
+                    )
+                normalized[endpoint].append(
+                    {
+                        "smarts": str(smarts),
+                        "bond_labels": list(labels),
+                        "inactive_geometry": geometry,
+                    }
+                )
+    return normalized
+
+
+def normalize_alchemical_bonds(raw):
+    """Validate one endpoint-specific bond for initial soft-bond support."""
+    if raw is None:
+        return {"ligand_a": [], "ligand_b": []}
+    if not isinstance(raw, dict) or set(raw) - {"ligand_a", "ligand_b"}:
+        raise HybridMappingError(
+            "alchemical_bonds must contain only ligand_a and ligand_b lists"
+        )
+    normalized = {"ligand_a": [], "ligand_b": []}
+    count = 0
+    for endpoint in normalized:
+        entries = raw.get(endpoint, [])
+        if not isinstance(entries, list):
+            raise HybridMappingError(f"alchemical_bonds.{endpoint} must be a list")
+        for position, entry in enumerate(entries, start=1):
+            field = f"alchemical_bonds.{endpoint} entry {position}"
+            if not isinstance(entry, dict) or set(entry) - {"atoms_0based", "mode"}:
+                raise HybridMappingError(
+                    f"{field} must contain atoms_0based and optional mode"
+                )
+            atoms = entry.get("atoms_0based")
+            if (
+                not isinstance(atoms, (list, tuple))
+                or len(atoms) != 2
+                or any(type(value) is not int or value < 0 for value in atoms)
+                or atoms[0] == atoms[1]
+            ):
+                raise HybridMappingError(
+                    f"{field} atoms_0based must be two distinct non-negative integers"
+                )
+            if str(entry.get("mode", "soft_bond")).lower() != "soft_bond":
+                raise HybridMappingError(f"{field} mode must be 'soft_bond'")
+            normalized[endpoint].append(
+                {"atoms_0based": list(atoms), "mode": "soft_bond"}
+            )
+            count += 1
+    if count > 1:
+        raise HybridMappingError("initial soft-bond support allows one changing bond per edge")
+    return normalized
+
+
+def _resolve_junction_selector(molecule, entry, endpoint, matched_labels=None):
+    if "atoms_0based" in entry:
+        return tuple(entry["atoms_0based"])
+    if "mapping_labels" in entry:
+        matched_labels = matched_labels or {}
+        if any(label not in matched_labels for label in entry["mapping_labels"]):
+            raise HybridMappingError(
+                f"junction_bonds.{endpoint} mapping_labels are not present in the "
+                "resolved paired SMARTS match"
+            )
+        return tuple(matched_labels[label] for label in entry["mapping_labels"])
+    query = Chem.MolFromSmarts(entry["smarts"])
+    labels = _mapped_smarts_labels(query, f"junction_bonds.{endpoint} smarts")
+    label_a, label_b = entry["bond_labels"]
+    matches = molecule.GetSubstructMatches(query, uniquify=False, useChirality=True)
+    pairs = {
+        (int(match[labels[label_a]]), int(match[labels[label_b]]))
+        for match in matches
+    }
+    if len(pairs) != 1:
+        raise HybridMappingError(
+            f"junction_bonds.{endpoint} SMARTS must resolve to exactly one ordered "
+            f"bond; observed {len(pairs)}"
+        )
+    return next(iter(pairs))
+
+
+def _resolve_junction_bonds(
+    molecule, mapping_atoms, entries, endpoint, matched_labels=None
+):
+    unique = set(range(molecule.GetNumAtoms())) - set(mapping_atoms)
+    selected = set()
+    z_matrix_roots = set()
+    resolved = []
+    seen = set()
+    for entry in entries:
+        core, root = _resolve_junction_selector(
+            molecule, entry, endpoint, matched_labels
+        )
+        if core >= molecule.GetNumAtoms() or root >= molecule.GetNumAtoms():
+            raise HybridMappingError(
+                f"junction_bonds.{endpoint} atom is outside the molecule"
+            )
+        bond = molecule.GetBondBetweenAtoms(core, root)
+        if bond is None:
+            raise HybridMappingError(
+                f"junction_bonds.{endpoint} atoms {core}:{root} are not bonded"
+            )
+        if bond.IsInRing():
+            raise HybridMappingError(
+                f"junction_bonds.{endpoint} atoms {core}:{root} form a ring bond"
+            )
+        if core not in mapping_atoms or root not in unique:
+            raise HybridMappingError(
+                f"junction_bonds.{endpoint} atoms must be ordered [mapped core, "
+                "endpoint-unique branch root]"
+            )
+        pending = [root]
+        component = set()
+        while pending:
+            atom = pending.pop()
+            if atom in component:
+                continue
+            component.add(atom)
+            pending.extend(
+                neighbor.GetIdx()
+                for neighbor in molecule.GetAtomWithIdx(atom).GetNeighbors()
+                if neighbor.GetIdx() != core and neighbor.GetIdx() not in component
+            )
+        if not component <= unique:
+            raise HybridMappingError(
+                f"junction_bonds.{endpoint} {core}:{root} does not isolate an "
+                "endpoint-unique branch"
+            )
+        key = (core, root)
+        if key in seen or selected & component:
+            raise HybridMappingError(
+                f"junction_bonds.{endpoint} contains a duplicate or overlapping branch"
+            )
+        seen.add(key)
+        selected.update(component)
+        geometry = entry["inactive_geometry"]
+        if geometry == "terminal_z_matrix":
+            z_matrix_roots.add(root)
+        resolved.append(
+            {
+                "endpoint": endpoint[-1],
+                "boundary_atoms_0based": [core, root],
+                "branch_atoms_0based": sorted(component),
+                "inactive_geometry": geometry,
+                "selector": dict(entry),
+            }
+        )
+    return selected, z_matrix_roots, resolved
 
 
 def _direct_rmsd(molecule_a, molecule_b, mapping):
@@ -212,13 +446,47 @@ def _explicit_pairs_map(molecule_a, molecule_b, settings):
     }
     requested_pairs = tuple(pairs)
     requested = set(requested_pairs)
+    alchemical = normalize_alchemical_bonds(settings.get("alchemical_bonds"))
+    alchemical_a = {
+        tuple(sorted(entry["atoms_0based"])) for entry in alchemical["ligand_a"]
+    }
+    alchemical_b = {
+        tuple(sorted(entry["atoms_0based"])) for entry in alchemical["ligand_b"]
+    }
     mapping = complete_covalent_atom_map(
         molecule_a,
         molecule_b,
         mapping,
         required_pairs=pairs,
         transmuted_pairs=transmuted,
+        alchemical_bonds_a=alchemical_a,
+        alchemical_bonds_b=alchemical_b,
     )
+    reverse_mapping = {atom_b: atom_a for atom_a, atom_b in mapping.items()}
+    for endpoint, selected in (("ligand_a", alchemical_a), ("ligand_b", alchemical_b)):
+        molecule = molecule_a if endpoint == "ligand_a" else molecule_b
+        other = molecule_b if endpoint == "ligand_a" else molecule_a
+        endpoint_mapping = mapping if endpoint == "ligand_a" else reverse_mapping
+        for atom1, atom2 in selected:
+            if atom1 >= molecule.GetNumAtoms() or atom2 >= molecule.GetNumAtoms():
+                raise HybridMappingError(
+                    f"alchemical_bonds.{endpoint} atom is outside the molecule"
+                )
+            if molecule.GetBondBetweenAtoms(atom1, atom2) is None:
+                raise HybridMappingError(
+                    f"alchemical_bonds.{endpoint} selected bond does not exist"
+                )
+            mapped = [atom in endpoint_mapping for atom in (atom1, atom2)]
+            if not any(mapped):
+                raise HybridMappingError(
+                    f"alchemical_bonds.{endpoint} must contain at least one mapped atom"
+                )
+            if all(mapped) and other.GetBondBetweenAtoms(
+                endpoint_mapping[atom1], endpoint_mapping[atom2]
+            ) is not None:
+                raise HybridMappingError(
+                    f"alchemical_bonds.{endpoint} counterpart must be absent in the other ligand"
+                )
     if any(atom >= molecule_a.GetNumAtoms() for atom in inactive_a):
         raise HybridMappingError(
             "explicit_pairs inactive ligand-A atom is outside the molecule"
@@ -311,6 +579,67 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
         inactive_b = set()
         matched_labels_a = {}
         matched_labels_b = {}
+    alchemical_bonds = normalize_alchemical_bonds(settings.get("alchemical_bonds"))
+    if settings.get("alchemical_bonds") is not None and method != "explicit_pairs":
+        raise HybridMappingError(
+            "alchemical_bonds initially require mapping.method explicit_pairs"
+        )
+    raw_junctions = settings.get("junction_bonds")
+    legacy_requested = bool(
+        settings.get("inactive_bonded_labels")
+        or settings.get("inactive_bonded_atoms_a_0based")
+        or settings.get("inactive_bonded_atoms_b_0based")
+        or "inactive_bonded_geometry" in settings
+    )
+    if raw_junctions is not None and legacy_requested:
+        raise HybridMappingError(
+            "junction_bonds cannot be combined with legacy inactive_bonded_* settings"
+        )
+    junction_settings = normalize_junction_bonds(raw_junctions)
+    resolved_junctions = []
+    z_matrix_roots_a = set()
+    z_matrix_roots_b = set()
+    if raw_junctions is not None:
+        inactive_a, z_matrix_roots_a, resolved_a = _resolve_junction_bonds(
+            molecule_a,
+            set(mapping),
+            junction_settings["ligand_a"],
+            "ligand_a",
+            matched_labels_a,
+        )
+        inactive_b, z_matrix_roots_b, resolved_b = _resolve_junction_bonds(
+            molecule_b,
+            set(mapping.values()),
+            junction_settings["ligand_b"],
+            "ligand_b",
+            matched_labels_b,
+        )
+        resolved_junctions = resolved_a + resolved_b
+    else:
+        geometry = str(settings.get("inactive_bonded_geometry", "bond_only")).lower()
+        components_a = _inactive_branch_components(
+            molecule_a, inactive_a, set(range(molecule_a.GetNumAtoms())) - set(mapping), "a"
+        )
+        components_b = _inactive_branch_components(
+            molecule_b,
+            inactive_b,
+            set(range(molecule_b.GetNumAtoms())) - set(mapping.values()),
+            "b",
+        )
+        if geometry == "terminal_z_matrix":
+            z_matrix_roots_a = {component["root"] for component in components_a}
+            z_matrix_roots_b = {component["root"] for component in components_b}
+        resolved_junctions = [
+            {
+                "endpoint": endpoint,
+                "boundary_atoms_0based": [component["center"], component["root"]],
+                "branch_atoms_0based": list(component["atoms"]),
+                "inactive_geometry": geometry,
+                "selector": {"legacy_inactive_atoms_0based": list(component["atoms"])},
+            }
+            for endpoint, components in (("a", components_a), ("b", components_b))
+            for component in components
+        ]
     rmsd = _direct_rmsd(molecule_a, molecule_b, mapping)
     maximum = settings.get("max_mapped_rmsd_a")
     if maximum is not None and rmsd > float(maximum):
@@ -318,7 +647,7 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
             f"mapped ligand RMSD {rmsd:.3f} A exceeds max_mapped_rmsd_a {float(maximum):.3f} A"
         )
     return mapping, {
-        "schema_version": 2,
+        "schema_version": 3,
         "aromaticity_model": "rdkit",
         "aromatic_atom_count_before": aromatic_before,
         "aromatic_atom_count_after": aromatic_after,
@@ -337,8 +666,17 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
         "inactive_bonded_atoms_a_0based": sorted(inactive_a),
         "inactive_bonded_atoms_b_0based": sorted(inactive_b),
         "inactive_bonded_geometry": str(
-            settings.get("inactive_bonded_geometry", "bond_only")
+            settings.get("inactive_bonded_geometry", "mixed" if len({
+                entry["inactive_geometry"] for entry in resolved_junctions
+            }) > 1 else (
+                resolved_junctions[0]["inactive_geometry"] if resolved_junctions else "bond_only"
+            ))
         ).lower(),
+        "junction_bonds": junction_settings if raw_junctions is not None else None,
+        "resolved_junction_bonds": resolved_junctions,
+        "inactive_z_matrix_root_atoms_a_0based": sorted(z_matrix_roots_a),
+        "inactive_z_matrix_root_atoms_b_0based": sorted(z_matrix_roots_b),
+        "alchemical_bonds": alchemical_bonds if settings.get("alchemical_bonds") is not None else None,
         "matched_smarts_labels_a_0based": matched_labels_a,
         "matched_smarts_labels_b_0based": matched_labels_b,
         "mapped_atom_count": len(mapping),

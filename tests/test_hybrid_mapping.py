@@ -204,3 +204,127 @@ def _test_explicit_pairs_terminal_z_matrix_requires_selected_atom():
                 "inactive_bonded_geometry": "terminal_z_matrix",
             },
         )
+
+
+def test_explicit_junction_bond_derives_branch_and_mode():
+    ligand_a = _parameters("CC(=O)NC1=CC=CC=C1")
+    ligand_b = _parameters("CS(=O)(=O)NC1=CC=CC=C1")
+    _, metadata = build_hybrid_atom_map(
+        ligand_a,
+        ligand_b,
+        {
+            "method": "explicit_pairs",
+            "pairs_0based": [[0, 0], [1, 1], [2, 2], [3, 4]],
+            "junction_bonds": {
+                "ligand_b": [
+                    {
+                        "atoms_0based": [1, 3],
+                        "inactive_geometry": "terminal_z_matrix",
+                    }
+                ]
+            },
+        },
+    )
+    assert metadata["inactive_bonded_atoms_b_0based"] == [3]
+    assert metadata["inactive_z_matrix_root_atoms_b_0based"] == [3]
+    assert metadata["resolved_junction_bonds"][0]["boundary_atoms_0based"] == [1, 3]
+
+
+def test_paired_smarts_junction_uses_resolved_mapping_labels():
+    ligand_a = _parameters("CC(=O)NC1=CC=CC=C1")
+    ligand_b = _parameters("CS(=O)(=O)NC1=CC=CC=C1")
+    _, metadata = build_hybrid_atom_map(
+        ligand_a,
+        ligand_b,
+        {
+            "method": "paired_smarts_transmutation",
+            "ligand_a_smarts": "[C:1]-[C:2](=[O:3])-[NH:4]",
+            "ligand_b_smarts": "[C:1]-[S:2](=[O:3])(=[O:5])-[NH:4]",
+            "junction_bonds": {
+                "ligand_b": [
+                    {
+                        "mapping_labels": [2, 5],
+                        "inactive_geometry": "terminal_z_matrix",
+                    }
+                ]
+            },
+        },
+    )
+    resolved = metadata["resolved_junction_bonds"][0]
+    assert resolved["boundary_atoms_0based"] == [1, 3]
+    assert resolved["inactive_geometry"] == "terminal_z_matrix"
+
+
+def test_junction_bond_rejects_ambiguous_smarts():
+    ligand_a = _parameters("CC(=O)NC1=CC=CC=C1")
+    ligand_b = _parameters("CS(=O)(=O)NC1=CC=CC=C1")
+    with pytest.raises(HybridMappingError, match="exactly one ordered bond"):
+        build_hybrid_atom_map(
+            ligand_a,
+            ligand_b,
+            {
+                "method": "explicit_pairs",
+                "pairs_0based": [[0, 0], [1, 1], [2, 2], [3, 4]],
+                "junction_bonds": {
+                    "ligand_b": [
+                        {
+                            "smarts": "[S:1](=[O:2])(=[O:3])",
+                            "bond_labels": [1, 2],
+                        }
+                    ]
+                },
+            },
+        )
+
+
+def test_explicit_soft_bond_allows_ring_closure():
+    ligand_a = _parameters("CCCCCC")
+    ligand_b = _parameters("C1CCCCC1")
+    _, metadata = build_hybrid_atom_map(
+        ligand_a,
+        ligand_b,
+        {
+            "method": "explicit_pairs",
+            "pairs_0based": [[index, index] for index in range(6)],
+            "alchemical_bonds": {
+                "ligand_b": [{"atoms_0based": [0, 5], "mode": "soft_bond"}]
+            },
+        },
+    )
+    assert metadata["alchemical_bonds"]["ligand_b"][0]["atoms_0based"] == [0, 5]
+
+
+def test_explicit_soft_bond_allows_mapped_to_unique_annulation_closure():
+    ligand_a = _parameters("c1ccccc1")
+    ligand_b = _parameters("c1ccc2c(c1)CCC2")
+
+    mapping, metadata = build_hybrid_atom_map(
+        ligand_a,
+        ligand_b,
+        {
+            "method": "explicit_pairs",
+            "pairs_0based": [[index, index] for index in range(6)],
+            "alchemical_bonds": {
+                "ligand_b": [{"atoms_0based": [3, 8], "mode": "soft_bond"}]
+            },
+        },
+    )
+
+    assert 3 in mapping
+    assert 8 not in mapping.values()
+    assert metadata["alchemical_bonds"]["ligand_b"][0]["atoms_0based"] == [3, 8]
+
+
+def test_junction_bonds_reject_legacy_fields():
+    settings = {
+        "junction_bonds": {"ligand_a": [{"atoms_0based": [0, 1]}]},
+        "inactive_bonded_geometry": "bond_only",
+    }
+    with pytest.raises(HybridMappingError, match="cannot be combined"):
+        # Structural normalization succeeds; conflict is mapping-context validation.
+        ligand = _parameters("CC")
+        build_hybrid_atom_map(
+            ligand,
+            ligand,
+            {"method": "explicit_pairs", "pairs_0based": [[0, 0], [1, 1]], **settings},
+        )

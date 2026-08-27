@@ -59,8 +59,11 @@ from atom_openmm.covalent_systems import (
 from atom_openmm.hybrid_mapping import (
     _explicit_pairs_map,
     _paired_smarts_transmutation_map,
+    _resolve_junction_bonds,
     _strict_explicit_pairs,
     _strict_nonnegative_indices,
+    normalize_junction_bonds,
+    normalize_alchemical_bonds,
 )
 from atom_openmm.equilibration import (
     neqti_hybrid_endpoint_steps,
@@ -154,6 +157,35 @@ def _mapping_settings(workflow, pair):
             "'paired_smarts_transmutation', or 'explicit_pairs'"
         )
     normalized = {"method": method}
+    junctions = settings.get("junction_bonds")
+    if junctions is not None:
+        legacy = {
+            "inactive_bonded_labels",
+            "inactive_bonded_atoms_a_0based",
+            "inactive_bonded_atoms_b_0based",
+            "inactive_bonded_geometry",
+        }
+        if legacy & set(settings):
+            raise CovalentWorkflowError(
+                "covalent mapping.junction_bonds cannot be combined with legacy "
+                "inactive_bonded_* settings"
+            )
+        try:
+            normalized["junction_bonds"] = normalize_junction_bonds(junctions)
+        except ValueError as exc:
+            raise CovalentWorkflowError(str(exc)) from exc
+    alchemical_bonds = settings.get("alchemical_bonds")
+    if alchemical_bonds is not None:
+        if method != "explicit_pairs":
+            raise CovalentWorkflowError(
+                "covalent mapping.alchemical_bonds initially require explicit_pairs"
+            )
+        try:
+            normalized["alchemical_bonds"] = normalize_alchemical_bonds(
+                alchemical_bonds
+            )
+        except ValueError as exc:
+            raise CovalentWorkflowError(str(exc)) from exc
     if method == "mcs_core_smarts":
         smarts = settings.get("smarts")
         if not isinstance(smarts, str) or not smarts.strip():
@@ -178,17 +210,18 @@ def _mapping_settings(workflow, pair):
             raise CovalentWorkflowError(
                 "covalent mapping.inactive_bonded_labels must be a mapping"
             )
-        normalized["inactive_bonded_labels"] = {
-            side: [int(value) for value in inactive.get(side, [])]
-            for side in ("ligand_a", "ligand_b")
-        }
-        geometry = str(settings.get("inactive_bonded_geometry", "bond_only")).lower()
-        if geometry not in {"bond_only", "terminal_z_matrix"}:
-            raise CovalentWorkflowError(
-                "covalent mapping.inactive_bonded_geometry must be 'bond_only' "
-                "or 'terminal_z_matrix'"
-            )
-        normalized["inactive_bonded_geometry"] = geometry
+        if junctions is None:
+            normalized["inactive_bonded_labels"] = {
+                side: [int(value) for value in inactive.get(side, [])]
+                for side in ("ligand_a", "ligand_b")
+            }
+            geometry = str(settings.get("inactive_bonded_geometry", "bond_only")).lower()
+            if geometry not in {"bond_only", "terminal_z_matrix"}:
+                raise CovalentWorkflowError(
+                    "covalent mapping.inactive_bonded_geometry must be 'bond_only' "
+                    "or 'terminal_z_matrix'"
+                )
+            normalized["inactive_bonded_geometry"] = geometry
     elif method == "explicit_pairs":
         try:
             pairs = _strict_explicit_pairs(settings.get("pairs_0based"))
@@ -213,14 +246,15 @@ def _mapping_settings(workflow, pair):
                 "covalent explicit_pairs terminal_z_matrix requires at least one "
                 "inactive bonded atom"
             )
-        normalized.update(
-            {
-                "pairs_0based": [list(pair) for pair in pairs],
-                "inactive_bonded_atoms_a_0based": inactive_a,
-                "inactive_bonded_atoms_b_0based": inactive_b,
-                "inactive_bonded_geometry": geometry,
-            }
-        )
+        normalized["pairs_0based"] = [list(pair) for pair in pairs]
+        if junctions is None:
+            normalized.update(
+                {
+                    "inactive_bonded_atoms_a_0based": inactive_a,
+                    "inactive_bonded_atoms_b_0based": inactive_b,
+                    "inactive_bonded_geometry": geometry,
+                }
+            )
     return normalized
 
 
@@ -550,6 +584,10 @@ def validate_covalent_workflow(path):
     ):
         raise CovalentWorkflowError(
             "workflow.neqti.softcore Gapsys parameters must be positive"
+        )
+    if config["softcore"]["soft_bond_alpha_nm2"] <= 0.0:
+        raise CovalentWorkflowError(
+            "workflow.neqti.softcore.soft_bond_alpha_nm2 must be positive"
         )
     if (
         config["softcore"]["ssc2_alpha_lj"] <= 0.0
@@ -2062,6 +2100,9 @@ def _iter_environment(
             for key, value in config["softcore"].items()
             if key != "long_range_correction"
         }
+        softcore_options["soft_bond_pairs"] = prepared.provenance.get(
+            "soft_bond_system_pairs", []
+        )
         lrc_mode = config["softcore"]["long_range_correction"]
         softcore = create_softcore_hamiltonian(
             prepared.endpoint_a,
@@ -3251,6 +3292,9 @@ def _normalized_settings(workflow):
         "ssc2_switch_width_nm": float(
             softcore.get("ssc2_switch_width_nm", 0.2)
         ),
+        "soft_bond_alpha_nm2": float(
+            softcore.get("soft_bond_alpha_nm2", 100.0)
+        ),
         "long_range_correction": str(
             softcore.get("long_range_correction", "dynamic")
         ),
@@ -3664,6 +3708,10 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
     transmuted_pairs = set()
     inactive_a = set()
     inactive_b = set()
+    inactive_z_matrix_roots_a = set()
+    inactive_z_matrix_roots_b = set()
+    alchemical_bonds_a = set()
+    alchemical_bonds_b = set()
     inactive_geometry = "bond_only"
     if mapping_settings["method"] == "dataset_core":
         core_a = inputs["ligand_a"]["info"]["core_match_atom_indices_1based"]
@@ -3715,6 +3763,8 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
         raw_b = _load_covalent_sdf(
             inputs["ligand_b"]["aldehyde"], inputs["ligand_b"]["name"]
         )
+        ligand_z_roots_a = set()
+        ligand_z_roots_b = set()
         if mapping_settings["method"] == "explicit_pairs":
             (
                 ligand_map,
@@ -3737,6 +3787,23 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
             ) = _paired_smarts_transmutation_map(raw_a, raw_b, mapping_settings)
             requested_pairs = ()
             completed_hydrogen_pairs = set()
+        resolved_junctions = []
+        if "junction_bonds" in mapping_settings:
+            ligand_inactive_a, ligand_z_roots_a, resolved_a = _resolve_junction_bonds(
+                raw_a,
+                set(ligand_map),
+                mapping_settings["junction_bonds"]["ligand_a"],
+                "ligand_a",
+                matched_labels_a,
+            )
+            ligand_inactive_b, ligand_z_roots_b, resolved_b = _resolve_junction_bonds(
+                raw_b,
+                set(ligand_map.values()),
+                mapping_settings["junction_bonds"]["ligand_b"],
+                "ligand_b",
+                matched_labels_b,
+            )
+            resolved_junctions = resolved_a + resolved_b
         product_a = {
             int(atom): int(product)
             for atom, product in meta_a["ligand_to_product_atom_indices"].items()
@@ -3755,6 +3822,35 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
         }
         inactive_a = {product_a[atom] for atom in ligand_inactive_a}
         inactive_b = {product_b[atom] for atom in ligand_inactive_b}
+        inactive_z_matrix_roots_a = {
+            product_a[atom] for atom in ligand_z_roots_a
+        }
+        inactive_z_matrix_roots_b = {
+            product_b[atom] for atom in ligand_z_roots_b
+        }
+        alchemical_bonds_a = {
+            tuple(sorted(product_a[atom] for atom in entry["atoms_0based"]))
+            for entry in (mapping_settings.get("alchemical_bonds") or {}).get(
+                "ligand_a", []
+            )
+        }
+        alchemical_bonds_b = {
+            tuple(sorted(product_b[atom] for atom in entry["atoms_0based"]))
+            for entry in (mapping_settings.get("alchemical_bonds") or {}).get(
+                "ligand_b", []
+            )
+        }
+        resolved_product_junctions = []
+        for entry in resolved_junctions:
+            product_map = product_a if entry["endpoint"] == "a" else product_b
+            converted = dict(entry)
+            converted["boundary_atoms_0based"] = [
+                product_map[atom] for atom in entry["boundary_atoms_0based"]
+            ]
+            converted["branch_atoms_0based"] = [
+                product_map[atom] for atom in entry["branch_atoms_0based"]
+            ]
+            resolved_product_junctions.append(converted)
         requested_product_pairs = [
             (product_a[atom_a], product_b[atom_b])
             for atom_a, atom_b in requested_pairs
@@ -3763,7 +3859,11 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
             (product_a[atom_a], product_b[atom_b])
             for atom_a, atom_b in completed_hydrogen_pairs
         }
-        inactive_geometry = mapping_settings.get("inactive_bonded_geometry", "bond_only")
+        modes = {entry["inactive_geometry"] for entry in resolved_junctions}
+        inactive_geometry = mapping_settings.get(
+            "inactive_bonded_geometry",
+            "mixed" if len(modes) > 1 else next(iter(modes), "bond_only"),
+        )
         atom_map = dict(required)
         if set(atom_map).intersection(transferred):
             raise CovalentWorkflowError(
@@ -3805,6 +3905,21 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
                 "inactive_bonded_atoms_a_0based": sorted(inactive_a),
                 "inactive_bonded_atoms_b_0based": sorted(inactive_b),
                 "inactive_bonded_geometry": inactive_geometry,
+                "junction_bonds": mapping_settings.get("junction_bonds"),
+                "resolved_junction_bonds": resolved_product_junctions,
+                "inactive_z_matrix_root_atoms_a_0based": sorted(
+                    inactive_z_matrix_roots_a
+                ),
+                "inactive_z_matrix_root_atoms_b_0based": sorted(
+                    inactive_z_matrix_roots_b
+                ),
+                "alchemical_bonds": mapping_settings.get("alchemical_bonds"),
+                "alchemical_product_bonds_a_0based": [
+                    list(pair) for pair in sorted(alchemical_bonds_a)
+                ],
+                "alchemical_product_bonds_b_0based": [
+                    list(pair) for pair in sorted(alchemical_bonds_b)
+                ],
             }
         )
     attachment_pairs = (
@@ -3831,6 +3946,8 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
             atom_map,
             required_pairs=required,
             transmuted_pairs=transmuted_pairs,
+            alchemical_bonds_a=alchemical_bonds_a,
+            alchemical_bonds_b=alchemical_bonds_b,
         )
     return (
         required,
@@ -3841,6 +3958,10 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
         inactive_a,
         inactive_b,
         inactive_geometry,
+        inactive_z_matrix_roots_a,
+        inactive_z_matrix_roots_b,
+        alchemical_bonds_a,
+        alchemical_bonds_b,
     )
 
 
@@ -3958,6 +4079,7 @@ def _upgrade_legacy_switch_protocol(protocol, dummy_bonded_scales=None):
         softcore.setdefault("ssc2_alpha_coul", 1.0)
         softcore.setdefault("ssc2_beta_coul", 1.0)
         softcore.setdefault("ssc2_switch_width_nm", 0.2)
+        softcore.setdefault("soft_bond_alpha_nm2", 100.0)
         upgraded["softcore"] = softcore
     serialized = yaml.safe_dump(upgraded, sort_keys=True)
     upgraded["fingerprint"] = hashlib.sha256(
@@ -4120,6 +4242,10 @@ def run_covalent_pair(settings, pair):
             inactive_a,
             inactive_b,
             inactive_geometry,
+            inactive_z_matrix_roots_a,
+            inactive_z_matrix_roots_b,
+            alchemical_bonds_a,
+            alchemical_bonds_b,
         ) = (
             _prepare_covalent_atom_map(inputs, mapping_settings)
         )
@@ -4154,6 +4280,10 @@ def run_covalent_pair(settings, pair):
             inactive_bonded_atoms_a=inactive_a,
             inactive_bonded_atoms_b=inactive_b,
             inactive_bonded_geometry=inactive_geometry,
+            inactive_z_matrix_root_atoms_a=inactive_z_matrix_roots_a,
+            inactive_z_matrix_root_atoms_b=inactive_z_matrix_roots_b,
+            alchemical_bonds_a=alchemical_bonds_a,
+            alchemical_bonds_b=alchemical_bonds_b,
         )
         physical_reference_a = create_solvated_capped_reference(
             parameters_a,
@@ -4204,10 +4334,34 @@ def run_covalent_pair(settings, pair):
                 ],
             },
         }
+        for prepared, offsets in (
+            (
+                protein,
+                {
+                    "ligand_a": int(meta_a["ligand_atom_offset"]),
+                    "ligand_b": int(meta_b["ligand_atom_offset"]),
+                },
+            ),
+            (reference, {"ligand_a": 0, "ligand_b": 0}),
+        ):
+            pairs = []
+            for endpoint, selected in (
+                ("ligand_a", hybrid.alchemical_bonds_a),
+                ("ligand_b", hybrid.alchemical_bonds_b),
+            ):
+                indices = prepared.provenance[f"{endpoint}_system_atom_indices"]
+                pairs.extend(
+                    [
+                        indices[atom1 - offsets[endpoint]],
+                        indices[atom2 - offsets[endpoint]],
+                    ]
+                    for atom1, atom2 in selected
+                )
+            prepared.provenance["soft_bond_system_pairs"] = pairs
         _validate_prepared_endpoint_charges(protein, "protein")
         _validate_prepared_endpoint_charges(reference, "reference")
         mapping_payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             **mapping_provenance,
             "map_a_to_b_0based": {
                 int(atom_a): int(atom_b) for atom_a, atom_b in sorted(hybrid.map_a_to_b.items())

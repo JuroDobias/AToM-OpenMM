@@ -21,6 +21,7 @@ from atom_openmm.covalent_softcore import (
     _gapsys_energy_expression,
     _gapsys_coulomb_correction_expression,
     create_softcore_hamiltonian,
+    _add_bonded_forces,
     resolve_softcore_path,
 )
 from atom_openmm.covalent_workflow import (
@@ -90,6 +91,29 @@ def _energy_forces(system, positions, parameters=None):
     )
     del context
     return energy, forces
+
+
+def test_soft_bond_is_exact_at_endpoints_and_bounded_midway():
+    endpoint_a = mm.System()
+    endpoint_b = mm.System()
+    for system in (endpoint_a, endpoint_b):
+        system.addParticle(12.0)
+        system.addParticle(12.0)
+    force = mm.HarmonicBondForce()
+    force.addBond(0, 1, 0.15, 1000.0)
+    endpoint_b.addForce(force)
+    output = mm.System()
+    output.addParticle(12.0)
+    output.addParticle(12.0)
+    _add_bonded_forces(output, endpoint_a, endpoint_b, soft_bond_pairs=[(0, 1)])
+    positions = np.asarray([[0, 0, 0], [10, 0, 0]]) * unit.nanometer
+    at_a, _ = _energy_forces(output, positions, {STERICS_PARAMETER: 0.0})
+    midway, _ = _energy_forces(output, positions, {STERICS_PARAMETER: 0.5})
+    at_b, _ = _energy_forces(output, positions, {STERICS_PARAMETER: 1.0})
+    expected_b = 0.5 * 1000.0 * (10.0 - 0.15) ** 2
+    assert at_a == 0.0
+    assert np.isclose(at_b, expected_b)
+    assert midway < 10.0
 
 
 def _test_softcore_nodes_reproduce_endpoint_energies_and_forces():
