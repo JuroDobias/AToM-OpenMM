@@ -150,7 +150,43 @@ def _topology_transmutation_mapping(molecule_a, molecule_b):
         )
         for index in range(query.GetNumAtoms())
     )
-    return {"method": "explicit_pairs", "pairs_0based": [list(pair) for pair in mapping]}
+    junctions = {"ligand_a": [], "ligand_b": []}
+    for atom_a, atom_b in mapping:
+        source_a = molecule_a.GetAtomWithIdx(atom_a)
+        source_b = molecule_b.GetAtomWithIdx(atom_b)
+        if source_a.GetAtomicNum() == source_b.GetAtomicNum():
+            continue
+        hydrogens_a = sorted(
+            atom.GetIdx() for atom in source_a.GetNeighbors()
+            if atom.GetAtomicNum() == 1
+        )
+        hydrogens_b = sorted(
+            atom.GetIdx() for atom in source_b.GetNeighbors()
+            if atom.GetAtomicNum() == 1
+        )
+        if hydrogens_a and not hydrogens_b:
+            junctions["ligand_a"].extend(
+                {
+                    "atoms_0based": [atom_a, hydrogen],
+                    "inactive_geometry": "terminal_z_matrix",
+                }
+                for hydrogen in hydrogens_a
+            )
+        elif hydrogens_b and not hydrogens_a:
+            junctions["ligand_b"].extend(
+                {
+                    "atoms_0based": [atom_b, hydrogen],
+                    "inactive_geometry": "terminal_z_matrix",
+                }
+                for hydrogen in hydrogens_b
+            )
+    settings = {
+        "method": "explicit_pairs",
+        "pairs_0based": [list(pair) for pair in mapping],
+    }
+    if any(junctions.values()):
+        settings["junction_bonds"] = junctions
+    return settings
 
 
 def _reference_datasets(table):

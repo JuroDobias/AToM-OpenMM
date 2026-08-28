@@ -11,6 +11,11 @@ Every primary edge belongs to a thermodynamic cycle. Radial edges from ligand
 bond. The `45 -> 46` and `43 -> 47` cross-edges close the thermodynamic cycles
 with conventional MCS mappings.
 
+The `43 -> 47` cross-edge maps the aromatic `CH -> N` transmutation directly.
+Its disappearing carbon-bound hydrogen is a ligand-A terminal Z-matrix branch:
+the dummy endpoint retains one bond, angle, and torsion instead of all original
+junction terms.
+
 The cohort also runs `27 -> 43` with the complete terminal phenyl and
 naphthyl groups left endpoint-specific. This whole-ring-unmapped calculation
 is a mapping-method control. It is analyzed separately and is not included as
