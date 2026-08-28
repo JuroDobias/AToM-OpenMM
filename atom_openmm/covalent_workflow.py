@@ -3788,6 +3788,17 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
             requested_pairs = ()
             completed_hydrogen_pairs = set()
         resolved_junctions = []
+        ligand_alchemical = normalize_alchemical_bonds(
+            mapping_settings.get("alchemical_bonds")
+        )
+        ligand_alchemical_a = {
+            tuple(sorted(entry["atoms_0based"]))
+            for entry in ligand_alchemical["ligand_a"]
+        }
+        ligand_alchemical_b = {
+            tuple(sorted(entry["atoms_0based"]))
+            for entry in ligand_alchemical["ligand_b"]
+        }
         if "junction_bonds" in mapping_settings:
             ligand_inactive_a, ligand_z_roots_a, resolved_a = _resolve_junction_bonds(
                 raw_a,
@@ -3795,6 +3806,7 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
                 mapping_settings["junction_bonds"]["ligand_a"],
                 "ligand_a",
                 matched_labels_a,
+                ligand_alchemical_a,
             )
             ligand_inactive_b, ligand_z_roots_b, resolved_b = _resolve_junction_bonds(
                 raw_b,
@@ -3802,6 +3814,7 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
                 mapping_settings["junction_bonds"]["ligand_b"],
                 "ligand_b",
                 matched_labels_b,
+                ligand_alchemical_b,
             )
             resolved_junctions = resolved_a + resolved_b
         product_a = {

@@ -1,0 +1,204 @@
+workflow:
+  type: rbfe
+  chemistry: covalent
+  alchemy:
+    model: hybrid_topology
+    cycle: complex_solvent
+    dummy_core_nonbonded: "off"
+    mapping:
+      method: explicit_pairs
+      pairs_0based:
+        - [1, 25]
+        - [2, 30]
+        - [3, 22]
+        - [4, 20]
+        - [5, 21]
+        - [6, 19]
+        - [7, 18]
+        - [8, 17]
+        - [9, 16]
+        - [10, 15]
+        - [11, 14]
+        - [12, 13]
+        - [13, 11]
+        - [14, 12]
+        - [15, 10]
+        - [16, 2]
+        - [17, 1]
+        - [18, 0]
+        - [19, 3]
+        - [20, 4]
+        - [21, 5]
+        - [22, 6]
+        - [23, 7]
+        - [24, 8]
+        - [25, 9]
+        - [26, 33]
+        - [27, 34]
+        - [28, 35]
+        - [29, 36]
+        - [30, 37]
+        - [31, 38]
+        - [32, 39]
+        - [33, 40]
+        - [34, 31]
+        - [35, 32]
+        - [36, 23]
+        - [37, 24]
+      junction_bonds:
+        ligand_a:
+          - atoms_0based: [1, 0]
+            inactive_geometry: terminal_z_matrix
+          - atoms_0based: [2, 41]
+            inactive_geometry: terminal_z_matrix
+        ligand_b:
+          - atoms_0based: [25, 26]
+            inactive_geometry: terminal_z_matrix
+      alchemical_bonds:
+        ligand_a: []
+        ligand_b:
+          - atoms_0based: [29, 30]
+            mode: soft_bond
+  sampling:
+    method: neqti
+  dataset: ../../../../../rhino_benchmarks/normalized/dataset.yaml
+  workdir: run
+  pairs:
+    - ligand_a: I79DJ_543
+      ligand_b: I79DJ_735
+      serotype: B14
+  platform: CUDA
+  platform_properties:
+    Precision: mixed
+  equilibration:
+    neqti:
+      complex_endpoint:
+        steps:
+          - id: restrained_minimization
+            type: minimization
+            tolerance_kj_mol_nm: 10.0
+            max_iterations: 1000
+            positional_restraints:
+              mask: >-
+                (!@H= & !:CVL,HOH,WAT,NA,CL,K,CA) |
+                (:CVL@N,CA,C,O,CB,SG & !@H=) |
+                #active:"NC(=O)C1(n2ccccc2=O)Cc2ccccc2C1"
+              k_kcal_mol_a2: 5.0
+              tolerance_a: 0.25
+          - id: restrained_nvt
+            type: md
+            ensemble: NVT
+            n_steps: 50000
+            timestep_ps: 0.001
+            reset_velocities: true
+            thermostat:
+              temperature_k: 300.0
+              friction_per_ps: 1.0
+            positional_restraints:
+              mask: >-
+                (!@H= & !:CVL,HOH,WAT,NA,CL,K,CA) |
+                (:CVL@N,CA,C,O,CB,SG & !@H=) |
+                #active:"NC(=O)C1(n2ccccc2=O)Cc2ccccc2C1"
+              k_kcal_mol_a2: 2.0
+              tolerance_a: 0.5
+            reporters:
+              state: {interval: 10000}
+          - id: restrained_npt
+            type: md
+            ensemble: NPT
+            n_steps: 100000
+            timestep_ps: 0.001
+            thermostat:
+              temperature_k: 300.0
+              friction_per_ps: 1.0
+            positional_restraints:
+              mask: >-
+                (!@H= & !:CVL,HOH,WAT,NA,CL,K,CA) |
+                (:CVL@N,CA,C,O,CB,SG & !@H=) |
+                #active:"NC(=O)C1(n2ccccc2=O)Cc2ccccc2C1"
+              k_kcal_mol_a2: 2.0
+              tolerance_a: 0.5
+            reporters:
+              state: {interval: 10000}
+          - id: unrestrained_npt
+            type: md
+            ensemble: NPT
+            n_steps: 1000000
+            timestep_ps: 0.002
+            thermostat:
+              temperature_k: 300.0
+              friction_per_ps: 1.0
+            reporters:
+              state: {interval: 10000}
+      solvent_endpoint:
+        mode: default
+  setup:
+    protein_forcefield: amber19/protein.ff19SB.xml
+    water_forcefield: amber19/opc.xml
+    ligand_forcefield: openff-2.2.1.offxml
+    ligand_charge_model: espaloma_nn
+    espaloma_model: espaloma-0.3.2
+    solvent_padding_a: 10.0
+    ionic_strength_molar: 0.15
+    dummy_bonded_scales:
+      bond: 1.0
+      angle: 1.0
+      proper_torsion: 1.0
+      junction_angle: 1.0
+      junction_proper_torsion: 1.0
+  neqti:
+    temperature_k: 300.0
+    pressure_bar: 1.0
+    timestep_fs: 2.0
+    n_snapshots: 100
+    decorrelation_steps: 100000
+    write_switch_pdbs: false
+    interpolation: softcore_linear
+    softcore:
+      function: beutler
+      alpha: 0.3
+      sigma_nm: 0.25
+      power: 1
+      charge_steps_per_stage: 12500
+      sterics_steps: 25000
+      soft_bond_alpha_nm2: 100.0
+      long_range_correction: dynamic
+    schedule_optimization:
+      enabled: true
+      pilot_samples: 10
+      subdivisions_per_stage: 10
+      min_segment_steps: 250
+      max_segment_steps: 15000
+    adaptive_switching:
+      enabled: true
+      candidate_times_ps: [100, 300, 1000]
+      pilot_samples_per_direction: 20
+      min_overlap_score_per_leg: 0.08
+      max_failed_fraction_per_direction: 0.05
+      reuse_selected_pilot_samples: true
+      on_exhausted: use_longest
+    convergence:
+      enabled: true
+      reopen_on_settings_change: true
+      min_samples_per_direction: 50
+      min_overlap_score_per_leg: 0.05
+      max_dg_error_kcal_per_mol: 0.5
+      check_interval_samples: 5
+      consecutive_checks: 3
+      max_dg_range_kcal_per_mol: 0.25
+      stationarity:
+        enabled: true
+        discard_fraction: 0.1
+        min_discard_samples: 5
+        max_discard_first_shift_kcal_per_mol: 0.3
+        max_discard_last_shift_kcal_per_mol: 0.2
+    failed_switch_policy: count_as_infinite
+    bootstrap_samples: 500
+    random_seed: 20260828
+    rest2:
+      enabled: true
+      sampler_backend: openmm_native
+      effective_temperatures_k: [300.0, 356.8, 424.3, 504.5, 600.0]
+      exchange_interval_steps: 500
+      checkpoint_interval_cycles: 10
+      execution: serial

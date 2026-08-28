@@ -221,9 +221,11 @@ def _resolve_junction_selector(molecule, entry, endpoint, matched_labels=None):
 
 
 def _resolve_junction_bonds(
-    molecule, mapping_atoms, entries, endpoint, matched_labels=None
+    molecule, mapping_atoms, entries, endpoint, matched_labels=None,
+    alchemical_bonds=(),
 ):
     unique = set(range(molecule.GetNumAtoms())) - set(mapping_atoms)
+    open_bonds = {tuple(sorted(pair)) for pair in alchemical_bonds}
     selected = set()
     z_matrix_roots = set()
     resolved = []
@@ -241,7 +243,7 @@ def _resolve_junction_bonds(
             raise HybridMappingError(
                 f"junction_bonds.{endpoint} atoms {core}:{root} are not bonded"
             )
-        if bond.IsInRing():
+        if bond.IsInRing() and not open_bonds:
             raise HybridMappingError(
                 f"junction_bonds.{endpoint} atoms {core}:{root} form a ring bond"
             )
@@ -261,6 +263,7 @@ def _resolve_junction_bonds(
                 neighbor.GetIdx()
                 for neighbor in molecule.GetAtomWithIdx(atom).GetNeighbors()
                 if neighbor.GetIdx() != core and neighbor.GetIdx() not in component
+                and tuple(sorted((atom, neighbor.GetIdx()))) not in open_bonds
             )
         if not component <= unique:
             raise HybridMappingError(
@@ -606,6 +609,7 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
             junction_settings["ligand_a"],
             "ligand_a",
             matched_labels_a,
+            alchemical_bonds["ligand_a"],
         )
         inactive_b, z_matrix_roots_b, resolved_b = _resolve_junction_bonds(
             molecule_b,
@@ -613,6 +617,7 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
             junction_settings["ligand_b"],
             "ligand_b",
             matched_labels_b,
+            alchemical_bonds["ligand_b"],
         )
         resolved_junctions = resolved_a + resolved_b
     else:
