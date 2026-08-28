@@ -345,6 +345,8 @@ def generate(benchmark_root, pilot_workflow, output, repeats=3, existing_27_46=N
     table = benchmark_root / "ATM_Validation/DDG_ATM_GAFF2.csv"
     molecules = _molecules(ligand_file)
     base_workflow = yaml.safe_load(Path(pilot_workflow).read_text())
+    if base_workflow.get("atom_options") is None:
+        base_workflow.pop("atom_options", None)
     primary_template = output / "templates/primary_cycles"
     control_template = output / "templates/whole_ring_control"
     _write_template(
