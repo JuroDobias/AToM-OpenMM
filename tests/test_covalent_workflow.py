@@ -12,6 +12,7 @@ from atom_openmm.covalent_workflow import (
     CovalentResumeError,
     _normalized_settings,
     _apply_state,
+    load_covalent_workflow,
     plan_covalent_workflow,
     validate_covalent_workflow,
     _dummy_particles,
@@ -1006,6 +1007,119 @@ def _write_fixture(tmp_path, *, decorrelation_steps=1000):
     path = tmp_path / "workflow.yaml"
     path.write_text(yaml.safe_dump(workflow))
     return path
+
+
+def _replace_fixture_pairs(path, pairs):
+    config = yaml.safe_load(path.read_text())
+    config["workflow"]["pairs"] = pairs
+    path.write_text(yaml.safe_dump(config, sort_keys=False))
+
+
+def _test_covalent_pair_normalizes_ccw_schema_and_preserves_fields(tmp_path):
+    path = _write_fixture(tmp_path)
+    metadata = {
+        "source_microstate_a_id": 2672,
+        "source_microstate_b_id": 2899,
+    }
+    _replace_fixture_pairs(
+        path,
+        [
+            {
+                "ligands": ["A", "B"],
+                "external_metadata": metadata,
+                "custom_field": "preserved",
+            }
+        ],
+    )
+
+    _, settings = load_covalent_workflow(path)
+    pair = settings["pairs"][0]
+
+    assert pair["ligand_a"] == "A"
+    assert pair["ligand_b"] == "B"
+    assert pair["ligands"] == ["A", "B"]
+    assert pair["external_metadata"] == metadata
+    assert pair["custom_field"] == "preserved"
+
+
+def _test_covalent_pair_preserves_existing_and_matching_mixed_schemas(tmp_path):
+    path = _write_fixture(tmp_path)
+    _replace_fixture_pairs(
+        path,
+        [
+            {"ligand_a": "A", "ligand_b": "B", "label": "canonical"},
+            {
+                "ligand_a": "A",
+                "ligand_b": "B",
+                "ligands": ["A", "B"],
+                "label": "mixed",
+            },
+        ],
+    )
+
+    _, settings = load_covalent_workflow(path)
+
+    assert settings["pairs"][0] == {
+        "ligand_a": "A",
+        "ligand_b": "B",
+        "label": "canonical",
+    }
+    assert settings["pairs"][1]["ligands"] == ["A", "B"]
+    assert settings["pairs"][1]["ligand_a"] == "A"
+    assert settings["pairs"][1]["ligand_b"] == "B"
+
+
+@pytest.mark.parametrize("ligands", [[], ["A"], ["A", "B", "C"]])
+def _test_covalent_pair_rejects_invalid_ligand_counts(tmp_path, ligands):
+    path = _write_fixture(tmp_path)
+    _replace_fixture_pairs(path, [{"ligands": ligands}])
+
+    with pytest.raises(CovalentWorkflowError, match="exactly two"):
+        load_covalent_workflow(path)
+
+
+@pytest.mark.parametrize("ligands", [["", "B"], ["A", "   "], [None, "B"]])
+def _test_covalent_pair_rejects_empty_ligand_identifiers(tmp_path, ligands):
+    path = _write_fixture(tmp_path)
+    _replace_fixture_pairs(path, [{"ligands": ligands}])
+
+    with pytest.raises(CovalentWorkflowError, match="non-empty string"):
+        load_covalent_workflow(path)
+
+
+@pytest.mark.parametrize(
+    "pair, message",
+    [
+        ({"ligand_a": "A"}, "both ligand_a and ligand_b"),
+        ({"ligand_b": "B"}, "both ligand_a and ligand_b"),
+        (
+            {"ligand_a": "A", "ligands": ["A", "B"]},
+            "both ligand_a and ligand_b",
+        ),
+        ({"ligand_a": "", "ligand_b": "B"}, "ligand_a must be a non-empty"),
+        (
+            {"ligand_a": "A", "ligand_b": "B", "ligands": ["A", "C"]},
+            "conflicting",
+        ),
+        ({"external_metadata": {"edge_id": 1}}, "requires ligand_a/ligand_b"),
+    ],
+)
+def _test_covalent_pair_rejects_incomplete_or_conflicting_schemas(
+    tmp_path, pair, message
+):
+    path = _write_fixture(tmp_path)
+    _replace_fixture_pairs(path, [pair])
+
+    with pytest.raises(CovalentWorkflowError, match=message):
+        load_covalent_workflow(path)
+
+
+def _test_covalent_pair_rejects_non_mapping_entry(tmp_path):
+    path = _write_fixture(tmp_path)
+    _replace_fixture_pairs(path, [["A", "B"]])
+
+    with pytest.raises(CovalentWorkflowError, match="pair 1 must be a mapping"):
+        load_covalent_workflow(path)
 
 
 def _test_covalent_mode_routes_through_atom_rbfe(tmp_path):

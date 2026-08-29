@@ -258,6 +258,61 @@ def _mapping_settings(workflow, pair):
     return normalized
 
 
+def _normalize_covalent_pairs(raw_pairs):
+    pairs = []
+    for index, raw_pair in enumerate(raw_pairs, start=1):
+        if not isinstance(raw_pair, dict):
+            raise CovalentWorkflowError(f"covalent pair {index} must be a mapping")
+
+        pair = dict(raw_pair)
+        has_a = "ligand_a" in pair
+        has_b = "ligand_b" in pair
+        has_ligands = "ligands" in pair
+
+        if has_a != has_b:
+            raise CovalentWorkflowError(
+                f"covalent pair {index} must define both ligand_a and ligand_b"
+            )
+
+        ligand_pair = None
+        if has_ligands:
+            ligands = pair["ligands"]
+            if not isinstance(ligands, (list, tuple)) or len(ligands) != 2:
+                raise CovalentWorkflowError(
+                    f"covalent pair {index} ligands must contain exactly two "
+                    "non-empty ligand identifiers"
+                )
+            ligand_pair = tuple(ligands)
+            for side, identifier in zip(("a", "b"), ligand_pair):
+                if not isinstance(identifier, str) or not identifier.strip():
+                    raise CovalentWorkflowError(
+                        f"covalent pair {index} ligand_{side} in ligands must be "
+                        "a non-empty string"
+                    )
+
+        if has_a:
+            canonical_pair = (pair["ligand_a"], pair["ligand_b"])
+            for side, identifier in zip(("a", "b"), canonical_pair):
+                if not isinstance(identifier, str) or not identifier.strip():
+                    raise CovalentWorkflowError(
+                        f"covalent pair {index} ligand_{side} must be a non-empty string"
+                    )
+            if ligand_pair is not None and ligand_pair != canonical_pair:
+                raise CovalentWorkflowError(
+                    f"covalent pair {index} has conflicting ligands and "
+                    "ligand_a/ligand_b definitions"
+                )
+        elif ligand_pair is not None:
+            pair["ligand_a"], pair["ligand_b"] = ligand_pair
+        else:
+            raise CovalentWorkflowError(
+                f"covalent pair {index} requires ligand_a/ligand_b or exactly two ligands"
+            )
+
+        pairs.append(pair)
+    return pairs
+
+
 def load_covalent_workflow(path):
     workflow_path = Path(path).resolve()
     if not workflow_path.exists():
@@ -278,9 +333,12 @@ def load_covalent_workflow(path):
     if not dataset_path.exists():
         raise CovalentWorkflowError(f"covalent dataset does not exist: {dataset_path}")
     dataset = yaml.safe_load(dataset_path.read_text()) or {}
-    pairs = workflow.get("pairs") or dataset.get("pilot_edges") or []
-    if not pairs:
+    raw_pairs = workflow.get("pairs") or dataset.get("pilot_edges") or []
+    if not raw_pairs:
         raise CovalentWorkflowError("covalent workflow contains no pairs")
+    if not isinstance(raw_pairs, (list, tuple)):
+        raise CovalentWorkflowError("covalent workflow pairs must be a sequence")
+    pairs = _normalize_covalent_pairs(raw_pairs)
     settings = {
         "config_path": workflow_path,
         "dataset_path": dataset_path,
