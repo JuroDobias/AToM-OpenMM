@@ -93,6 +93,13 @@ def test_annulation_closure_is_absent_only_from_open_dummy_endpoint():
         left,
         right,
         atom_map=mapping,
+        inactive_bonded_atoms_b=set(
+            metadata["inactive_bonded_atoms_b_0based"]
+        ),
+        inactive_bonded_geometry=metadata["inactive_bonded_geometry"],
+        inactive_z_matrix_root_atoms_b=set(
+            metadata["inactive_z_matrix_root_atoms_b_0based"]
+        ),
         alchemical_bonds_b={(3, 8)},
     )
     closure = tuple(sorted((hybrid.map_b_to_hybrid[3], hybrid.map_b_to_hybrid[8])))
@@ -111,6 +118,8 @@ def test_annulation_closure_is_absent_only_from_open_dummy_endpoint():
     assert closure not in bonds(hybrid.endpoint_a)
     assert closure in bonds(hybrid.endpoint_b)
     assert anchor in bonds(hybrid.endpoint_a)
+    assert hybrid.inactive_z_matrix_root_atoms_b == (6,)
+    assert len(hybrid.inactive_z_matrix_terms) == 1
     switching = create_softcore_hamiltonian(
         hybrid.endpoint_a,
         hybrid.endpoint_b,

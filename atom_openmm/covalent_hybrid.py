@@ -408,6 +408,27 @@ def _graph_distance_class(molecule, atom1, atom2, excluded_bonds=()):
     return 4
 
 
+def _bond_remains_in_cycle(molecule, atom1, atom2, excluded_bonds=()):
+    excluded = {tuple(sorted(pair)) for pair in excluded_bonds}
+    excluded.add(tuple(sorted((int(atom1), int(atom2)))))
+    pending = [int(atom1)]
+    visited = set()
+    while pending:
+        atom = pending.pop()
+        if atom == int(atom2):
+            return True
+        if atom in visited:
+            continue
+        visited.add(atom)
+        pending.extend(
+            neighbor.GetIdx()
+            for neighbor in molecule.GetAtomWithIdx(atom).GetNeighbors()
+            if tuple(sorted((atom, neighbor.GetIdx()))) not in excluded
+            and neighbor.GetIdx() not in visited
+        )
+    return False
+
+
 def _validate_alchemical_bonds(molecule, selected_bonds, unique, endpoint):
     """Validate the initial one-ring-bond topology-changing implementation."""
     selected = {tuple(sorted(pair)) for pair in selected_bonds}
@@ -563,9 +584,12 @@ def _torsion_barrier_kj_mol(terms):
     return float(np.max(energy) - np.min(energy))
 
 
-def _inactive_branch_components(molecule, selected, unique, endpoint):
+def _inactive_branch_components(
+    molecule, selected, unique, endpoint, excluded_bonds=()
+):
     """Return validated selected components and their unique mapped boundary."""
     selected = set(selected)
+    excluded_bonds = {tuple(sorted(pair)) for pair in excluded_bonds}
     if not selected:
         return []
     components = []
@@ -579,7 +603,10 @@ def _inactive_branch_components(molecule, selected, unique, endpoint):
             atom = stack.pop()
             for neighbor in molecule.GetAtomWithIdx(atom).GetNeighbors():
                 index = neighbor.GetIdx()
-                if index in remaining:
+                if (
+                    index in remaining
+                    and tuple(sorted((atom, index))) not in excluded_bonds
+                ):
                     remaining.remove(index)
                     component.add(index)
                     stack.append(index)
@@ -588,7 +615,10 @@ def _inactive_branch_components(molecule, selected, unique, endpoint):
         for atom in component:
             for bond in molecule.GetAtomWithIdx(atom).GetBonds():
                 neighbor = bond.GetOtherAtomIdx(atom)
-                if neighbor not in component:
+                if (
+                    neighbor not in component
+                    and tuple(sorted((atom, neighbor))) not in excluded_bonds
+                ):
                     boundaries.append((atom, neighbor, bond))
         if any(center in unique for _, center, _ in boundaries):
             raise CovalentAlchemyError(
@@ -601,8 +631,10 @@ def _inactive_branch_components(molecule, selected, unique, endpoint):
                 f"inactive bonded branch {sorted(component)} in endpoint {endpoint} "
                 f"must have exactly one boundary bond; observed {len(boundaries)}"
             )
-        root, center, boundary_bond = boundaries[0]
-        if boundary_bond.IsInRing():
+        root, center, _ = boundaries[0]
+        if _bond_remains_in_cycle(
+            molecule, root, center, excluded_bonds
+        ):
             raise CovalentAlchemyError(
                 f"inactive bonded branch {sorted(component)} in endpoint {endpoint} "
                 "crosses a ring boundary and is not supported"
@@ -1229,10 +1261,18 @@ def build_covalent_hybrid_molecule(
         molecule_b, inactive_bonded_atoms_b, unique_b
     )
     inactive_components_a = _inactive_branch_components(
-        molecule_a, inactive_bonded_atoms_a, unique_a, "a"
+        molecule_a,
+        inactive_bonded_atoms_a,
+        unique_a,
+        "a",
+        alchemical_bonds_a,
     )
     inactive_components_b = _inactive_branch_components(
-        molecule_b, inactive_bonded_atoms_b, unique_b, "b"
+        molecule_b,
+        inactive_bonded_atoms_b,
+        unique_b,
+        "b",
+        alchemical_bonds_b,
     )
     roots_a = {component["root"] for component in inactive_components_a}
     roots_b = {component["root"] for component in inactive_components_b}
