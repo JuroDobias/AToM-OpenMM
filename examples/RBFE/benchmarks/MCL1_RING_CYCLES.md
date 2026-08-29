@@ -8,8 +8,10 @@ thermodynamic cycles:
 
 Every primary edge belongs to a thermodynamic cycle. Radial edges from ligand
 27 preserve its complete heavy-atom graph and use one soft alchemical closure
-bond. The `45 -> 46` and `43 -> 47` cross-edges close the thermodynamic cycles
-with conventional MCS mappings.
+bond. The other annulation boundary is explicitly retained as a
+`terminal_z_matrix` junction, so the open endpoint keeps only one bond, angle,
+and torsion frame for the inactive ring branch. The `45 -> 46` and `43 -> 47`
+cross-edges close the thermodynamic cycles with conventional mappings.
 
 The `43 -> 47` cross-edge maps the aromatic `CH -> N` transmutation directly.
 Its disappearing carbon-bound hydrogen is a ligand-A terminal Z-matrix branch:

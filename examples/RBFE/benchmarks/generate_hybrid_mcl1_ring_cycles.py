@@ -87,14 +87,32 @@ def _embedded_base_map(base, target):
         )
     # Keep one junction as the branch anchor and alchemically close the other.
     soft_bond = max(boundary, key=lambda pair: (max(pair), min(pair)))
-    return pairs, soft_bond
+    anchor_bond = next(pair for pair in boundary if pair != soft_bond)
+    mapped_target = {atom_b for _, atom_b in pairs}
+    anchor_bond = sorted(
+        anchor_bond,
+        key=lambda atom: (atom not in mapped_target, atom),
+    )
+    if anchor_bond[0] not in mapped_target or anchor_bond[1] in mapped_target:
+        raise ValueError(
+            f"annulation anchor is not [mapped core, unique branch]: {anchor_bond}"
+        )
+    return pairs, anchor_bond, soft_bond
 
 
 def _closure_mapping(base, target):
-    pairs, soft_bond = _embedded_base_map(base, target)
+    pairs, anchor_bond, soft_bond = _embedded_base_map(base, target)
     return {
         "method": "explicit_pairs",
         "pairs_0based": pairs,
+        "junction_bonds": {
+            "ligand_b": [
+                {
+                    "atoms_0based": anchor_bond,
+                    "inactive_geometry": "terminal_z_matrix",
+                }
+            ]
+        },
         "alchemical_bonds": {
             "ligand_b": [{"atoms_0based": soft_bond, "mode": "soft_bond"}]
         },
