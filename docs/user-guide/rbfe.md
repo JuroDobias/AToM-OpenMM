@@ -447,6 +447,16 @@ must isolate one unique component. Omitted unique heavy atoms, two core
 attachments, overlapping junctions, and ambiguous SMARTS are rejected. Different
 junctions in one edge may independently use either geometry mode.
 
+Junction declarations are optional. By default, every endpoint-unique component
+with exactly one mapped-core attachment is detected and assigned
+`terminal_z_matrix`. An explicit `junction_bonds` entry remains authoritative for
+its branch. If the mapped core does not provide the two additional connected
+heavy atoms needed for a deterministic frame, the branch falls back to
+`bond_only` and the reason is recorded in the mapping metadata and log. Components
+with multiple mapped-core attachments are not framed automatically; use an
+alchemical bond, a different atom map, or an explicit dual-topology treatment for
+those transformations.
+
 | Inactive bonded term | `bond_only` | `terminal_z_matrix` |
 | --- | --- | --- |
 | Inside the selected branch | Retained with configured dummy bonded scaling | Retained with configured dummy bonded scaling |
@@ -1430,6 +1440,27 @@ of steps is
 The defaults (`alpha: 0.3`, `sigma_nm: 0.25`, `power: 1`) match the established
 GROMACS softcore settings used for the RHINO calculations. Endpoint total charges
 must currently be equal.
+
+For difficult internal edits, bonded terms can be staged independently from
+sterics:
+
+```yaml
+neqti:
+  interpolation: softcore_linear
+  softcore:
+    total_steps: 50000
+    path:
+      mode: staged_bonded
+```
+
+The five forward stages are: decharge A unique atoms; introduce B bonded terms
+while B sterics remain off; exchange A/B sterics and mapped parameters; remove A
+bonded terms; and charge B unique atoms. The reverse switch is exactly reversed.
+The fixed fractions are `10/20/40/20/10`, so a 2 fs switch uses 50,000, 150,000,
+or 500,000 total steps for 100, 300, or 1000 ps without lengthening the requested
+protocol. Schedule optimization may redistribute subdivisions within these five
+chemical intervals while preserving the total step budget. Existing staged,
+general, and concerted paths retain their previous bonded interpolation.
 
 Parameter changes are linear within each chemical path interval by default. An
 experimental second-order smoothstep schedule can instead be selected explicitly:

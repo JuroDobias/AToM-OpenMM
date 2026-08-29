@@ -21,6 +21,9 @@ MAPPED_CHARGE_PARAMETER = "COVALENT_MAPPED_CHARGE"
 STERICS_PARAMETER = "COVALENT_STERICS"
 STERICS_A_PARAMETER = "COVALENT_STERICS_A"
 STERICS_B_PARAMETER = "COVALENT_STERICS_B"
+BONDED_A_PARAMETER = "COVALENT_BONDED_A"
+BONDED_B_PARAMETER = "COVALENT_BONDED_B"
+SEPARATE_BONDED_PARAMETER = "COVALENT_SEPARATE_BONDED"
 RECIPROCAL_A_CHARGE_PARAMETER = "COVALENT_RECIPROCAL_A_CHARGE"
 RECIPROCAL_B_CHARGE_PARAMETER = "COVALENT_RECIPROCAL_B_CHARGE"
 RECIPROCAL_A_EXCEPTION_PARAMETER = "COVALENT_RECIPROCAL_A_EXCEPTION"
@@ -176,18 +179,29 @@ def _add_bonded_forces(
     bonds_b = _bond_terms(bond_b)
     common_bonds = mm.HarmonicBondForce()
     changed_bonds = mm.CustomBondForce(
-        "0.5*((1-COVALENT_STERICS)*kA*(r-rA)^2+COVALENT_STERICS*kB*(r-rB)^2)"
+        "0.5*(wA*kA*(r-rA)^2+wB*kB*(r-rB)^2);"
+        "wA=(1-separate)*(1-COVALENT_STERICS)+separate*COVALENT_BONDED_A;"
+        "wB=(1-separate)*COVALENT_STERICS+separate*COVALENT_BONDED_B;"
+        "separate=COVALENT_SEPARATE_BONDED"
     )
+    changed_bonds.addGlobalParameter(BONDED_A_PARAMETER, 0.0)
+    changed_bonds.addGlobalParameter(BONDED_B_PARAMETER, 0.0)
     changed_bonds.addGlobalParameter(STERICS_PARAMETER, 0.0)
+    changed_bonds.addGlobalParameter(SEPARATE_BONDED_PARAMETER, 0.0)
     for name in ("rA", "kA", "rB", "kB"):
         changed_bonds.addPerBondParameter(name)
     soft_bonds = mm.CustomBondForce(
         "0.5*(wA*kA*drA^2/(1+SOFT_BOND_ALPHA*(1-wA)*drA^2)"
         "+wB*kB*drB^2/(1+SOFT_BOND_ALPHA*(1-wB)*drB^2));"
-        "wA=1-COVALENT_STERICS;wB=COVALENT_STERICS;"
+        "wA=(1-separate)*(1-COVALENT_STERICS)+separate*COVALENT_BONDED_A;"
+        "wB=(1-separate)*COVALENT_STERICS+separate*COVALENT_BONDED_B;"
+        "separate=COVALENT_SEPARATE_BONDED;"
         "drA=r-rA;drB=r-rB"
     )
+    soft_bonds.addGlobalParameter(BONDED_A_PARAMETER, 0.0)
+    soft_bonds.addGlobalParameter(BONDED_B_PARAMETER, 0.0)
     soft_bonds.addGlobalParameter(STERICS_PARAMETER, 0.0)
+    soft_bonds.addGlobalParameter(SEPARATE_BONDED_PARAMETER, 0.0)
     soft_bonds.addGlobalParameter("SOFT_BOND_ALPHA", float(soft_bond_alpha_nm2))
     for name in ("rA", "kA", "rB", "kB"):
         soft_bonds.addPerBondParameter(name)
@@ -227,10 +241,15 @@ def _add_bonded_forces(
     angles_b = _angle_terms(angle_b)
     common_angles = mm.HarmonicAngleForce()
     changed_angles = mm.CustomAngleForce(
-        "0.5*((1-COVALENT_STERICS)*kA*(theta-thetaA)^2"
-        "+COVALENT_STERICS*kB*(theta-thetaB)^2)"
+        "0.5*(wA*kA*(theta-thetaA)^2+wB*kB*(theta-thetaB)^2);"
+        "wA=(1-separate)*(1-COVALENT_STERICS)+separate*COVALENT_BONDED_A;"
+        "wB=(1-separate)*COVALENT_STERICS+separate*COVALENT_BONDED_B;"
+        "separate=COVALENT_SEPARATE_BONDED"
     )
+    changed_angles.addGlobalParameter(BONDED_A_PARAMETER, 0.0)
+    changed_angles.addGlobalParameter(BONDED_B_PARAMETER, 0.0)
     changed_angles.addGlobalParameter(STERICS_PARAMETER, 0.0)
+    changed_angles.addGlobalParameter(SEPARATE_BONDED_PARAMETER, 0.0)
     for name in ("thetaA", "kA", "thetaB", "kB"):
         changed_angles.addPerAngleParameter(name)
     for particles in sorted(set(angles_a) | set(angles_b)):
@@ -266,14 +285,31 @@ def _add_bonded_forces(
         common_torsions.setName("CovalentCommonTorsions")
         output.addForce(common_torsions)
     for label, terms, expression in (
-        ("A", only_a, "COVALENT_STERICS_A*k*(1+cos(periodicity*theta-phase))"),
-        ("B", only_b, "COVALENT_STERICS_B*k*(1+cos(periodicity*theta-phase))"),
+        (
+            "A",
+            only_a,
+            "((1-COVALENT_SEPARATE_BONDED)*COVALENT_STERICS_A"
+            "+COVALENT_SEPARATE_BONDED*COVALENT_BONDED_A)"
+            "*k*(1+cos(periodicity*theta-phase))",
+        ),
+        (
+            "B",
+            only_b,
+            "((1-COVALENT_SEPARATE_BONDED)*COVALENT_STERICS_B"
+            "+COVALENT_SEPARATE_BONDED*COVALENT_BONDED_B)"
+            "*k*(1+cos(periodicity*theta-phase))",
+        ),
     ):
         force = mm.CustomTorsionForce(expression)
+        force.addGlobalParameter(
+            BONDED_A_PARAMETER if label == "A" else BONDED_B_PARAMETER,
+            0.0,
+        )
         force.addGlobalParameter(
             STERICS_A_PARAMETER if label == "A" else STERICS_B_PARAMETER,
             0.0,
         )
+        force.addGlobalParameter(SEPARATE_BONDED_PARAMETER, 0.0)
         for name in ("periodicity", "phase", "k"):
             force.addPerTorsionParameter(name)
         for particles, periodicity, phase, k in terms:
@@ -281,6 +317,17 @@ def _add_bonded_forces(
         if force.getNumTorsions():
             force.setName(f"CovalentInterpolatedTorsions{label}")
             output.addForce(force)
+
+    parameter_anchor = mm.CustomExternalForce(
+        "0*(COVALENT_BONDED_A+COVALENT_BONDED_B+COVALENT_SEPARATE_BONDED)"
+    )
+    parameter_anchor.addGlobalParameter(BONDED_A_PARAMETER, 0.0)
+    parameter_anchor.addGlobalParameter(BONDED_B_PARAMETER, 0.0)
+    parameter_anchor.addGlobalParameter(SEPARATE_BONDED_PARAMETER, 0.0)
+    if output.getNumParticles():
+        parameter_anchor.addParticle(0, [])
+    parameter_anchor.setName("CovalentBondedParameterAnchor")
+    output.addForce(parameter_anchor)
 
 
 def _configure_nonbonded_like(source, target):
@@ -1474,17 +1521,24 @@ def resolve_softcore_path(
 ):
     if path_mode is not None:
         path_mode = str(path_mode).lower()
-        if path_mode != "concerted":
-            raise CovalentAlchemyError("softcore path mode must be 'concerted'")
+        if path_mode not in {"concerted", "staged_bonded"}:
+            raise CovalentAlchemyError(
+                "softcore path mode must be 'concerted' or 'staged_bonded'"
+            )
         if any(value is not None for value in (path_nodes, vdw_a, charge_a)):
             raise CovalentAlchemyError(
-                "softcore concerted mode cannot be combined with explicit path arrays"
+                "softcore named path modes cannot be combined with explicit path arrays"
             )
-        path_nodes = []
-        vdw_a = [1.0, 0.0]
-        charge_a = [1.0, 0.0]
+        if path_mode == "concerted":
+            path_nodes = []
+            vdw_a = [1.0, 0.0]
+            charge_a = [1.0, 0.0]
+        else:
+            path_nodes = [0.1, 0.3, 0.7, 0.9]
+            vdw_a = [1.0, 1.0, 1.0, 0.0, 0.0, 0.0]
+            charge_a = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         if segments_per_interval is None:
-            segments_per_interval = [1]
+            segments_per_interval = [1] * (len(path_nodes) + 1)
     general_values = (total_steps, path_nodes, vdw_a, charge_a, segments_per_interval)
     general = any(value is not None for value in general_values)
     if general:
@@ -1533,7 +1587,7 @@ def resolve_softcore_path(
         if total < 1:
             raise CovalentAlchemyError("softcore total_steps must be positive")
         interval_steps = _allocate_interval_steps(total, nodes, segments)
-        source = "concerted" if path_mode == "concerted" else "general"
+        source = path_mode if path_mode is not None else "general"
     else:
         if charge_steps_per_stage < 1 or sterics_steps < 1:
             raise CovalentAlchemyError("softcore stage steps must be positive")
@@ -1562,12 +1616,36 @@ def resolve_softcore_path(
 
     vdw_b = list(reversed(vdw))
     charge_b = list(reversed(charge))
-    mapped_vdw = [
-        0.5 * (1.0 - left + right) for left, right in zip(vdw, vdw_b)
-    ]
-    mapped_charge = [
-        0.5 * (1.0 - left + right) for left, right in zip(charge, charge_b)
-    ]
+    if source == "staged_bonded":
+        bonded_a = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0]
+        mapped_vdw = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+        mapped_charge = list(mapped_vdw)
+        stage_labels = [
+            "discharge_a",
+            "promote_b_bonded",
+            "exchange_sterics_and_mapped",
+            "demote_a_bonded",
+            "charge_b",
+        ]
+        reverse_stage_labels = [
+            "discharge_b",
+            "promote_a_bonded",
+            "exchange_sterics_and_mapped",
+            "demote_b_bonded",
+            "charge_a",
+        ]
+    else:
+        bonded_a = list(vdw)
+        mapped_vdw = [
+            0.5 * (1.0 - left + right) for left, right in zip(vdw, vdw_b)
+        ]
+        mapped_charge = [
+            0.5 * (1.0 - left + right) for left, right in zip(charge, charge_b)
+        ]
+        stage_labels = [f"interval_{index + 1}" for index in range(len(nodes) + 1)]
+        reverse_stage_labels = list(reversed(stage_labels))
+    bonded_b = list(reversed(bonded_a))
+    separate_bonded = [1.0 if source == "staged_bonded" else 0.0] * len(vdw)
     return {
         "source": source,
         "nodes": nodes,
@@ -1575,8 +1653,13 @@ def resolve_softcore_path(
         "vdw_b": vdw_b,
         "charge_a": charge,
         "charge_b": charge_b,
+        "bonded_a": bonded_a,
+        "bonded_b": bonded_b,
+        "separate_bonded": separate_bonded,
         "mapped_vdw": mapped_vdw,
         "mapped_charge": mapped_charge,
+        "stage_labels": stage_labels,
+        "reverse_stage_labels": reverse_stage_labels,
         "segments_per_interval": segments,
         "interval_steps": interval_steps,
         "total_steps": total,
@@ -1603,6 +1686,9 @@ def _expand_path(resolved):
         STERICS_A_PARAMETER: resolved["vdw_a"],
         STERICS_B_PARAMETER: resolved["vdw_b"],
         STERICS_PARAMETER: resolved["mapped_vdw"],
+        BONDED_A_PARAMETER: resolved["bonded_a"],
+        BONDED_B_PARAMETER: resolved["bonded_b"],
+        SEPARATE_BONDED_PARAMETER: resolved["separate_bonded"],
     }
     values = {
         name: _expand_node_values(nodes, resolved)

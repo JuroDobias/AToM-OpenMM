@@ -188,6 +188,11 @@ the branch's internal bonded geometry while removing mixed branch/core angular
 terms; `terminal_z_matrix` additionally retains one deterministic junction angle
 and torsion frame. This is intended for local internal valence changes where
 duplicating a large downstream ligand region would be inefficient.
+Unambiguous one-anchor unique branches now receive this Z-matrix framing
+automatically, with a recorded `bond_only` fallback when the mapped core cannot
+define a heavy-atom frame. The optional `staged_bonded` softcore path independently
+stages charge, bonded, steric, and mapped-atom changes within the original total
+switching-time budget.
 
 Every ligand-pair directory also contains an atomically updated `result.yaml` for integration with workflow managers and databases. It uses the same schema for asynchronous replica exchange and NEQTI, reports DDG in kcal/mol and kJ/mol, records input provenance and artifacts, and exposes `prepared`, `running`, `partial`, `completed`, or `failed` status.
 

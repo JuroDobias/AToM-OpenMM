@@ -71,6 +71,15 @@ def _sha256(path):
 
 def _mapping_settings(workflow):
     settings = dict((workflow.get("alchemy") or {}).get("mapping") or {})
+    legacy_geometry_requested = any(
+        key in settings
+        for key in (
+            "inactive_bonded_labels",
+            "inactive_bonded_atoms_a_0based",
+            "inactive_bonded_atoms_b_0based",
+            "inactive_bonded_geometry",
+        )
+    )
     method = settings.get("method", "mcs")
     if method not in {"mcs", "mcs_core_smarts", "paired_smarts_transmutation", "explicit_pairs"}:
         raise HybridWorkflowError(
@@ -153,7 +162,7 @@ def _mapping_settings(workflow):
         raise HybridWorkflowError(
             "explicit_pairs terminal_z_matrix requires at least one inactive bonded atom"
         )
-    if "junction_bonds" not in settings:
+    if "junction_bonds" not in settings and legacy_geometry_requested:
         settings["inactive_bonded_geometry"] = geometry
     if "max_mapped_rmsd_a" in settings:
         settings["max_mapped_rmsd_a"] = float(settings["max_mapped_rmsd_a"])

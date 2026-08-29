@@ -105,6 +105,23 @@ def _test_element_transmutation_requires_neqti():
     )
 
 
+def _test_explicit_mapping_does_not_mask_automatic_junction_geometry():
+    from atom_openmm.hybrid_workflow import _mapping_settings
+
+    settings = _mapping_settings(
+        {
+            "alchemy": {
+                "mapping": {
+                    "method": "explicit_pairs",
+                    "pairs_0based": [[0, 0], [1, 1]],
+                }
+            }
+        }
+    )
+
+    assert "inactive_bonded_geometry" not in settings
+
+
 def _test_hybrid_dummy_core_nonbonded_defaults_off_and_accepts_retain(tmp_path):
     from atom_openmm.hybrid_workflow import HybridWorkflowError, _validate_settings
 

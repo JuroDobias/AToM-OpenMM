@@ -286,10 +286,116 @@ def _resolve_junction_bonds(
                 "boundary_atoms_0based": [core, root],
                 "branch_atoms_0based": sorted(component),
                 "inactive_geometry": geometry,
+                "selection_source": "explicit",
+                "fallback_reason": None,
                 "selector": dict(entry),
             }
         )
     return selected, z_matrix_roots, resolved
+
+
+def _has_mapped_heavy_z_matrix_chain(molecule, mapped, core, root):
+    for atom_b_obj in molecule.GetAtomWithIdx(core).GetNeighbors():
+        atom_b = atom_b_obj.GetIdx()
+        if atom_b == root or atom_b not in mapped or atom_b_obj.GetAtomicNum() == 1:
+            continue
+        for atom_a_obj in atom_b_obj.GetNeighbors():
+            atom_a = atom_a_obj.GetIdx()
+            if (
+                atom_a != core
+                and atom_a in mapped
+                and atom_a_obj.GetAtomicNum() != 1
+            ):
+                return True
+    return False
+
+
+def _automatic_junction_bonds(
+    molecule, mapping_atoms, endpoint, *, alchemical_bonds=(), excluded_atoms=()
+):
+    """Resolve every unambiguous endpoint-unique branch junction."""
+    mapped = set(mapping_atoms)
+    unique = set(range(molecule.GetNumAtoms())) - mapped
+    open_bonds = {tuple(sorted(pair)) for pair in alchemical_bonds}
+    excluded = set(excluded_atoms)
+    pending = set(unique)
+    components = []
+    while pending:
+        start = min(pending)
+        stack = [start]
+        component = set()
+        while stack:
+            atom = stack.pop()
+            if atom in component:
+                continue
+            component.add(atom)
+            pending.discard(atom)
+            stack.extend(
+                neighbor.GetIdx()
+                for neighbor in molecule.GetAtomWithIdx(atom).GetNeighbors()
+                if neighbor.GetIdx() in unique
+                and neighbor.GetIdx() not in component
+                and tuple(sorted((atom, neighbor.GetIdx()))) not in open_bonds
+            )
+        components.append(component)
+
+    selected = set()
+    z_matrix_roots = set()
+    resolved = []
+    warnings = []
+    for component in components:
+        if component & excluded:
+            continue
+        boundaries = sorted(
+            {
+                (neighbor.GetIdx(), atom)
+                for atom in component
+                for neighbor in molecule.GetAtomWithIdx(atom).GetNeighbors()
+                if neighbor.GetIdx() in mapped
+                and tuple(sorted((atom, neighbor.GetIdx()))) not in open_bonds
+            }
+        )
+        if len(boundaries) != 1:
+            if boundaries:
+                warnings.append(
+                    {
+                        "endpoint": endpoint[-1],
+                        "branch_atoms_0based": sorted(component),
+                        "reason": "multiple_mapped_core_boundaries",
+                        "boundary_count": len(boundaries),
+                    }
+                )
+            continue
+        core, root = boundaries[0]
+        has_frame = _has_mapped_heavy_z_matrix_chain(
+            molecule, mapped, core, root
+        )
+        geometry = "terminal_z_matrix" if has_frame else "bond_only"
+        fallback = None if has_frame else "no_mapped_heavy_reference_chain"
+        selected.update(component)
+        if has_frame:
+            z_matrix_roots.add(root)
+        else:
+            warnings.append(
+                {
+                    "endpoint": endpoint[-1],
+                    "branch_atoms_0based": sorted(component),
+                    "reason": fallback,
+                    "boundary_atoms_0based": [core, root],
+                }
+            )
+        resolved.append(
+            {
+                "endpoint": endpoint[-1],
+                "boundary_atoms_0based": [core, root],
+                "branch_atoms_0based": sorted(component),
+                "inactive_geometry": geometry,
+                "selection_source": "automatic",
+                "fallback_reason": fallback,
+                "selector": {"automatic_junction": True},
+            }
+        )
+    return selected, z_matrix_roots, resolved, warnings
 
 
 def _direct_rmsd(molecule_a, molecule_b, mapping):
@@ -600,6 +706,7 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
         )
     junction_settings = normalize_junction_bonds(raw_junctions)
     resolved_junctions = []
+    junction_warnings = []
     z_matrix_roots_a = set()
     z_matrix_roots_b = set()
     if raw_junctions is not None:
@@ -640,11 +747,33 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
                 "boundary_atoms_0based": [component["center"], component["root"]],
                 "branch_atoms_0based": list(component["atoms"]),
                 "inactive_geometry": geometry,
+                "selection_source": "legacy",
+                "fallback_reason": None,
                 "selector": {"legacy_inactive_atoms_0based": list(component["atoms"])},
             }
             for endpoint, components in (("a", components_a), ("b", components_b))
             for component in components
         ]
+    auto_a, auto_z_a, auto_resolved_a, auto_warnings_a = _automatic_junction_bonds(
+        molecule_a,
+        set(mapping),
+        "ligand_a",
+        alchemical_bonds=alchemical_bonds["ligand_a"],
+        excluded_atoms=inactive_a,
+    )
+    auto_b, auto_z_b, auto_resolved_b, auto_warnings_b = _automatic_junction_bonds(
+        molecule_b,
+        set(mapping.values()),
+        "ligand_b",
+        alchemical_bonds=alchemical_bonds["ligand_b"],
+        excluded_atoms=inactive_b,
+    )
+    inactive_a.update(auto_a)
+    inactive_b.update(auto_b)
+    z_matrix_roots_a.update(auto_z_a)
+    z_matrix_roots_b.update(auto_z_b)
+    resolved_junctions.extend(auto_resolved_a + auto_resolved_b)
+    junction_warnings.extend(auto_warnings_a + auto_warnings_b)
     rmsd = _direct_rmsd(molecule_a, molecule_b, mapping)
     maximum = settings.get("max_mapped_rmsd_a")
     if maximum is not None and rmsd > float(maximum):
@@ -679,6 +808,7 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
         ).lower(),
         "junction_bonds": junction_settings if raw_junctions is not None else None,
         "resolved_junction_bonds": resolved_junctions,
+        "automatic_junction_warnings": junction_warnings,
         "inactive_z_matrix_root_atoms_a_0based": sorted(z_matrix_roots_a),
         "inactive_z_matrix_root_atoms_b_0based": sorted(z_matrix_roots_b),
         "alchemical_bonds": alchemical_bonds if settings.get("alchemical_bonds") is not None else None,

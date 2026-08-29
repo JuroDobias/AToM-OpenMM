@@ -1,0 +1,118 @@
+workflow:
+  type: rbfe
+  chemistry: covalent
+  alchemy:
+    model: hybrid_topology
+    cycle: complex_solvent
+    dummy_core_nonbonded: "off"
+    mapping:
+      method: explicit_pairs
+      pairs_0based:
+        - [1, 25]
+        - [2, 30]
+        - [3, 22]
+        - [4, 20]
+        - [5, 21]
+        - [6, 19]
+        - [7, 18]
+        - [8, 17]
+        - [9, 16]
+        - [10, 15]
+        - [11, 14]
+        - [12, 13]
+        - [13, 11]
+        - [14, 12]
+        - [15, 10]
+        - [16, 2]
+        - [17, 1]
+        - [18, 0]
+        - [19, 3]
+        - [20, 4]
+        - [21, 5]
+        - [22, 6]
+        - [23, 7]
+        - [24, 8]
+        - [25, 9]
+        - [26, 33]
+        - [27, 34]
+        - [28, 35]
+        - [29, 36]
+        - [30, 37]
+        - [31, 38]
+        - [32, 39]
+        - [33, 40]
+        - [34, 31]
+        - [35, 32]
+        - [36, 23]
+        - [37, 24]
+      alchemical_bonds:
+        ligand_a: []
+        ligand_b:
+          - atoms_0based: [29, 30]
+            mode: soft_bond
+  sampling:
+    method: neqti
+  dataset: ../../../../../../rhino_benchmarks/normalized/dataset.yaml
+  workdir: run
+  pairs:
+    - ligands: [I79DJ_543, I79DJ_735]
+      external_metadata:
+        purpose: staged_bonded_local_smoke
+  platform: OpenCL
+  platform_properties:
+    Precision: mixed
+  setup:
+    protein_forcefield: amber19/protein.ff19SB.xml
+    water_forcefield: amber19/opc.xml
+    ligand_forcefield: openff-2.2.1.offxml
+    ligand_charge_model: espaloma_nn
+    espaloma_model: espaloma-0.3.2
+    solvent_padding_a: 10.0
+    ionic_strength_molar: 0.15
+    dummy_bonded_scales:
+      bond: 1.0
+      angle: 1.0
+      proper_torsion: 1.0
+      junction_angle: 1.0
+      junction_proper_torsion: 1.0
+  neqti:
+    temperature_k: 300.0
+    pressure_bar: 1.0
+    timestep_fs: 2.0
+    endpoint_equilibration:
+      minimization_tolerance_kj_mol_nm: 100.0
+      minimization_max_iterations: 100
+      nvt_steps: 100
+      nvt_timestep_fs: 1.0
+      npt_steps: 100
+      npt_timestep_fs: 1.0
+    n_snapshots: 1
+    decorrelation_steps: 10
+    write_switch_pdbs: true
+    interpolation: softcore_linear
+    softcore:
+      function: beutler
+      coulomb_function: linear_pme
+      alpha: 0.3
+      sigma_nm: 0.25
+      power: 1
+      total_steps: 1000
+      path:
+        mode: staged_bonded
+      soft_bond_alpha_nm2: 100.0
+      long_range_correction: dynamic
+    switch_work_profile:
+      enabled: true
+      interval_steps: 20
+      phases: [production]
+    schedule_optimization:
+      enabled: false
+    adaptive_switching:
+      enabled: false
+    convergence:
+      enabled: false
+    failed_switch_policy: count_as_infinite
+    bootstrap_samples: 0
+    random_seed: 20260829
+    rest2:
+      enabled: false

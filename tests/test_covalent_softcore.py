@@ -5,11 +5,14 @@ import openmm as mm
 from openmm import unit
 
 from atom_openmm.covalent_softcore import (
+    BONDED_A_PARAMETER,
+    BONDED_B_PARAMETER,
     CHARGE_A_PARAMETER,
     CHARGE_B_PARAMETER,
     GAPSYS_RECIPROCAL_A_CHARGE_PARAMETER,
     MAPPED_CHARGE_PARAMETER,
     RECIPROCAL_A_CHARGE_PARAMETER,
+    SEPARATE_BONDED_PARAMETER,
     SOFTCORE_NONBONDED_FORCE_GROUP,
     STERICS_PARAMETER,
     STERICS_A_PARAMETER,
@@ -877,6 +880,67 @@ def _test_general_linear_path_preserves_endpoints_and_budget():
         assert np.allclose(observed_forces, expected_forces, atol=1.0e-3)
 
 
+def _test_staged_bonded_path_is_symmetric_and_preserves_budget():
+    resolved = resolve_softcore_path(
+        total_steps=50000,
+        path_mode="staged_bonded",
+        segments_per_interval=[1, 1, 1, 1, 1],
+    )
+
+    assert resolved["nodes"] == [0.1, 0.3, 0.7, 0.9]
+    assert resolved["interval_steps"] == [5000, 10000, 20000, 10000, 5000]
+    assert resolved["bonded_a"] == [1.0, 1.0, 1.0, 1.0, 0.0, 0.0]
+    assert resolved["bonded_b"] == list(reversed(resolved["bonded_a"]))
+    assert resolved["mapped_charge"] == [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+    assert resolved["mapped_vdw"] == resolved["mapped_charge"]
+    assert resolved["stage_labels"] == [
+        "discharge_a",
+        "promote_b_bonded",
+        "exchange_sterics_and_mapped",
+        "demote_a_bonded",
+        "charge_b",
+    ]
+
+
+def _test_staged_bonded_hamiltonian_preserves_endpoints_and_separates_controls():
+    endpoint_a = _endpoint("a")
+    endpoint_b = _endpoint("b")
+    hamiltonian = create_softcore_hamiltonian(
+        endpoint_a,
+        endpoint_b,
+        [2],
+        [3],
+        total_steps=1000,
+        path_mode="staged_bonded",
+        segments_per_interval=[1, 1, 1, 1, 1],
+    )
+    positions = np.asarray(
+        [[0, 0, 0], [0.15, 0, 0], [0.28, 0.08, 0], [0.29, -0.09, 0.03], [0.7, 0.4, 0.3]]
+    ) * unit.nanometer
+
+    for endpoint, node in ((endpoint_a, 0), (endpoint_b, -1)):
+        expected_energy, expected_forces = _energy_forces(endpoint, positions)
+        parameters = {
+            name: values[node]
+            for name, values in hamiltonian.parameter_values.items()
+        }
+        observed_energy, observed_forces = _energy_forces(
+            hamiltonian.system, positions, parameters
+        )
+        assert np.isclose(observed_energy, expected_energy, atol=1.0e-5)
+        assert np.allclose(observed_forces, expected_forces, atol=1.0e-3)
+
+    promote_b = {
+        name: values[2] for name, values in hamiltonian.parameter_values.items()
+    }
+    assert promote_b[BONDED_A_PARAMETER] == 1.0
+    assert promote_b[BONDED_B_PARAMETER] == 1.0
+    assert promote_b[SEPARATE_BONDED_PARAMETER] == 1.0
+    assert promote_b[STERICS_A_PARAMETER] == 1.0
+    assert promote_b[STERICS_B_PARAMETER] == 0.0
+    assert promote_b[MAPPED_CHARGE_PARAMETER] == 0.0
+
+
 def _test_general_midpoint_path_keeps_both_vdw_branches_fully_coupled():
     hamiltonian = create_softcore_hamiltonian(
         _endpoint("a"),
@@ -895,6 +959,7 @@ def _test_general_midpoint_path_keeps_both_vdw_branches_fully_coupled():
     assert hamiltonian.parameter_values["COVALENT_CHARGE_A"][midpoint] == 0.5
     assert hamiltonian.parameter_values["COVALENT_CHARGE_B"][midpoint] == 0.5
     assert hamiltonian.parameter_values["COVALENT_STERICS"][midpoint] == 0.5
+    assert hamiltonian.parameter_values[SEPARATE_BONDED_PARAMETER][midpoint] == 0.0
     positions = np.asarray(
         [[0, 0, 0], [0.15, 0, 0], [0.28, 0.08, 0], [0.28, 0.08, 0], [0.7, 0.4, 0.3]]
     ) * unit.nanometer
@@ -905,6 +970,26 @@ def _test_general_midpoint_path_keeps_both_vdw_branches_fully_coupled():
     energy, forces = _energy_forces(hamiltonian.system, positions, parameters)
     assert np.isfinite(energy)
     assert np.all(np.isfinite(forces))
+
+    bond_force = next(
+        force
+        for force in hamiltonian.system.getForces()
+        if force.getName() == "CovalentInterpolatedBonds"
+    )
+    bond_force.setForceGroup(30)
+    context = mm.Context(hamiltonian.system, mm.VerletIntegrator(0.001))
+    context.setPositions(positions)
+    for name, value in parameters.items():
+        context.setParameter(name, value)
+    observed_bond_energy = context.getState(
+        getEnergy=True, groups=1 << 30
+    ).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+    distance = np.linalg.norm(np.asarray([0.28, 0.08, 0.0]) - np.asarray([0.15, 0.0, 0.0]))
+    expected_bond_energy = 0.25 * 800.0 * (
+        (distance - 0.14) ** 2 + (distance - 0.16) ** 2
+    )
+    del context
+    assert np.isclose(observed_bond_energy, expected_bond_energy, atol=1.0e-6)
 
 
 def _test_segment_work_increments_sum_to_total_protocol_work():

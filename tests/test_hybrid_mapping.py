@@ -2,12 +2,59 @@ from types import SimpleNamespace
 
 import pytest
 from openff.toolkit import Molecule
+from rdkit import Chem
 
 from atom_openmm.hybrid_mapping import (
     HybridMappingError,
+    _automatic_junction_bonds,
     _strict_explicit_pairs,
     build_hybrid_atom_map,
 )
+
+
+def _test_automatic_junction_uses_z_matrix_for_mapped_heavy_chain():
+    molecule = Chem.MolFromSmiles("CCCC")
+
+    selected, roots, resolved, warnings = _automatic_junction_bonds(
+        molecule, {0, 1, 2}, "ligand_b"
+    )
+
+    assert selected == {3}
+    assert roots == {3}
+    assert resolved[0]["boundary_atoms_0based"] == [2, 3]
+    assert resolved[0]["inactive_geometry"] == "terminal_z_matrix"
+    assert resolved[0]["selection_source"] == "automatic"
+    assert warnings == []
+
+
+def _test_automatic_junction_falls_back_without_heavy_reference_chain():
+    molecule = Chem.MolFromSmiles("CC")
+
+    selected, roots, resolved, warnings = _automatic_junction_bonds(
+        molecule, {0}, "ligand_a"
+    )
+
+    assert selected == {1}
+    assert roots == set()
+    assert resolved[0]["inactive_geometry"] == "bond_only"
+    assert resolved[0]["fallback_reason"] == "no_mapped_heavy_reference_chain"
+    assert warnings[0]["reason"] == "no_mapped_heavy_reference_chain"
+
+
+def _test_automatic_junction_opens_declared_annulation_bond():
+    molecule = Chem.MolFromSmiles("c1ccc2c(c1)CCC2")
+
+    selected, roots, resolved, warnings = _automatic_junction_bonds(
+        molecule,
+        set(range(6)),
+        "ligand_b",
+        alchemical_bonds={(3, 8)},
+    )
+
+    assert selected == {6, 7, 8}
+    assert roots == {6}
+    assert resolved[0]["boundary_atoms_0based"] == [4, 6]
+    assert warnings == []
 
 
 def _parameters(smiles):
@@ -144,8 +191,33 @@ def _test_explicit_pairs_support_explicit_inactive_atoms():
         },
     )
 
-    assert metadata["inactive_bonded_atoms_b_0based"] == [3]
+    assert 3 in metadata["inactive_bonded_atoms_b_0based"]
+    automatic = [
+        entry
+        for entry in metadata["resolved_junction_bonds"]
+        if entry["selection_source"] == "automatic"
+    ]
+    assert automatic
     assert metadata["inactive_bonded_geometry"] == "terminal_z_matrix"
+
+
+def _test_explicit_pairs_automatically_activate_z_matrix_geometry():
+    ligand_a = _parameters("CCC")
+    ligand_b = _parameters("CCCC")
+
+    _, metadata = build_hybrid_atom_map(
+        ligand_a,
+        ligand_b,
+        {
+            "method": "explicit_pairs",
+            "pairs_0based": [[0, 0], [1, 1], [2, 2]],
+        },
+    )
+
+    assert 3 in metadata["inactive_bonded_atoms_b_0based"]
+    assert 3 in metadata["inactive_z_matrix_root_atoms_b_0based"]
+    assert metadata["inactive_bonded_geometry"] == "terminal_z_matrix"
+    assert metadata["resolved_junction_bonds"][0]["selection_source"] == "automatic"
 
 
 @pytest.mark.parametrize(

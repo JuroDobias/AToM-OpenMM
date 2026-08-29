@@ -59,6 +59,20 @@ charge stage, so the configured 10000 + 30000 + 10000 steps produce a 100 ps
 switch at 2 fs. The implementation keeps PME and common protein/water forces in a
 single system rather than evaluating two complete endpoint Hamiltonians.
 
+Set `softcore.path.mode: staged_bonded` together with `softcore.total_steps` to
+separate the bonded transformation from sterics. Its symmetric five-stage path
+uses `10/20/40/20/10` percent of the requested total time: decharge A, promote B
+bonded terms, exchange sterics and mapped parameters, demote A bonded terms, and
+charge B. This is useful when a local valence change must reorganize before the
+new branch acquires steric interactions. It does not increase a configured 100,
+300, or 1000 ps switch.
+
+Unique branches with one mapped-core attachment use automatic
+`terminal_z_matrix` framing when the mapped core supplies a connected heavy-atom
+reference chain. Explicit `junction_bonds` entries override this choice. A branch
+without a valid frame falls back to `bond_only` with a warning in the log and
+mapping metadata.
+
 For experimental paths, replace the two staged step settings with
 `softcore.total_steps` and `softcore.path`. An empty `nodes` list with
 `vdw_a: [1, 0]` and `charge_a: [1, 0]` transforms charge and van der Waals terms

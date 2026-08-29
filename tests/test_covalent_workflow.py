@@ -617,6 +617,38 @@ def _test_general_softcore_path_normalizes_optimizer_segments():
     assert resolved["mapped_vdw"] == [0.0, 0.5, 1.0]
 
 
+def _test_staged_bonded_workflow_uses_five_optimized_intervals():
+    workflow = {
+        "neqti": {
+            "timestep_fs": 2.0,
+            "interpolation": "softcore_linear",
+            "softcore": {
+                "total_steps": 50000,
+                "path": {"mode": "staged_bonded"},
+            },
+            "schedule_optimization": {"enabled": True},
+            "adaptive_switching": {
+                "enabled": True,
+                "candidate_times_ps": [100, 300, 1000],
+            },
+        }
+    }
+
+    config = _normalized_settings(workflow)
+    protocol = _switch_protocol(config)
+    resolved = protocol["softcore"]["resolved_path"]
+
+    assert config["switch_steps"] == 50000
+    assert config["schedule_optimization"]["segments_per_interval"] == [10] * 5
+    assert config["adaptive_switching"]["candidate_total_steps"] == [
+        50000,
+        150000,
+        500000,
+    ]
+    assert resolved["source"] == "staged_bonded"
+    assert resolved["interval_steps"] == [5000, 10000, 20000, 10000, 5000]
+
+
 def _test_gapsys_and_work_profile_settings_are_recorded_in_protocol():
     config = _normalized_settings(
         {
@@ -1162,10 +1194,8 @@ def _test_covalent_mapping_settings_accept_paired_smarts_transmutation():
     )
 
     assert settings["method"] == "paired_smarts_transmutation"
-    assert settings["inactive_bonded_labels"] == {
-        "ligand_a": [], "ligand_b": []
-    }
-    assert settings["inactive_bonded_geometry"] == "bond_only"
+    assert "inactive_bonded_labels" not in settings
+    assert "inactive_bonded_geometry" not in settings
 
 
 def _test_covalent_mapping_settings_accept_explicit_pairs():
@@ -1176,10 +1206,27 @@ def _test_covalent_mapping_settings_accept_explicit_pairs():
     assert settings == {
         "method": "explicit_pairs",
         "pairs_0based": [[0, 1], [2, 3]],
-        "inactive_bonded_atoms_a_0based": [],
-        "inactive_bonded_atoms_b_0based": [],
-        "inactive_bonded_geometry": "bond_only",
     }
+
+
+def _test_covalent_mapping_settings_preserve_explicit_legacy_geometry():
+    settings = _mapping_settings(
+        {
+            "alchemy": {
+                "mapping": {
+                    "method": "explicit_pairs",
+                    "pairs_0based": [[0, 1]],
+                    "inactive_bonded_atoms_b_0based": [2, 3],
+                    "inactive_bonded_geometry": "bond_only",
+                }
+            }
+        },
+        {},
+    )
+
+    assert settings["inactive_bonded_atoms_a_0based"] == []
+    assert settings["inactive_bonded_atoms_b_0based"] == [2, 3]
+    assert settings["inactive_bonded_geometry"] == "bond_only"
 
 
 def _test_covalent_explicit_mapping_requires_single_edge(monkeypatch):

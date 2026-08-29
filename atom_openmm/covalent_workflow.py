@@ -24,6 +24,7 @@ from atom_openmm.covalent_hybrid import (
     DummyBondedScales,
     build_covalent_hybrid_molecule,
     complete_covalent_atom_map,
+    find_covalent_atom_map,
     inactive_branch_metadata,
     inactive_z_matrix_metadata,
     normalize_mapping_aromaticity,
@@ -37,6 +38,8 @@ from atom_openmm.covalent_parameters import (
 )
 from atom_openmm.covalent_protein import prepare_protein_covalent_hybrid
 from atom_openmm.covalent_softcore import (
+    BONDED_A_PARAMETER,
+    BONDED_B_PARAMETER,
     AMBER_SSC2_IMPLEMENTATION,
     CHARGE_A_PARAMETER,
     CHARGE_B_PARAMETER,
@@ -44,6 +47,7 @@ from atom_openmm.covalent_softcore import (
     MAPPED_CHARGE_PARAMETER,
     LEGACY_SSC2_IMPLEMENTATION,
     SOFTCORE_NONBONDED_FORCE_GROUP,
+    SEPARATE_BONDED_PARAMETER,
     STERICS_A_PARAMETER,
     STERICS_B_PARAMETER,
     STERICS_PARAMETER,
@@ -57,6 +61,7 @@ from atom_openmm.covalent_systems import (
     write_prepared_hybrid_bundle,
 )
 from atom_openmm.hybrid_mapping import (
+    _automatic_junction_bonds,
     _explicit_pairs_map,
     _paired_smarts_transmutation_map,
     _resolve_junction_bonds,
@@ -101,6 +106,9 @@ WORK_PROFILE_PARAMETERS = (
     STERICS_A_PARAMETER,
     STERICS_B_PARAMETER,
     STERICS_PARAMETER,
+    BONDED_A_PARAMETER,
+    BONDED_B_PARAMETER,
+    SEPARATE_BONDED_PARAMETER,
 )
 
 
@@ -145,6 +153,15 @@ def _mapping_settings(workflow, pair):
         raise CovalentWorkflowError("workflow.pairs[].mapping must be a mapping")
     settings = dict(default or {})
     settings.update(override or {})
+    legacy_geometry_requested = any(
+        key in settings
+        for key in (
+            "inactive_bonded_labels",
+            "inactive_bonded_atoms_a_0based",
+            "inactive_bonded_atoms_b_0based",
+            "inactive_bonded_geometry",
+        )
+    )
     method = settings.get("method")
     if method is None:
         method = "mcs_core_smarts" if settings.get("smarts") else "dataset_core"
@@ -210,7 +227,7 @@ def _mapping_settings(workflow, pair):
             raise CovalentWorkflowError(
                 "covalent mapping.inactive_bonded_labels must be a mapping"
             )
-        if junctions is None:
+        if junctions is None and legacy_geometry_requested:
             normalized["inactive_bonded_labels"] = {
                 side: [int(value) for value in inactive.get(side, [])]
                 for side in ("ligand_a", "ligand_b")
@@ -247,7 +264,7 @@ def _mapping_settings(workflow, pair):
                 "inactive bonded atom"
             )
         normalized["pairs_0based"] = [list(pair) for pair in pairs]
-        if junctions is None:
+        if junctions is None and legacy_geometry_requested:
             normalized.update(
                 {
                     "inactive_bonded_atoms_a_0based": inactive_a,
@@ -1824,7 +1841,15 @@ def _run_segmented_protocol(
         raise ValueError(
             "profile interval, parameter values, and metadata are required"
         )
+    profile_metadata = None if profile_metadata is None else dict(profile_metadata)
+    stage_labels = None if profile_metadata is None else profile_metadata.pop(
+        "stage_labels", None
+    )
     direction = None if profile_metadata is None else profile_metadata["direction"]
+    segment_groups = integrator.get_segments_per_stage()
+    stage_by_segment = []
+    for stage_index, count in enumerate(segment_groups):
+        stage_by_segment.extend([stage_index] * int(count))
     for segment, steps in enumerate(segment_steps):
         steps = int(steps)
         local_step = 0
@@ -1867,6 +1892,11 @@ def _run_segmented_protocol(
                     "status": "running",
                     "failure_message": "",
                     "segment": segment + 1,
+                    "stage": (
+                        stage_labels[stage_by_segment[segment]]
+                        if stage_labels is not None
+                        else f"stage_{stage_by_segment[segment] + 1}"
+                    ),
                     "step_start": window_start_step,
                     "step_end": total_step,
                     "lambda_start": lambda_start,
@@ -1906,6 +1936,7 @@ def _work_profile_fields():
         "status",
         "failure_message",
         "segment",
+        "stage",
         "step_start",
         "step_end",
         "lambda_start",
@@ -2214,6 +2245,11 @@ def _iter_environment(
             softcore.total_steps,
             softcore.resolved_path["source"],
         )
+        LOGGER.info(
+            "%s softcore forward stages: %s",
+            name,
+            " -> ".join(softcore.resolved_path["stage_labels"]),
+        )
     optimization = config["schedule_optimization"]
     if optimization["enabled"]:
         optimizer_path = workdir / "covalent_schedule_optimization.yaml"
@@ -2328,6 +2364,11 @@ def _iter_environment(
                             "environment": name,
                             "direction": direction,
                             "sample": cycle + 1,
+                            "stage_labels": (
+                                softcore.resolved_path["stage_labels"]
+                                if direction == "forward"
+                                else softcore.resolved_path["reverse_stage_labels"]
+                            ),
                         },
                     )
                 except Exception as exc:
@@ -2828,6 +2869,11 @@ def _iter_environment(
                             "environment": name,
                             "direction": direction,
                             "sample": sample + 1,
+                            "stage_labels": (
+                                softcore.resolved_path["stage_labels"]
+                                if direction == "forward"
+                                else softcore.resolved_path["reverse_stage_labels"]
+                            ),
                         },
                     )
                 switch_elapsed = time.perf_counter() - started
@@ -3381,8 +3427,11 @@ def _normalized_settings(workflow):
                 "softcore path.mode cannot be combined with explicit path arrays"
             )
         nodes = [] if path_mode is not None else list(path_raw.get("nodes", []))
-        default_segments = [10] * (len(nodes) + 1) if optimization_enabled else [1] * (
-            len(nodes) + 1
+        interval_count = (
+            5 if str(path_mode).lower() == "staged_bonded" else len(nodes) + 1
+        )
+        default_segments = (
+            [10] * interval_count if optimization_enabled else [1] * interval_count
         )
         softcore_settings.update(
             {
@@ -3846,6 +3895,7 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
             requested_pairs = ()
             completed_hydrogen_pairs = set()
         resolved_junctions = []
+        automatic_junction_warnings = []
         ligand_alchemical = normalize_alchemical_bonds(
             mapping_settings.get("alchemical_bonds")
         )
@@ -3875,6 +3925,30 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
                 ligand_alchemical_b,
             )
             resolved_junctions = resolved_a + resolved_b
+        auto_a, auto_z_a, auto_resolved_a, auto_warnings_a = (
+            _automatic_junction_bonds(
+                raw_a,
+                set(ligand_map),
+                "ligand_a",
+                alchemical_bonds=ligand_alchemical_a,
+                excluded_atoms=ligand_inactive_a,
+            )
+        )
+        auto_b, auto_z_b, auto_resolved_b, auto_warnings_b = (
+            _automatic_junction_bonds(
+                raw_b,
+                set(ligand_map.values()),
+                "ligand_b",
+                alchemical_bonds=ligand_alchemical_b,
+                excluded_atoms=ligand_inactive_b,
+            )
+        )
+        ligand_inactive_a.update(auto_a)
+        ligand_inactive_b.update(auto_b)
+        ligand_z_roots_a.update(auto_z_a)
+        ligand_z_roots_b.update(auto_z_b)
+        resolved_junctions.extend(auto_resolved_a + auto_resolved_b)
+        automatic_junction_warnings.extend(auto_warnings_a + auto_warnings_b)
         product_a = {
             int(atom): int(product)
             for atom, product in meta_a["ligand_to_product_atom_indices"].items()
@@ -3922,6 +3996,25 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
                 product_map[atom] for atom in entry["branch_atoms_0based"]
             ]
             resolved_product_junctions.append(converted)
+        product_junction_warnings = []
+        for entry in automatic_junction_warnings:
+            product_map = product_a if entry["endpoint"] == "a" else product_b
+            converted = dict(entry)
+            converted["branch_atoms_0based"] = [
+                product_map[atom] for atom in entry["branch_atoms_0based"]
+            ]
+            if "boundary_atoms_0based" in entry:
+                converted["boundary_atoms_0based"] = [
+                    product_map[atom] for atom in entry["boundary_atoms_0based"]
+                ]
+            product_junction_warnings.append(converted)
+        for warning in product_junction_warnings:
+            LOGGER.warning(
+                "Automatic junction fallback for ligand %s branch %s: %s",
+                warning["endpoint"].upper(),
+                warning["branch_atoms_0based"],
+                warning["reason"],
+            )
         requested_product_pairs = [
             (product_a[atom_a], product_b[atom_b])
             for atom_a, atom_b in requested_pairs
@@ -3978,6 +4071,7 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
                 "inactive_bonded_geometry": inactive_geometry,
                 "junction_bonds": mapping_settings.get("junction_bonds"),
                 "resolved_junction_bonds": resolved_product_junctions,
+                "automatic_junction_warnings": product_junction_warnings,
                 "inactive_z_matrix_root_atoms_a_0based": sorted(
                     inactive_z_matrix_roots_a
                 ),
@@ -4006,7 +4100,13 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
     for pair_to_require in attachment_pairs:
         if pair_to_require not in required:
             required.append(pair_to_require)
-    if atom_map is not None:
+    if atom_map is None:
+        atom_map = find_covalent_atom_map(
+            product_molecule_a,
+            product_molecule_b,
+            required_pairs=required,
+        )
+    else:
         if attachment_pairs[1] not in atom_map.items():
             raise CovalentWorkflowError(
                 "ligand atom map must contain the ligand electrophile carbon"
@@ -4020,6 +4120,51 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
             alchemical_bonds_a=alchemical_bonds_a,
             alchemical_bonds_b=alchemical_bonds_b,
         )
+    if mapping_settings["method"] in {"dataset_core", "mcs_core_smarts"}:
+        auto_a, auto_z_a, resolved_a, warnings_a = _automatic_junction_bonds(
+            product_molecule_a,
+            set(atom_map),
+            "ligand_a",
+            excluded_atoms=inactive_a,
+        )
+        auto_b, auto_z_b, resolved_b, warnings_b = _automatic_junction_bonds(
+            product_molecule_b,
+            set(atom_map.values()),
+            "ligand_b",
+            excluded_atoms=inactive_b,
+        )
+        inactive_a.update(auto_a)
+        inactive_b.update(auto_b)
+        inactive_z_matrix_roots_a.update(auto_z_a)
+        inactive_z_matrix_roots_b.update(auto_z_b)
+        resolved = resolved_a + resolved_b
+        warnings = warnings_a + warnings_b
+        modes = {entry["inactive_geometry"] for entry in resolved}
+        inactive_geometry = (
+            "mixed" if len(modes) > 1 else next(iter(modes), "bond_only")
+        )
+        provenance.update(
+            {
+                "inactive_bonded_atoms_a_0based": sorted(inactive_a),
+                "inactive_bonded_atoms_b_0based": sorted(inactive_b),
+                "inactive_bonded_geometry": inactive_geometry,
+                "resolved_junction_bonds": resolved,
+                "automatic_junction_warnings": warnings,
+                "inactive_z_matrix_root_atoms_a_0based": sorted(
+                    inactive_z_matrix_roots_a
+                ),
+                "inactive_z_matrix_root_atoms_b_0based": sorted(
+                    inactive_z_matrix_roots_b
+                ),
+            }
+        )
+        for warning in warnings:
+            LOGGER.warning(
+                "Automatic junction fallback for ligand %s branch %s: %s",
+                warning["endpoint"].upper(),
+                warning["branch_atoms_0based"],
+                warning["reason"],
+            )
     return (
         required,
         attachment_pairs,
