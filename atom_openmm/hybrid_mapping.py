@@ -689,6 +689,13 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
         matched_labels_a = {}
         matched_labels_b = {}
     alchemical_bonds = normalize_alchemical_bonds(settings.get("alchemical_bonds"))
+    alchemical_bond_pairs = {
+        endpoint: {
+            tuple(sorted(entry["atoms_0based"]))
+            for entry in entries
+        }
+        for endpoint, entries in alchemical_bonds.items()
+    }
     if settings.get("alchemical_bonds") is not None and method != "explicit_pairs":
         raise HybridMappingError(
             "alchemical_bonds initially require mapping.method explicit_pairs"
@@ -716,7 +723,7 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
             junction_settings["ligand_a"],
             "ligand_a",
             matched_labels_a,
-            alchemical_bonds["ligand_a"],
+            alchemical_bond_pairs["ligand_a"],
         )
         inactive_b, z_matrix_roots_b, resolved_b = _resolve_junction_bonds(
             molecule_b,
@@ -724,7 +731,7 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
             junction_settings["ligand_b"],
             "ligand_b",
             matched_labels_b,
-            alchemical_bonds["ligand_b"],
+            alchemical_bond_pairs["ligand_b"],
         )
         resolved_junctions = resolved_a + resolved_b
     else:
@@ -758,14 +765,14 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
         molecule_a,
         set(mapping),
         "ligand_a",
-        alchemical_bonds=alchemical_bonds["ligand_a"],
+        alchemical_bonds=alchemical_bond_pairs["ligand_a"],
         excluded_atoms=inactive_a,
     )
     auto_b, auto_z_b, auto_resolved_b, auto_warnings_b = _automatic_junction_bonds(
         molecule_b,
         set(mapping.values()),
         "ligand_b",
-        alchemical_bonds=alchemical_bonds["ligand_b"],
+        alchemical_bonds=alchemical_bond_pairs["ligand_b"],
         excluded_atoms=inactive_b,
     )
     inactive_a.update(auto_a)
