@@ -4304,6 +4304,26 @@ def _upgrade_legacy_switch_protocol(protocol, dummy_bonded_scales=None):
     return upgraded
 
 
+def _drop_legacy_default_mapping_geometry(observed, expected, mapping_label):
+    """Canonicalize the former explicit bond-only mapping default."""
+    observed_mapping = observed.get(mapping_label)
+    expected_mapping = expected.get(mapping_label)
+    if not isinstance(observed_mapping, dict) or not isinstance(expected_mapping, dict):
+        return observed
+    if "inactive_bonded_geometry" in expected_mapping:
+        return observed
+    if observed_mapping.get("inactive_bonded_geometry") != "bond_only":
+        return observed
+    normalized = dict(observed)
+    normalized_mapping = dict(observed_mapping)
+    normalized_mapping.pop("inactive_bonded_geometry")
+    normalized[mapping_label] = normalized_mapping
+    normalized.pop("fingerprint", None)
+    serialized = yaml.safe_dump(normalized, sort_keys=True)
+    normalized["fingerprint"] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return normalized
+
+
 def _ensure_switch_protocol(
     workdir,
     config,
@@ -4335,6 +4355,9 @@ def _ensure_switch_protocol(
             )
         observed = _upgrade_legacy_switch_protocol(
             observed, expected["dummy_bonded_scales"]
+        )
+        observed = _drop_legacy_default_mapping_geometry(
+            observed, expected, mapping_label
         )
         if observed != expected:
             raise CovalentWorkflowError(

@@ -789,6 +789,27 @@ def _test_legacy_beutler_protocol_resumes_with_new_default_fields(tmp_path):
     assert yaml.safe_load(path.read_text()) == observed
 
 
+def _test_legacy_explicit_bond_only_mapping_default_resumes(tmp_path):
+    config = _normalized_settings({"neqti": {"interpolation": "softcore_linear"}})
+    mapping = {"method": "mcs"}
+    legacy = _switch_protocol(config, mapping, "hybrid_mapping")
+    legacy["hybrid_mapping"]["inactive_bonded_geometry"] = "bond_only"
+    legacy["fingerprint"] = "legacy"
+    path = tmp_path / "switch_protocol.yaml"
+    path.write_text(yaml.safe_dump(legacy, sort_keys=False))
+
+    observed = _ensure_switch_protocol(
+        tmp_path,
+        config,
+        mapping,
+        environments=("complex", "solvent"),
+        mapping_label="hybrid_mapping",
+    )
+
+    assert observed == _switch_protocol(config, mapping, "hybrid_mapping")
+    assert yaml.safe_load(path.read_text()) == observed
+
+
 def _test_legacy_ssc2_protocol_requires_explicit_legacy_name(tmp_path):
     config = _normalized_settings(
         {
