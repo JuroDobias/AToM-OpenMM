@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import os
 import shutil
@@ -494,7 +495,22 @@ def _write_bundle(workdir, complex_system, solvent_system, manifest):
     return manifest
 
 
-def _load_bundle(workdir, fingerprint):
+def _legacy_preparation_inputs_match(observed, expected):
+    if not isinstance(observed, dict) or not isinstance(expected, dict):
+        return False
+    normalized = copy.deepcopy(observed)
+    observed_mapping = normalized.get("mapping")
+    expected_mapping = expected.get("mapping")
+    if isinstance(observed_mapping, dict) and isinstance(expected_mapping, dict):
+        if (
+            "inactive_bonded_geometry" not in expected_mapping
+            and observed_mapping.get("inactive_bonded_geometry") == "bond_only"
+        ):
+            observed_mapping.pop("inactive_bonded_geometry")
+    return normalized == expected
+
+
+def _load_bundle(workdir, fingerprint, fingerprint_inputs=None):
     directory = workdir / "prepared"
     manifest_path = directory / "manifest.yaml"
     if not manifest_path.is_file():
@@ -503,7 +519,13 @@ def _load_bundle(workdir, fingerprint):
     if manifest.get("schema_version") != PREPARATION_SCHEMA_VERSION:
         raise HybridWorkflowError("prepared bundle schema differs; use a new workdir")
     if manifest.get("fingerprint") != fingerprint:
-        raise HybridWorkflowError("prepared bundle inputs differ; use a new workdir")
+        if not _legacy_preparation_inputs_match(
+            manifest.get("fingerprint_inputs"), fingerprint_inputs
+        ):
+            raise HybridWorkflowError("prepared bundle inputs differ; use a new workdir")
+        manifest["fingerprint"] = fingerprint
+        manifest["fingerprint_inputs"] = fingerprint_inputs
+        _write_yaml_atomic(manifest_path, manifest)
     return (
         load_prepared_hybrid_bundle(directory, manifest["environments"]["complex"]),
         load_prepared_hybrid_bundle(directory, manifest["environments"]["solvent"]),
@@ -530,7 +552,7 @@ def _prepare_pair(pair, receptor, workflow, workdir):
     fingerprint, fingerprint_inputs = _preparation_fingerprint(
         pair, receptor, workflow, mapping_settings
     )
-    loaded = _load_bundle(workdir, fingerprint)
+    loaded = _load_bundle(workdir, fingerprint, fingerprint_inputs)
     if loaded is not None:
         return (*loaded[:2], loaded[2], fingerprint)
     if _runtime_artifacts_exist(workdir):

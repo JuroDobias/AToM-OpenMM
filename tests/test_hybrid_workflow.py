@@ -1,3 +1,4 @@
+import copy
 from pathlib import Path
 
 import yaml
@@ -62,6 +63,23 @@ def _test_hybrid_workflow_validates_and_plans_two_environments(tmp_path):
     assert plan["alchemy_model"] == "hybrid_topology"
     assert plan["thermodynamic_cycle"] == "complex_solvent"
     assert plan["pairs"][0]["environments"] == ["complex", "solvent"]
+
+
+def _test_legacy_bond_only_preparation_inputs_match_current_default():
+    from atom_openmm.hybrid_workflow import _legacy_preparation_inputs_match
+
+    expected = {
+        "schema_version": 3,
+        "files": {"ligand_a": {"sha256": "a"}},
+        "setup": {"solvent_model": "tip3p"},
+        "mapping": {"method": "mcs"},
+    }
+    observed = copy.deepcopy(expected)
+    observed["mapping"]["inactive_bonded_geometry"] = "bond_only"
+
+    assert _legacy_preparation_inputs_match(observed, expected)
+    observed["mapping"]["method"] = "explicit_pairs"
+    assert not _legacy_preparation_inputs_match(observed, expected)
 
 
 def _test_explicit_mapping_requires_single_edge(tmp_path):
