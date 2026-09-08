@@ -140,8 +140,15 @@ def _topology_transmutation_mapping(molecule_a, molecule_b):
         timeout=30,
     )
     query = Chem.MolFromSmarts(result.smartsString)
-    if query is None or result.numAtoms != heavy_a.GetNumAtoms():
-        raise ValueError("topology-transmutation edge does not preserve ligand A")
+    preserves_both_graphs = (
+        result.numAtoms == heavy_a.GetNumAtoms() == heavy_b.GetNumAtoms()
+        and result.numBonds == heavy_a.GetNumBonds() == heavy_b.GetNumBonds()
+    )
+    if query is None or not preserves_both_graphs:
+        raise ValueError(
+            "topology-transmutation edge does not preserve both complete "
+            "heavy-atom graphs"
+        )
     matches_a = heavy_a.GetSubstructMatches(query, uniquify=False, maxMatches=1000)
     matches_b = heavy_b.GetSubstructMatches(query, uniquify=False, maxMatches=1000)
     coordinates_a = heavy_a.GetConformer()
