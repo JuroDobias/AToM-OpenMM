@@ -136,6 +136,89 @@ def test_annulation_closure_is_absent_only_from_open_dummy_endpoint():
     assert soft_bonds.getNumBonds() == 1
 
 
+def _test_scheme1_soft_bond_preserves_annulation_endpoints_and_tracks_pairs():
+    left = _bundle("c1ccccc1")
+    right = _bundle("c1ccc2c(c1)CCC2")
+    mapping, metadata = build_hybrid_atom_map(
+        left,
+        right,
+        {
+            "method": "explicit_pairs",
+            "pairs_0based": [[index, index] for index in range(6)],
+            "alchemical_bonds": {
+                "ligand_b": [{"atoms_0based": [3, 8], "mode": "soft_bond"}]
+            },
+        },
+    )
+    hybrid = build_covalent_hybrid_molecule(
+        left,
+        right,
+        atom_map=mapping,
+        inactive_bonded_atoms_b=set(metadata["inactive_bonded_atoms_b_0based"]),
+        inactive_bonded_geometry=metadata["inactive_bonded_geometry"],
+        inactive_z_matrix_root_atoms_b=set(
+            metadata["inactive_z_matrix_root_atoms_b_0based"]
+        ),
+        alchemical_bonds_b={(3, 8)},
+    )
+    changes = [
+        {
+            "endpoint": item.endpoint,
+            "system_atoms_0based": list(item.hybrid_atoms),
+            "closed_class": item.closed_class,
+            "open_class": item.open_class,
+        }
+        for item in hybrid.alchemical_bond_pair_changes
+    ]
+    assert changes
+    assert any(item["closed_class"] == 1 for item in changes)
+    switching = create_softcore_hamiltonian(
+        hybrid.endpoint_a,
+        hybrid.endpoint_b,
+        [hybrid.map_a_to_hybrid[index] for index in hybrid.unique_a],
+        [hybrid.map_b_to_hybrid[index] for index in hybrid.unique_b],
+        total_steps=100,
+        path_mode="scheme1_soft_bond",
+        segments_per_interval=[1, 1],
+        soft_bond_pairs=[
+            (hybrid.map_b_to_hybrid[3], hybrid.map_b_to_hybrid[8])
+        ],
+        soft_bond_pair_changes=changes,
+    )
+
+    def energy_forces(system, parameters=None):
+        context = mm.Context(system, mm.VerletIntegrator(0.001))
+        context.setPositions(hybrid.positions)
+        for name, value in (parameters or {}).items():
+            context.setParameter(name, value)
+        state = context.getState(getEnergy=True, getForces=True)
+        result = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+        forces = state.getForces(asNumpy=True).value_in_unit(
+            unit.kilojoule_per_mole / unit.nanometer
+        )
+        del context
+        return result, forces
+
+    for endpoint, index in ((hybrid.endpoint_a, 0), (hybrid.endpoint_b, -1)):
+        parameters = {
+            name: values[index]
+            for name, values in switching.parameter_values.items()
+        }
+        observed_energy, observed_forces = energy_forces(
+            switching.system, parameters
+        )
+        expected_energy, expected_forces = energy_forces(endpoint)
+        assert np.isclose(observed_energy, expected_energy, atol=1.0e-5)
+        assert np.allclose(observed_forces, expected_forces, rtol=1.0e-5, atol=1.0e-2)
+
+    midpoint = {
+        name: values[1] for name, values in switching.parameter_values.items()
+    }
+    midpoint_energy, midpoint_forces = energy_forces(switching.system, midpoint)
+    assert np.isfinite(midpoint_energy)
+    assert np.all(np.isfinite(midpoint_forces))
+
+
 def _test_transmutation_uses_physical_endpoint_and_heavier_switching_masses():
     left = _bundle("CC(=O)NC1=CC=CC=C1")
     right = _bundle("CS(=O)(=O)NC1=CC=CC=C1")

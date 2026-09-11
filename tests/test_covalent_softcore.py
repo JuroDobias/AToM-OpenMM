@@ -2,6 +2,7 @@ import math
 
 import numpy as np
 import openmm as mm
+import pytest
 from openmm import unit
 
 from atom_openmm.covalent_softcore import (
@@ -9,6 +10,7 @@ from atom_openmm.covalent_softcore import (
     BONDED_B_PARAMETER,
     CHARGE_A_PARAMETER,
     CHARGE_B_PARAMETER,
+    EXPLICIT_PATH_CONTROLS,
     GAPSYS_RECIPROCAL_A_CHARGE_PARAMETER,
     MAPPED_CHARGE_PARAMETER,
     RECIPROCAL_A_CHARGE_PARAMETER,
@@ -110,9 +112,21 @@ def test_soft_bond_is_exact_at_endpoints_and_bounded_midway():
     output.addParticle(12.0)
     _add_bonded_forces(output, endpoint_a, endpoint_b, soft_bond_pairs=[(0, 1)])
     positions = np.asarray([[0, 0, 0], [10, 0, 0]]) * unit.nanometer
-    at_a, _ = _energy_forces(output, positions, {STERICS_PARAMETER: 0.0})
-    midway, _ = _energy_forces(output, positions, {STERICS_PARAMETER: 0.5})
-    at_b, _ = _energy_forces(output, positions, {STERICS_PARAMETER: 1.0})
+    at_a, _ = _energy_forces(
+        output,
+        positions,
+        {"COVALENT_SOFT_BOND_A": 1.0, "COVALENT_SOFT_BOND_B": 0.0},
+    )
+    midway, _ = _energy_forces(
+        output,
+        positions,
+        {"COVALENT_SOFT_BOND_A": 0.5, "COVALENT_SOFT_BOND_B": 0.5},
+    )
+    at_b, _ = _energy_forces(
+        output,
+        positions,
+        {"COVALENT_SOFT_BOND_A": 0.0, "COVALENT_SOFT_BOND_B": 1.0},
+    )
     expected_b = 0.5 * 1000.0 * (10.0 - 0.15) ** 2
     assert at_a == 0.0
     assert np.isclose(at_b, expected_b)
@@ -847,6 +861,67 @@ def _test_softcore_subdivision_preserves_path_and_total_steps():
     assert hamiltonian.segment_steps == [3, 3, 3, 2, 5, 4, 4, 4, 3, 3, 3, 2]
 
 
+def _test_legacy_staged_path_transforms_soft_bond_topology_in_central_stage():
+    resolved = resolve_softcore_path(
+        charge_steps_per_stage=10,
+        sterics_steps=30,
+    )
+
+    assert resolved["source"] == "legacy_staged"
+    assert resolved["bond_nonbonded_charge_a"] == [0.0, 0.0, 1.0, 1.0]
+    assert resolved["bond_nonbonded_charge_b"] == [1.0, 1.0, 0.0, 0.0]
+    assert resolved["bond_nonbonded_vdw_a"] == [0.0, 0.0, 1.0, 1.0]
+    assert resolved["bond_nonbonded_vdw_b"] == [1.0, 1.0, 0.0, 0.0]
+    assert resolved["bond_one_four_charge_a"] == [1.0, 1.0, 0.0, 0.0]
+    assert resolved["bond_one_four_charge_b"] == [0.0, 0.0, 1.0, 1.0]
+    assert resolved["bond_one_four_vdw_a"] == [1.0, 1.0, 0.0, 0.0]
+    assert resolved["bond_one_four_vdw_b"] == [0.0, 0.0, 1.0, 1.0]
+
+
+def _test_legacy_staged_hamiltonian_builds_soft_bond_topology_force():
+    hamiltonian = create_softcore_hamiltonian(
+        _endpoint("a"),
+        _endpoint("b"),
+        [2],
+        [3],
+        soft_bond_pairs=[(1, 3)],
+        soft_bond_pair_changes=[{
+            "endpoint": "b",
+            "system_atoms_0based": [0, 3],
+            "closed_class": 3,
+            "open_class": 4,
+        }],
+        charge_steps_per_stage=10,
+        sterics_steps=30,
+    )
+
+    force = next(
+        force for force in hamiltonian.system.getForces()
+        if force.getName() == "CovalentSoftBondTopologyPairsB"
+    )
+    assert force.getNumBonds() == 1
+
+
+def _test_soft_bond_topology_rejects_path_without_topology_controls():
+    with pytest.raises(Exception, match="selected alchemical bond requires"):
+        create_softcore_hamiltonian(
+            _endpoint("a"),
+            _endpoint("b"),
+            [2],
+            [3],
+            soft_bond_pairs=[(1, 3)],
+            soft_bond_pair_changes=[{
+                "endpoint": "b",
+                "system_atoms_0based": [0, 3],
+                "closed_class": 3,
+                "open_class": 4,
+            }],
+            total_steps=100,
+            path_mode="staged_bonded",
+            segments_per_interval=[1, 1, 1, 1, 1],
+        )
+
+
 def _test_general_linear_path_preserves_endpoints_and_budget():
     endpoint_a = _endpoint("a")
     endpoint_b = _endpoint("b")
@@ -900,6 +975,61 @@ def _test_staged_bonded_path_is_symmetric_and_preserves_budget():
         "demote_a_bonded",
         "charge_b",
     ]
+
+
+def _test_scheme1_soft_bond_path_exposes_independent_topology_controls():
+    resolved = resolve_softcore_path(
+        total_steps=100,
+        path_mode="scheme1_soft_bond",
+        segments_per_interval=[2, 3],
+    )
+
+    assert resolved["interval_steps"] == [50, 50]
+    assert resolved["soft_bond_a"] == [1.0, 0.5, 0.0]
+    assert resolved["soft_angles_a"] == [1.0, 0.0, 0.0]
+    assert resolved["bond_nonbonded_vdw_a"] == [0.0, 1.0, 1.0]
+    assert resolved["bond_one_four_charge_a"] == [1.0, 0.0, 0.0]
+
+
+def _test_explicit_control_nodes_inherit_values_and_require_physical_endpoints():
+    preset = resolve_softcore_path(
+        total_steps=100,
+        path_mode="scheme1_soft_bond",
+        segments_per_interval=[1, 1],
+    )
+    aliases = {"sterics_a": "vdw_a", "sterics_b": "vdw_b"}
+    controls = [
+        {
+            name: preset[aliases.get(name, name)][index]
+            for name in EXPLICIT_PATH_CONTROLS
+        }
+        for index in range(3)
+    ]
+    nodes = [
+        {"at": 0.0, "label": "a", "controls": controls[0]},
+        {"at": 0.5, "label": "open", "controls": controls[1]},
+        {"at": 1.0, "label": "b", "controls": controls[2]},
+    ]
+    resolved = resolve_softcore_path(
+        total_steps=101,
+        control_nodes=nodes,
+        segments_per_interval=[1, 1],
+    )
+    assert resolved["source"] == "explicit_nodes"
+    assert resolved["interval_steps"] == [51, 50]
+    assert resolved["stage_labels"] == ["open", "b"]
+
+    invalid = [dict(node) for node in nodes]
+    invalid[-1] = {
+        **invalid[-1],
+        "controls": {**invalid[-1]["controls"], "soft_bond_b": 0.5},
+    }
+    with pytest.raises(Exception, match="not a physical endpoint"):
+        resolve_softcore_path(
+            total_steps=100,
+            control_nodes=invalid,
+            segments_per_interval=[1, 1],
+        )
 
 
 def _test_staged_bonded_hamiltonian_preserves_endpoints_and_separates_controls():
@@ -960,6 +1090,14 @@ def _test_general_midpoint_path_keeps_both_vdw_branches_fully_coupled():
     assert hamiltonian.parameter_values["COVALENT_CHARGE_B"][midpoint] == 0.5
     assert hamiltonian.parameter_values["COVALENT_STERICS"][midpoint] == 0.5
     assert hamiltonian.parameter_values[SEPARATE_BONDED_PARAMETER][midpoint] == 0.0
+    assert hamiltonian.parameter_values["COVALENT_SOFT_BOND_A"][midpoint] == 0.5
+    assert hamiltonian.parameter_values["COVALENT_SOFT_ANGLE_A"][midpoint] == 1.0
+    assert hamiltonian.parameter_values[
+        "COVALENT_BOND_NONBONDED_VDW_A"
+    ][midpoint] == 0.0
+    assert hamiltonian.parameter_values[
+        "COVALENT_BOND_ONE_FOUR_VDW_A"
+    ][midpoint] == 1.0
     positions = np.asarray(
         [[0, 0, 0], [0.15, 0, 0], [0.28, 0.08, 0], [0.28, 0.08, 0], [0.7, 0.4, 0.3]]
     ) * unit.nanometer

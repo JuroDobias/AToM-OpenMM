@@ -22,6 +22,7 @@ from atom_openmm.covalent_alchemy import (
 )
 from atom_openmm.covalent_hybrid import (
     DummyBondedScales,
+    alchemical_bond_pair_metadata,
     build_covalent_hybrid_molecule,
     complete_covalent_atom_map,
     find_covalent_atom_map,
@@ -123,6 +124,7 @@ def _softcore_path_options(settings):
         "charge_a",
         "segments_per_interval",
         "path_mode",
+        "control_nodes",
     }
     return {key: value for key, value in settings.items() if key in keys}
 
@@ -2192,6 +2194,27 @@ def _iter_environment(
         softcore_options["soft_bond_pairs"] = prepared.provenance.get(
             "soft_bond_system_pairs", []
         )
+        topology_path = bool(softcore_options["soft_bond_pairs"])
+        if (
+            softcore_options.get("path_mode") == "scheme1_soft_bond"
+            and not softcore_options["soft_bond_pairs"]
+        ):
+            raise CovalentWorkflowError(
+                "softcore path mode scheme1_soft_bond requires one selected "
+                "mapping.alchemical_bonds entry"
+            )
+        if (
+            topology_path
+            and softcore_options["soft_bond_pairs"]
+            and "soft_bond_pair_changes" not in prepared.provenance
+        ):
+            raise CovalentResumeError(
+                "the selected soft-bond path requires topology-pair metadata; "
+                "prepare the calculation in a new workdir"
+            )
+        softcore_options["soft_bond_pair_changes"] = prepared.provenance.get(
+            "soft_bond_pair_changes", []
+        )
         lrc_mode = config["softcore"]["long_range_correction"]
         softcore = create_softcore_hamiltonian(
             prepared.endpoint_a,
@@ -3427,9 +3450,19 @@ def _normalized_settings(workflow):
                 "softcore path.mode cannot be combined with explicit path arrays"
             )
         nodes = [] if path_mode is not None else list(path_raw.get("nodes", []))
-        interval_count = (
-            5 if str(path_mode).lower() == "staged_bonded" else len(nodes) + 1
-        )
+        control_nodes = bool(nodes) and all(isinstance(node, dict) for node in nodes)
+        if any(isinstance(node, dict) for node in nodes) and not control_nodes:
+            raise CovalentWorkflowError(
+                "softcore path.nodes cannot mix numeric and mapping-valued nodes"
+            )
+        if control_nodes:
+            interval_count = len(nodes) - 1
+        elif str(path_mode).lower() == "staged_bonded":
+            interval_count = 5
+        elif str(path_mode).lower() == "scheme1_soft_bond":
+            interval_count = 2
+        else:
+            interval_count = len(nodes) + 1
         default_segments = (
             [10] * interval_count if optimization_enabled else [1] * interval_count
         )
@@ -3446,6 +3479,8 @@ def _normalized_settings(workflow):
         )
         if path_mode is not None:
             softcore_settings["path_mode"] = str(path_mode).lower()
+        elif control_nodes:
+            softcore_settings["control_nodes"] = nodes
         else:
             softcore_settings.update(
                 {
@@ -4217,7 +4252,8 @@ def _switch_protocol(config, mapping_settings=None, mapping_label="covalent_mapp
             implementation = function
         protocol["softcore"]["implementation"] = implementation
         has_general_path = any(
-            key in config["softcore"] for key in ("path_nodes", "path_mode")
+            key in config["softcore"]
+            for key in ("path_nodes", "path_mode", "control_nodes")
         )
         if has_general_path:
             protocol["softcore"]["resolved_path"] = resolve_softcore_path(
@@ -4597,6 +4633,18 @@ def run_covalent_pair(settings, pair):
                     for atom1, atom2 in selected
                 )
             prepared.provenance["soft_bond_system_pairs"] = pairs
+            prepared.provenance["soft_bond_pair_changes"] = [
+                {
+                    **entry,
+                    "system_atoms_0based": [
+                        prepared.provenance[
+                            f"ligand_{entry['endpoint']}_system_atom_indices"
+                        ][atom - offsets[f"ligand_{entry['endpoint']}"]]
+                        for atom in entry["atoms_0based"]
+                    ],
+                }
+                for entry in alchemical_bond_pair_metadata(hybrid)
+            ]
         _validate_prepared_endpoint_charges(protein, "protein")
         _validate_prepared_endpoint_charges(reference, "reference")
         mapping_payload = {
@@ -4627,6 +4675,7 @@ def run_covalent_pair(settings, pair):
             "vacuum_nonbonded_pair_counts": vacuum_nonbonded_pair_counts(hybrid),
             "inactive_z_matrix_terms": inactive_z_matrix_metadata(hybrid),
             "inactive_bonded_branches": inactive_branch_metadata(hybrid),
+            "alchemical_bond_pair_changes": alchemical_bond_pair_metadata(hybrid),
         }
         parameterization = {
             "ligand_a": parameters_a.provenance,

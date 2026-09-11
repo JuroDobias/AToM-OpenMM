@@ -457,6 +457,12 @@ with multiple mapped-core attachments are not framed automatically; use an
 alchemical bond, a different atom map, or an explicit dual-topology treatment for
 those transformations.
 
+The ordinary three-interval staged softcore path also supports selected
+`alchemical_bonds`. During its central sterics/bonded interval it transforms the
+nonbonded exclusion class and associated 1-4 terms changed by opening or closing
+the selected ring bond. The finer `scheme1_soft_bond` path is optional and is only
+needed when those controls must be scheduled independently.
+
 | Inactive bonded term | `bond_only` | `terminal_z_matrix` |
 | --- | --- | --- |
 | Inside the selected branch | Retained with configured dummy bonded scaling | Retained with configured dummy bonded scaling |
@@ -580,13 +586,16 @@ workflow:
 This closes a six-atom chain at endpoint B. The connected endpoint uses its
 physical harmonic bond and the open endpoint has no closure bond. Intermediate
 states use a bounded soft-bond stretch potential; angles and torsions containing
-the closure bond follow the existing sterics path. The changing bond may join
-two mapped atoms or a mapped atom to an endpoint-unique annulation branch. It
+the closure bond follow the existing sterics path unless the finer
+`scheme1_soft_bond` path is selected. The changing bond may join two mapped
+atoms or a mapped atom to an endpoint-unique annulation branch. It
 must be an unconstrained ring bond whose removal leaves the molecule connected.
 Initial support is limited to one changing bond, authoritative `explicit_pairs`,
-and NEQTI. Annulations are accepted only when opening the selected bond does not
-change unique-dummy exclusion or 1-4 classes. Multi-bond linker contractions and
-aromatic bond-order rearrangements remain unsupported.
+and NEQTI. The publication-style topology-pair schedule currently requires every
+changed exclusion/1-4 pair to include an endpoint-unique atom; a topology-only
+closure entirely inside the mapped common core remains unsupported by that path.
+Multi-bond linker contractions and aromatic bond-order rearrangements remain
+unsupported.
 
 For large flexible transformations, `alchemy.dummy_core_nonbonded: retain`
 also preserves inactive unique-common electrostatics, Lennard-Jones terms,
@@ -1461,6 +1470,39 @@ or 500,000 total steps for 100, 300, or 1000 ps without lengthening the requeste
 protocol. Schedule optimization may redistribute subdivisions within these five
 chemical intervals while preserving the total step budget. Existing staged,
 general, and concerted paths retain their previous bonded interpolation.
+
+For a selected `mapping.alchemical_bonds` ring-opening or ring-closing bond, the
+experimental publication-style topology schedule can control the closure terms
+more finely:
+
+```yaml
+neqti:
+  interpolation: softcore_linear
+  softcore:
+    total_steps: 50000
+    path:
+      mode: scheme1_soft_bond
+```
+
+This symmetric two-interval path softens the disappearing bond stretch across
+the whole first half, removes its angles and proper/improper torsions by the
+midpoint, and separately exchanges topology-derived ordinary and 1-4 Coulomb/LJ
+pairs. The forming endpoint executes the reverse ordering. The implementation
+identifies every unique-branch 1-2, 1-3, 1-4, or ordinary pair whose
+graph-distance class changes when the selected bond is removed. Corrections are
+zero at both physical endpoints; endpoint energy and force identity is therefore
+preserved. Initial support remains limited to one selected soft bond per edge.
+
+For path experiments, `path.nodes` may instead be a list of mappings with `at`,
+an optional `label`, and a `controls` mapping. The first node must define all
+controls; later nodes inherit omitted values. Coordinates must increase strictly
+from `0.0` to `1.0`, and the first and last controls must reproduce physical A
+and B. Supported controls are `charge_a/b`, `sterics_a/b`, `mapped_charge`,
+`mapped_vdw`, `bonded_a/b`, `soft_bond_a/b`, `soft_angles_a/b`,
+`soft_torsions_a/b`, `bond_nonbonded_charge_a/b`,
+`bond_nonbonded_vdw_a/b`, `bond_one_four_charge_a/b`, and
+`bond_one_four_vdw_a/b`. The normalized nodes and resolved per-segment schedule
+are written into protocol metadata and participate in restart fingerprints.
 
 Parameter changes are linear within each chemical path interval by default. An
 experimental second-order smoothstep schedule can instead be selected explicitly:

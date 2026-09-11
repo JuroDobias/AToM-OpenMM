@@ -192,7 +192,11 @@ Unambiguous one-anchor unique branches now receive this Z-matrix framing
 automatically, with a recorded `bond_only` fallback when the mapped core cannot
 define a heavy-atom frame. The optional `staged_bonded` softcore path independently
 stages charge, bonded, steric, and mapped-atom changes within the original total
-switching-time budget.
+switching-time budget. A selected ring-opening or ring-closing bond can instead
+use `softcore.path.mode: scheme1_soft_bond`, which separately schedules its
+stretch, angles, torsions, changing ordinary nonbonded pairs, and 1-4 pairs while
+preserving exact physical endpoints. Mapping-valued path nodes expose the same
+controls for protocol development.
 
 Every ligand-pair directory also contains an atomically updated `result.yaml` for integration with workflow managers and databases. It uses the same schema for asynchronous replica exchange and NEQTI, reports DDG in kcal/mol and kJ/mol, records input provenance and artifacts, and exposes `prepared`, `running`, `partial`, `completed`, or `failed` status.
 

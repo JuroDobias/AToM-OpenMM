@@ -4,6 +4,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from itertools import combinations
 import math
+import statistics
 import openmm as mm
 from openmm import unit
 
@@ -24,6 +25,20 @@ STERICS_B_PARAMETER = "COVALENT_STERICS_B"
 BONDED_A_PARAMETER = "COVALENT_BONDED_A"
 BONDED_B_PARAMETER = "COVALENT_BONDED_B"
 SEPARATE_BONDED_PARAMETER = "COVALENT_SEPARATE_BONDED"
+SOFT_BOND_A_PARAMETER = "COVALENT_SOFT_BOND_A"
+SOFT_BOND_B_PARAMETER = "COVALENT_SOFT_BOND_B"
+SOFT_ANGLE_A_PARAMETER = "COVALENT_SOFT_ANGLE_A"
+SOFT_ANGLE_B_PARAMETER = "COVALENT_SOFT_ANGLE_B"
+SOFT_TORSION_A_PARAMETER = "COVALENT_SOFT_TORSION_A"
+SOFT_TORSION_B_PARAMETER = "COVALENT_SOFT_TORSION_B"
+BOND_NONBONDED_CHARGE_A_PARAMETER = "COVALENT_BOND_NONBONDED_CHARGE_A"
+BOND_NONBONDED_CHARGE_B_PARAMETER = "COVALENT_BOND_NONBONDED_CHARGE_B"
+BOND_NONBONDED_VDW_A_PARAMETER = "COVALENT_BOND_NONBONDED_VDW_A"
+BOND_NONBONDED_VDW_B_PARAMETER = "COVALENT_BOND_NONBONDED_VDW_B"
+BOND_ONE_FOUR_CHARGE_A_PARAMETER = "COVALENT_BOND_ONE_FOUR_CHARGE_A"
+BOND_ONE_FOUR_CHARGE_B_PARAMETER = "COVALENT_BOND_ONE_FOUR_CHARGE_B"
+BOND_ONE_FOUR_VDW_A_PARAMETER = "COVALENT_BOND_ONE_FOUR_VDW_A"
+BOND_ONE_FOUR_VDW_B_PARAMETER = "COVALENT_BOND_ONE_FOUR_VDW_B"
 RECIPROCAL_A_CHARGE_PARAMETER = "COVALENT_RECIPROCAL_A_CHARGE"
 RECIPROCAL_B_CHARGE_PARAMETER = "COVALENT_RECIPROCAL_B_CHARGE"
 RECIPROCAL_A_EXCEPTION_PARAMETER = "COVALENT_RECIPROCAL_A_EXCEPTION"
@@ -37,6 +52,40 @@ ONE_4PI_EPS0 = 138.935456
 AMBER_SSC2_IMPLEMENTATION = "amber_gti_ssc2_v1"
 LEGACY_SSC2_IMPLEMENTATION = "effective_distance_ssc2_v1"
 GROMACS_GAPSYS_IMPLEMENTATION = "gromacs_gapsys_2026_v1"
+
+
+EXPLICIT_PATH_CONTROLS = (
+    "charge_a", "charge_b", "sterics_a", "sterics_b",
+    "mapped_charge", "mapped_vdw", "bonded_a", "bonded_b",
+    "soft_bond_a", "soft_bond_b", "soft_angles_a", "soft_angles_b",
+    "soft_torsions_a", "soft_torsions_b",
+    "bond_nonbonded_charge_a", "bond_nonbonded_charge_b",
+    "bond_nonbonded_vdw_a", "bond_nonbonded_vdw_b",
+    "bond_one_four_charge_a", "bond_one_four_charge_b",
+    "bond_one_four_vdw_a", "bond_one_four_vdw_b",
+)
+
+EXPLICIT_ENDPOINT_A_CONTROLS = {
+    "charge_a": 1.0, "charge_b": 0.0,
+    "sterics_a": 1.0, "sterics_b": 0.0,
+    "mapped_charge": 0.0, "mapped_vdw": 0.0,
+    "bonded_a": 1.0, "bonded_b": 0.0,
+    "soft_bond_a": 1.0, "soft_bond_b": 0.0,
+    "soft_angles_a": 1.0, "soft_angles_b": 0.0,
+    "soft_torsions_a": 1.0, "soft_torsions_b": 0.0,
+    "bond_nonbonded_charge_a": 0.0, "bond_nonbonded_charge_b": 1.0,
+    "bond_nonbonded_vdw_a": 0.0, "bond_nonbonded_vdw_b": 1.0,
+    "bond_one_four_charge_a": 1.0, "bond_one_four_charge_b": 0.0,
+    "bond_one_four_vdw_a": 1.0, "bond_one_four_vdw_b": 0.0,
+}
+EXPLICIT_ENDPOINT_B_CONTROLS = {
+    name: EXPLICIT_ENDPOINT_A_CONTROLS[
+        name[:-1] + ("b" if name.endswith("a") else "a")
+    ]
+    if name.endswith(("a", "b"))
+    else 1.0
+    for name in EXPLICIT_PATH_CONTROLS
+}
 
 
 @dataclass(frozen=True)
@@ -106,6 +155,11 @@ def _canonical_angle(particles):
     particles = tuple(int(value) for value in particles)
     reverse = tuple(reversed(particles))
     return min(particles, reverse)
+
+
+def _term_contains_bond(atoms, selected_bonds):
+    atoms = {int(atom) for atom in atoms}
+    return any(set(pair) <= atoms for pair in selected_bonds)
 
 
 def _bond_terms(force):
@@ -193,15 +247,11 @@ def _add_bonded_forces(
     soft_bonds = mm.CustomBondForce(
         "0.5*(wA*kA*drA^2/(1+SOFT_BOND_ALPHA*(1-wA)*drA^2)"
         "+wB*kB*drB^2/(1+SOFT_BOND_ALPHA*(1-wB)*drB^2));"
-        "wA=(1-separate)*(1-COVALENT_STERICS)+separate*COVALENT_BONDED_A;"
-        "wB=(1-separate)*COVALENT_STERICS+separate*COVALENT_BONDED_B;"
-        "separate=COVALENT_SEPARATE_BONDED;"
+        "wA=COVALENT_SOFT_BOND_A;wB=COVALENT_SOFT_BOND_B;"
         "drA=r-rA;drB=r-rB"
     )
-    soft_bonds.addGlobalParameter(BONDED_A_PARAMETER, 0.0)
-    soft_bonds.addGlobalParameter(BONDED_B_PARAMETER, 0.0)
-    soft_bonds.addGlobalParameter(STERICS_PARAMETER, 0.0)
-    soft_bonds.addGlobalParameter(SEPARATE_BONDED_PARAMETER, 0.0)
+    soft_bonds.addGlobalParameter(SOFT_BOND_A_PARAMETER, 0.0)
+    soft_bonds.addGlobalParameter(SOFT_BOND_B_PARAMETER, 0.0)
     soft_bonds.addGlobalParameter("SOFT_BOND_ALPHA", float(soft_bond_alpha_nm2))
     for name in ("rA", "kA", "rB", "kB"):
         soft_bonds.addPerBondParameter(name)
@@ -252,6 +302,14 @@ def _add_bonded_forces(
     changed_angles.addGlobalParameter(SEPARATE_BONDED_PARAMETER, 0.0)
     for name in ("thetaA", "kA", "thetaB", "kB"):
         changed_angles.addPerAngleParameter(name)
+    soft_angles = mm.CustomAngleForce(
+        "0.5*(COVALENT_SOFT_ANGLE_A*kA*(theta-thetaA)^2"
+        "+COVALENT_SOFT_ANGLE_B*kB*(theta-thetaB)^2)"
+    )
+    soft_angles.addGlobalParameter(SOFT_ANGLE_A_PARAMETER, 0.0)
+    soft_angles.addGlobalParameter(SOFT_ANGLE_B_PARAMETER, 0.0)
+    for name in ("thetaA", "kA", "thetaB", "kB"):
+        soft_angles.addPerAngleParameter(name)
     for particles in sorted(set(angles_a) | set(angles_b)):
         value_a = angles_a.get(particles)
         value_b = angles_b.get(particles)
@@ -261,7 +319,8 @@ def _add_bonded_forces(
             fallback = value_a or value_b
             theta_a, k_a = value_a or (fallback[0], 0.0)
             theta_b, k_b = value_b or (fallback[0], 0.0)
-            changed_angles.addAngle(*particles, [theta_a, k_a, theta_b, k_b])
+            target = soft_angles if _term_contains_bond(particles, soft_bond_pairs) else changed_angles
+            target.addAngle(*particles, [theta_a, k_a, theta_b, k_b])
     if common_angles.getNumAngles():
         if angle_a is not None:
             _copy_force_metadata(angle_a, common_angles)
@@ -270,6 +329,9 @@ def _add_bonded_forces(
     if changed_angles.getNumAngles():
         changed_angles.setName("CovalentInterpolatedAngles")
         output.addForce(changed_angles)
+    if soft_angles.getNumAngles():
+        soft_angles.setName("CovalentSoftBondAngles")
+        output.addForce(soft_angles)
 
     torsion_a = _force(endpoint_a, mm.PeriodicTorsionForce)
     torsion_b = _force(endpoint_b, mm.PeriodicTorsionForce)
@@ -300,6 +362,15 @@ def _add_bonded_forces(
             "*k*(1+cos(periodicity*theta-phase))",
         ),
     ):
+        regular_terms = []
+        closure_terms = []
+        for term in terms:
+            target = (
+                closure_terms
+                if _term_contains_bond(term[0], soft_bond_pairs)
+                else regular_terms
+            )
+            target.append(term)
         force = mm.CustomTorsionForce(expression)
         force.addGlobalParameter(
             BONDED_A_PARAMETER if label == "A" else BONDED_B_PARAMETER,
@@ -312,18 +383,47 @@ def _add_bonded_forces(
         force.addGlobalParameter(SEPARATE_BONDED_PARAMETER, 0.0)
         for name in ("periodicity", "phase", "k"):
             force.addPerTorsionParameter(name)
-        for particles, periodicity, phase, k in terms:
+        for particles, periodicity, phase, k in regular_terms:
             force.addTorsion(*particles, [periodicity, phase, k])
         if force.getNumTorsions():
             force.setName(f"CovalentInterpolatedTorsions{label}")
             output.addForce(force)
+        soft_scale = SOFT_TORSION_A_PARAMETER if label == "A" else SOFT_TORSION_B_PARAMETER
+        soft_force = mm.CustomTorsionForce(
+            f"{soft_scale}*k*(1+cos(periodicity*theta-phase))"
+        )
+        soft_force.addGlobalParameter(soft_scale, 0.0)
+        for name in ("periodicity", "phase", "k"):
+            soft_force.addPerTorsionParameter(name)
+        for particles, periodicity, phase, k in closure_terms:
+            soft_force.addTorsion(*particles, [periodicity, phase, k])
+        if soft_force.getNumTorsions():
+            soft_force.setName(f"CovalentSoftBondTorsions{label}")
+            output.addForce(soft_force)
 
     parameter_anchor = mm.CustomExternalForce(
-        "0*(COVALENT_BONDED_A+COVALENT_BONDED_B+COVALENT_SEPARATE_BONDED)"
+        "0*(COVALENT_BONDED_A+COVALENT_BONDED_B+COVALENT_SEPARATE_BONDED"
+        "+COVALENT_SOFT_BOND_A+COVALENT_SOFT_BOND_B"
+        "+COVALENT_SOFT_ANGLE_A+COVALENT_SOFT_ANGLE_B"
+        "+COVALENT_SOFT_TORSION_A+COVALENT_SOFT_TORSION_B"
+        "+COVALENT_BOND_NONBONDED_CHARGE_A+COVALENT_BOND_NONBONDED_CHARGE_B"
+        "+COVALENT_BOND_NONBONDED_VDW_A+COVALENT_BOND_NONBONDED_VDW_B"
+        "+COVALENT_BOND_ONE_FOUR_CHARGE_A+COVALENT_BOND_ONE_FOUR_CHARGE_B"
+        "+COVALENT_BOND_ONE_FOUR_VDW_A+COVALENT_BOND_ONE_FOUR_VDW_B)"
     )
     parameter_anchor.addGlobalParameter(BONDED_A_PARAMETER, 0.0)
     parameter_anchor.addGlobalParameter(BONDED_B_PARAMETER, 0.0)
     parameter_anchor.addGlobalParameter(SEPARATE_BONDED_PARAMETER, 0.0)
+    for parameter in (
+        SOFT_BOND_A_PARAMETER, SOFT_BOND_B_PARAMETER,
+        SOFT_ANGLE_A_PARAMETER, SOFT_ANGLE_B_PARAMETER,
+        SOFT_TORSION_A_PARAMETER, SOFT_TORSION_B_PARAMETER,
+        BOND_NONBONDED_CHARGE_A_PARAMETER, BOND_NONBONDED_CHARGE_B_PARAMETER,
+        BOND_NONBONDED_VDW_A_PARAMETER, BOND_NONBONDED_VDW_B_PARAMETER,
+        BOND_ONE_FOUR_CHARGE_A_PARAMETER, BOND_ONE_FOUR_CHARGE_B_PARAMETER,
+        BOND_ONE_FOUR_VDW_A_PARAMETER, BOND_ONE_FOUR_VDW_B_PARAMETER,
+    ):
+        parameter_anchor.addGlobalParameter(parameter, 0.0)
     if output.getNumParticles():
         parameter_anchor.addParticle(0, [])
     parameter_anchor.setName("CovalentBondedParameterAnchor")
@@ -394,6 +494,92 @@ def _add_exception_offset(force, parameter, exception, charge=0.0, sigma=0.0, ep
     if charge == 0.0 and sigma == 0.0 and epsilon == 0.0:
         return
     force.addExceptionParameterOffset(parameter, exception, charge, sigma, epsilon)
+
+
+def _infer_one_four_scales(force):
+    charge_scales = []
+    epsilon_scales = []
+    for pair, (chargeprod, _sigma, epsilon) in _exception_dict(force).items():
+        atom1, atom2 = pair
+        q1, sigma1, epsilon1 = force.getParticleParameters(atom1)
+        q2, sigma2, epsilon2 = force.getParticleParameters(atom2)
+        ordinary_charge = _float(q1 * q2, unit.elementary_charge**2)
+        ordinary_epsilon = math.sqrt(
+            max(0.0, _float(epsilon1, unit.kilojoule_per_mole))
+            * max(0.0, _float(epsilon2, unit.kilojoule_per_mole))
+        )
+        if abs(ordinary_charge) > 1.0e-10 and abs(chargeprod) > 1.0e-10:
+            charge_scales.append(abs(chargeprod / ordinary_charge))
+        if ordinary_epsilon > 1.0e-10 and epsilon > 1.0e-10:
+            epsilon_scales.append(epsilon / ordinary_epsilon)
+    return (
+        float(statistics.median(charge_scales)) if charge_scales else 1.0,
+        float(statistics.median(epsilon_scales)) if epsilon_scales else 1.0,
+    )
+
+
+def _pair_parameters_for_class(
+    force, pair, distance_class, one_four_scales, *, use_existing_exception
+):
+    atom1, atom2 = pair
+    q1, sigma1, epsilon1 = force.getParticleParameters(atom1)
+    q2, sigma2, epsilon2 = force.getParticleParameters(atom2)
+    sigma = 0.5 * (
+        _float(sigma1, unit.nanometer) + _float(sigma2, unit.nanometer)
+    )
+    if distance_class <= 2:
+        return 0.0, sigma, 0.0
+    if distance_class == 3:
+        exception = (
+            _exception_dict(force).get(tuple(sorted(pair)))
+            if use_existing_exception
+            else None
+        )
+        if exception is not None:
+            return exception
+        charge_scale, epsilon_scale = one_four_scales
+    else:
+        charge_scale = epsilon_scale = 1.0
+    return (
+        _float(q1 * q2, unit.elementary_charge**2) * charge_scale,
+        sigma,
+        math.sqrt(
+            max(0.0, _float(epsilon1, unit.kilojoule_per_mole))
+            * max(0.0, _float(epsilon2, unit.kilojoule_per_mole))
+        ) * epsilon_scale,
+    )
+
+
+def _new_soft_bond_topology_pair_force(label):
+    lower = label.lower()
+    force = mm.CustomBondForce(
+        "ONE_4PI_EPS0*((wcq-baseline*qbranch)*qClosed+woq*qOpen)/r"
+        "+4*(wcv-baseline*vbranch)*eClosed*((sClosed/r)^12-(sClosed/r)^6)"
+        "+4*wov*eOpen*((sOpen/r)^12-(sOpen/r)^6);"
+        f"wcq=qbranch*COVALENT_BOND_ONE_FOUR_CHARGE_{label};"
+        f"wcv=vbranch*COVALENT_BOND_ONE_FOUR_VDW_{label};"
+        f"woq=qbranch*COVALENT_BOND_NONBONDED_CHARGE_{label};"
+        f"wov=vbranch*COVALENT_BOND_NONBONDED_VDW_{label};"
+        f"qbranch=COVALENT_CHARGE_{label};vbranch=COVALENT_STERICS_{label}"
+    )
+    force.setName(f"CovalentSoftBondTopologyPairs{label}")
+    for parameter in (
+        CHARGE_A_PARAMETER if lower == "a" else CHARGE_B_PARAMETER,
+        STERICS_A_PARAMETER if lower == "a" else STERICS_B_PARAMETER,
+        BOND_NONBONDED_CHARGE_A_PARAMETER if lower == "a" else BOND_NONBONDED_CHARGE_B_PARAMETER,
+        BOND_NONBONDED_VDW_A_PARAMETER if lower == "a" else BOND_NONBONDED_VDW_B_PARAMETER,
+        BOND_ONE_FOUR_CHARGE_A_PARAMETER if lower == "a" else BOND_ONE_FOUR_CHARGE_B_PARAMETER,
+        BOND_ONE_FOUR_VDW_A_PARAMETER if lower == "a" else BOND_ONE_FOUR_VDW_B_PARAMETER,
+    ):
+        force.addGlobalParameter(parameter, 0.0)
+    force.addGlobalParameter("ONE_4PI_EPS0", ONE_4PI_EPS0)
+    for parameter in (
+        "qClosed", "sClosed", "eClosed", "qOpen", "sOpen", "eOpen",
+        "baseline",
+    ):
+        force.addPerBondParameter(parameter)
+    force.setUsesPeriodicBoundaryConditions(True)
+    return force
 
 
 def _beutler_expression(scale):
@@ -976,6 +1162,8 @@ def _add_nonbonded_forces(
     ssc2_beta_coul,
     ssc2_switch_width_nm,
     use_long_range_correction,
+    soft_bond_pair_changes=(),
+    enable_soft_bond_topology=False,
 ):
     source_a = _force(endpoint_a, mm.NonbondedForce)
     source_b = _force(endpoint_b, mm.NonbondedForce)
@@ -1002,9 +1190,27 @@ def _add_nonbonded_forces(
     all_particles = set(range(endpoint_a.getNumParticles()))
     environment = all_particles - unique_a - unique_b
 
+    topology_changes = {}
+    for raw in (soft_bond_pair_changes or ()) if enable_soft_bond_topology else ():
+        endpoint = str(raw["endpoint"]).lower()
+        pair = tuple(sorted(int(value) for value in raw["system_atoms_0based"]))
+        if endpoint not in {"a", "b"} or len(pair) != 2:
+            raise CovalentAlchemyError("invalid soft-bond topology-pair metadata")
+        endpoint_unique = unique_a if endpoint == "a" else unique_b
+        if not endpoint_unique.intersection(pair):
+            raise CovalentAlchemyError(
+                "soft-bond topology changes between mapped common atoms are not supported"
+            )
+        topology_changes[pair] = {
+            "endpoint": endpoint,
+            "closed_class": int(raw["closed_class"]),
+            "open_class": int(raw["open_class"]),
+        }
+
     exceptions_a = _exception_dict(source_a)
     exceptions_b = _exception_dict(source_b)
     exception_pairs = set(exceptions_a) | set(exceptions_b)
+    exception_pairs.update(topology_changes)
     exception_pairs.update(
         tuple(sorted((particle_a, particle_b)))
         for particle_a in unique_a for particle_b in unique_b
@@ -1219,6 +1425,10 @@ def _add_nonbonded_forces(
         ssc2_alpha_lj,
         ssc2_switch_width_nm,
     )
+    topology_pair_a = _new_soft_bond_topology_pair_force("A")
+    topology_pair_b = _new_soft_bond_topology_pair_force("B")
+    one_four_a = _infer_one_four_scales(source_a)
+    one_four_b = _infer_one_four_scales(source_b)
 
     for pair in sorted(exception_pairs):
         value_a = exceptions_a.get(pair, (0.0, 1.0, 0.0))
@@ -1228,6 +1438,7 @@ def _add_nonbonded_forces(
         p1, p2 = pair
         in_a = int(p1 in unique_a) + int(p2 in unique_a)
         in_b = int(p1 in unique_b) + int(p2 in unique_b)
+        topology_change = topology_changes.get(pair)
         if use_ssc2_coulomb and not use_amber_reciprocal:
             index = force.addException(p1, p2, 0.0, 1.0, 0.0)
         elif use_amber_reciprocal:
@@ -1303,6 +1514,26 @@ def _add_nonbonded_forces(
                     exception_coulomb_b.addBond(p1, p2, [q_b, sigma_b])
                 if epsilon_b != 0.0:
                     exception_lj_b.addBond(p1, p2, [sigma_b, epsilon_b])
+        if topology_change is not None:
+            endpoint = topology_change["endpoint"]
+            source = source_a if endpoint == "a" else source_b
+            scales = one_four_a if endpoint == "a" else one_four_b
+            closed = _pair_parameters_for_class(
+                source,
+                pair,
+                topology_change["closed_class"],
+                scales,
+                use_existing_exception=True,
+            )
+            opened = _pair_parameters_for_class(
+                source,
+                pair,
+                topology_change["open_class"],
+                scales,
+                use_existing_exception=False,
+            )
+            target = topology_pair_a if endpoint == "a" else topology_pair_b
+            target.addBond(p1, p2, [*closed, *opened, 1.0])
         if use_ssc2_coulomb:
             combined_direct.addExclusion(p1, p2)
             if combined_lrc is not None:
@@ -1348,6 +1579,10 @@ def _add_nonbonded_forces(
         output.addForce(exception_coulomb_a)
     if (use_ssc2_coulomb or use_gapsys_coulomb) and exception_coulomb_b.getNumBonds():
         output.addForce(exception_coulomb_b)
+    if topology_pair_a.getNumBonds():
+        output.addForce(topology_pair_a)
+    if topology_pair_b.getNumBonds():
+        output.addForce(topology_pair_b)
 
 
 def _vacuum_bond_terms(force):
@@ -1518,21 +1753,149 @@ def resolve_softcore_path(
     charge_a=None,
     segments_per_interval=None,
     path_mode=None,
+    control_nodes=None,
 ):
+    if control_nodes is not None:
+        if path_mode is not None or any(
+            value is not None for value in (path_nodes, vdw_a, charge_a)
+        ):
+            raise CovalentAlchemyError(
+                "explicit softcore control nodes cannot be combined with a named "
+                "path mode or legacy path arrays"
+            )
+        if total_steps is None or segments_per_interval is None:
+            raise CovalentAlchemyError(
+                "explicit softcore control nodes require total_steps and "
+                "segments_per_interval"
+            )
+        if not isinstance(control_nodes, (list, tuple)) or len(control_nodes) < 2:
+            raise CovalentAlchemyError(
+                "softcore control nodes must contain at least two mappings"
+            )
+        normalized = []
+        previous = None
+        for index, raw in enumerate(control_nodes):
+            if not isinstance(raw, dict) or set(raw) - {"at", "label", "controls"}:
+                raise CovalentAlchemyError(
+                    f"softcore control node {index + 1} must contain at, optional "
+                    "label, and controls"
+                )
+            controls = raw.get("controls")
+            if not isinstance(controls, dict) or set(controls) - set(EXPLICIT_PATH_CONTROLS):
+                raise CovalentAlchemyError(
+                    f"softcore control node {index + 1} contains invalid controls"
+                )
+            if previous is None:
+                missing = set(EXPLICIT_PATH_CONTROLS) - set(controls)
+                if missing:
+                    raise CovalentAlchemyError(
+                        "the first softcore control node must define every control; "
+                        f"missing {', '.join(sorted(missing))}"
+                    )
+                resolved_controls = {}
+            else:
+                resolved_controls = dict(previous["controls"])
+            for name, value in controls.items():
+                value = float(value)
+                if not 0.0 <= value <= 1.0:
+                    raise CovalentAlchemyError(
+                        f"softcore control {name} at node {index + 1} must be in [0, 1]"
+                    )
+                resolved_controls[name] = value
+            node = {
+                "at": float(raw.get("at", -1.0)),
+                "label": str(raw.get("label", f"node_{index}")),
+                "controls": resolved_controls,
+            }
+            normalized.append(node)
+            previous = node
+        coordinates = [node["at"] for node in normalized]
+        if coordinates[0] != 0.0 or coordinates[-1] != 1.0 or any(
+            right <= left for left, right in zip(coordinates, coordinates[1:])
+        ):
+            raise CovalentAlchemyError(
+                "softcore control-node coordinates must increase strictly from 0 to 1"
+            )
+        for label, controls, expected in (
+            ("first", normalized[0]["controls"], EXPLICIT_ENDPOINT_A_CONTROLS),
+            ("last", normalized[-1]["controls"], EXPLICIT_ENDPOINT_B_CONTROLS),
+        ):
+            mismatched = [
+                name for name, value in expected.items()
+                if not math.isclose(controls[name], value, abs_tol=1.0e-12)
+            ]
+            if mismatched:
+                raise CovalentAlchemyError(
+                    f"the {label} softcore control node is not a physical endpoint; "
+                    f"invalid controls: {', '.join(mismatched)}"
+                )
+        segments = [int(value) for value in segments_per_interval]
+        if len(segments) != len(normalized) - 1 or any(value < 1 for value in segments):
+            raise CovalentAlchemyError(
+                "segments_per_interval must contain one positive value per control-node interval"
+            )
+        total = int(total_steps)
+        if total < 1:
+            raise CovalentAlchemyError("softcore total_steps must be positive")
+        internal_nodes = coordinates[1:-1]
+        interval_steps = _allocate_interval_steps(total, internal_nodes, segments)
+        values = {
+            name: [node["controls"][name] for node in normalized]
+            for name in EXPLICIT_PATH_CONTROLS
+        }
+        return {
+            "source": "explicit_nodes",
+            "nodes": internal_nodes,
+            "control_nodes": normalized,
+            "vdw_a": values["sterics_a"],
+            "vdw_b": values["sterics_b"],
+            "charge_a": values["charge_a"],
+            "charge_b": values["charge_b"],
+            "bonded_a": values["bonded_a"],
+            "bonded_b": values["bonded_b"],
+            "separate_bonded": [1.0] * len(normalized),
+            "mapped_vdw": values["mapped_vdw"],
+            "mapped_charge": values["mapped_charge"],
+            "soft_bond_a": values["soft_bond_a"],
+            "soft_bond_b": values["soft_bond_b"],
+            "soft_angles_a": values["soft_angles_a"],
+            "soft_angles_b": values["soft_angles_b"],
+            "soft_torsions_a": values["soft_torsions_a"],
+            "soft_torsions_b": values["soft_torsions_b"],
+            "bond_nonbonded_charge_a": values["bond_nonbonded_charge_a"],
+            "bond_nonbonded_charge_b": values["bond_nonbonded_charge_b"],
+            "bond_nonbonded_vdw_a": values["bond_nonbonded_vdw_a"],
+            "bond_nonbonded_vdw_b": values["bond_nonbonded_vdw_b"],
+            "bond_one_four_charge_a": values["bond_one_four_charge_a"],
+            "bond_one_four_charge_b": values["bond_one_four_charge_b"],
+            "bond_one_four_vdw_a": values["bond_one_four_vdw_a"],
+            "bond_one_four_vdw_b": values["bond_one_four_vdw_b"],
+            "stage_labels": [node["label"] for node in normalized[1:]],
+            "reverse_stage_labels": [node["label"] for node in reversed(normalized[:-1])],
+            "segments_per_interval": segments,
+            "interval_steps": interval_steps,
+            "total_steps": total,
+        }
     if path_mode is not None:
         path_mode = str(path_mode).lower()
-        if path_mode not in {"concerted", "staged_bonded"}:
+        if path_mode not in {"concerted", "staged_bonded", "scheme1_soft_bond"}:
             raise CovalentAlchemyError(
-                "softcore path mode must be 'concerted' or 'staged_bonded'"
+                "softcore path mode must be 'concerted', 'staged_bonded', or "
+                "'scheme1_soft_bond'"
             )
         if any(value is not None for value in (path_nodes, vdw_a, charge_a)):
             raise CovalentAlchemyError(
                 "softcore named path modes cannot be combined with explicit path arrays"
             )
-        if path_mode == "concerted":
+        if path_mode in {"concerted", "scheme1_soft_bond"}:
             path_nodes = []
-            vdw_a = [1.0, 0.0]
-            charge_a = [1.0, 0.0]
+            if path_mode == "scheme1_soft_bond":
+                path_nodes = [0.5]
+                vdw_a = [1.0, 0.5, 0.0]
+                charge_a = [1.0, 0.5, 0.0]
+            else:
+                vdw_a = [1.0, 0.0]
+                charge_a = [1.0, 0.0]
         else:
             path_nodes = [0.1, 0.3, 0.7, 0.9]
             vdw_a = [1.0, 1.0, 1.0, 0.0, 0.0, 0.0]
@@ -1646,7 +2009,7 @@ def resolve_softcore_path(
         reverse_stage_labels = list(reversed(stage_labels))
     bonded_b = list(reversed(bonded_a))
     separate_bonded = [1.0 if source == "staged_bonded" else 0.0] * len(vdw)
-    return {
+    result = {
         "source": source,
         "nodes": nodes,
         "vdw_a": vdw,
@@ -1664,6 +2027,78 @@ def resolve_softcore_path(
         "interval_steps": interval_steps,
         "total_steps": total,
     }
+    if source == "scheme1_soft_bond":
+        result.update({
+            "soft_bond_a": [1.0, 0.5, 0.0],
+            "soft_bond_b": [0.0, 0.5, 1.0],
+            "soft_angles_a": [1.0, 0.0, 0.0],
+            "soft_angles_b": [0.0, 0.0, 1.0],
+            "soft_torsions_a": [1.0, 0.0, 0.0],
+            "soft_torsions_b": [0.0, 0.0, 1.0],
+            "bond_nonbonded_charge_a": [0.0, 0.0, 1.0],
+            "bond_nonbonded_charge_b": [1.0, 0.0, 0.0],
+            "bond_nonbonded_vdw_a": [0.0, 1.0, 1.0],
+            "bond_nonbonded_vdw_b": [1.0, 1.0, 0.0],
+            "bond_one_four_charge_a": [1.0, 0.0, 0.0],
+            "bond_one_four_charge_b": [0.0, 0.0, 1.0],
+            "bond_one_four_vdw_a": [1.0, 1.0, 0.0],
+            "bond_one_four_vdw_b": [0.0, 1.0, 1.0],
+            "stage_labels": ["soften_topology_a", "form_topology_b"],
+            "reverse_stage_labels": ["soften_topology_b", "form_topology_a"],
+        })
+    else:
+        if source == "staged_bonded":
+            legacy_soft_bond_a = list(result["bonded_a"])
+            legacy_soft_bond_b = list(result["bonded_b"])
+        else:
+            legacy_soft_bond_a = [1.0 - value for value in result["mapped_vdw"]]
+            legacy_soft_bond_b = list(result["mapped_vdw"])
+        if source == "legacy_staged":
+            topology_b = list(result["mapped_vdw"])
+            topology_a = [1.0 - value for value in topology_b]
+        else:
+            topology_a = topology_b = None
+        result.update({
+            "soft_bond_a": legacy_soft_bond_a,
+            "soft_bond_b": legacy_soft_bond_b,
+            "soft_angles_a": list(result["bonded_a"]),
+            "soft_angles_b": list(result["bonded_b"]),
+            "soft_torsions_a": list(result["bonded_a"]),
+            "soft_torsions_b": list(result["bonded_b"]),
+            "bond_nonbonded_charge_a": (
+                topology_b if topology_b is not None
+                else [0.0] * len(result["bonded_a"])
+            ),
+            "bond_nonbonded_charge_b": (
+                topology_a if topology_a is not None
+                else [0.0] * len(result["bonded_b"])
+            ),
+            "bond_nonbonded_vdw_a": (
+                topology_b if topology_b is not None
+                else [0.0] * len(result["bonded_a"])
+            ),
+            "bond_nonbonded_vdw_b": (
+                topology_a if topology_a is not None
+                else [0.0] * len(result["bonded_b"])
+            ),
+            "bond_one_four_charge_a": (
+                topology_a if topology_a is not None
+                else [1.0] * len(result["bonded_a"])
+            ),
+            "bond_one_four_charge_b": (
+                topology_b if topology_b is not None
+                else [1.0] * len(result["bonded_b"])
+            ),
+            "bond_one_four_vdw_a": (
+                topology_a if topology_a is not None
+                else [1.0] * len(result["bonded_a"])
+            ),
+            "bond_one_four_vdw_b": (
+                topology_b if topology_b is not None
+                else [1.0] * len(result["bonded_b"])
+            ),
+        })
+    return result
 
 
 def _expand_node_values(nodes, resolved):
@@ -1689,6 +2124,20 @@ def _expand_path(resolved):
         BONDED_A_PARAMETER: resolved["bonded_a"],
         BONDED_B_PARAMETER: resolved["bonded_b"],
         SEPARATE_BONDED_PARAMETER: resolved["separate_bonded"],
+        SOFT_BOND_A_PARAMETER: resolved["soft_bond_a"],
+        SOFT_BOND_B_PARAMETER: resolved["soft_bond_b"],
+        SOFT_ANGLE_A_PARAMETER: resolved["soft_angles_a"],
+        SOFT_ANGLE_B_PARAMETER: resolved["soft_angles_b"],
+        SOFT_TORSION_A_PARAMETER: resolved["soft_torsions_a"],
+        SOFT_TORSION_B_PARAMETER: resolved["soft_torsions_b"],
+        BOND_NONBONDED_CHARGE_A_PARAMETER: resolved["bond_nonbonded_charge_a"],
+        BOND_NONBONDED_CHARGE_B_PARAMETER: resolved["bond_nonbonded_charge_b"],
+        BOND_NONBONDED_VDW_A_PARAMETER: resolved["bond_nonbonded_vdw_a"],
+        BOND_NONBONDED_VDW_B_PARAMETER: resolved["bond_nonbonded_vdw_b"],
+        BOND_ONE_FOUR_CHARGE_A_PARAMETER: resolved["bond_one_four_charge_a"],
+        BOND_ONE_FOUR_CHARGE_B_PARAMETER: resolved["bond_one_four_charge_b"],
+        BOND_ONE_FOUR_VDW_A_PARAMETER: resolved["bond_one_four_vdw_a"],
+        BOND_ONE_FOUR_VDW_B_PARAMETER: resolved["bond_one_four_vdw_b"],
     }
     values = {
         name: _expand_node_values(nodes, resolved)
@@ -1764,6 +2213,7 @@ def create_softcore_hamiltonian(
     ssc2_switch_width_nm: float = 0.2,
     soft_bond_alpha_nm2: float = 100.0,
     soft_bond_pairs=(),
+    soft_bond_pair_changes=(),
     charge_steps_per_stage: int = 10000,
     sterics_steps: int = 30000,
     subdivisions_per_stage: int = 1,
@@ -1773,6 +2223,7 @@ def create_softcore_hamiltonian(
     charge_a=None,
     segments_per_interval=None,
     path_mode: str | None = None,
+    control_nodes=None,
     stage_interpolation: str = "linear",
     use_long_range_correction: bool = True,
 ) -> CovalentSoftcoreHamiltonian:
@@ -1847,7 +2298,18 @@ def create_softcore_hamiltonian(
         charge_a=charge_a,
         segments_per_interval=segments_per_interval,
         path_mode=path_mode,
+        control_nodes=control_nodes,
     )
+    topology_path_sources = {
+        "legacy_staged",
+        "scheme1_soft_bond",
+        "explicit_nodes",
+    }
+    if soft_bond_pair_changes and resolved_path["source"] not in topology_path_sources:
+        raise CovalentAlchemyError(
+            "the selected alchemical bond requires the legacy staged, "
+            "scheme1_soft_bond, or explicit control-node path"
+        )
     if coulomb_function == "gapsys":
         if function != "gapsys":
             raise CovalentAlchemyError(
@@ -1889,6 +2351,8 @@ def create_softcore_hamiltonian(
         ssc2_beta_coul=float(ssc2_beta_coul),
         ssc2_switch_width_nm=float(ssc2_switch_width_nm),
         use_long_range_correction=bool(use_long_range_correction),
+        soft_bond_pair_changes=soft_bond_pair_changes,
+        enable_soft_bond_topology=resolved_path["source"] in topology_path_sources,
     )
     _copy_other_forces(output, endpoint_a, endpoint_b)
     values, steps = _expand_path(resolved_path)

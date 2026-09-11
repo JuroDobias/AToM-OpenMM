@@ -56,7 +56,9 @@ endpoint-A unique-branch charges, then transforms bonded and softcore Lennard-Jo
 terms, and finally introduces endpoint-B charges. The reverse path executes the
 same stages in reverse. `charge_steps_per_stage` applies independently to each
 charge stage, so the configured 10000 + 30000 + 10000 steps produce a 100 ps
-switch at 2 fs. The implementation keeps PME and common protein/water forces in a
+switch at 2 fs. When the mapping selects an `alchemical_bonds` ring opening, this
+central stage also transforms the affected exclusions, ordinary nonbonded pairs,
+and 1-4 terms. The implementation keeps PME and common protein/water forces in a
 single system rather than evaluating two complete endpoint Hamiltonians.
 
 Set `softcore.path.mode: staged_bonded` together with `softcore.total_steps` to
@@ -66,6 +68,11 @@ bonded terms, exchange sterics and mapped parameters, demote A bonded terms, and
 charge B. This is useful when a local valence change must reorganize before the
 new branch acquires steric interactions. It does not increase a configured 100,
 300, or 1000 ps switch.
+
+For an edge with one selected `alchemical_bonds` closure, use
+`softcore.path.mode: scheme1_soft_bond` to apply the finer two-half soft-bond
+schedule. It independently controls closure stretch, angles, torsions, changing
+ordinary nonbonded pairs, and 1-4 terms without changing the total switch time.
 
 Unique branches with one mapped-core attachment use automatic
 `terminal_z_matrix` framing when the mapped core supplies a connected heavy-atom

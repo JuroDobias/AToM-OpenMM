@@ -649,6 +649,30 @@ def _test_staged_bonded_workflow_uses_five_optimized_intervals():
     assert resolved["interval_steps"] == [5000, 10000, 20000, 10000, 5000]
 
 
+def _test_scheme1_soft_bond_workflow_uses_two_optimized_intervals():
+    config = _normalized_settings(
+        {
+            "neqti": {
+                "interpolation": "softcore_linear",
+                "softcore": {
+                    "total_steps": 50000,
+                    "path": {"mode": "scheme1_soft_bond"},
+                },
+                "schedule_optimization": {"enabled": True},
+            }
+        }
+    )
+    resolved = _switch_protocol(config)["softcore"]["resolved_path"]
+
+    assert config["schedule_optimization"]["segments_per_interval"] == [10, 10]
+    assert resolved["source"] == "scheme1_soft_bond"
+    assert resolved["interval_steps"] == [25000, 25000]
+    assert resolved["stage_labels"] == [
+        "soften_topology_a",
+        "form_topology_b",
+    ]
+
+
 def _test_gapsys_and_work_profile_settings_are_recorded_in_protocol():
     config = _normalized_settings(
         {

@@ -12,6 +12,7 @@ from atom_openmm.covalent_hybrid import (
     CovalentHybridMolecule,
     _add_unique_vacuum_nonbonded,
     _inactive_scales,
+    _term_contains_bond,
 )
 from atom_openmm.covalent_parameters import CovalentParameterBundle
 from atom_openmm.covalent_systems import (
@@ -209,13 +210,15 @@ def _add_source_constraints(target, sources):
     for index in range(target.getNumConstraints()):
         p1, p2, distance = target.getConstraintParameters(index)
         existing[tuple(sorted((int(p1), int(p2))))] = distance.value_in_unit(unit.nanometer)
-    for system, mapping, active_atoms in sources:
+    for system, mapping, active_atoms, excluded_bonds in sources:
         for index in range(system.getNumConstraints()):
             p1, p2, distance = system.getConstraintParameters(index)
             source_pair = (int(p1), int(p2))
             if not all(atom in mapping for atom in source_pair):
                 continue
             if not any(atom in active_atoms for atom in source_pair):
+                continue
+            if _term_contains_bond(source_pair, excluded_bonds):
                 continue
             pair = tuple(sorted(mapping[atom] for atom in source_pair))
             distance_nm = distance.value_in_unit(unit.nanometer)
@@ -243,6 +246,8 @@ def _graft_endpoint(
     active_atoms_b,
     state,
     dummy_bonded_scales,
+    alchemical_bonds_a,
+    alchemical_bonds_b,
 ):
     sulfur = receptor_atoms["SG"]
     hydrogen = receptor_atoms["HG"]
@@ -261,8 +266,18 @@ def _graft_endpoint(
     _add_source_constraints(
         output,
         (
-            (parameters_a.system, source_to_global_a, active_atoms_a),
-            (parameters_b.system, source_to_global_b, active_atoms_b),
+            (
+                parameters_a.system,
+                source_to_global_a,
+                active_atoms_a,
+                alchemical_bonds_a if state == "b" else set(),
+            ),
+            (
+                parameters_b.system,
+                source_to_global_b,
+                active_atoms_b,
+                alchemical_bonds_b if state == "a" else set(),
+            ),
         ),
     )
     molecule_a = parameters_a.molecule.to_rdkit()
@@ -281,7 +296,10 @@ def _graft_endpoint(
         )
         _source_terms(
             output, parameters_b.system, source_to_global_b,
-            lambda atoms: any(atom in unique_b for atom in atoms),
+            lambda atoms: (
+                any(atom in unique_b for atom in atoms)
+                and not _term_contains_bond(atoms, alchemical_bonds_b)
+            ),
             bond_scale=lambda _: dummy_bonded_scales.bond,
             angle_scale=angle_scale_b,
             torsion_scale=torsion_scale_b,
@@ -298,7 +316,10 @@ def _graft_endpoint(
         )
         _source_terms(
             output, parameters_a.system, source_to_global_a,
-            lambda atoms: any(atom in unique_a for atom in atoms),
+            lambda atoms: (
+                any(atom in unique_a for atom in atoms)
+                and not _term_contains_bond(atoms, alchemical_bonds_a)
+            ),
             bond_scale=lambda _: dummy_bonded_scales.bond,
             angle_scale=angle_scale_a,
             torsion_scale=torsion_scale_a,
@@ -473,12 +494,14 @@ def prepare_protein_covalent_hybrid(
         source_to_global_a, source_to_global_b, receptor_atoms, unique_a, unique_b,
         active_atoms_a, active_atoms_b, "a",
         hybrid.dummy_bonded_scales,
+        set(hybrid.alchemical_bonds_a), set(hybrid.alchemical_bonds_b),
     )
     endpoint_b = _graft_endpoint(
         base_system, parameters_a, parameters_b, hybrid,
         source_to_global_a, source_to_global_b, receptor_atoms, unique_a, unique_b,
         active_atoms_a, active_atoms_b, "b",
         hybrid.dummy_bonded_scales,
+        set(hybrid.alchemical_bonds_a), set(hybrid.alchemical_bonds_b),
     )
 
     # Clone the base topology and append the ligand-union residue atoms and bonds.

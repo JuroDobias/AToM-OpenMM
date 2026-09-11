@@ -159,14 +159,15 @@ workflow:
       alpha: 0.3
       sigma_nm: 0.25
       power: 1
-      charge_steps_per_stage: 12500
-      sterics_steps: 25000
+      total_steps: 50000
+      path:
+        mode: scheme1_soft_bond
       soft_bond_alpha_nm2: 100.0
       long_range_correction: dynamic
     schedule_optimization:
       enabled: true
       pilot_samples: 10
-      subdivisions_per_stage: 10
+      segments_per_interval: [10, 10]
       min_segment_steps: 250
       max_segment_steps: 15000
     adaptive_switching:

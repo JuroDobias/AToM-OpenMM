@@ -39,6 +39,16 @@ class CovalentHybridMolecule:
     inactive_z_matrix_terms: tuple["InactiveZMatrixTerm", ...] = ()
     alchemical_bonds_a: tuple[tuple[int, int], ...] = ()
     alchemical_bonds_b: tuple[tuple[int, int], ...] = ()
+    alchemical_bond_pair_changes: tuple["AlchemicalBondPairChange", ...] = ()
+
+
+@dataclass(frozen=True)
+class AlchemicalBondPairChange:
+    endpoint: str
+    atoms: tuple[int, int]
+    hybrid_atoms: tuple[int, int]
+    closed_class: int
+    open_class: int
 
 
 @dataclass(frozen=True)
@@ -448,16 +458,29 @@ def _validate_alchemical_bonds(molecule, selected_bonds, unique, endpoint):
             raise CovalentAlchemyError(
                 f"ligand-{endpoint} alchemical bond {atom1}:{atom2} disconnects the molecule"
             )
-    unique = sorted(unique)
-    for offset, atom1 in enumerate(unique):
-        for atom2 in unique[offset + 1:]:
+
+
+def _alchemical_bond_pair_changes(molecule, selected_bonds, mapping, endpoint):
+    selected = {tuple(sorted(pair)) for pair in selected_bonds}
+    if not selected:
+        return ()
+    changes = []
+    for atom1 in range(molecule.GetNumAtoms()):
+        for atom2 in range(atom1 + 1, molecule.GetNumAtoms()):
             closed = _graph_distance_class(molecule, atom1, atom2)
             opened = _graph_distance_class(molecule, atom1, atom2, selected)
-            if closed != opened and min(closed, opened) <= 3:
-                raise CovalentAlchemyError(
-                    f"ligand-{endpoint} alchemical bond changes the nonbonded exclusion "
-                    f"class of dummy atoms {atom1}:{atom2}; this topology is not yet supported"
+            if closed == opened or min(closed, opened) > 3:
+                continue
+            changes.append(
+                AlchemicalBondPairChange(
+                    endpoint=endpoint,
+                    atoms=(atom1, atom2),
+                    hybrid_atoms=tuple(sorted((mapping[atom1], mapping[atom2]))),
+                    closed_class=closed,
+                    open_class=opened,
                 )
+            )
+    return tuple(changes)
 
 
 def _add_union_constraints(output, systems_and_maps):
@@ -1166,6 +1189,20 @@ def inactive_branch_metadata(hybrid: CovalentHybridMolecule):
     ]
 
 
+def alchemical_bond_pair_metadata(hybrid: CovalentHybridMolecule):
+    """Serialize exclusion/1-4 classes affected by a selected soft bond."""
+    return [
+        {
+            "endpoint": change.endpoint,
+            "atoms_0based": list(change.atoms),
+            "hybrid_atoms_0based": list(change.hybrid_atoms),
+            "closed_class": change.closed_class,
+            "open_class": change.open_class,
+        }
+        for change in hybrid.alchemical_bond_pair_changes
+    ]
+
+
 def build_covalent_hybrid_molecule(
     parameters_a: CovalentParameterBundle,
     parameters_b: CovalentParameterBundle,
@@ -1357,6 +1394,14 @@ def build_covalent_hybrid_molecule(
     for atom in unique_b:
         positions[map_b_to_hybrid[atom]] = np.asarray(conformer_b.GetAtomPosition(atom))
     topology = _hybrid_topology(molecule_a, molecule_b, map_a_to_hybrid, map_b_to_hybrid)
+    bond_pair_changes = (
+        _alchemical_bond_pair_changes(
+            molecule_a, alchemical_bonds_a, map_a_to_hybrid, "a"
+        )
+        + _alchemical_bond_pair_changes(
+            molecule_b, alchemical_bonds_b, map_b_to_hybrid, "b"
+        )
+    )
     return CovalentHybridMolecule(
         topology=topology,
         positions=positions * unit.angstrom,
@@ -1400,6 +1445,7 @@ def build_covalent_hybrid_molecule(
         ),
         alchemical_bonds_a=tuple(sorted(alchemical_bonds_a)),
         alchemical_bonds_b=tuple(sorted(alchemical_bonds_b)),
+        alchemical_bond_pair_changes=bond_pair_changes,
     )
 
 

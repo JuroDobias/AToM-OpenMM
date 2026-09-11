@@ -14,6 +14,7 @@ from openff.units import unit as offunit
 
 from atom_openmm.covalent_hybrid import (
     HybridBondedScales,
+    alchemical_bond_pair_metadata,
     build_hybrid_molecule,
     inactive_branch_metadata,
     inactive_z_matrix_metadata,
@@ -277,7 +278,7 @@ def _validate_settings(workflow):
             if key in {
                 "charge_steps_per_stage", "sterics_steps", "subdivisions_per_stage",
                 "total_steps", "path_nodes", "vdw_a", "charge_a",
-                "segments_per_interval", "path_mode",
+                "segments_per_interval", "path_mode", "control_nodes",
             }
         })
     except Exception as exc:
@@ -642,6 +643,9 @@ def _prepare_pair(pair, receptor, workflow, workdir):
     )
     mapping_payload["inactive_z_matrix_terms"] = inactive_z_matrix_metadata(hybrid)
     mapping_payload["inactive_bonded_branches"] = inactive_branch_metadata(hybrid)
+    mapping_payload["alchemical_bond_pair_changes"] = (
+        alchemical_bond_pair_metadata(hybrid)
+    )
     mapping_payload["resolved_inactive_bonded_atoms_a_0based"] = list(
         hybrid.inactive_bonded_atoms_a
     )
@@ -698,6 +702,18 @@ def _prepare_pair(pair, receptor, workflow, workdir):
                 [indices[atom1], indices[atom2]] for atom1, atom2 in selected
             )
         prepared.provenance["soft_bond_system_pairs"] = pairs
+        prepared.provenance["soft_bond_pair_changes"] = [
+            {
+                **entry,
+                "system_atoms_0based": [
+                    prepared.provenance[
+                        f"ligand_{entry['endpoint']}_system_atom_indices"
+                    ][atom]
+                    for atom in entry["atoms_0based"]
+                ],
+            }
+            for entry in alchemical_bond_pair_metadata(hybrid)
+        ]
     _validate_prepared_endpoint_charges(complex_system, "complex")
     _validate_prepared_endpoint_charges(solvent_system, "solvent")
     manifest = {
@@ -709,6 +725,9 @@ def _prepare_pair(pair, receptor, workflow, workdir):
         "inactive_bonded_geometry": hybrid.inactive_bonded_geometry,
         "soft_bond_system_pairs": complex_system.provenance[
             "soft_bond_system_pairs"
+        ],
+        "soft_bond_pair_changes": complex_system.provenance[
+            "soft_bond_pair_changes"
         ],
         "vacuum_nonbonded_pair_counts": vacuum_nonbonded_pair_counts(hybrid),
         "parameterization": {
