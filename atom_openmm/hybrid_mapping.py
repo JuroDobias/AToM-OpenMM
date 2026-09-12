@@ -586,10 +586,6 @@ def _explicit_pairs_map(molecule_a, molecule_b, settings):
                     f"alchemical_bonds.{endpoint} selected bond does not exist"
                 )
             mapped = [atom in endpoint_mapping for atom in (atom1, atom2)]
-            if not any(mapped):
-                raise HybridMappingError(
-                    f"alchemical_bonds.{endpoint} must contain at least one mapped atom"
-                )
             if all(mapped) and other.GetBondBetweenAtoms(
                 endpoint_mapping[atom1], endpoint_mapping[atom2]
             ) is not None:

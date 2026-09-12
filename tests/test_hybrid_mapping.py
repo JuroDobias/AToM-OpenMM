@@ -387,6 +387,27 @@ def test_explicit_soft_bond_allows_mapped_to_unique_annulation_closure():
     assert metadata["alchemical_bonds"]["ligand_b"][0]["atoms_0based"] == [3, 8]
 
 
+def test_explicit_soft_bond_allows_unique_to_unique_annulation_closure():
+    ligand_a = _parameters("c1ccccc1")
+    ligand_b = _parameters("c1ccc2c(c1)CCC2")
+
+    mapping, metadata = build_hybrid_atom_map(
+        ligand_a,
+        ligand_b,
+        {
+            "method": "explicit_pairs",
+            "pairs_0based": [[index, index] for index in range(6)],
+            "alchemical_bonds": {
+                "ligand_b": [{"atoms_0based": [7, 8], "mode": "soft_bond"}]
+            },
+        },
+    )
+
+    assert 7 not in mapping.values()
+    assert 8 not in mapping.values()
+    assert metadata["alchemical_bonds"]["ligand_b"][0]["atoms_0based"] == [7, 8]
+
+
 def test_soft_closure_opens_ring_for_z_matrix_anchor():
     ligand_a = _parameters("c1ccccc1")
     ligand_b = _parameters("c1ccc2c(c1)CCC2")
