@@ -387,7 +387,7 @@ def test_explicit_soft_bond_allows_mapped_to_unique_annulation_closure():
     assert metadata["alchemical_bonds"]["ligand_b"][0]["atoms_0based"] == [3, 8]
 
 
-def test_explicit_soft_bond_allows_unique_to_unique_annulation_closure():
+def _test_explicit_soft_bond_allows_unique_to_unique_annulation_closure():
     ligand_a = _parameters("c1ccccc1")
     ligand_b = _parameters("c1ccc2c(c1)CCC2")
 

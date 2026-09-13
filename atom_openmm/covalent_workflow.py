@@ -746,6 +746,8 @@ def validate_covalent_workflow(path):
         raise CovalentWorkflowError("covalent endpoint equilibration tolerances and timesteps must be positive")
     rest2 = config["rest2"]
     if rest2["enabled"]:
+        if rest2["timestep_fs"] <= 0:
+            raise CovalentWorkflowError("REST2 timestep_fs must be positive")
         backend = rest2.get("sampler_backend", "custom")
         if rest2["execution"] not in {"serial", "process"}:
             raise CovalentWorkflowError(
@@ -2064,10 +2066,11 @@ def _sample_endpoint(
 ):
     if rest2_config.get("enabled", False):
         rest2 = create_rest2_system(system, hot_atoms)
+        rest2_timestep_fs = float(rest2_config.get("timestep_fs", timestep_fs))
         base_integrator = mm.LangevinMiddleIntegrator(
             float(temperature_k) * unit.kelvin,
             1.0 / unit.picosecond,
-            float(timestep_fs) * unit.femtosecond,
+            rest2_timestep_fs * unit.femtosecond,
         )
         sampler = create_rest2_exchange_sampler(
             system=rest2.system,
@@ -3368,6 +3371,11 @@ def _normalized_settings(workflow):
     path_raw = softcore.get("path")
     interpolation = str(neqti.get("interpolation", "envelope"))
     enabled = bool(rest2.get("enabled", True))
+    default_rest2_timestep_fs = (
+        1.0
+        if str(workflow.get("chemistry", "covalent")).lower() == "covalent"
+        else float(neqti.get("timestep_fs", 2.0))
+    )
     temperatures = rest2.get(
         "effective_temperatures_k",
         [300.0, 344.6, 395.9, 454.7, 522.3, 600.0],
@@ -3685,6 +3693,9 @@ def _normalized_settings(workflow):
         "rest2": {
             "enabled": enabled,
             "sampler_backend": rest2_sampler_backend,
+            "timestep_fs": float(
+                rest2.get("timestep_fs", default_rest2_timestep_fs)
+            ),
             "effective_temperatures_k": [float(value) for value in temperatures],
             "exchange_interval_steps": int(rest2.get("exchange_interval_steps", 500)),
             "checkpoint_interval_cycles": int(rest2.get("checkpoint_interval_cycles", 10)),

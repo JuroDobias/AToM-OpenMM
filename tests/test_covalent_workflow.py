@@ -429,6 +429,25 @@ def test_covalent_endpoint_equilibration_defaults_and_legacy_npt_alias():
     assert configured["npt_steps"] == 250000
 
 
+def _test_covalent_rest2_uses_independent_safe_timestep_default():
+    covalent = _normalized_settings(
+        {"chemistry": "covalent", "neqti": {"timestep_fs": 2.0}}
+    )
+    noncovalent = _normalized_settings(
+        {"chemistry": "noncovalent", "neqti": {"timestep_fs": 2.0}}
+    )
+    configured = _normalized_settings(
+        {
+            "chemistry": "covalent",
+            "neqti": {"timestep_fs": 2.0, "rest2": {"timestep_fs": 0.5}},
+        }
+    )
+
+    assert covalent["rest2"]["timestep_fs"] == 1.0
+    assert noncovalent["rest2"]["timestep_fs"] == 2.0
+    assert configured["rest2"]["timestep_fs"] == 0.5
+
+
 def _test_equilibration_protocol_fingerprint_rejects_changed_steps(tmp_path):
     from atom_openmm.covalent_workflow import (
         CovalentResumeError,
