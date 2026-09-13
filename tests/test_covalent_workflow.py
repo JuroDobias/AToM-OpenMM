@@ -429,7 +429,7 @@ def test_covalent_endpoint_equilibration_defaults_and_legacy_npt_alias():
     assert configured["npt_steps"] == 250000
 
 
-def _test_covalent_rest2_uses_independent_safe_timestep_default():
+def test_rest2_uses_neqti_timestep_default_and_allows_override():
     covalent = _normalized_settings(
         {"chemistry": "covalent", "neqti": {"timestep_fs": 2.0}}
     )
@@ -443,7 +443,7 @@ def _test_covalent_rest2_uses_independent_safe_timestep_default():
         }
     )
 
-    assert covalent["rest2"]["timestep_fs"] == 1.0
+    assert covalent["rest2"]["timestep_fs"] == 2.0
     assert noncovalent["rest2"]["timestep_fs"] == 2.0
     assert configured["rest2"]["timestep_fs"] == 0.5
 

@@ -392,11 +392,14 @@ def _mapped_indices(indices, mapping):
 
 
 def _term_contains_bond(atoms, selected_bonds):
-    """Return whether a sequential bonded term contains a selected bond."""
-    return any(
-        tuple(sorted((int(atom1), int(atom2)))) in selected_bonds
-        for atom1, atom2 in zip(atoms, atoms[1:])
-    )
+    """Return whether a bonded term contains both atoms of a selected bond.
+
+    Proper torsions use a sequential atom order, but SMIRNOFF improper
+    torsions do not. Testing only adjacent tuple entries leaves impropers
+    spanning an alchemical bond active after that bond has been opened.
+    """
+    term_atoms = {int(atom) for atom in atoms}
+    return any(set(pair) <= term_atoms for pair in selected_bonds)
 
 
 def _graph_distance_class(molecule, atom1, atom2, excluded_bonds=()):

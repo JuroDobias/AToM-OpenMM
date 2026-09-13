@@ -137,7 +137,7 @@ class CovalentResumeError(CovalentWorkflowError):
     pass
 
 
-PREPARATION_SCHEMA_VERSION = 2
+PREPARATION_SCHEMA_VERSION = 3
 
 
 def _resolve(path, base):
@@ -3371,11 +3371,7 @@ def _normalized_settings(workflow):
     path_raw = softcore.get("path")
     interpolation = str(neqti.get("interpolation", "envelope"))
     enabled = bool(rest2.get("enabled", True))
-    default_rest2_timestep_fs = (
-        1.0
-        if str(workflow.get("chemistry", "covalent")).lower() == "covalent"
-        else float(neqti.get("timestep_fs", 2.0))
-    )
+    default_rest2_timestep_fs = float(neqti.get("timestep_fs", 2.0))
     temperatures = rest2.get(
         "effective_temperatures_k",
         [300.0, 344.6, 395.9, 454.7, 522.3, 600.0],

@@ -12,6 +12,7 @@ from atom_openmm.covalent_hybrid import (
     _hybrid_topology,
     _inactive_scales,
     _inactive_branch_components,
+    _term_contains_bond,
     build_covalent_hybrid_molecule,
     complete_covalent_atom_map,
 )
@@ -39,6 +40,14 @@ def test_hybrid_topology_sanitizes_atom_names_for_mmcif():
     topology = _hybrid_topology(molecule, molecule, {0: 0, 1: 1}, {0: 0, 1: 1})
 
     assert [atom.name for atom in topology.atoms()] == ["C1", "O2"]
+
+
+def test_soft_bond_detection_includes_nonsequential_improper_atoms():
+    selected = {(89, 90)}
+
+    assert _term_contains_bond((88, 89, 90, 91), selected)
+    assert _term_contains_bond((89, 88, 90, 93), selected)
+    assert not _term_contains_bond((89, 88, 92, 93), selected)
 
 
 def test_endpoint_excludes_all_cross_branch_nonbonded_pairs():
