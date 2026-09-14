@@ -15,7 +15,7 @@ conda activate myatom_openmm86
 export PYTHONPATH="$(cd ../../.. && pwd):${PYTHONPATH:-}"
 
 TASK=${SLURM_ARRAY_TASK_ID}
-TASK_DIR=$(find run_gaff2_tip4pew/tasks -maxdepth 1 -type d -name "$(printf '%02d' "${TASK}")_*" -print -quit 2>/dev/null || true)
+TASK_DIR=$(find run_gaff2_tip4pew_restraint_fix/tasks -maxdepth 1 -type d -name "$(printf '%02d' "${TASK}")_*" -print -quit 2>/dev/null || true)
 RESULT=${TASK_DIR}/result.yaml
 CHILD=""
 WALLTIME=0
@@ -34,7 +34,7 @@ if wait "${CHILD}"; then
   exit 0
 fi
 
-TASK_DIR=$(find run_gaff2_tip4pew/tasks -maxdepth 1 -type d -name "$(printf '%02d' "${TASK}")_*" -print -quit 2>/dev/null || true)
+TASK_DIR=$(find run_gaff2_tip4pew_restraint_fix/tasks -maxdepth 1 -type d -name "$(printf '%02d' "${TASK}")_*" -print -quit 2>/dev/null || true)
 RESULT=${TASK_DIR}/result.yaml
 if [[ "${WALLTIME}" -eq 1 && ! -f "${RESULT}" ]]; then
   sbatch --dependency=afterany:"${SLURM_JOB_ID}" --array="${TASK}" run_array.slurm

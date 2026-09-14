@@ -1,4 +1,4 @@
-workdir: run_gaff2_tip4pew
+workdir: run_gaff2_tip4pew_restraint_fix
 receptor: inputs/protein.pdb
 ligand: inputs/6OMe.sdf
 replicates: 3

@@ -53,10 +53,10 @@ After completion, run:
 ```bash
 python -m atom_openmm.md_validation workflow.yaml --analyze
 python -m atom_openmm.md_validation_dcd \
-  run_gaff2_tip4pew/prepared/canonical_topology.cif run_gaff2_tip4pew/tasks/*
+  run_gaff2_tip4pew_restraint_fix/prepared/canonical_topology.cif run_gaff2_tip4pew_restraint_fix/tasks/*
 ```
 
-The second command also writes `run_gaff2_tip4pew/dna_analysis_corrected.yaml` with
+The second command also writes `run_gaff2_tip4pew_restraint_fix/dna_analysis_corrected.yaml` with
 replicate means and between-replicate standard deviations. On Slurm,
 `analyze.slurm` runs both commands after the simulation array completes.
 
