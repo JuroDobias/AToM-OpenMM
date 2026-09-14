@@ -124,8 +124,11 @@ def _fingerprint(config):
         "configuration": {key: value for key, value in config.items() if not key.startswith("_")},
         "inputs": {key: _sha256(value) for key, value in source_paths.items()},
         "implementation": {
-            Path(module.__file__).name: _sha256(module.__file__)
-            for module in (hybrid_parameters, hybrid_systems, hu2024_atp, metal_ions, receptor_normalization)
+            **{
+                Path(module.__file__).name: _sha256(module.__file__)
+                for module in (hybrid_parameters, hybrid_systems, hu2024_atp, metal_ions, receptor_normalization)
+            },
+            Path(__file__).name: _sha256(__file__),
         },
     }
     return hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
@@ -335,6 +338,7 @@ def _phase_protocol(config):
         {"id": "minimized", "kind": "min", "restrained": True,
          "max_iterations": int(protocol.get("minimization_max_iterations", 500))},
         {"id": "restrained_nvt", "kind": "md", "npt": False, "restrained": True,
+         "reset_velocities": True,
          "steps": int(protocol.get("restrained_nvt_steps", 50000))},
         {"id": "restrained_npt", "kind": "md", "npt": True, "restrained": True,
          "steps": int(protocol.get("restrained_npt_steps", 250000))},
@@ -485,10 +489,13 @@ def _run_md_phase(config, topology, base_system, positions, state, phase, output
         state = mm.XmlSerializer.deserialize(running_state_path.read_text())
         completed = int(yaml.safe_load(progress_path.read_text()).get("completed_steps", 0))
         LOGGER.info("Resuming phase %s at step %d/%d", phase["id"], completed, phase.get("steps", 0))
+    resumed = completed > 0
     if state is None:
         simulation.context.setVelocitiesToTemperature(temperature * unit.kelvin, seed)
     else:
         simulation.context.setState(state)
+    if phase.get("reset_velocities") and not resumed:
+        simulation.context.setVelocitiesToTemperature(temperature * unit.kelvin, seed)
     simulation.currentStep = completed
     if phase["kind"] == "min":
         simulation.minimizeEnergy(

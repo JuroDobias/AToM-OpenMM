@@ -8,7 +8,7 @@ import pytest
 
 from atom_openmm.hu2024_atp import read_b3_cmap, read_frcmod, read_prepi
 from atom_openmm.md_validation import (
-    MDValidationError, _metric_context, _run_md_phase, task_spec,
+    MDValidationError, _metric_context, _phase_protocol, _run_md_phase, task_spec,
 )
 from atom_openmm.metal_ions import apply_panteva_m1264, c4_kcal_a4_to_kj_nm4
 from atom_openmm.receptor_normalization import normalize_legacy_pdb
@@ -53,6 +53,30 @@ def _test_panteva_c4_units_and_atp_overrides(tmp_path):
     assert custom.getParticleParameters(0)[1] == pytest.approx(c4_kcal_a4_to_kj_nm4(21.25))
     assert custom.getParticleParameters(1)[1] == pytest.approx(c4_kcal_a4_to_kj_nm4(238.75))
     assert custom.getParticleParameters(3)[1] == pytest.approx(c4_kcal_a4_to_kj_nm4(180.5))
+
+
+def _test_panteva_exclusions_match_base_nonbonded_force(tmp_path):
+    topology = _minimal_topology()
+    system = _minimal_system(topology.getNumAtoms())
+    nonbonded = system.getForce(0)
+    nonbonded.addException(0, 1, 0.0, 0.2, 0.0)
+    nonbonded.addException(1, 2, 0.0, 0.2, 0.0)
+    table = tmp_path / "lj_1264_pol.dat"
+    table.write_text("OW 1.444\nO2 0.569\nNB 1.090\n")
+    apply_panteva_m1264(
+        system, topology, atom_classes=["O2", "NB", "OW", "OW"],
+        polarizability_table=table,
+    )
+    custom = system.getForce(1)
+    assert [tuple(custom.getExclusionParticles(i)) for i in range(custom.getNumExclusions())] == [
+        (0, 1), (1, 2),
+    ]
+    system.setDefaultPeriodicBoxVectors(
+        mm.Vec3(3, 0, 0), mm.Vec3(0, 3, 0), mm.Vec3(0, 0, 3),
+    )
+    context = mm.Context(system, mm.VerletIntegrator(0.001), mm.Platform.getPlatformByName("CPU"))
+    context.setPositions(np.asarray([[0, 0, 0], [0.2, 0, 0], [1, 0, 0], [1.5, 0, 0]]) * unit.nanometer)
+    assert np.isfinite(context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
 
 
 def _test_hu_parameter_readers_normalize_prime_names(tmp_path):
@@ -103,6 +127,11 @@ def _test_matrix_task_mapping():
     assert task_spec(config, 11)["replicate"] == 3
     with pytest.raises(MDValidationError):
         task_spec(config, 12)
+
+
+def _test_first_nvt_resets_velocities_after_minimization():
+    phases = _phase_protocol({})
+    assert [phase["id"] for phase in phases if phase.get("reset_velocities")] == ["restrained_nvt"]
 
 
 def _test_short_cpu_md_writes_metrics_and_checkpoint(tmp_path):

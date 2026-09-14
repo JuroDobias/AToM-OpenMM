@@ -229,6 +229,9 @@ def apply_hu2024_atp(system, topology, *, prepi, frcmod, mod_py,
     mg_indices = [atom.index for atom in topology_atoms if atom.element and atom.element.symbol == "Mg"]
     corrected_atoms = {index for index, atom_type in global_types.items() if atom_type in hu_cross}
     correction.addInteractionGroup(set(mg_indices), corrected_atoms)
+    from atom_openmm.metal_ions import copy_nonbonded_exclusions
+
+    copy_nonbonded_exclusions(nonbonded, correction)
     correction.setNonbondedMethod(mm.CustomNonbondedForce.CutoffPeriodic)
     correction.setCutoffDistance(nonbonded.getCutoffDistance())
     corrected_pairs = len(mg_indices) * len(corrected_atoms)

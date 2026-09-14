@@ -28,6 +28,13 @@ def read_polarizabilities(path):
     return values
 
 
+def copy_nonbonded_exclusions(nonbonded, custom):
+    """Match the NonbondedForce exception list used by OpenMM's CPU neighbor list."""
+    for index in range(nonbonded.getNumExceptions()):
+        atom_a, atom_b, *_ = nonbonded.getExceptionParameters(index)
+        custom.addExclusion(atom_a, atom_b)
+
+
 def apply_panteva_m1264(system, topology, *, atom_classes,
                        polarizability_table, atp_residue_name="ATP"):
     """Apply Li-Merz Mg 12-6-4/TIP3P with Panteva ATP pair overrides."""
@@ -74,6 +81,7 @@ def apply_panteva_m1264(system, topology, *, atom_classes,
     for atom in atoms:
         force.addParticle([1.0 if atom.index in mg_set else 0.0, c4_values[atom.index]])
     force.addInteractionGroup(mg_set, set(range(len(atoms))) - mg_set)
+    copy_nonbonded_exclusions(nonbonded, force)
     if nonbonded.getNonbondedMethod() == mm.NonbondedForce.NoCutoff:
         force.setNonbondedMethod(mm.CustomNonbondedForce.NoCutoff)
     else:

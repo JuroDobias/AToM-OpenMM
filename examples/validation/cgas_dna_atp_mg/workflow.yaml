@@ -1,4 +1,4 @@
-workdir: run
+workdir: run_v2
 receptor: inputs/protein.pdb
 ligand: inputs/6OMe.sdf
 replicates: 3
