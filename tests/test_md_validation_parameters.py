@@ -8,7 +8,8 @@ import pytest
 
 from atom_openmm.hu2024_atp import read_b3_cmap, read_frcmod, read_prepi
 from atom_openmm.md_validation import (
-    MDValidationError, _metric_context, _phase_protocol, _run_md_phase, task_spec,
+    MDValidationError, _add_ligand_metal_restraint, _add_restraints,
+    _metric_context, _phase_protocol, _run_md_phase, task_spec,
 )
 from atom_openmm.metal_ions import (
     MetalIonParameterError, apply_panteva_m1264, c4_kcal_a4_to_kj_nm4,
@@ -167,6 +168,25 @@ def _test_matrix_task_mapping():
 def _test_first_nvt_resets_velocities_after_minimization():
     phases = _phase_protocol({})
     assert [phase["id"] for phase in phases if phase.get("reset_velocities")] == ["restrained_nvt"]
+
+
+def _test_positional_and_ligand_metal_restraints_share_context():
+    topology = _minimal_topology()
+    system = _minimal_system(topology.getNumAtoms())
+    vectors = (mm.Vec3(3, 0, 0), mm.Vec3(0, 3, 0), mm.Vec3(0, 0, 3)) * unit.nanometer
+    topology.setPeriodicBoxVectors(vectors)
+    system.setDefaultPeriodicBoxVectors(*vectors)
+    positions = np.asarray([[0.0, 0, 0], [0.2, 0, 0], [0.3, 0, 0], [1.0, 0, 0]]) * unit.nanometer
+    _add_restraints(system, topology, positions, 5.0)
+    _add_ligand_metal_restraint(
+        system, topology, positions,
+        {"ligand_atom_index_0based": 0, "lower_bound_a": 1.8, "upper_bound_a": 3.0},
+        25.0,
+    )
+    context = mm.Context(system, mm.VerletIntegrator(0.001), mm.Platform.getPlatformByName("Reference"))
+    context.setPositions(positions)
+    energy = context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+    assert np.isfinite(energy)
 
 
 def _test_explicit_validation_protocol_is_preserved():

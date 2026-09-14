@@ -321,13 +321,13 @@ def _restraint_indices(topology, selection):
 
 def _add_restraints(system, topology, positions, strength, selection="solute_heavy"):
     force = mm.CustomExternalForce(
-        "0.5*k*periodicdistance(x,y,z,x0,y0,z0)^2"
+        "0.5*positional_k*periodicdistance(x,y,z,x0,y0,z0)^2"
     )
     force.setName("MD validation solute-heavy positional restraints")
     for name in ("x0", "y0", "z0"):
         force.addPerParticleParameter(name)
     force.addGlobalParameter(
-        "k", float(strength) * 418.4 * unit.kilojoule_per_mole / unit.nanometer**2
+        "positional_k", float(strength) * 418.4 * unit.kilojoule_per_mole / unit.nanometer**2
     )
     for index in _restraint_indices(topology, selection):
         xyz = positions[index].value_in_unit(unit.nanometer)
@@ -359,11 +359,11 @@ def _add_ligand_metal_restraint(system, topology, positions, settings, strength)
     if lower < 0 or upper <= lower:
         raise MDValidationError("ligand metal restraint bounds must satisfy 0 <= lower < upper")
     force = mm.CustomBondForce(
-        "0.5*k*(max(0, r-upper)^2 + max(0, lower-r)^2)"
+        "0.5*ligand_metal_k*(max(0, r-upper)^2 + max(0, lower-r)^2)"
     )
     force.setName("MD validation ligand-metal flat-bottom restraint")
     force.addGlobalParameter(
-        "k", float(strength) * 418.4 * unit.kilojoule_per_mole / unit.nanometer**2
+        "ligand_metal_k", float(strength) * 418.4 * unit.kilojoule_per_mole / unit.nanometer**2
     )
     force.addGlobalParameter("lower", lower * unit.nanometer)
     force.addGlobalParameter("upper", upper * unit.nanometer)
