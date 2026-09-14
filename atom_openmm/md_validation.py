@@ -297,16 +297,29 @@ def _platform(config):
     return platform, properties
 
 
-def _solute_heavy_indices(topology):
-    excluded = {"HOH", "WAT", "NA", "CL", "K", "CA", "MG", "ZN"}
-    return [
-        atom.index for atom in topology.atoms()
-        if atom.residue.name.upper() not in excluded
-        and atom.element is not None and atom.element.symbol != "H"
-    ]
+def _restraint_indices(topology, selection):
+    solvent = {"HOH", "WAT", "TIP3", "TIP4", "OPC", "NA", "CL", "K", "CA"}
+    ligand_residue = next(topology.residues())
+    amino = set("ALA ARG ASN ASP CYS GLU GLN GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL".split())
+    indices = []
+    for atom in topology.atoms():
+        name = atom.residue.name.upper()
+        if atom.element is None or atom.element.symbol == "H" or name in solvent:
+            continue
+        if selection == "solute_heavy":
+            include = True
+        elif selection == "environment_heavy":
+            include = atom.residue != ligand_residue
+        elif selection == "protein_dna_heavy":
+            include = name in amino or name.startswith("D")
+        else:
+            raise MDValidationError(f"unknown positional restraint selection: {selection}")
+        if include:
+            indices.append(atom.index)
+    return indices
 
 
-def _add_restraints(system, topology, positions, strength):
+def _add_restraints(system, topology, positions, strength, selection="solute_heavy"):
     force = mm.CustomExternalForce(
         "0.5*k*periodicdistance(x,y,z,x0,y0,z0)^2"
     )
@@ -316,10 +329,53 @@ def _add_restraints(system, topology, positions, strength):
     force.addGlobalParameter(
         "k", float(strength) * 418.4 * unit.kilojoule_per_mole / unit.nanometer**2
     )
-    for index in _solute_heavy_indices(topology):
+    for index in _restraint_indices(topology, selection):
         xyz = positions[index].value_in_unit(unit.nanometer)
         force.addParticle(index, [float(value) for value in xyz])
     system.addForce(force)
+
+
+def _add_ligand_metal_restraint(system, topology, positions, settings, strength):
+    if not settings or strength is None or float(strength) <= 0:
+        return None
+    ligand_residue = next(topology.residues())
+    ligand_atoms = list(ligand_residue.atoms())
+    ligand_index = int(settings["ligand_atom_index_0based"])
+    if ligand_index < 0 or ligand_index >= len(ligand_atoms):
+        raise MDValidationError("ligand metal restraint atom index is outside the ligand")
+    ligand_atom = ligand_atoms[ligand_index]
+    metals = [
+        atom for atom in topology.atoms()
+        if atom.element is not None and atom.element.symbol == str(settings.get("metal", "Mg"))
+    ]
+    if not metals:
+        raise MDValidationError("ligand metal restraint did not find the requested metal")
+    coordinates = np.asarray(positions.value_in_unit(unit.nanometer))
+    metal_atom = min(
+        metals, key=lambda atom: np.linalg.norm(coordinates[atom.index] - coordinates[ligand_atom.index])
+    )
+    lower = float(settings.get("lower_bound_a", 1.8)) / 10.0
+    upper = float(settings.get("upper_bound_a", 3.0)) / 10.0
+    if lower < 0 or upper <= lower:
+        raise MDValidationError("ligand metal restraint bounds must satisfy 0 <= lower < upper")
+    force = mm.CustomBondForce(
+        "0.5*k*(max(0, r-upper)^2 + max(0, lower-r)^2)"
+    )
+    force.setName("MD validation ligand-metal flat-bottom restraint")
+    force.addGlobalParameter(
+        "k", float(strength) * 418.4 * unit.kilojoule_per_mole / unit.nanometer**2
+    )
+    force.addGlobalParameter("lower", lower * unit.nanometer)
+    force.addGlobalParameter("upper", upper * unit.nanometer)
+    force.addBond(ligand_atom.index, metal_atom.index)
+    force.setUsesPeriodicBoundaryConditions(True)
+    system.addForce(force)
+    return {
+        "ligand_atom_index": ligand_atom.index,
+        "ligand_atom_name": ligand_atom.name,
+        "metal_atom_index": metal_atom.index,
+        "metal_atom_name": metal_atom.name,
+    }
 
 
 def _set_barostat(system, pressure_bar, temperature_k, enabled):
@@ -334,6 +390,33 @@ def _set_barostat(system, pressure_bar, temperature_k, enabled):
 
 def _phase_protocol(config):
     protocol = config.get("protocol") or {}
+    if "steps" in protocol:
+        phases = protocol["steps"]
+        if not isinstance(phases, list) or not phases:
+            raise MDValidationError("protocol.steps must be a non-empty list")
+        normalized = []
+        seen = set()
+        for raw in phases:
+            if not isinstance(raw, dict):
+                raise MDValidationError("each protocol step must be a mapping")
+            phase = dict(raw)
+            identifier = str(phase.get("id", "")).strip()
+            kind = str(phase.get("kind", "")).strip()
+            if not identifier or identifier in seen:
+                raise MDValidationError("protocol step ids must be non-empty and unique")
+            if kind not in {"min", "md"}:
+                raise MDValidationError(f"protocol step {identifier} kind must be min or md")
+            seen.add(identifier)
+            phase["id"] = identifier
+            phase["kind"] = kind
+            if kind == "min":
+                phase["max_iterations"] = int(phase.get("max_iterations", 500))
+            else:
+                phase["steps"] = int(phase.get("steps", 0))
+                if phase["steps"] < 1:
+                    raise MDValidationError(f"protocol step {identifier} requires positive steps")
+            normalized.append(phase)
+        return normalized
     return [
         {"id": "minimized", "kind": "min", "restrained": True,
          "max_iterations": int(protocol.get("minimization_max_iterations", 500))},
@@ -467,12 +550,23 @@ def _run_md_phase(config, topology, base_system, positions, state, phase, output
     system = _clone(base_system)
     temperature = float(config.get("temperature_k", 300.0))
     pressure = float(config.get("pressure_bar", 1.0))
-    if phase.get("restrained"):
-        _add_restraints(system, topology, positions, float(config.get("restraint_k_kcal_mol_a2", 5.0)))
+    restraint_strength = phase.get("restraint_k_kcal_mol_a2")
+    if restraint_strength is None and phase.get("restrained"):
+        restraint_strength = float(config.get("restraint_k_kcal_mol_a2", 5.0))
+    if restraint_strength is not None and float(restraint_strength) > 0:
+        _add_restraints(
+            system, topology, positions, float(restraint_strength),
+            str(phase.get("restraint_selection", "solute_heavy")),
+        )
+    _add_ligand_metal_restraint(
+        system, topology, positions,
+        (config.get("protocol") or {}).get("ligand_metal_restraint"),
+        phase.get("ligand_metal_restraint_k_kcal_mol_a2"),
+    )
     _set_barostat(system, pressure, temperature, bool(phase.get("npt")))
     integrator = mm.LangevinMiddleIntegrator(
         temperature * unit.kelvin, float(config.get("friction_per_ps", 1.0)) / unit.picosecond,
-        float(config.get("timestep_fs", 2.0)) * unit.femtosecond,
+        float(phase.get("timestep_fs", config.get("timestep_fs", 2.0))) * unit.femtosecond,
     )
     integrator.setRandomNumberSeed(seed)
     platform, properties = _platform(config)
@@ -534,7 +628,7 @@ def _run_md_phase(config, topology, base_system, positions, state, phase, output
                 current = simulation.context.getState(getPositions=True, enforcePeriodicBox=True)
                 row = _metrics_row(
                     current, metric_context, completed,
-                    completed * float(config.get("timestep_fs", 2.0)) / 1000.0,
+                    completed * float(phase.get("timestep_fs", config.get("timestep_fs", 2.0))) / 1000.0,
                 )
                 if fields is None:
                     fields = list(row)
@@ -600,6 +694,7 @@ def run_task(config, task_index):
         overlays.append(apply_panteva_m1264(
             system, topology, atom_classes=manifest.get("atom_classes"),
             polarizability_table=_resolve(config, config["panteva_m1264"]["polarizability_table"]),
+            water_model=(config.get("setup") or {}).get("solvent_model", "tip3p"),
         ))
     if spec["hu2024_atp"]:
         hu = config.get("hu2024_atp") or {}

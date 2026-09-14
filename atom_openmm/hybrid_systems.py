@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import openmm as mm
 from openmm import app, unit
-from openmmforcefields.generators import EspalomaTemplateGenerator
+from openmmforcefields.generators import EspalomaTemplateGenerator, GAFFTemplateGenerator
 
 from atom_openmm.covalent_parameters import CovalentParameterError
 from atom_openmm.covalent_systems import PreparedCovalentSystem, _nonbonded_force
@@ -137,11 +137,21 @@ def create_physical_ligand_environment(
             receptor_pdb.topology, receptor_pdb.positions, forcefield
         )
         modeller.add(receptor_pdb.topology, receptor_pdb.positions)
-    generator = EspalomaTemplateGenerator(
-        molecules=[molecule],
-        forcefield=setup.get("ligand_forcefield", "espaloma-0.3.2"),
-        template_generator_kwargs={"charge_method": "from-molecule"},
-    )
+    ligand_forcefield = setup.get("ligand_forcefield", "espaloma-0.3.2")
+    if ligand_forcefield.startswith("espaloma"):
+        generator = EspalomaTemplateGenerator(
+            molecules=[molecule],
+            forcefield=ligand_forcefield,
+            template_generator_kwargs={"charge_method": "from-molecule"},
+        )
+    elif ligand_forcefield.startswith("gaff-"):
+        generator = GAFFTemplateGenerator(
+            molecules=[molecule], forcefield=ligand_forcefield
+        )
+    else:
+        raise HybridSystemError(
+            "ligand_forcefield must be an Espaloma or GAFF force field"
+        )
     forcefield.registerTemplateGenerator(generator.generator)
     modeller.addExtraParticles(forcefield)
     solvent_model = setup.get("solvent_model")
@@ -255,7 +265,10 @@ def create_physical_ligand_environment(
                 atom_type = None if template_atom is None else forcefield._atomTypes.get(template_atom.type)
                 atom_class = None if atom_type is None else atom_type.atomClass
                 if residue.name in {"HOH", "WAT"}:
-                    atom_class = "OW" if atom.element.symbol == "O" else "HW"
+                    if atom.element is None:
+                        atom_class = "EP"
+                    else:
+                        atom_class = "OW" if atom.element.symbol == "O" else "HW"
                 elif atom_class is None and atom.name in {"H2", "H3"} and atom.element.symbol == "H":
                     atom_class = "H"
                 elif atom_class is None and atom.name == "OXT" and atom.element.symbol == "O":

@@ -10,7 +10,9 @@ from atom_openmm.hu2024_atp import read_b3_cmap, read_frcmod, read_prepi
 from atom_openmm.md_validation import (
     MDValidationError, _metric_context, _phase_protocol, _run_md_phase, task_spec,
 )
-from atom_openmm.metal_ions import apply_panteva_m1264, c4_kcal_a4_to_kj_nm4
+from atom_openmm.metal_ions import (
+    MetalIonParameterError, apply_panteva_m1264, c4_kcal_a4_to_kj_nm4,
+)
 from atom_openmm.receptor_normalization import normalize_legacy_pdb
 
 
@@ -37,6 +39,15 @@ def _minimal_system(count):
         force.addParticle(0.0, 0.3, 0.1)
     system.addForce(force)
     return system
+
+
+def _tip4p_topology_and_system():
+    topology = _minimal_topology()
+    water = list(topology.residues())[-1]
+    topology.addAtom("M", None, water)
+    system = _minimal_system(topology.getNumAtoms())
+    system.setVirtualSite(4, mm.ThreeParticleAverageSite(3, 3, 3, 1.0, 0.0, 0.0))
+    return topology, system
 
 
 def _test_panteva_c4_units_and_atp_overrides(tmp_path):
@@ -77,6 +88,30 @@ def _test_panteva_exclusions_match_base_nonbonded_force(tmp_path):
     context = mm.Context(system, mm.VerletIntegrator(0.001), mm.Platform.getPlatformByName("CPU"))
     context.setPositions(np.asarray([[0, 0, 0], [0.2, 0, 0], [1, 0, 0], [1.5, 0, 0]]) * unit.nanometer)
     assert np.isfinite(context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
+
+
+def _test_panteva_rejects_mismatched_water_model(tmp_path):
+    table = tmp_path / "lj_1264_pol.dat"
+    table.write_text("OW 1.444\nO2 0.569\nNB 1.090\n")
+    with pytest.raises(MetalIonParameterError, match="TIP4P-Ew"):
+        apply_panteva_m1264(
+            _minimal_system(4), _minimal_topology(),
+            atom_classes=["O2", "NB", "OW", "OW"],
+            polarizability_table=table, water_model="tip3p",
+        )
+
+
+def _test_panteva_gives_tip4p_virtual_site_zero_c4(tmp_path):
+    topology, system = _tip4p_topology_and_system()
+    table = tmp_path / "lj_1264_pol.dat"
+    table.write_text("OW 1.444\nO2 0.569\nNB 1.090\n")
+    apply_panteva_m1264(
+        system, topology, atom_classes=["O2", "NB", "OW", "OW", "EP"],
+        polarizability_table=table,
+    )
+    custom = system.getForce(1)
+    assert custom.getParticleParameters(3)[1] == pytest.approx(c4_kcal_a4_to_kj_nm4(180.5))
+    assert custom.getParticleParameters(4)[1] == pytest.approx(0.0)
 
 
 def _test_hu_parameter_readers_normalize_prime_names(tmp_path):
@@ -132,6 +167,18 @@ def _test_matrix_task_mapping():
 def _test_first_nvt_resets_velocities_after_minimization():
     phases = _phase_protocol({})
     assert [phase["id"] for phase in phases if phase.get("reset_velocities")] == ["restrained_nvt"]
+
+
+def _test_explicit_validation_protocol_is_preserved():
+    config = {"protocol": {"steps": [
+        {"id": "ligand_min", "kind": "min", "max_iterations": 123},
+        {"id": "npt", "kind": "md", "steps": 456, "npt": True,
+         "restraint_selection": "protein_dna_heavy"},
+    ]}}
+    phases = _phase_protocol(config)
+    assert phases[0]["max_iterations"] == 123
+    assert phases[1]["steps"] == 456
+    assert phases[1]["restraint_selection"] == "protein_dna_heavy"
 
 
 def _test_short_cpu_md_writes_metrics_and_checkpoint(tmp_path):

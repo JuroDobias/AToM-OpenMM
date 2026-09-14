@@ -36,8 +36,13 @@ def copy_nonbonded_exclusions(nonbonded, custom):
 
 
 def apply_panteva_m1264(system, topology, *, atom_classes,
-                       polarizability_table, atp_residue_name="ATP"):
-    """Apply Li-Merz Mg 12-6-4/TIP3P with Panteva ATP pair overrides."""
+                       polarizability_table, atp_residue_name="ATP",
+                       water_model="tip4pew"):
+    """Apply TIP4P-Ew Li-Merz Mg 12-6-4 with Panteva ATP overrides."""
+    if str(water_model).lower() not in {"tip4pew", "tip4p-ew"}:
+        raise MetalIonParameterError(
+            "Panteva m12-6-4 parameters require the TIP4P-Ew water model"
+        )
     nonbonded = next(
         (force for force in system.getForces() if isinstance(force, mm.NonbondedForce)), None
     )
@@ -58,6 +63,9 @@ def apply_panteva_m1264(system, topology, *, atom_classes,
 
     c4_values = []
     for atom, atom_class in zip(atoms, atom_classes):
+        if atom_class == "EP" and system.isVirtualSite(atom.index):
+            c4_values.append(0.0)
+            continue
         if atom_class not in polarizabilities and atom_class is not None and atom_class.upper() in polarizabilities:
             atom_class = atom_class.upper()
         if atom_class not in polarizabilities:
