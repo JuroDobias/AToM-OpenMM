@@ -1,5 +1,8 @@
 # cGAS DNA/ATP/Mg validation matrix
 
+The completed 3 x 20 ns comparison and interpretation are in
+[`REPORT.md`](REPORT.md).
+
 This experiment compares four parameter combinations using one canonical solvated
 cGAS system and three independent 20 ns replicas per combination:
 
@@ -46,7 +49,7 @@ replicate means and between-replicate standard deviations. On Slurm,
 
 The task metrics track Mg coordination, initial Mg-donor distances, Mg-Mg
 distance, and heavy-atom RMSDs for ATP, 6OMe, and DNA.
-The live CSV's DNA RMSD can jump when DNA atoms cross the periodic-image
-boundary. Use `dna_rmsd_corrected.csv` from the second command for DNA RMSD;
-it computes protein-aligned, minimum-image displacements directly from each
-committed DCD frame and leaves the live CSV unchanged.
+The live CSV's structural RMSDs can jump when separate solute components cross
+periodic-image boundaries. Use the corrected RMSD columns in
+`dna_rmsd_corrected.csv`; the postprocessor reconstructs protein, DNA, ATP, and
+ligand components before fitting and leaves the live CSV unchanged.
