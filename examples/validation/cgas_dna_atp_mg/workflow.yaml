@@ -1,4 +1,4 @@
-workdir: run_v2
+workdir: run_gaff2_tip4pew
 receptor: inputs/protein.pdb
 ligand: inputs/6OMe.sdf
 replicates: 3
@@ -10,7 +10,6 @@ temperature_k: 300.0
 pressure_bar: 1.0
 timestep_fs: 2.0
 friction_per_ps: 1.0
-restraint_k_kcal_mol_a2: 5.0
 report_interval_steps: 5000
 checkpoint_interval_steps: 50000
 expected:
@@ -25,10 +24,10 @@ setup:
     - amber14-all.xml
     - inputs/ATP.xml
   solvent_forcefield:
-    - amber14/tip3p.xml
-  solvent_model: tip3p
-  ligand_forcefield: espaloma-0.3.2
-  ligand_charge_model: nn
+    - amber14/tip4pew.xml
+  solvent_model: tip4pew
+  ligand_forcefield: gaff-2.2.20
+  ligand_charge_model: am1-bcc
   solvent_padding_a: 11.0
   solvent_box_shape: dodecahedron
   ionic_strength_molar: 0.15
@@ -43,8 +42,59 @@ panteva_m1264:
   polarizability_table: parameters/lj_1264_pol.dat
 
 protocol:
-  minimization_max_iterations: 500
-  restrained_nvt_steps: 50000
-  restrained_npt_steps: 250000
-  unrestrained_npt_steps: 250000
-  production_steps: 10000000
+  ligand_metal_restraint:
+    ligand_atom_index_0based: 6  # O2x in 6OMe.sdf
+    metal: Mg
+    lower_bound_a: 1.8
+    upper_bound_a: 3.0
+  steps:
+    - id: ligand_relax_min
+      kind: min
+      max_iterations: 2000
+      restraint_selection: environment_heavy
+      restraint_k_kcal_mol_a2: 25.0
+      ligand_metal_restraint_k_kcal_mol_a2: 25.0
+    - id: solute_restrained_min
+      kind: min
+      max_iterations: 2000
+      restraint_selection: solute_heavy
+      restraint_k_kcal_mol_a2: 25.0
+      ligand_metal_restraint_k_kcal_mol_a2: 25.0
+    - id: strong_restrained_nvt
+      kind: md
+      npt: false
+      reset_velocities: true
+      steps: 150000       # 300 ps
+      restraint_selection: solute_heavy
+      restraint_k_kcal_mol_a2: 25.0
+      ligand_metal_restraint_k_kcal_mol_a2: 25.0
+    - id: strong_restrained_npt
+      kind: md
+      npt: true
+      steps: 500000       # 1 ns
+      restraint_selection: solute_heavy
+      restraint_k_kcal_mol_a2: 25.0
+      ligand_metal_restraint_k_kcal_mol_a2: 10.0
+    - id: soft_restrained_npt
+      kind: md
+      npt: true
+      steps: 500000       # 1 ns
+      restraint_selection: solute_heavy
+      restraint_k_kcal_mol_a2: 1.2
+      ligand_metal_restraint_k_kcal_mol_a2: 2.0
+    - id: receptor_restrained_npt
+      kind: md
+      npt: true
+      steps: 250000       # 500 ps
+      restraint_selection: protein_dna_heavy
+      restraint_k_kcal_mol_a2: 1.2
+      ligand_metal_restraint_k_kcal_mol_a2: 0.5
+    - id: unrestrained_npt
+      kind: md
+      npt: true
+      steps: 500000       # 1 ns
+    - id: production
+      kind: md
+      npt: true
+      steps: 10000000     # 20 ns
+      production: true

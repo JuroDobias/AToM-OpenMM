@@ -12,4 +12,4 @@ conda activate myatom_openmm86
 export PYTHONPATH="$(cd ../../.. && pwd):${PYTHONPATH:-}"
 python -m atom_openmm.md_validation workflow.yaml --analyze
 python -m atom_openmm.md_validation_dcd \
-  run_v2/prepared/canonical_topology.cif run_v2/tasks/*
+  run_gaff2_tip4pew/prepared/canonical_topology.cif run_gaff2_tip4pew/tasks/*
