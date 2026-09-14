@@ -118,6 +118,7 @@ def create_physical_ligand_environment(
     receptor: Path | None,
     setup: dict,
     solvation_seed: int,
+    record_atom_classes: bool = False,
 ) -> PreparedPhysicalEnvironment:
     molecule = parameters.molecule
     topology = molecule.to_topology().to_openmm()
@@ -231,6 +232,37 @@ def create_physical_ligand_environment(
         rigidWater=True,
         removeCMMotion=True,
     )
+    atom_classes = None
+    if record_atom_classes:
+        atom_classes = []
+        for residue in modeller.topology.residues():
+            template = forcefield._templates.get(residue.name)
+            template_atoms = {} if template is None else {atom.name: atom for atom in template.atoms}
+            residue_atom_names = {atom.name for atom in residue.atoms()}
+            if set(template_atoms) != residue_atom_names and residue.name in {"HIS", "DG", "DC", "DA", "DT", "MET", "ALA"}:
+                candidates = (
+                    candidate for name, candidate in forcefield._templates.items()
+                    if name.startswith(residue.name[:2]) or name.endswith(residue.name)
+                    or (residue.name == "HIS" and name in {"HID", "HIE", "HIP"})
+                )
+                for candidate in candidates:
+                    mapped = {atom.name: atom for atom in candidate.atoms}
+                    if set(mapped) == residue_atom_names:
+                        template_atoms = mapped
+                        break
+            for atom in residue.atoms():
+                template_atom = template_atoms.get(atom.name)
+                atom_type = None if template_atom is None else forcefield._atomTypes.get(template_atom.type)
+                atom_class = None if atom_type is None else atom_type.atomClass
+                if residue.name in {"HOH", "WAT"}:
+                    atom_class = "OW" if atom.element.symbol == "O" else "HW"
+                elif atom_class is None and atom.name in {"H2", "H3"} and atom.element.symbol == "H":
+                    atom_class = "H"
+                elif atom_class is None and atom.name == "OXT" and atom.element.symbol == "O":
+                    atom_class = "O2"
+                elif atom.element and atom.element.symbol in {"Na", "Cl", "Mg", "Zn"}:
+                    atom_class = {"Na": "Na+", "Cl": "Cl-", "Mg": "Mg2+", "Zn": "Zn2+"}[atom.element.symbol]
+                atom_classes.append(atom_class)
     force = _nonbonded_force(system)
     observed = np.asarray(
         [
@@ -273,6 +305,8 @@ def create_physical_ligand_environment(
             else np.asarray(canonical_box_vectors, dtype=float).tolist()
         ),
     }
+    if record_atom_classes:
+        provenance["amber_atom_classes"] = atom_classes
     return PreparedPhysicalEnvironment(
         modeller.topology,
         modeller.positions,

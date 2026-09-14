@@ -1,0 +1,50 @@
+workdir: run
+receptor: inputs/protein.pdb
+ligand: inputs/6OMe.sdf
+replicates: 3
+random_seed: 20260914
+platform: CUDA
+platform_properties:
+  Precision: mixed
+temperature_k: 300.0
+pressure_bar: 1.0
+timestep_fs: 2.0
+friction_per_ps: 1.0
+restraint_k_kcal_mol_a2: 5.0
+report_interval_steps: 5000
+checkpoint_interval_steps: 50000
+expected:
+  magnesium: 2
+  zinc: 1
+  atp: 1
+  dna_nucleotides: 36
+  retained_water_extra_particles: 137
+
+setup:
+  protein_forcefield:
+    - amber14-all.xml
+    - inputs/ATP.xml
+  solvent_forcefield:
+    - amber14/tip3p.xml
+  solvent_model: tip3p
+  ligand_forcefield: espaloma-0.3.2
+  ligand_charge_model: nn
+  solvent_padding_a: 11.0
+  solvent_box_shape: dodecahedron
+  ionic_strength_molar: 0.15
+  nonbonded_cutoff_a: 9.0
+
+hu2024_atp:
+  prepi: parameters/ATP-B3.prepi
+  frcmod: parameters/ATP-B3.frcmod
+  mod_py: parameters/mod.py
+
+panteva_m1264:
+  polarizability_table: parameters/lj_1264_pol.dat
+
+protocol:
+  minimization_max_iterations: 500
+  restrained_nvt_steps: 50000
+  restrained_npt_steps: 250000
+  unrestrained_npt_steps: 250000
+  production_steps: 10000000

@@ -5,3 +5,6 @@ build/
 dist/
 site/
 examples/**/local_runs/
+examples/validation/**/inputs/
+examples/validation/**/parameters/
+examples/validation/**/run*/
