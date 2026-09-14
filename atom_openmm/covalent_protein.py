@@ -11,7 +11,7 @@ from atom_openmm.covalent_alchemy import CovalentAlchemyError
 from atom_openmm.covalent_hybrid import (
     CovalentHybridMolecule,
     _add_unique_vacuum_nonbonded,
-    _inactive_scales,
+    _inactive_bonded_scalers,
     _term_contains_bond,
 )
 from atom_openmm.covalent_parameters import CovalentParameterBundle
@@ -282,11 +282,29 @@ def _graft_endpoint(
     )
     molecule_a = parameters_a.molecule.to_rdkit()
     molecule_b = parameters_b.molecule.to_rdkit()
-    angle_scale_a, torsion_scale_a = _inactive_scales(
-        molecule_a, unique_a, dummy_bonded_scales
+    z_matrix_a = {
+        term.dummy_atom: term
+        for term in hybrid.inactive_z_matrix_terms
+        if term.endpoint == "a"
+    }
+    z_matrix_b = {
+        term.dummy_atom: term
+        for term in hybrid.inactive_z_matrix_terms
+        if term.endpoint == "b"
+    }
+    bond_scale_a, angle_scale_a, torsion_scale_a = _inactive_bonded_scalers(
+        molecule_a,
+        unique_a,
+        set(hybrid.inactive_bonded_atoms_a),
+        z_matrix_a,
+        dummy_bonded_scales,
     )
-    angle_scale_b, torsion_scale_b = _inactive_scales(
-        molecule_b, unique_b, dummy_bonded_scales
+    bond_scale_b, angle_scale_b, torsion_scale_b = _inactive_bonded_scalers(
+        molecule_b,
+        unique_b,
+        set(hybrid.inactive_bonded_atoms_b),
+        z_matrix_b,
+        dummy_bonded_scales,
     )
 
     if state == "a":
@@ -300,7 +318,7 @@ def _graft_endpoint(
                 any(atom in unique_b for atom in atoms)
                 and not _term_contains_bond(atoms, alchemical_bonds_b)
             ),
-            bond_scale=lambda _: dummy_bonded_scales.bond,
+            bond_scale=bond_scale_b,
             angle_scale=angle_scale_b,
             torsion_scale=torsion_scale_b,
         )
@@ -320,7 +338,7 @@ def _graft_endpoint(
                 any(atom in unique_a for atom in atoms)
                 and not _term_contains_bond(atoms, alchemical_bonds_a)
             ),
-            bond_scale=lambda _: dummy_bonded_scales.bond,
+            bond_scale=bond_scale_a,
             angle_scale=angle_scale_a,
             torsion_scale=torsion_scale_a,
         )

@@ -596,6 +596,50 @@ def _inactive_scales(molecule, unique, scales):
     return angle, torsion
 
 
+def _inactive_bonded_scalers(
+    molecule,
+    unique,
+    selected,
+    z_matrix,
+    scales,
+):
+    """Return the bonded-term policy for an inactive branch.
+
+    This policy is shared by reference and protein endpoint construction so
+    that embedding the hybrid molecule cannot change its dummy Hamiltonian.
+    """
+    base_angle, base_torsion = _inactive_scales(molecule, unique, scales)
+
+    def bond(_atoms):
+        return scales.bond
+
+    def angle(atoms):
+        selected_atoms = set(atoms) & selected
+        if not selected_atoms or selected_atoms == set(atoms):
+            return base_angle(atoms)
+        if len(selected_atoms) == 1:
+            term = z_matrix.get(next(iter(selected_atoms)))
+            if term is not None and (
+                atoms == term.angle_atoms or atoms[::-1] == term.angle_atoms
+            ):
+                return base_angle(atoms)
+        return 0.0
+
+    def torsion(atoms):
+        selected_atoms = set(atoms) & selected
+        if not selected_atoms or selected_atoms == set(atoms):
+            return base_torsion(atoms)
+        if len(selected_atoms) == 1:
+            term = z_matrix.get(next(iter(selected_atoms)))
+            if term is not None and _canonical_torsion(atoms) == _canonical_torsion(
+                term.torsion_atoms
+            ):
+                return base_torsion(atoms)
+        return 0.0
+
+    return bond, angle, torsion
+
+
 def _canonical_torsion(atoms):
     atoms = tuple(int(atom) for atom in atoms)
     reverse = atoms[::-1]
@@ -932,43 +976,20 @@ def _build_endpoint(
     force_b_angle = _source_force(system_b, mm.HarmonicAngleForce)
     force_a_torsion = _source_force(system_a, mm.PeriodicTorsionForce)
     force_b_torsion = _source_force(system_b, mm.PeriodicTorsionForce)
-    angle_scale_a, torsion_scale_a = _inactive_scales(
-        molecule_a, unique_a, dummy_bonded_scales
+    bond_scale_a, angle_scale_a, torsion_scale_a = _inactive_bonded_scalers(
+        molecule_a,
+        unique_a,
+        inactive_bonded_atoms_a,
+        inactive_z_matrix_a,
+        dummy_bonded_scales,
     )
-    angle_scale_b, torsion_scale_b = _inactive_scales(
-        molecule_b, unique_b, dummy_bonded_scales
+    bond_scale_b, angle_scale_b, torsion_scale_b = _inactive_bonded_scalers(
+        molecule_b,
+        unique_b,
+        inactive_bonded_atoms_b,
+        inactive_z_matrix_b,
+        dummy_bonded_scales,
     )
-
-    def local_angle_scale(base, atoms, selected, z_matrix):
-        selected_atoms = set(atoms) & selected
-        if not selected_atoms:
-            return base(atoms)
-        if selected_atoms == set(atoms):
-            return base(atoms)
-        if len(selected_atoms) == 1:
-            term = z_matrix.get(next(iter(selected_atoms)))
-            if term is not None and (
-                atoms == term.angle_atoms or atoms[::-1] == term.angle_atoms
-            ):
-                return base(atoms)
-        return 0.0
-
-    def local_torsion_scale(base, atoms, selected, z_matrix):
-        selected_atoms = set(atoms) & selected
-        if not selected_atoms:
-            return base(atoms)
-        if selected_atoms == set(atoms):
-            return base(atoms)
-        if len(selected_atoms) == 1:
-            term = z_matrix.get(next(iter(selected_atoms)))
-            if term is not None and _canonical_torsion(atoms) == _canonical_torsion(
-                term.torsion_atoms
-            ):
-                return base(atoms)
-        return 0.0
-
-    def local_bond_scale(atoms, selected):
-        return dummy_bonded_scales.bond
     if state == "a":
         _add_bonds(bonds, force_a_bond, map_a_to_hybrid, lambda _: True)
         _add_angles(angles, force_a_angle, map_a_to_hybrid, lambda _: True)
@@ -977,9 +998,9 @@ def _build_endpoint(
             any(i in unique_b for i in atoms)
             and not _term_contains_bond(atoms, alchemical_bonds_b)
         )
-        _add_bonds(bonds, force_b_bond, map_b_to_hybrid, include, lambda atoms: local_bond_scale(atoms, inactive_bonded_atoms_b))
-        _add_angles(angles, force_b_angle, map_b_to_hybrid, include, lambda atoms: local_angle_scale(angle_scale_b, atoms, inactive_bonded_atoms_b, inactive_z_matrix_b))
-        _add_torsions(torsions, force_b_torsion, map_b_to_hybrid, include, lambda atoms: local_torsion_scale(torsion_scale_b, atoms, inactive_bonded_atoms_b, inactive_z_matrix_b))
+        _add_bonds(bonds, force_b_bond, map_b_to_hybrid, include, bond_scale_b)
+        _add_angles(angles, force_b_angle, map_b_to_hybrid, include, angle_scale_b)
+        _add_torsions(torsions, force_b_torsion, map_b_to_hybrid, include, torsion_scale_b)
     else:
         _add_bonds(bonds, force_b_bond, map_b_to_hybrid, lambda _: True)
         _add_angles(angles, force_b_angle, map_b_to_hybrid, lambda _: True)
@@ -988,9 +1009,9 @@ def _build_endpoint(
             any(i in unique_a for i in atoms)
             and not _term_contains_bond(atoms, alchemical_bonds_a)
         )
-        _add_bonds(bonds, force_a_bond, map_a_to_hybrid, include, lambda atoms: local_bond_scale(atoms, inactive_bonded_atoms_a))
-        _add_angles(angles, force_a_angle, map_a_to_hybrid, include, lambda atoms: local_angle_scale(angle_scale_a, atoms, inactive_bonded_atoms_a, inactive_z_matrix_a))
-        _add_torsions(torsions, force_a_torsion, map_a_to_hybrid, include, lambda atoms: local_torsion_scale(torsion_scale_a, atoms, inactive_bonded_atoms_a, inactive_z_matrix_a))
+        _add_bonds(bonds, force_a_bond, map_a_to_hybrid, include, bond_scale_a)
+        _add_angles(angles, force_a_angle, map_a_to_hybrid, include, angle_scale_a)
+        _add_torsions(torsions, force_a_torsion, map_a_to_hybrid, include, torsion_scale_a)
     for force in (bonds, angles, torsions):
         if (hasattr(force, "getNumBonds") and force.getNumBonds()) or (
             hasattr(force, "getNumAngles") and force.getNumAngles()
