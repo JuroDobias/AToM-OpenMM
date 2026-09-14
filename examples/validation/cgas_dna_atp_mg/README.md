@@ -36,7 +36,17 @@ After completion, run:
 
 ```bash
 python -m atom_openmm.md_validation workflow.yaml --analyze
+python -m atom_openmm.md_validation_dcd \
+  run_v2/prepared/canonical_topology.cif run_v2/tasks/*
 ```
+
+The second command also writes `run_v2/dna_analysis_corrected.yaml` with
+replicate means and between-replicate standard deviations. On Slurm,
+`analyze.slurm` runs both commands after the simulation array completes.
 
 The task metrics track Mg coordination, initial Mg-donor distances, Mg-Mg
 distance, and heavy-atom RMSDs for ATP, 6OMe, and DNA.
+The live CSV's DNA RMSD can jump when DNA atoms cross the periodic-image
+boundary. Use `dna_rmsd_corrected.csv` from the second command for DNA RMSD;
+it computes protein-aligned, minimum-image displacements directly from each
+committed DCD frame and leaves the live CSV unchanged.
