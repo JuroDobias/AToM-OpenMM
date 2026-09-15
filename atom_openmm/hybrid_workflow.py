@@ -246,6 +246,26 @@ def _validate_settings(workflow):
         raise HybridWorkflowError(
             "Espaloma requires ligand_charge_model: nn; GAFF supports am1-bcc or resp-sigma-hole"
         )
+    fixed_sites = setup.get("ligand_sigma_holes")
+    if fixed_sites is not None:
+        if not isinstance(fixed_sites, dict):
+            raise HybridWorkflowError("workflow.setup.ligand_sigma_holes must be a mapping")
+        if not ligand_forcefield.startswith("espaloma") or charge_model != "nn":
+            raise HybridWorkflowError(
+                "fixed ligand_sigma_holes currently require Espaloma with NN charges"
+            )
+        if str(fixed_sites.get("model", "fixed")) != "fixed":
+            raise HybridWorkflowError("ligand_sigma_holes.model must be 'fixed'")
+        if str(fixed_sites.get("compensate_on", "halogen")) != "halogen":
+            raise HybridWorkflowError(
+                "ligand_sigma_holes.compensate_on must be 'halogen'"
+            )
+        for field in ("charge_e", "distance_a"):
+            value = fixed_sites.get(field)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                raise HybridWorkflowError(
+                    f"ligand_sigma_holes.{field} must be a positive number"
+                )
     if charge_model == "resp-sigma-hole":
         cache = setup.get("ligand_parameter_cache")
         protocol = setup.get("ligand_parameter_protocol")
@@ -638,6 +658,7 @@ def _prepare_pair(pair, receptor, workflow, workdir, base_dir=None):
         allow_undefined_stereo=allow_undefined_stereo,
         ligand_parameter_cache=parameter_cache,
         ligand_parameter_protocol=parameter_protocol,
+        ligand_sigma_holes=setup.get("ligand_sigma_holes"),
     )
     parameters_b = parameterize_ligand(
         pair["lig2_file"], ligand_forcefield=ligand_forcefield,
@@ -645,6 +666,7 @@ def _prepare_pair(pair, receptor, workflow, workdir, base_dir=None):
         allow_undefined_stereo=allow_undefined_stereo,
         ligand_parameter_cache=parameter_cache,
         ligand_parameter_protocol=parameter_protocol,
+        ligand_sigma_holes=setup.get("ligand_sigma_holes"),
     )
     if not np.isclose(parameters_a.total_charge_e, parameters_b.total_charge_e, atol=1e-6):
         raise HybridWorkflowError("parameterized endpoint ligand charges differ")

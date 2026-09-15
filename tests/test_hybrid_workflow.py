@@ -1,6 +1,7 @@
 import copy
 from pathlib import Path
 
+import pytest
 import yaml
 from rdkit import Chem
 from rdkit.Chem import AllChem
@@ -98,6 +99,23 @@ def _test_panteva_accepts_espaloma_with_separate_gaff2_c4_typing(tmp_path):
         },
     })
     _validate_settings(workflow)
+
+
+def _test_fixed_sigma_hole_settings_are_validated(tmp_path):
+    from atom_openmm.hybrid_workflow import HybridWorkflowError, _validate_settings
+
+    workflow = yaml.safe_load(_workflow(tmp_path).read_text())["workflow"]
+    workflow["setup"]["ligand_sigma_holes"] = {
+        "model": "fixed",
+        "charge_e": 0.03,
+        "distance_a": 1.64,
+        "compensate_on": "halogen",
+    }
+    _validate_settings(workflow)
+
+    workflow["setup"]["ligand_sigma_holes"]["charge_e"] = 0.0
+    with pytest.raises(HybridWorkflowError, match="charge_e"):
+        _validate_settings(workflow)
 
 
 def _test_legacy_bond_only_preparation_inputs_match_current_default():

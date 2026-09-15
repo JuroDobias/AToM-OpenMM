@@ -17,6 +17,7 @@ from atom_openmm.covalent_parameters import (
     VirtualSiteParameter,
 )
 from atom_openmm.hybrid_virtual_sites import add_common_sigma_holes
+from atom_openmm.hybrid_parameters import _apply_fixed_sigma_holes
 from atom_openmm.ligand_parameterization import (
     LigandParameterizationError,
     _canonical_identity,
@@ -283,3 +284,34 @@ def _test_common_sigma_hole_is_added_to_both_endpoints():
     context.setPositions(augmented.positions)
     energy = context.getState(getEnergy=True).getPotentialEnergy()
     assert np.isfinite(energy.value_in_unit(unit.kilojoules_per_mole))
+
+
+def _test_fixed_sigma_hole_transfers_charge_from_chlorine():
+    molecule = _molecule("CCl")
+    system = mm.System()
+    force = mm.NonbondedForce()
+    charges = np.zeros(molecule.n_atoms)
+    for atom in molecule.atoms:
+        system.addParticle(atom.mass.m_as(offunit.dalton) * unit.dalton)
+        force.addParticle(0.0, 0.3, 0.0)
+    system.addForce(force)
+
+    adjusted, sites = _apply_fixed_sigma_holes(
+        molecule,
+        system,
+        charges,
+        {"charge_e": 0.03, "distance_a": 1.64},
+    )
+
+    chlorine = next(
+        index for index, atom in enumerate(molecule.atoms)
+        if atom.atomic_number == 17
+    )
+    assert adjusted[chlorine] == pytest.approx(-0.03)
+    assert len(sites) == 1
+    assert sites[0].charge_e == pytest.approx(0.03)
+    assert adjusted.sum() + sites[0].charge_e == pytest.approx(0.0)
+    observed = force.getParticleParameters(chlorine)[0].value_in_unit(
+        unit.elementary_charge
+    )
+    assert observed == pytest.approx(-0.03)

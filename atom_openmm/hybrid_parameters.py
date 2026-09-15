@@ -12,13 +12,57 @@ from openmmforcefields.generators import EspalomaTemplateGenerator, GAFFTemplate
 from atom_openmm.covalent_parameters import (
     CovalentParameterBundle,
     CovalentParameterError,
+    VirtualSiteParameter,
     _system_charges,
     constrain_charge_sum,
+)
+from atom_openmm.ligand_parameterization import (
+    SIGMA_HOLE_SMARTS,
+    _find_sigma_holes,
 )
 
 
 HybridParameterBundle = CovalentParameterBundle
 HybridParameterError = CovalentParameterError
+
+
+def _apply_fixed_sigma_holes(molecule, system, charges_e, settings):
+    if settings is None:
+        return np.asarray(charges_e, dtype=float), ()
+    protocol = {
+        "sigma_holes": {
+            "smarts": str(settings.get("smarts", SIGMA_HOLE_SMARTS)),
+            "distance_a": float(settings["distance_a"]),
+        }
+    }
+    matches = _find_sigma_holes(molecule, protocol)
+    if not matches:
+        raise HybridParameterError(
+            "fixed ligand_sigma_holes did not match any C-Cl bond"
+        )
+    charge = float(settings["charge_e"])
+    charges = np.asarray(charges_e, dtype=float).copy()
+    sites = []
+    for index, parents in enumerate(matches, start=1):
+        chlorine = int(parents[1])
+        charges[chlorine] -= charge
+        sites.append(VirtualSiteParameter(
+            name=f"CL_EP_{index}",
+            kind="sigma_hole",
+            parent_atom_indices=tuple(int(value) for value in parents),
+            distance_a=float(settings["distance_a"]),
+            charge_e=charge,
+        ))
+    nonbonded = next(
+        force for force in system.getForces()
+        if isinstance(force, mm.NonbondedForce)
+    )
+    for index, value in enumerate(charges):
+        _, sigma, epsilon = nonbonded.getParticleParameters(index)
+        nonbonded.setParticleParameters(
+            index, float(value) * unit.elementary_charge, sigma, epsilon
+        )
+    return charges, tuple(sites)
 
 
 def parameterize_ligand(
@@ -29,6 +73,7 @@ def parameterize_ligand(
     allow_undefined_stereo: bool = False,
     ligand_parameter_cache: Path | None = None,
     ligand_parameter_protocol: str = "gaff2-resp-cl-ep-v1",
+    ligand_sigma_holes: dict | None = None,
 ) -> HybridParameterBundle:
     if ligand_charge_model == "resp-sigma-hole":
         if ligand_parameter_cache is None:
@@ -100,21 +145,37 @@ def parameterize_ligand(
     for index, charge in enumerate(charges):
         _, sigma, epsilon = nonbonded.getParticleParameters(index)
         nonbonded.setParticleParameters(index, charge, sigma, epsilon)
+    charges, virtual_sites = _apply_fixed_sigma_holes(
+        molecule, system, charges, ligand_sigma_holes
+    )
     for atom, parameterized_atom in zip(molecule.atoms, parameterized_molecule.atoms):
         atom.name = parameterized_atom.name
     molecule.partial_charges = charges * offunit.elementary_charge
     provenance = {
         "charge_model": charge_model,
         "ligand_forcefield": ligand_forcefield,
-        "net_charge_e": float(charges.sum()),
+        "atomic_charge_sum_e": float(charges.sum()),
+        "net_charge_e": float(
+            charges.sum() + sum(site.charge_e for site in virtual_sites)
+        ),
         "uniform_charge_correction_e": float(correction),
         "source": str(Path(sdf).resolve()),
         "allow_undefined_stereo": bool(allow_undefined_stereo),
+        "fixed_sigma_holes": (
+            None if ligand_sigma_holes is None else {
+                **ligand_sigma_holes,
+                "site_count": len(virtual_sites),
+            }
+        ),
     }
     return HybridParameterBundle(
         molecule=molecule,
         system=system,
         charges_e=charges,
-        cache_key=f"{Path(sdf).resolve()}:{ligand_forcefield}:{charge_model}",
+        cache_key=(
+            f"{Path(sdf).resolve()}:{ligand_forcefield}:{charge_model}:"
+            f"{ligand_sigma_holes!r}"
+        ),
         provenance=provenance,
+        virtual_sites=virtual_sites,
     )
