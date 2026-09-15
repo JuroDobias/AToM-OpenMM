@@ -78,6 +78,8 @@ def _test_resp_input_equivalences_repeated_conformers():
     assert text.count(" 1.0") == 2
     assert "    2\n    1    2    2    2" in text
     assert text.rstrip().endswith("    1    3    2    3")
+    assert "    0    0\n\n\n    2" in text
+    assert "    0    0\n\n\n\n    2" not in text
 
 
 def _test_parse_resp_charges_accepts_equivalent_repeated_values(tmp_path):
@@ -157,6 +159,9 @@ def _test_multiconformer_input_is_accepted_by_amber_resp(tmp_path):
     assert completed.returncode == 0, completed.stdout + completed.stderr
     fitted = _parse_resp_charges(tmp_path / "resp.chg", 3, 2)
     assert fitted.sum() == pytest.approx(0.0, abs=1.0e-5)
+    assert fitted[0] > 0.0
+    assert fitted[1] < 0.0
+    assert fitted[2] > 0.0
 
 
 def _simple_system(charges):

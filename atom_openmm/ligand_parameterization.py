@@ -329,9 +329,12 @@ def _site_coordinates(atom_coordinates_bohr: np.ndarray, sites, distance_a: floa
 def _write_multi_esp(path: Path, datasets: list[tuple[np.ndarray, np.ndarray, np.ndarray]]) -> None:
     with Path(path).open("w") as handle:
         for centers, potentials, points in datasets:
-            handle.write(f"{len(centers):5d}{len(potentials):5d}\n")
+            handle.write(f"{len(centers):5d}{len(potentials):5d}{0:5d}\n")
             for xyz in centers:
-                handle.write("".join(f"{value:16.7E}" for value in xyz) + "\n")
+                # Amber reserves the first E16.7 field for the ESP value.
+                handle.write(
+                    " " * 16 + "".join(f"{value:16.7E}" for value in xyz) + "\n"
+                )
             for potential, xyz in zip(potentials, points):
                 handle.write(f"{potential:16.7E}" + "".join(f"{value:16.7E}" for value in xyz) + "\n")
 
@@ -354,17 +357,17 @@ def _resp_input(
         ])
         for element in centers:
             lines.append(f"{element:5d}{0:5d}")
-        lines.append("")
+        if conformer + 1 < conformer_count:
+            lines.append("")
     lines.extend(["", ""])
     if conformer_count > 1:
-        for atom_index in range(1, len(centers) + 1):
-            lines.append(f"{conformer_count:5d}")
-            pairs = [
-                value
-                for conformer in range(1, conformer_count + 1)
-                for value in (conformer, atom_index)
-            ]
-            lines.append("".join(f"{value:5d}" for value in pairs))
+        # Match Amber respgen's canonical transitive equivalence layout.
+        for conformer in range(2, conformer_count + 1):
+            for atom_index in range(1, len(centers) + 1):
+                lines.append(f"{2:5d}")
+                lines.append(
+                    f"{1:5d}{atom_index:5d}{conformer:5d}{atom_index:5d}"
+                )
     lines.extend(["", ""])
     return "\n".join(lines)
 
