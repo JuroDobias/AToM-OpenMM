@@ -1,0 +1,235 @@
+workflow:
+  type: rbfe
+  chemistry: noncovalent
+  alchemy:
+    model: hybrid_topology
+    cycle: complex_solvent
+    dummy_core_nonbonded: "off"
+    mapping:
+      method: explicit_pairs
+      pairs_0based:
+        - [0, 0]
+        - [1, 1]
+        - [2, 2]
+        - [3, 3]
+        - [4, 4]
+        - [5, 5]
+        - [6, 6]
+        - [7, 7]
+        - [8, 8]
+        - [9, 9]
+        - [10, 10]
+        - [11, 11]
+        - [12, 12]
+        - [13, 13]
+        - [14, 14]
+        - [15, 15]
+        - [16, 16]
+        - [17, 17]
+        - [18, 18]
+        - [19, 19]
+        - [20, 20]
+        - [21, 21]
+        - [22, 22]
+        - [23, 23]
+  sampling:
+    method: neqti
+  workdir: run_standard_12_6
+  receptor: inputs/protein.pdb
+  ligands_dir: ligands
+  pairs:
+    - [imidazole, oxazole6O]
+  platform: CUDA
+  platform_properties:
+    Precision: mixed
+
+  setup:
+    protein_forcefield:
+      - amber14-all.xml
+      - inputs/ATP.xml
+    solvent_forcefield:
+      - amber14/tip4pew.xml
+    solvent_model: tip4pew
+    ligand_forcefield: gaff-2.2.20
+    ligand_charge_model: am1-bcc
+    solvent_padding_a: 14.0
+    solvent_box_shape: dodecahedron
+    ionic_strength_molar: 0.15
+    nonbonded_cutoff_a: 9.0
+    metal_ions:
+      model: standard_12_6
+
+  equilibration:
+    neqti:
+      complex_endpoint:
+        steps:
+          - id: ligand_relax_min
+            type: minimization
+            tolerance_kj_mol_nm: 10.0
+            max_iterations: 2000
+            positional_restraints:
+              mask: '!@H= & !:HYB,HOH,WAT,NA,CL,K,CA,MG,ZN'
+              k_kcal_mol_a2: 25.0
+              tolerance_a: 0.0
+            distance_restraints:
+              - &mg_restraint_strong
+                atom1_mask: '#active:"[O;X2]"'
+                atom2_mask: ':MG'
+                pairing: closest_initial
+                lower_bound_a: 1.8
+                upper_bound_a: 3.0
+                k_kcal_mol_a2: 25.0
+          - id: solute_restrained_min
+            type: minimization
+            tolerance_kj_mol_nm: 10.0
+            max_iterations: 2000
+            positional_restraints:
+              mask: '!@H= & !:HOH,WAT,NA,CL,K,CA,MG,ZN'
+              k_kcal_mol_a2: 25.0
+              tolerance_a: 0.0
+            distance_restraints:
+              - *mg_restraint_strong
+          - id: strong_restrained_nvt
+            type: md
+            ensemble: NVT
+            n_steps: 150000
+            timestep_ps: 0.002
+            reset_velocities: true
+            thermostat: {temperature_k: 300.0, friction_per_ps: 1.0}
+            positional_restraints:
+              mask: '!@H= & !:HOH,WAT,NA,CL,K,CA,MG,ZN'
+              k_kcal_mol_a2: 25.0
+              tolerance_a: 0.0
+            distance_restraints:
+              - *mg_restraint_strong
+            reporters:
+              state: {interval: 10000}
+          - id: strong_restrained_npt
+            type: md
+            ensemble: NPT
+            n_steps: 500000
+            timestep_ps: 0.002
+            thermostat: {temperature_k: 300.0, friction_per_ps: 1.0}
+            positional_restraints:
+              mask: '!@H= & !:HOH,WAT,NA,CL,K,CA,MG,ZN'
+              k_kcal_mol_a2: 25.0
+              tolerance_a: 0.0
+            distance_restraints:
+              - <<: *mg_restraint_strong
+                k_kcal_mol_a2: 10.0
+            reporters:
+              state: {interval: 10000}
+          - id: soft_restrained_npt
+            type: md
+            ensemble: NPT
+            n_steps: 500000
+            timestep_ps: 0.002
+            thermostat: {temperature_k: 300.0, friction_per_ps: 1.0}
+            positional_restraints:
+              mask: '!@H= & !:HOH,WAT,NA,CL,K,CA,MG,ZN'
+              k_kcal_mol_a2: 1.2
+              tolerance_a: 0.0
+            distance_restraints:
+              - <<: *mg_restraint_strong
+                k_kcal_mol_a2: 2.0
+            reporters:
+              state: {interval: 10000}
+          - id: receptor_restrained_npt
+            type: md
+            ensemble: NPT
+            n_steps: 250000
+            timestep_ps: 0.002
+            thermostat: {temperature_k: 300.0, friction_per_ps: 1.0}
+            positional_restraints:
+              mask: '!@H= & !:HYB,ATP,HOH,WAT,NA,CL,K,CA,MG,ZN'
+              k_kcal_mol_a2: 1.2
+              tolerance_a: 0.0
+            distance_restraints:
+              - <<: *mg_restraint_strong
+                k_kcal_mol_a2: 0.5
+            reporters:
+              state: {interval: 10000}
+          - id: unrestrained_npt
+            type: md
+            ensemble: NPT
+            n_steps: 500000
+            timestep_ps: 0.002
+            thermostat: {temperature_k: 300.0, friction_per_ps: 1.0}
+            reporters:
+              state: {interval: 10000}
+      solvent_endpoint:
+        steps:
+          - id: solvent_min
+            type: minimization
+            tolerance_kj_mol_nm: 10.0
+            max_iterations: 1000
+          - id: solvent_nvt
+            type: md
+            ensemble: NVT
+            n_steps: 50000
+            timestep_ps: 0.002
+            reset_velocities: true
+            thermostat: {temperature_k: 300.0, friction_per_ps: 1.0}
+            reporters:
+              state: {interval: 10000}
+          - id: solvent_npt
+            type: md
+            ensemble: NPT
+            n_steps: 250000
+            timestep_ps: 0.002
+            thermostat: {temperature_k: 300.0, friction_per_ps: 1.0}
+            reporters:
+              state: {interval: 10000}
+
+  neqti:
+    temperature_k: 300.0
+    pressure_bar: 1.0
+    timestep_fs: 2.0
+    n_snapshots: 20
+    decorrelation_steps: 100000
+    interpolation: softcore_linear
+    softcore:
+      function: beutler
+      coulomb_function: linear_pme
+      stage_interpolation: linear
+      alpha: 0.3
+      sigma_nm: 0.25
+      power: 1
+      charge_steps_per_stage: 12500
+      sterics_steps: 25000
+      long_range_correction: dynamic
+    schedule_optimization:
+      enabled: true
+      pilot_samples: 10
+      subdivisions_per_stage: 10
+      min_segment_steps: 250
+      max_segment_steps: 15000
+    adaptive_switching:
+      enabled: true
+      candidate_times_ps: [100, 300, 1000]
+      pilot_samples_per_direction: 20
+      min_overlap_score_per_leg: 0.08
+      max_failed_fraction_per_direction: 0.05
+      reuse_selected_pilot_samples: true
+      on_exhausted: use_longest
+    convergence:
+      enabled: true
+      reopen_on_settings_change: true
+      min_samples_per_direction: 20
+      min_overlap_score_per_leg: 0.05
+      max_dg_error_kcal_per_mol: 0.7
+      check_interval_samples: 5
+      consecutive_checks: 3
+      max_dg_range_kcal_per_mol: 0.35
+      stationarity:
+        enabled: true
+        discard_fraction: 0.1
+        min_discard_samples: 5
+        max_discard_first_shift_kcal_per_mol: 0.4
+        max_discard_last_shift_kcal_per_mol: 0.3
+    failed_switch_policy: count_as_infinite
+    bootstrap_samples: 500
+    random_seed: 20260915
+    rest2:
+      enabled: false
+

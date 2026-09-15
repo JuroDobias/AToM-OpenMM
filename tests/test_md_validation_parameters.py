@@ -12,7 +12,8 @@ from atom_openmm.md_validation import (
     _metric_context, _phase_protocol, _run_md_phase, task_spec,
 )
 from atom_openmm.metal_ions import (
-    MetalIonParameterError, apply_panteva_m1264, c4_kcal_a4_to_kj_nm4,
+    MetalIonParameterError, PANTEVA_FORCE_NAME, apply_panteva_m1264,
+    c4_kcal_a4_to_kj_nm4, merge_panteva_endpoint_forces,
 )
 from atom_openmm.receptor_normalization import normalize_legacy_pdb
 
@@ -80,9 +81,10 @@ def _test_panteva_exclusions_match_base_nonbonded_force(tmp_path):
         polarizability_table=table,
     )
     custom = system.getForce(1)
-    assert [tuple(custom.getExclusionParticles(i)) for i in range(custom.getNumExclusions())] == [
-        (0, 1), (1, 2),
-    ]
+    assert [
+        tuple(custom.getExclusionParticles(i))
+        for i in range(custom.getNumExclusions())
+    ] == [(0, 1), (1, 2)]
     system.setDefaultPeriodicBoxVectors(
         mm.Vec3(3, 0, 0), mm.Vec3(0, 3, 0), mm.Vec3(0, 0, 3),
     )
@@ -113,6 +115,60 @@ def _test_panteva_gives_tip4p_virtual_site_zero_c4(tmp_path):
     custom = system.getForce(1)
     assert custom.getParticleParameters(3)[1] == pytest.approx(c4_kcal_a4_to_kj_nm4(180.5))
     assert custom.getParticleParameters(4)[1] == pytest.approx(0.0)
+
+
+def _test_panteva_hybrid_merge_reproduces_both_endpoint_forces():
+    def endpoint(c4_values, exclusions=()):
+        system = mm.System()
+        force = mm.CustomNonbondedForce("-(isMg1*c42+isMg2*c41)/r^4")
+        force.setName(PANTEVA_FORCE_NAME)
+        force.addPerParticleParameter("isMg")
+        force.addPerParticleParameter("c4")
+        for mass, is_mg, c4 in zip((24.0, 16.0, 16.0, 16.0), (1, 0, 0, 0), c4_values):
+            system.addParticle(mass)
+            force.addParticle([is_mg, c4])
+        force.addInteractionGroup({0}, {1, 2, 3})
+        for atom1, atom2 in exclusions:
+            force.addExclusion(atom1, atom2)
+        force.setNonbondedMethod(mm.CustomNonbondedForce.NoCutoff)
+        system.addForce(force)
+        return system
+
+    endpoint_a = endpoint([0.0, 1.0, 2.0, 0.0], [(2, 3)])
+    endpoint_b = endpoint([0.0, 1.5, 0.0, 3.0])
+    merged = mm.System()
+    canonical = mm.CustomNonbondedForce("0")
+    for _ in range(4):
+        merged.addParticle(16.0)
+        canonical.addParticle([])
+    canonical.addExclusion(2, 3)
+    merged.addForce(canonical)
+    assert merge_panteva_endpoint_forces(merged, endpoint_a, endpoint_b, {2}, {3})
+    correction = next(
+        force for force in merged.getForces()
+        if force.getName() == PANTEVA_FORCE_NAME
+    )
+    assert [
+        tuple(correction.getExclusionParticles(index))
+        for index in range(correction.getNumExclusions())
+    ] == [(2, 3)]
+    positions = np.asarray([[0, 0, 0], [0.4, 0, 0], [0, 0.5, 0], [0, 0, 0.6]]) * unit.nanometer
+
+    def energy(system, parameters=None):
+        context = mm.Context(system, mm.VerletIntegrator(0.001), mm.Platform.getPlatformByName("Reference"))
+        context.setPositions(positions)
+        for name, value in (parameters or {}).items():
+            context.setParameter(name, value)
+        return context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+
+    assert energy(merged, {
+        "COVALENT_STERICS_A": 1.0, "COVALENT_STERICS_B": 0.0,
+        "COVALENT_STERICS": 0.0,
+    }) == pytest.approx(energy(endpoint_a))
+    assert energy(merged, {
+        "COVALENT_STERICS_A": 0.0, "COVALENT_STERICS_B": 1.0,
+        "COVALENT_STERICS": 1.0,
+    }) == pytest.approx(energy(endpoint_b))
 
 
 def _test_hu_parameter_readers_normalize_prime_names(tmp_path):

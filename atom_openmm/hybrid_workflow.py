@@ -47,6 +47,8 @@ from atom_openmm.hybrid_mapping import (
 )
 from atom_openmm.hybrid_parameters import parameterize_ligand
 from atom_openmm.hybrid_systems import create_physical_ligand_environment
+from atom_openmm.metal_ions import apply_panteva_m1264, gaff2_atom_classes
+from atom_openmm.receptor_normalization import normalize_legacy_pdb
 from atom_openmm.neqti import (
     _bar_overlap_score,
     _convergence_reached,
@@ -61,6 +63,38 @@ class HybridWorkflowError(ValueError):
 
 
 PREPARATION_SCHEMA_VERSION = 3
+
+
+def _metal_ion_settings(workflow, base_dir=None, *, resolve_paths=True):
+    setup = workflow.get("setup") or {}
+    raw = setup.get("metal_ions") or {}
+    if not isinstance(raw, dict):
+        raise HybridWorkflowError("workflow.setup.metal_ions must be a mapping")
+    model = str(raw.get("model", "standard_12_6")).lower()
+    if model not in {"standard_12_6", "panteva_m12_6_4"}:
+        raise HybridWorkflowError(
+            "workflow.setup.metal_ions.model must be 'standard_12_6' or "
+            "'panteva_m12_6_4'"
+        )
+    result = {"model": model}
+    if model == "panteva_m12_6_4":
+        table = raw.get("polarizability_table")
+        if not isinstance(table, str) or not table:
+            raise HybridWorkflowError(
+                "workflow.setup.metal_ions.polarizability_table is required for Panteva m12-6-4"
+            )
+        if resolve_paths:
+            table = Path(table)
+            if not table.is_absolute():
+                table = Path(base_dir or Path.cwd()) / table
+            table = table.resolve()
+            if not table.is_file():
+                raise HybridWorkflowError(f"Panteva polarizability table does not exist: {table}")
+        result.update({
+            "polarizability_table": str(table),
+            "atp_residue_name": str(raw.get("atp_residue_name", "ATP")),
+        })
+    return result
 
 
 def _sha256(path):
@@ -196,14 +230,26 @@ def _validate_settings(workflow):
         raise HybridWorkflowError(
             "workflow.setup.allow_undefined_stereo must be true or false"
         )
-    if not str(setup.get("ligand_forcefield", "espaloma-0.3.2")).startswith("espaloma"):
+    ligand_forcefield = str(setup.get("ligand_forcefield", "espaloma-0.3.2"))
+    if not ligand_forcefield.startswith(("espaloma", "gaff-")):
         raise HybridWorkflowError(
-            "noncovalent hybrid topology currently supports Espaloma ligand force fields"
+            "noncovalent hybrid topology supports Espaloma and GAFF ligand force fields"
         )
-    if setup.get("ligand_charge_model", "nn") != "nn":
+    charge_model = setup.get("ligand_charge_model", "nn")
+    if (
+        ligand_forcefield.startswith("espaloma") and charge_model != "nn"
+    ) or (
+        ligand_forcefield.startswith("gaff-") and charge_model not in {"am1-bcc", "bcc"}
+    ):
         raise HybridWorkflowError(
-            "noncovalent hybrid topology currently supports ligand_charge_model: nn"
+            "Espaloma requires ligand_charge_model: nn and GAFF requires am1-bcc"
         )
+    metal = _metal_ion_settings(workflow, resolve_paths=False)
+    if metal["model"] == "panteva_m12_6_4":
+        if not ligand_forcefield.startswith("gaff-"):
+            raise HybridWorkflowError("Panteva m12-6-4 hybrid systems require a GAFF ligand force field")
+        if str(setup.get("solvent_model", "")).lower() not in {"tip4pew", "tip4p-ew"}:
+            raise HybridWorkflowError("Panteva m12-6-4 hybrid systems require solvent_model: tip4pew")
     config = _normalized_settings(workflow)
     if any(value < 0.0 for value in config["dummy_bonded_scales"].values()):
         raise HybridWorkflowError(
@@ -457,12 +503,15 @@ def plan_noncovalent_hybrid_workflow(path):
     }
 
 
-def _preparation_fingerprint(pair, receptor, workflow, mapping):
+def _preparation_fingerprint(pair, receptor, workflow, mapping, base_dir=None):
     files = {
         "receptor": receptor,
         "ligand_a": pair["lig1_file"],
         "ligand_b": pair["lig2_file"],
     }
+    metal = _metal_ion_settings(workflow, base_dir)
+    if metal["model"] == "panteva_m12_6_4":
+        files["panteva_polarizability_table"] = metal["polarizability_table"]
     payload = {
         "schema_version": PREPARATION_SCHEMA_VERSION,
         "files": {
@@ -548,10 +597,10 @@ def _runtime_artifacts_exist(workdir):
     )
 
 
-def _prepare_pair(pair, receptor, workflow, workdir):
+def _prepare_pair(pair, receptor, workflow, workdir, base_dir=None):
     mapping_settings = _mapping_settings(workflow)
     fingerprint, fingerprint_inputs = _preparation_fingerprint(
-        pair, receptor, workflow, mapping_settings
+        pair, receptor, workflow, mapping_settings, base_dir
     )
     loaded = _load_bundle(workdir, fingerprint, fingerprint_inputs)
     if loaded is not None:
@@ -653,14 +702,90 @@ def _prepare_pair(pair, receptor, workflow, workdir):
         hybrid.inactive_bonded_atoms_b
     )
     seed = int(setup.get("solvation_seed", _normalized_settings(workflow)["random_seed"]))
+    metal = _metal_ion_settings(workflow, base_dir)
+    record_atom_classes = metal["model"] == "panteva_m12_6_4"
+    normalized_receptor = workdir / "receptor_normalized.pdb"
+    receptor_normalization = normalize_legacy_pdb(
+        receptor, normalized_receptor
+    )
     physical_complex = create_physical_ligand_environment(
-        parameters_a, receptor=receptor, setup=setup, solvation_seed=seed
+        parameters_a, receptor=normalized_receptor, setup=setup, solvation_seed=seed,
+        record_atom_classes=record_atom_classes,
     )
     physical_solvent = create_physical_ligand_environment(
         parameters_a, receptor=None, setup=setup, solvation_seed=seed + 1
     )
     complex_system = solvate_capped_reference_hybrid(hybrid, physical_complex)
     solvent_system = solvate_capped_reference_hybrid(hybrid, physical_solvent)
+    if record_atom_classes:
+        ligand_classes_a = gaff2_atom_classes(
+            pair["lig1_file"], parameters_a.molecule.conformers[0].to_openmm()
+        )
+        ligand_classes_b = gaff2_atom_classes(
+            pair["lig2_file"], parameters_b.molecule.conformers[0].to_openmm()
+        )
+        environment_classes = list(
+            physical_complex.provenance["amber_atom_classes"][
+                physical_complex.solute_atom_count:
+            ]
+        )
+        classes_a = [None] * hybrid.topology.getNumAtoms()
+        classes_b = [None] * hybrid.topology.getNumAtoms()
+        for atom, system_atom in hybrid.map_a_to_hybrid.items():
+            classes_a[system_atom] = ligand_classes_a[atom]
+            classes_b[system_atom] = ligand_classes_a[atom]
+        for atom, system_atom in hybrid.map_b_to_hybrid.items():
+            classes_b[system_atom] = ligand_classes_b[atom]
+            if classes_a[system_atom] is None:
+                classes_a[system_atom] = ligand_classes_b[atom]
+        for atom, system_atom in hybrid.map_a_to_hybrid.items():
+            if classes_b[system_atom] is None:
+                classes_b[system_atom] = ligand_classes_a[atom]
+        if any(value is None for value in classes_a + classes_b + environment_classes):
+            raise HybridWorkflowError("Panteva hybrid atom-class assignment is incomplete")
+        classes_a.extend(environment_classes)
+        classes_b.extend(environment_classes)
+        environment_indices = set(
+            range(
+                hybrid.topology.getNumAtoms(),
+                complex_system.endpoint_a.getNumParticles(),
+            )
+        )
+        active_a = environment_indices | {
+            int(hybrid.map_a_to_hybrid[index]) for index in range(parameters_a.molecule.n_atoms)
+        }
+        active_b = environment_indices | {
+            int(hybrid.map_b_to_hybrid[index]) for index in range(parameters_b.molecule.n_atoms)
+        }
+        overlay_a = apply_panteva_m1264(
+            complex_system.endpoint_a,
+            complex_system.topology,
+            atom_classes=classes_a,
+            polarizability_table=metal["polarizability_table"],
+            atp_residue_name=metal["atp_residue_name"],
+            water_model=setup["solvent_model"],
+            active_atom_indices=active_a,
+        )
+        overlay_b = apply_panteva_m1264(
+            complex_system.endpoint_b,
+            complex_system.topology,
+            atom_classes=classes_b,
+            polarizability_table=metal["polarizability_table"],
+            atp_residue_name=metal["atp_residue_name"],
+            water_model=setup["solvent_model"],
+            active_atom_indices=active_b,
+        )
+        complex_system.provenance["metal_ions"] = {
+            **metal,
+            "endpoint_a": overlay_a,
+            "endpoint_b": overlay_b,
+        }
+    else:
+        complex_system.provenance["metal_ions"] = metal
+    solvent_system.provenance["metal_ions"] = {
+        "model": "not_applicable",
+        "reason": "no magnesium in solvent leg",
+    }
     selection_metadata = {
         "ligand_a": {
             "structure_file": str(Path(pair["lig1_file"]).resolve()),
@@ -734,6 +859,7 @@ def _prepare_pair(pair, receptor, workflow, workdir):
             "ligand_a": parameters_a.provenance,
             "ligand_b": parameters_b.provenance,
         },
+        "receptor_normalization": receptor_normalization,
         "mass_policy": {
             "endpoint_equilibration": "physical",
             "switching": "heavier_endpoint",
@@ -1334,7 +1460,7 @@ def run_noncovalent_hybrid_workflow(path):
             )
             _ensure_equilibration_protocol(workdir, config)
             complex_system, solvent_system, manifest, _ = _prepare_pair(
-                pair, plan["receptor_file"], workflow, workdir
+                pair, plan["receptor_file"], workflow, workdir, plan.get("base_dir")
             )
             if workflow.get("prepare_only", False) or not workflow.get("run", True):
                 payload = _result(

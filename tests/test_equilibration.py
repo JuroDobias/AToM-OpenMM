@@ -184,3 +184,46 @@ def _test_temperature_ramp_rejects_non_langevin_integrator():
             },
             0,
         )
+
+
+def _test_distance_restraint_resolves_closest_pair_and_has_flat_bottom(monkeypatch):
+    import numpy as np
+    import openmm as mm
+    from openmm import app, unit
+
+    from atom_openmm import equilibration
+
+    topology = app.Topology()
+    chain = topology.addChain()
+    residue = topology.addResidue("TST", chain)
+    for index in range(3):
+        topology.addAtom(f"A{index}", app.element.carbon, residue)
+    positions = np.asarray([[0, 0, 0], [1, 0, 0], [0.25, 0, 0]]) * unit.nanometer
+
+    class FakeResolver:
+        def __init__(self, topology, positions, **kwargs):
+            pass
+
+        def resolve(self, mask, label):
+            return {"ligand": [0, 1], "metal": [2]}[mask]
+
+    monkeypatch.setattr(equilibration, "AmberMaskResolver", FakeResolver)
+    cfg = {
+        "type": "minimization",
+        "distance_restraints": [{
+            "atom1_mask": "ligand", "atom2_mask": "metal",
+            "lower_bound_a": 1.8, "upper_bound_a": 3.0,
+            "k_kcal_mol_a2": 25.0,
+        }],
+    }
+    resolved = equilibration._resolve_step_restraints([cfg], topology, positions)[0]
+    assert resolved["distance_pairs"] == [{"atom1": 0, "atom2": 2}]
+    system = mm.System()
+    for _ in range(3):
+        system.addParticle(12.0)
+    equilibration._apply_restraints(system, cfg, positions, resolved)
+    context = mm.Context(system, mm.VerletIntegrator(0.001))
+    context.setPositions(positions)
+    assert context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(
+        unit.kilojoule_per_mole
+    ) == pytest.approx(0.0)

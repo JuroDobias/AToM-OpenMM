@@ -1677,7 +1677,12 @@ def _merge_unique_vacuum_force(output, endpoint_a, endpoint_b):
         )
 
 
-def _copy_other_forces(output, endpoint_a, endpoint_b):
+def _copy_other_forces(output, endpoint_a, endpoint_b, unique_a, unique_b):
+    from atom_openmm.metal_ions import (
+        PANTEVA_FORCE_NAME,
+        merge_panteva_endpoint_forces,
+    )
+
     supported = (
         mm.HarmonicBondForce,
         mm.HarmonicAngleForce,
@@ -1688,13 +1693,19 @@ def _copy_other_forces(output, endpoint_a, endpoint_b):
     for force in endpoint_b.getForces():
         if (
             not isinstance(force, supported)
-            and force.getName() != "CovalentUniqueVacuumNonbondedForce"
+            and force.getName() not in {
+                "CovalentUniqueVacuumNonbondedForce",
+                PANTEVA_FORCE_NAME,
+            }
         ):
             forces_b_by_name[(type(force), force.getName())].append(force)
     for force in endpoint_a.getForces():
         if (
             isinstance(force, supported)
-            or force.getName() == "CovalentUniqueVacuumNonbondedForce"
+            or force.getName() in {
+                "CovalentUniqueVacuumNonbondedForce",
+                PANTEVA_FORCE_NAME,
+            }
         ):
             continue
         matches = forces_b_by_name[(type(force), force.getName())]
@@ -1717,6 +1728,7 @@ def _copy_other_forces(output, endpoint_a, endpoint_b):
     if leftovers:
         raise CovalentAlchemyError(f"endpoint A is missing forces present in endpoint B: {leftovers}")
     _merge_unique_vacuum_force(output, endpoint_a, endpoint_b)
+    merge_panteva_endpoint_forces(output, endpoint_a, endpoint_b, unique_a, unique_b)
 
 
 def _allocate_interval_steps(total_steps, nodes, segment_counts):
@@ -2354,7 +2366,7 @@ def create_softcore_hamiltonian(
         soft_bond_pair_changes=soft_bond_pair_changes,
         enable_soft_bond_topology=resolved_path["source"] in topology_path_sources,
     )
-    _copy_other_forces(output, endpoint_a, endpoint_b)
+    _copy_other_forces(output, endpoint_a, endpoint_b, unique_a, unique_b)
     values, steps = _expand_path(resolved_path)
     if coulomb_function == "amber_ssc2":
         _add_amber_reciprocal_path(values, resolved_path)

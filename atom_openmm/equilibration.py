@@ -12,6 +12,7 @@ from sys import stdout
 from typing import Any
 
 import openmm as mm
+import numpy as np
 from openmm import XmlSerializer
 from openmm.app import PDBFile, Simulation, StateDataReporter, XTCReporter
 from openmm.unit import (
@@ -315,6 +316,33 @@ def _resolve_step_restraints(steps, topology, positions, *, keywords=None, endpo
                 pos_cfg["mask"],
                 f"steps[{i}].positional_restraints.mask",
             )
+        distance_pairs = []
+        for j, cfg in enumerate(step.get("distance_restraints") or []):
+            atoms1 = resolver.resolve(
+                cfg["atom1_mask"],
+                f"steps[{i}].distance_restraints[{j}].atom1_mask",
+            )
+            atoms2 = resolver.resolve(
+                cfg["atom2_mask"],
+                f"steps[{i}].distance_restraints[{j}].atom2_mask",
+            )
+            candidates = [(atom1, atom2) for atom1 in atoms1 for atom2 in atoms2 if atom1 != atom2]
+            if not candidates:
+                raise EquilibrationConfigError(
+                    f"steps[{i}].distance_restraints[{j}] has no distinct atom pair"
+                )
+            if cfg.get("pairing", "closest_initial") != "closest_initial":
+                raise EquilibrationConfigError(
+                    f"steps[{i}].distance_restraints[{j}].pairing must be 'closest_initial'"
+                )
+            positions_nm = np.asarray(positions.value_in_unit(nanometer))
+            atom1, atom2 = min(
+                candidates,
+                key=lambda pair: float(np.linalg.norm(positions_nm[pair[0]] - positions_nm[pair[1]])),
+            )
+            distance_pairs.append({"atom1": atom1, "atom2": atom2})
+        if distance_pairs:
+            step_resolved["distance_pairs"] = distance_pairs
         resolved.append(step_resolved)
     return resolved
 
@@ -337,6 +365,22 @@ def _add_positional_restraints(system, reference_positions, atom_indices, cfg):
     system.addForce(force)
 
 
+def _add_distance_restraint(system, pair, cfg, index):
+    lower = float(cfg["lower_bound_a"]) * A_TO_NM
+    upper = float(cfg["upper_bound_a"]) * A_TO_NM
+    k = float(cfg["k_kcal_mol_a2"]) * KCAL_MOL_A2_TO_KJ_MOL_NM2
+    force = mm.CustomBondForce(
+        "0.5*k*(step(lower-r)*(r-lower)^2+step(r-upper)*(r-upper)^2)"
+    )
+    force.setName(f"DistanceRestraint{index + 1}")
+    force.addPerBondParameter("k")
+    force.addPerBondParameter("lower")
+    force.addPerBondParameter("upper")
+    force.addBond(int(pair["atom1"]), int(pair["atom2"]), [k, lower, upper])
+    force.setUsesPeriodicBoundaryConditions(system.usesPeriodicBoundaryConditions())
+    system.addForce(force)
+
+
 def _apply_restraints(system, step_cfg, reference_positions, resolved):
     if "positional_restraints" in step_cfg:
         _add_positional_restraints(
@@ -345,6 +389,10 @@ def _apply_restraints(system, step_cfg, reference_positions, resolved):
             resolved["positional_atom_indices"],
             step_cfg["positional_restraints"],
         )
+    for index, (cfg, pair) in enumerate(
+        zip(step_cfg.get("distance_restraints") or [], resolved.get("distance_pairs") or [])
+    ):
+        _add_distance_restraint(system, pair, cfg, index)
 
 
 def _set_barostat(system, step_cfg):
@@ -369,13 +417,18 @@ def _set_barostat(system, step_cfg):
 
 
 def _step_restraint_label(step_cfg):
-    if "positional_restraints" not in step_cfg:
+    if "positional_restraints" not in step_cfg and not step_cfg.get("distance_restraints"):
         return "none"
-    cfg = step_cfg["positional_restraints"]
-    return (
-        f"mask={cfg['mask']!r}, k={float(cfg['k_kcal_mol_a2']):g} kcal/mol/A^2, "
-        f"tolerance={float(cfg.get('tolerance_a', 0.0)):g} A"
-    )
+    labels = []
+    if "positional_restraints" in step_cfg:
+        cfg = step_cfg["positional_restraints"]
+        labels.append(
+            f"mask={cfg['mask']!r}, k={float(cfg['k_kcal_mol_a2']):g} kcal/mol/A^2, "
+            f"tolerance={float(cfg.get('tolerance_a', 0.0)):g} A"
+        )
+    if step_cfg.get("distance_restraints"):
+        labels.append(f"distance_restraints={len(step_cfg['distance_restraints'])}")
+    return "; ".join(labels)
 
 
 def _step_barostat_label(step_cfg):
@@ -452,6 +505,31 @@ def _validate_step(step_cfg, index):
         for key in ("mask", "k_kcal_mol_a2"):
             if key not in cfg:
                 raise EquilibrationConfigError(f"steps[{index}].positional_restraints.{key} is required")
+    distance_restraints = step_cfg.get("distance_restraints") or []
+    if not isinstance(distance_restraints, list) or not all(
+        isinstance(item, dict) for item in distance_restraints
+    ):
+        raise EquilibrationConfigError(
+            f"steps[{index}].distance_restraints must be a list of mappings"
+        )
+    for restraint_index, cfg in enumerate(distance_restraints):
+        for key in (
+            "atom1_mask", "atom2_mask", "lower_bound_a", "upper_bound_a",
+            "k_kcal_mol_a2",
+        ):
+            if key not in cfg:
+                raise EquilibrationConfigError(
+                    f"steps[{index}].distance_restraints[{restraint_index}].{key} is required"
+                )
+        if float(cfg["lower_bound_a"]) < 0 or float(cfg["upper_bound_a"]) <= float(cfg["lower_bound_a"]):
+            raise EquilibrationConfigError(
+                f"steps[{index}].distance_restraints[{restraint_index}] requires "
+                "0 <= lower_bound_a < upper_bound_a"
+            )
+        if float(cfg["k_kcal_mol_a2"]) < 0:
+            raise EquilibrationConfigError(
+                f"steps[{index}].distance_restraints[{restraint_index}].k_kcal_mol_a2 cannot be negative"
+            )
 
 
 def _build_reporters(step_cfg, step_dir, *, keywords=None):
