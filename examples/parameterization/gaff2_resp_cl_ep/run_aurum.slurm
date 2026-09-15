@@ -27,6 +27,7 @@ ulimit -s hard
 export g16root=/uochb/soft/generic/gaussian/gaussian16_a03/arch/amd64-pgi_12.10-acml
 export LD_LIBRARY_PATH="$g16root/g16${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export GAUSS_EXEDIR="$g16root/g16"
+export PATH="$GAUSS_EXEDIR:$PATH"
 
 cd "$submission_dir"
 python -m atom_openmm.ligand_parameterization parameterization.yaml
