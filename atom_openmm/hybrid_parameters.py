@@ -17,8 +17,9 @@ from atom_openmm.covalent_parameters import (
     constrain_charge_sum,
 )
 from atom_openmm.ligand_parameterization import (
-    SIGMA_HOLE_SMARTS,
     _find_sigma_holes,
+    _sigma_hole_name,
+    normalize_sigma_hole_settings,
 )
 
 
@@ -29,25 +30,23 @@ HybridParameterError = CovalentParameterError
 def _apply_fixed_sigma_holes(molecule, system, charges_e, settings):
     if settings is None:
         return np.asarray(charges_e, dtype=float), ()
-    protocol = {
-        "sigma_holes": {
-            "smarts": str(settings.get("smarts", SIGMA_HOLE_SMARTS)),
-            "distance_a": float(settings["distance_a"]),
-        }
+    sigma_settings = {
+        key: settings[key]
+        for key in ("halogens", "smarts", "distance_a")
+        if key in settings
     }
+    protocol = {"sigma_holes": normalize_sigma_hole_settings(sigma_settings)}
     matches = _find_sigma_holes(molecule, protocol)
     if not matches:
-        raise HybridParameterError(
-            "fixed ligand_sigma_holes did not match any C-Cl bond"
-        )
+        return np.asarray(charges_e, dtype=float), ()
     charge = float(settings["charge_e"])
     charges = np.asarray(charges_e, dtype=float).copy()
     sites = []
     for index, parents in enumerate(matches, start=1):
-        chlorine = int(parents[1])
-        charges[chlorine] -= charge
+        halogen = int(parents[1])
+        charges[halogen] -= charge
         sites.append(VirtualSiteParameter(
-            name=f"CL_EP_{index}",
+            name=_sigma_hole_name(molecule, parents, index),
             kind="sigma_hole",
             parent_atom_indices=tuple(int(value) for value in parents),
             distance_a=float(settings["distance_a"]),

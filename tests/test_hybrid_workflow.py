@@ -107,6 +107,7 @@ def _test_fixed_sigma_hole_settings_are_validated(tmp_path):
     workflow = yaml.safe_load(_workflow(tmp_path).read_text())["workflow"]
     workflow["setup"]["ligand_sigma_holes"] = {
         "model": "fixed",
+        "halogens": ["Cl"],
         "charge_e": 0.03,
         "distance_a": 1.64,
         "compensate_on": "halogen",
@@ -115,6 +116,11 @@ def _test_fixed_sigma_hole_settings_are_validated(tmp_path):
 
     workflow["setup"]["ligand_sigma_holes"]["charge_e"] = 0.0
     with pytest.raises(HybridWorkflowError, match="charge_e"):
+        _validate_settings(workflow)
+
+    workflow["setup"]["ligand_sigma_holes"]["charge_e"] = 0.03
+    workflow["setup"]["ligand_sigma_holes"]["smarts"] = "[#6]-[#17]"
+    with pytest.raises(HybridWorkflowError, match="not both"):
         _validate_settings(workflow)
 
 

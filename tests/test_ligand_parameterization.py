@@ -21,6 +21,7 @@ from atom_openmm.hybrid_parameters import _apply_fixed_sigma_holes
 from atom_openmm.ligand_parameterization import (
     LigandParameterizationError,
     _canonical_identity,
+    _find_sigma_holes,
     _parse_resp_charges,
     _parse_amber_esp,
     _resp_input,
@@ -28,6 +29,7 @@ from atom_openmm.ligand_parameterization import (
     cache_identity,
     load_cached_parameters,
     normalize_protocol,
+    normalize_sigma_hole_settings,
 )
 
 
@@ -69,6 +71,43 @@ def _test_cache_identity_ignores_execution_resources():
 def _test_protocol_rejects_unsupported_qm_engine():
     with pytest.raises(LigandParameterizationError, match="gaussian16"):
         normalize_protocol({"qm": {"engine": "orca"}})
+
+
+def _test_sigma_hole_selector_is_normalized_and_validated():
+    assert normalize_protocol(None)["sigma_holes"]["halogens"] == ["Cl"]
+    assert normalize_sigma_hole_settings({"halogens": ["cl", "BR", "Cl"]})[
+        "halogens"
+    ] == ["Cl", "Br"]
+    with pytest.raises(LigandParameterizationError, match="not both"):
+        normalize_sigma_hole_settings({
+            "halogens": ["Cl"],
+            "smarts": "[#6]-[#17]",
+        })
+    with pytest.raises(LigandParameterizationError, match="unsupported"):
+        normalize_sigma_hole_settings({"halogens": ["At"]})
+
+
+def _test_sigma_hole_selector_controls_eligible_elements():
+    molecule = _molecule("FCCl")
+    chlorine_only = normalize_protocol({"sigma_holes": {"halogens": ["Cl"]}})
+    both = normalize_protocol({"sigma_holes": {"halogens": ["F", "Cl"]}})
+
+    chlorine_sites = _find_sigma_holes(molecule, chlorine_only)
+    both_sites = _find_sigma_holes(molecule, both)
+
+    assert len(chlorine_sites) == 1
+    assert molecule.atoms[chlorine_sites[0][1]].symbol == "Cl"
+    assert {molecule.atoms[site[1]].symbol for site in both_sites} == {"F", "Cl"}
+
+
+def _test_legacy_sigma_hole_smarts_remains_supported():
+    molecule = _molecule("FCCl")
+    protocol = normalize_protocol({
+        "sigma_holes": {"smarts": "[#6:1]-[#9X1:2]"}
+    })
+    sites = _find_sigma_holes(molecule, protocol)
+    assert len(sites) == 1
+    assert molecule.atoms[sites[0][1]].symbol == "F"
 
 
 def _test_resp_input_equivalences_repeated_conformers():
@@ -315,3 +354,23 @@ def _test_fixed_sigma_hole_transfers_charge_from_chlorine():
         unit.elementary_charge
     )
     assert observed == pytest.approx(-0.03)
+
+
+def _test_fixed_sigma_holes_are_a_noop_without_selected_halogen():
+    molecule = _molecule("CC")
+    system = mm.System()
+    force = mm.NonbondedForce()
+    charges = np.zeros(molecule.n_atoms)
+    for atom in molecule.atoms:
+        system.addParticle(atom.mass.m_as(offunit.dalton) * unit.dalton)
+        force.addParticle(0.0, 0.3, 0.0)
+    system.addForce(force)
+
+    adjusted, sites = _apply_fixed_sigma_holes(
+        molecule,
+        system,
+        charges,
+        {"halogens": ["Cl"], "charge_e": 0.03, "distance_a": 1.64},
+    )
+    assert np.array_equal(adjusted, charges)
+    assert sites == ()

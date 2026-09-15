@@ -33,6 +33,8 @@ from atom_openmm.covalent_parameters import (
 SCHEMA_VERSION = 1
 DEFAULT_PROTOCOL_ID = "gaff2-resp-cl-ep-v1"
 SIGMA_HOLE_SMARTS = "[#6:1]-[#17X1:2]"
+DEFAULT_SIGMA_HOLE_HALOGENS = ("Cl",)
+SIGMA_HOLE_ATOMIC_NUMBERS = {"F": 9, "Cl": 17, "Br": 35, "I": 53}
 
 
 class LigandParameterizationError(RuntimeError):
@@ -66,10 +68,44 @@ def _digest(payload: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def normalize_sigma_hole_settings(raw: dict | None) -> dict:
+    raw = dict(raw or {})
+    if "smarts" in raw and "halogens" in raw:
+        raise LigandParameterizationError(
+            "sigma_holes may specify halogens or legacy smarts, not both"
+        )
+    normalized = {"distance_a": float(raw.get("distance_a", 1.64))}
+    if normalized["distance_a"] <= 0.0:
+        raise LigandParameterizationError("sigma-hole distance must be positive")
+    if "smarts" in raw:
+        smarts = raw["smarts"]
+        if not isinstance(smarts, str) or not smarts.strip():
+            raise LigandParameterizationError("sigma_holes.smarts must be non-empty")
+        normalized["smarts"] = smarts.strip()
+        return normalized
+
+    halogens = raw.get("halogens", DEFAULT_SIGMA_HOLE_HALOGENS)
+    if isinstance(halogens, (str, bytes)) or not isinstance(halogens, (list, tuple)):
+        raise LigandParameterizationError("sigma_holes.halogens must be a list")
+    canonical = []
+    symbols_by_lower = {symbol.lower(): symbol for symbol in SIGMA_HOLE_ATOMIC_NUMBERS}
+    for value in halogens:
+        if not isinstance(value, str) or value.strip().lower() not in symbols_by_lower:
+            supported = ", ".join(SIGMA_HOLE_ATOMIC_NUMBERS)
+            raise LigandParameterizationError(
+                f"unsupported sigma-hole halogen {value!r}; choose from {supported}"
+            )
+        symbol = symbols_by_lower[value.strip().lower()]
+        if symbol not in canonical:
+            canonical.append(symbol)
+    normalized["halogens"] = canonical
+    return normalized
+
+
 def normalize_protocol(raw: dict | None) -> dict:
     raw = dict(raw or {})
     qm = dict(raw.get("qm") or {})
-    sigma = dict(raw.get("sigma_holes") or {})
+    sigma = normalize_sigma_hole_settings(raw.get("sigma_holes"))
     protocol = {
         "id": str(raw.get("id", DEFAULT_PROTOCOL_ID)),
         "forcefield": str(raw.get("forcefield", "gaff-2.2.20")),
@@ -88,10 +124,7 @@ def normalize_protocol(raw: dict | None) -> dict:
             "parallel_conformers": int(qm.get("parallel_conformers", 5)),
             "executable": str(qm.get("executable", "g16")),
         },
-        "sigma_holes": {
-            "smarts": str(sigma.get("smarts", SIGMA_HOLE_SMARTS)),
-            "distance_a": float(sigma.get("distance_a", 1.64)),
-        },
+        "sigma_holes": sigma,
         "resp": {
             "qwt": float((raw.get("resp") or {}).get("qwt", 0.0005)),
             "executable": str((raw.get("resp") or {}).get("executable", "resp")),
@@ -123,8 +156,6 @@ def normalize_protocol(raw: dict | None) -> dict:
         )
     if not protocol["forcefield"].startswith("gaff-"):
         raise LigandParameterizationError("RESP artifacts currently require a GAFF force field")
-    if protocol["sigma_holes"]["distance_a"] <= 0.0:
-        raise LigandParameterizationError("sigma-hole distance must be positive")
     return protocol
 
 
@@ -149,25 +180,49 @@ def cache_identity(molecule: Molecule, protocol: dict) -> tuple[str, str]:
 
 def _find_sigma_holes(molecule: Molecule, protocol: dict) -> list[tuple[int, int, int]]:
     rdkit = molecule.to_rdkit()
-    query = Chem.MolFromSmarts(protocol["sigma_holes"]["smarts"])
-    if query is None or query.GetNumAtoms() != 2:
-        raise LigandParameterizationError("sigma-hole SMARTS must contain exactly two atoms")
-    matches = rdkit.GetSubstructMatches(query, uniquify=True, useChirality=True)
+    settings = protocol["sigma_holes"]
+    if "smarts" in settings:
+        query = Chem.MolFromSmarts(settings["smarts"])
+        if query is None or query.GetNumAtoms() != 2:
+            raise LigandParameterizationError(
+                "sigma-hole SMARTS must contain exactly two atoms"
+            )
+        matches = rdkit.GetSubstructMatches(query, uniquify=True, useChirality=True)
+    else:
+        selected = {
+            SIGMA_HOLE_ATOMIC_NUMBERS[symbol]
+            for symbol in settings.get("halogens", DEFAULT_SIGMA_HOLE_HALOGENS)
+        }
+        matches = []
+        for halogen in rdkit.GetAtoms():
+            if halogen.GetAtomicNum() not in selected or halogen.GetDegree() != 1:
+                continue
+            parent = halogen.GetNeighbors()[0]
+            if parent.GetAtomicNum() == 6:
+                matches.append((parent.GetIdx(), halogen.GetIdx()))
     sites = []
-    for carbon, chlorine in matches:
-        if rdkit.GetAtomWithIdx(chlorine).GetAtomicNum() != 17:
-            raise LigandParameterizationError("sigma-hole SMARTS atom 2 must be chlorine")
+    for carbon, halogen in matches:
+        atomic_number = rdkit.GetAtomWithIdx(halogen).GetAtomicNum()
+        if atomic_number not in SIGMA_HOLE_ATOMIC_NUMBERS.values():
+            raise LigandParameterizationError("sigma-hole SMARTS atom 2 must be a halogen")
+        if rdkit.GetAtomWithIdx(carbon).GetAtomicNum() != 6:
+            raise LigandParameterizationError("sigma-hole SMARTS atom 1 must be carbon")
         frame_candidates = sorted(
             atom.GetIdx()
             for atom in rdkit.GetAtomWithIdx(carbon).GetNeighbors()
-            if atom.GetIdx() != chlorine
+            if atom.GetIdx() != halogen
         )
         if not frame_candidates:
             raise LigandParameterizationError(
-                f"chlorine parent carbon {carbon} has no virtual-site frame atom"
+                f"halogen parent carbon {carbon} has no virtual-site frame atom"
             )
-        sites.append((carbon, chlorine, frame_candidates[0]))
+        sites.append((carbon, halogen, frame_candidates[0]))
     return sites
+
+
+def _sigma_hole_name(molecule: Molecule, parents, index: int) -> str:
+    symbol = molecule.atoms[int(parents[1])].symbol.upper()
+    return f"{symbol}_EP_{index}"
 
 
 def _generate_conformers(molecule: Molecule, count: int, seed: int) -> list[Chem.Mol]:
@@ -588,7 +643,7 @@ def _publish_artifact(config_path: Path, config: dict) -> Path:
         fitted, diagnostics = _run_resp(staging, molecule, sites, protocol, esp_paths)
         virtual_sites = tuple(
             VirtualSiteParameter(
-                name=f"CL_EP_{index + 1}", kind="sigma_hole",
+                name=_sigma_hole_name(molecule, parents, index + 1), kind="sigma_hole",
                 parent_atom_indices=tuple(int(value) for value in parents),
                 distance_a=protocol["sigma_holes"]["distance_a"],
                 charge_e=float(fitted[molecule.n_atoms + index]),

@@ -177,6 +177,20 @@ site 1.64 A beyond Cl on the C-Cl axis; the atomic and off-center charges are
 fit together. Ligands without carbon-bound chlorine receive ordinary
 multi-conformer RESP charges from the same protocol.
 
+Select the elements that receive automatic sites in the parameterization YAML:
+
+```yaml
+protocol:
+  sigma_holes:
+    halogens: [Cl, Br, I]
+    distance_a: 1.64
+```
+
+The selector recognizes carbon-bound monovalent `F`, `Cl`, `Br`, and `I` and
+defaults to `[Cl]`. Fluorine is intentionally not enabled by default. The older
+two-atom `smarts` setting remains supported, but cannot be combined with
+`halogens`.
+
 The cache key covers molecular graph, stereochemistry, formal charge, force
 field, and scientific fitting settings. It does not depend on the input path,
 atom order, Gaussian executable path, or requested CPU resources. Completed

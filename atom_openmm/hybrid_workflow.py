@@ -266,6 +266,18 @@ def _validate_settings(workflow):
                 raise HybridWorkflowError(
                     f"ligand_sigma_holes.{field} must be a positive number"
                 )
+        from atom_openmm.ligand_parameterization import (
+            LigandParameterizationError,
+            normalize_sigma_hole_settings,
+        )
+        try:
+            normalize_sigma_hole_settings({
+                key: fixed_sites[key]
+                for key in ("halogens", "smarts", "distance_a")
+                if key in fixed_sites
+            })
+        except LigandParameterizationError as exc:
+            raise HybridWorkflowError(f"invalid ligand_sigma_holes: {exc}") from exc
     if charge_model == "resp-sigma-hole":
         cache = setup.get("ligand_parameter_cache")
         protocol = setup.get("ligand_parameter_protocol")

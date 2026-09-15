@@ -18,7 +18,7 @@ protocol:
     cores_per_conformer: 7
     memory_mb_per_conformer: 12000
   sigma_holes:
-    smarts: "[#6:1]-[#17X1:2]"
+    halogens: [Cl]
     distance_a: 1.64
   resp:
     qwt: 0.0005
