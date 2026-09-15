@@ -370,7 +370,16 @@ def _resp_input(
 
 
 def _parse_resp_charges(path: Path, center_count: int, conformer_count: int) -> np.ndarray:
-    values = np.asarray([float(value) for value in Path(path).read_text().split()])
+    text = Path(path).read_text()
+    if "*" in text:
+        raise LigandParameterizationError(
+            f"RESP charge output overflowed its fixed-width field: {path}"
+        )
+    tokens = re.findall(
+        r"[-+]?(?:\d+\.\d*|\.\d+)(?:[EeDd][-+]?\d+)?",
+        text,
+    )
+    values = np.asarray([float(value.replace("D", "E")) for value in tokens])
     if values.size == center_count:
         return values
     if values.size == center_count * conformer_count:
@@ -640,6 +649,20 @@ def _publish_artifact(config_path: Path, config: dict) -> Path:
         if progress_artifact.exists():
             shutil.rmtree(progress_artifact)
         return artifact
+    except Exception:
+        failure_root = (
+            cache_dir / "work" / artifact_key /
+            f"postprocessing_failure_{os.environ.get('SLURM_JOB_ID', os.getpid())}"
+        )
+        failure_root.mkdir(parents=True, exist_ok=True)
+        for name in (
+            "resp_sigma_hole", "resp_atom_only", "resp_atom_only_control",
+        ):
+            source = staging / name
+            destination = failure_root / name
+            if source.is_dir() and not destination.exists():
+                shutil.copytree(source, destination)
+        raise
     finally:
         if staging is not None and staging.exists():
             shutil.rmtree(staging)

@@ -87,6 +87,20 @@ def _test_parse_resp_charges_accepts_equivalent_repeated_values(tmp_path):
     assert np.allclose(observed, [0.10, -0.15, 0.05])
 
 
+def _test_parse_resp_charges_accepts_adjacent_fixed_width_values(tmp_path):
+    path = tmp_path / "resp.chg"
+    path.write_text(" -8.606855-20.470074 29.076929\n")
+    observed = _parse_resp_charges(path, 3, 1)
+    assert np.allclose(observed, [-8.606855, -20.470074, 29.076929])
+
+
+def _test_parse_resp_charges_rejects_fortran_overflow(tmp_path):
+    path = tmp_path / "resp.chg"
+    path.write_text(" -0.001044**********\n")
+    with pytest.raises(LigandParameterizationError, match="overflowed"):
+        _parse_resp_charges(path, 2, 1)
+
+
 def _test_parse_amber_esp_accepts_adjacent_large_grid_count(tmp_path):
     centers = np.asarray([[0.0, 0.0, 0.0]])
     potentials = np.zeros(10000)
