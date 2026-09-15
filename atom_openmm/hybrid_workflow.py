@@ -257,8 +257,6 @@ def _validate_settings(workflow):
             raise HybridWorkflowError("ligand_parameter_protocol must be a non-empty string")
     metal = _metal_ion_settings(workflow, resolve_paths=False)
     if metal["model"] == "panteva_m12_6_4":
-        if not ligand_forcefield.startswith("gaff-"):
-            raise HybridWorkflowError("Panteva m12-6-4 hybrid systems require a GAFF ligand force field")
         if str(setup.get("solvent_model", "")).lower() not in {"tip4pew", "tip4p-ew"}:
             raise HybridWorkflowError("Panteva m12-6-4 hybrid systems require solvent_model: tip4pew")
     config = _normalized_settings(workflow)
@@ -806,6 +804,13 @@ def _prepare_pair(pair, receptor, workflow, workdir, base_dir=None):
         )
         complex_system.provenance["metal_ions"] = {
             **metal,
+            "ligand_c4_atom_class_source": "gaff2",
+            "ligand_nonbonded_forcefield": ligand_forcefield,
+            "parameter_compatibility": (
+                "matched_gaff2"
+                if ligand_forcefield.startswith("gaff-")
+                else "mixed_experimental"
+            ),
             "endpoint_a": overlay_a,
             "endpoint_b": overlay_b,
         }

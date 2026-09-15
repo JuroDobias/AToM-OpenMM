@@ -86,6 +86,20 @@ def _test_resp_sigma_hole_setup_requires_gaff_and_cache(tmp_path):
         raise AssertionError("RESP setup without a parameter cache was accepted")
 
 
+def _test_panteva_accepts_espaloma_with_separate_gaff2_c4_typing(tmp_path):
+    from atom_openmm.hybrid_workflow import _validate_settings
+
+    workflow = yaml.safe_load(_workflow(tmp_path).read_text())["workflow"]
+    workflow["setup"].update({
+        "solvent_model": "tip4pew",
+        "metal_ions": {
+            "model": "panteva_m12_6_4",
+            "polarizability_table": "/shared/lj_1264_pol.dat",
+        },
+    })
+    _validate_settings(workflow)
+
+
 def _test_legacy_bond_only_preparation_inputs_match_current_default():
     from atom_openmm.hybrid_workflow import _legacy_preparation_inputs_match
 
