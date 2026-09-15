@@ -27,7 +27,27 @@ def parameterize_ligand(
     ligand_forcefield: str = "espaloma-0.3.2",
     ligand_charge_model: str = "nn",
     allow_undefined_stereo: bool = False,
+    ligand_parameter_cache: Path | None = None,
+    ligand_parameter_protocol: str = "gaff2-resp-cl-ep-v1",
 ) -> HybridParameterBundle:
+    if ligand_charge_model == "resp-sigma-hole":
+        if ligand_parameter_cache is None:
+            raise HybridParameterError(
+                "resp-sigma-hole requires workflow.setup.ligand_parameter_cache"
+            )
+        from atom_openmm.ligand_parameterization import load_cached_parameters
+
+        parameters = load_cached_parameters(
+            Path(sdf), cache_dir=Path(ligand_parameter_cache),
+            protocol_id=str(ligand_parameter_protocol),
+        )
+        cached_forcefield = parameters.provenance.get("ligand_forcefield")
+        if cached_forcefield != ligand_forcefield:
+            raise HybridParameterError(
+                f"cached ligand force field {cached_forcefield!r} differs from "
+                f"workflow ligand_forcefield {ligand_forcefield!r}"
+            )
+        return parameters
     molecule = Molecule.from_file(
         str(sdf), allow_undefined_stereo=bool(allow_undefined_stereo)
     )

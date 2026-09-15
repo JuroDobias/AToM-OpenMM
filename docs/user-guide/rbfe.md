@@ -157,6 +157,36 @@ workflow:
 
 `ligand_charge_model: nn` is supported for Espaloma ligand force fields. `ligand_charge_model: am1-bcc` is supported for Espaloma and is the expected GAFF setup behavior. OpenFF charge assignment is controlled by the selected OpenFF/SMIRNOFF force field and generator rather than a separate wrapper charge-model option.
 
+Noncovalent hybrid workflows can instead consume an offline, content-addressed
+GAFF/RESP parameter artifact:
+
+```yaml
+workflow:
+  setup:
+    ligand_forcefield: gaff-2.2.20
+    ligand_charge_model: resp-sigma-hole
+    ligand_parameter_cache: /shared/atom-openmm/ligand-parameters
+    ligand_parameter_protocol: gaff2-resp-cl-ep-v1
+```
+
+Create each artifact before the GPU workflow with
+`atom-parameterize-ligand parameterization.yaml`. The default protocol fits one
+charge set against five independently optimized HF/6-31G* conformers. Each
+carbon-bound chlorine receives a massless, Lennard-Jones-free positive charge
+site 1.64 A beyond Cl on the C-Cl axis; the atomic and off-center charges are
+fit together. Ligands without carbon-bound chlorine receive ordinary
+multi-conformer RESP charges from the same protocol.
+
+The cache key covers molecular graph, stereochemistry, formal charge, force
+field, and scientific fitting settings. It does not depend on the input path,
+atom order, Gaussian executable path, or requested CPU resources. Completed
+Gaussian conformers are checkpointed under `cache/work/` and reused after a
+timeout. Only an atomically published artifact with `status: completed` is
+accepted by production. For an alchemical pair, each C-Cl virtual site and its
+three-atom local frame must map between endpoints; creation or deletion of a
+sigma-hole site is currently rejected. See
+`examples/parameterization/gaff2_resp_cl_ep` for the CPU-only Aurum job.
+
 Common combinations include:
 
 ```yaml

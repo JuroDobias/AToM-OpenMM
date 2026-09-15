@@ -1,0 +1,26 @@
+schema_version: 1
+ligand: ligand.sdf
+cache_dir: parameter_cache
+
+protocol:
+  id: gaff2-resp-cl-ep-v1
+  forcefield: gaff-2.2.20
+  conformers: 5
+  conformer_seed: 20260915
+  qm:
+    engine: gaussian16
+    geometry_method: HF
+    geometry_basis: 6-31G*
+    esp_method: HF
+    esp_basis: 6-31G*
+    executable: g16
+    parallel_conformers: 5
+    cores_per_conformer: 7
+    memory_mb_per_conformer: 12000
+  sigma_holes:
+    smarts: "[#6:1]-[#17X1:2]"
+    distance_a: 1.64
+  resp:
+    qwt: 0.0005
+    executable: resp
+    espgen_executable: espgen

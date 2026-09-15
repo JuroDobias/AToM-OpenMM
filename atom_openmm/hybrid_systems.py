@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 import openmm as mm
 from openmm import app, unit
+from openff.toolkit import Molecule
+from openff.units import unit as offunit
 from openmmforcefields.generators import EspalomaTemplateGenerator, GAFFTemplateGenerator
 
 from atom_openmm.covalent_parameters import CovalentParameterError
@@ -121,6 +123,17 @@ def create_physical_ligand_environment(
     record_atom_classes: bool = False,
 ) -> PreparedPhysicalEnvironment:
     molecule = parameters.molecule
+    template_molecule = Molecule(molecule)
+    if parameters.virtual_sites:
+        solvation_charges = np.asarray(parameters.charges_e, dtype=float).copy()
+        for site in parameters.virtual_sites:
+            if site.kind != "sigma_hole" or len(site.parent_atom_indices) != 3:
+                raise HybridSystemError("unsupported cached ligand virtual site")
+            chlorine = int(site.parent_atom_indices[1])
+            solvation_charges[chlorine] += float(site.charge_e)
+        template_molecule.partial_charges = (
+            solvation_charges * offunit.elementary_charge
+        )
     topology = molecule.to_topology().to_openmm()
     positions = molecule.conformers[0].to_openmm()
     modeller = app.Modeller(topology, positions)
@@ -146,7 +159,7 @@ def create_physical_ligand_environment(
         )
     elif ligand_forcefield.startswith("gaff-"):
         generator = GAFFTemplateGenerator(
-            molecules=[molecule], forcefield=ligand_forcefield
+            molecules=[template_molecule], forcefield=ligand_forcefield
         )
     else:
         raise HybridSystemError(
@@ -242,6 +255,13 @@ def create_physical_ligand_environment(
         rigidWater=True,
         removeCMMotion=True,
     )
+    if parameters.virtual_sites:
+        cached_nonbonded = _nonbonded_force(parameters.system)
+        environment_nonbonded = _nonbonded_force(system)
+        for index in range(molecule.n_atoms):
+            environment_nonbonded.setParticleParameters(
+                index, *cached_nonbonded.getParticleParameters(index)
+            )
     atom_classes = None
     if record_atom_classes:
         atom_classes = []

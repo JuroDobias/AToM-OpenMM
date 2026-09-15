@@ -1,0 +1,250 @@
+from pathlib import Path
+import shutil
+import subprocess
+
+import numpy as np
+import openmm as mm
+import pytest
+import yaml
+from openff.toolkit import Molecule
+from openff.units import unit as offunit
+from openmm import app, unit
+from rdkit import Chem
+
+from atom_openmm.covalent_hybrid import CovalentHybridMolecule, DummyBondedScales
+from atom_openmm.covalent_parameters import (
+    CovalentParameterBundle,
+    VirtualSiteParameter,
+)
+from atom_openmm.hybrid_virtual_sites import add_common_sigma_holes
+from atom_openmm.ligand_parameterization import (
+    LigandParameterizationError,
+    _canonical_identity,
+    _parse_resp_charges,
+    _resp_input,
+    _write_multi_esp,
+    cache_identity,
+    load_cached_parameters,
+    normalize_protocol,
+)
+
+
+def _molecule(smiles="CCCl"):
+    molecule = Molecule.from_smiles(smiles)
+    molecule.generate_conformers(n_conformers=1)
+    molecule.generate_unique_atom_names()
+    return molecule
+
+
+def _test_cache_identity_does_not_depend_on_atom_order():
+    molecule = _molecule()
+    rdkit = molecule.to_rdkit()
+    order = list(reversed(range(rdkit.GetNumAtoms())))
+    reordered = Molecule.from_rdkit(Chem.RenumberAtoms(rdkit, order))
+    protocol = normalize_protocol(None)
+    assert _canonical_identity(molecule) == _canonical_identity(reordered)
+    assert cache_identity(molecule, protocol) == cache_identity(reordered, protocol)
+
+
+def _test_cache_identity_ignores_execution_resources():
+    molecule = _molecule()
+    first = normalize_protocol(None)
+    second = normalize_protocol({
+        "qm": {
+            "cores_per_conformer": 2,
+            "memory_mb_per_conformer": 4000,
+            "parallel_conformers": 1,
+            "executable": "/opt/gaussian/g16",
+        },
+        "resp": {
+            "executable": "/opt/amber/bin/resp",
+            "espgen_executable": "/opt/amber/bin/espgen",
+        },
+    })
+    assert cache_identity(molecule, first) == cache_identity(molecule, second)
+
+
+def _test_protocol_rejects_unsupported_qm_engine():
+    with pytest.raises(LigandParameterizationError, match="gaussian16"):
+        normalize_protocol({"qm": {"engine": "orca"}})
+
+
+def _test_resp_input_equivalences_repeated_conformers():
+    text = _resp_input([6, 17], 1, 2, 0, 0.0005)
+    assert "nmol=2" in text
+    assert "conformer 1\n    0    3" in text
+    assert "conformer 2\n    0    3" in text
+    assert text.count(" 1.0") == 2
+    assert "    2\n    1    2    2    2" in text
+    assert text.rstrip().endswith("    1    3    2    3")
+
+
+def _test_parse_resp_charges_accepts_equivalent_repeated_values(tmp_path):
+    path = tmp_path / "resp.chg"
+    path.write_text(" 0.10 -0.15 0.05\n 0.10 -0.15 0.05\n")
+    observed = _parse_resp_charges(path, 3, 2)
+    assert np.allclose(observed, [0.10, -0.15, 0.05])
+
+
+@pytest.mark.skipif(shutil.which("resp") is None, reason="AmberTools RESP is unavailable")
+def _test_multiconformer_input_is_accepted_by_amber_resp(tmp_path):
+    centers = np.asarray(
+        [[0.0, 0.0, 0.0], [3.4, 0.0, 0.0], [6.5, 0.0, 0.0]],
+        dtype=float,
+    )
+    charges = np.asarray([0.15, -0.20, 0.05])
+    points = np.asarray(
+        [
+            [x, y, z]
+            for x in (-3.0, 1.5, 5.0, 9.0)
+            for y in (-3.5, 3.5)
+            for z in (-2.5, 2.5)
+        ],
+        dtype=float,
+    )
+    potentials = np.sum(
+        charges[None, :] /
+        np.linalg.norm(points[:, None, :] - centers[None, :, :], axis=2),
+        axis=1,
+    )
+    shifted = centers + np.asarray([0.2, -0.1, 0.15])
+    shifted_points = points + np.asarray([0.2, -0.1, 0.15])
+    _write_multi_esp(
+        tmp_path / "esp.dat",
+        [
+            (centers, potentials, points),
+            (shifted, potentials, shifted_points),
+        ],
+    )
+    (tmp_path / "resp.in").write_text(_resp_input([6, 17], 1, 2, 0, 0.0005))
+    completed = subprocess.run(
+        [
+            shutil.which("resp"), "-O", "-i", "resp.in", "-o", "resp.out",
+            "-p", "resp.pch", "-t", "resp.chg", "-e", "esp.dat",
+        ],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    fitted = _parse_resp_charges(tmp_path / "resp.chg", 3, 2)
+    assert fitted.sum() == pytest.approx(0.0, abs=1.0e-5)
+
+
+def _simple_system(charges):
+    system = mm.System()
+    for mass in (12.0, 35.45, 12.0):
+        system.addParticle(mass * unit.dalton)
+    bonds = mm.HarmonicBondForce()
+    bonds.addBond(0, 1, 0.18 * unit.nanometer, 100.0 * unit.kilojoules_per_mole / unit.nanometer**2)
+    bonds.addBond(0, 2, 0.14 * unit.nanometer, 100.0 * unit.kilojoules_per_mole / unit.nanometer**2)
+    system.addForce(bonds)
+    nonbonded = mm.NonbondedForce()
+    for charge in charges:
+        nonbonded.addParticle(charge, 0.3, 0.1)
+    nonbonded.addException(0, 1, 0.0, 1.0, 0.0)
+    nonbonded.addException(1, 2, 0.0, 1.0, 0.0)
+    system.addForce(nonbonded)
+    return system
+
+
+def _test_cached_bundle_is_remapped_to_requested_atom_order(tmp_path):
+    stored = _molecule()
+    protocol = normalize_protocol(None)
+    molecule_key, artifact_key = cache_identity(stored, protocol)
+    artifact = tmp_path / "artifacts" / artifact_key
+    artifact.mkdir(parents=True)
+    stored.to_file(str(artifact / "ligand.sdf"), file_format="SDF")
+    charges = np.linspace(-0.2, 0.2, stored.n_atoms)
+    system = mm.System()
+    for atom in stored.atoms:
+        system.addParticle(float(atom.mass.m_as(offunit.dalton)) * unit.dalton)
+    force = mm.NonbondedForce()
+    for charge in charges:
+        force.addParticle(charge, 0.3, 0.0)
+    system.addForce(force)
+    (artifact / "system.xml").write_text(mm.XmlSerializer.serialize(system))
+    (artifact / "manifest.yaml").write_text(yaml.safe_dump({
+        "schema_version": 1,
+        "status": "completed",
+        "artifact_key": artifact_key,
+        "molecule": _canonical_identity(stored),
+        "protocol": protocol,
+        "atomic_charges_e": charges.tolist(),
+        "virtual_sites": [],
+        "files": {"molecule": "ligand.sdf", "system": "system.xml"},
+    }))
+    index = tmp_path / "index" / molecule_key
+    index.mkdir(parents=True)
+    (index / f"{protocol['id']}.yaml").write_text(yaml.safe_dump({
+        "schema_version": 1, "artifact_key": artifact_key,
+    }))
+    requested_path = tmp_path / "requested.sdf"
+    rdkit = Chem.RenumberAtoms(stored.to_rdkit(), list(reversed(range(stored.n_atoms))))
+    requested = Molecule.from_rdkit(rdkit)
+    requested.to_file(str(requested_path), file_format="SDF")
+    loaded = load_cached_parameters(
+        requested_path, cache_dir=tmp_path, protocol_id=protocol["id"]
+    )
+    assert loaded.cache_key == artifact_key
+    assert sorted(loaded.charges_e) == pytest.approx(sorted(charges))
+    observed = next(
+        force for force in loaded.system.getForces()
+        if isinstance(force, mm.NonbondedForce)
+    )
+    assert [
+        observed.getParticleParameters(i)[0].value_in_unit(unit.elementary_charge)
+        for i in range(requested.n_atoms)
+    ] == pytest.approx(loaded.charges_e)
+
+
+def _hybrid_bundle(site_charge):
+    topology = app.Topology()
+    chain = topology.addChain("A")
+    residue = topology.addResidue("HYB", chain)
+    topology.addAtom("C1", app.element.carbon, residue)
+    topology.addAtom("CL", app.element.chlorine, residue)
+    topology.addAtom("C2", app.element.carbon, residue)
+    positions = np.asarray([[0.0, 0.0, 0.0], [0.18, 0.0, 0.0], [0.0, 0.14, 0.0]]) * unit.nanometer
+    return topology, positions, _simple_system([0.1, -0.15, 0.0]), VirtualSiteParameter(
+        name="CL_EP_1", kind="sigma_hole", parent_atom_indices=(0, 1, 2),
+        distance_a=1.64, charge_e=site_charge,
+    )
+
+
+def _test_common_sigma_hole_is_added_to_both_endpoints():
+    topology, positions, endpoint_a, site_a = _hybrid_bundle(0.05)
+    _, _, endpoint_b, site_b = _hybrid_bundle(0.06)
+    hybrid = CovalentHybridMolecule(
+        topology=topology, positions=positions, endpoint_a=endpoint_a,
+        endpoint_b=endpoint_b, map_a_to_b={0: 0, 1: 1, 2: 2},
+        map_a_to_hybrid={0: 0, 1: 1, 2: 2},
+        map_b_to_hybrid={0: 0, 1: 1, 2: 2}, unique_a=(), unique_b=(),
+        anchor_pairs=(), attachment_pairs=None,
+        dummy_bonded_scales=DummyBondedScales(), dummy_core_nonbonded="off",
+    )
+    molecule = _molecule("CCl")
+    parameters_a = CovalentParameterBundle(
+        molecule, endpoint_a, np.asarray([0.1, -0.15, 0.0]), "a", {}, (site_a,)
+    )
+    parameters_b = CovalentParameterBundle(
+        molecule, endpoint_b, np.asarray([0.1, -0.16, 0.0]), "b", {}, (site_b,)
+    )
+    augmented = add_common_sigma_holes(hybrid, parameters_a, parameters_b)
+    assert augmented.topology.getNumAtoms() == 4
+    assert augmented.endpoint_a.isVirtualSite(3)
+    assert augmented.endpoint_b.isVirtualSite(3)
+    assert augmented.endpoint_a.getParticleMass(3) == 0.0 * unit.dalton
+    force_a = next(
+        force for force in augmented.endpoint_a.getForces()
+        if isinstance(force, mm.NonbondedForce)
+    )
+    assert force_a.getParticleParameters(3)[0].value_in_unit(unit.elementary_charge) == pytest.approx(0.05)
+    assert force_a.getNumExceptions() > endpoint_a.getForce(1).getNumExceptions()
+    integrator = mm.VerletIntegrator(0.001 * unit.picoseconds)
+    context = mm.Context(
+        augmented.endpoint_a, integrator, mm.Platform.getPlatformByName("Reference")
+    )
+    context.setPositions(augmented.positions)
+    energy = context.getState(getEnergy=True).getPotentialEnergy()
+    assert np.isfinite(energy.value_in_unit(unit.kilojoules_per_mole))

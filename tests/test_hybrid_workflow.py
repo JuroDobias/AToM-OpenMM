@@ -65,6 +65,27 @@ def _test_hybrid_workflow_validates_and_plans_two_environments(tmp_path):
     assert plan["pairs"][0]["environments"] == ["complex", "solvent"]
 
 
+def _test_resp_sigma_hole_setup_requires_gaff_and_cache(tmp_path):
+    from atom_openmm.hybrid_workflow import HybridWorkflowError, _validate_settings
+
+    workflow = yaml.safe_load(_workflow(tmp_path).read_text())["workflow"]
+    workflow["setup"] = {
+        "ligand_forcefield": "gaff-2.2.20",
+        "ligand_charge_model": "resp-sigma-hole",
+        "ligand_parameter_cache": "/shared/ligand-parameters",
+        "ligand_parameter_protocol": "gaff2-resp-cl-ep-v1",
+    }
+    _validate_settings(workflow)
+
+    del workflow["setup"]["ligand_parameter_cache"]
+    try:
+        _validate_settings(workflow)
+    except HybridWorkflowError as exc:
+        assert "ligand_parameter_cache" in str(exc)
+    else:
+        raise AssertionError("RESP setup without a parameter cache was accepted")
+
+
 def _test_legacy_bond_only_preparation_inputs_match_current_default():
     from atom_openmm.hybrid_workflow import _legacy_preparation_inputs_match
 

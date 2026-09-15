@@ -47,6 +47,7 @@ from atom_openmm.hybrid_mapping import (
 )
 from atom_openmm.hybrid_parameters import parameterize_ligand
 from atom_openmm.hybrid_systems import create_physical_ligand_environment
+from atom_openmm.hybrid_virtual_sites import add_common_sigma_holes
 from atom_openmm.metal_ions import apply_panteva_m1264, gaff2_atom_classes
 from atom_openmm.receptor_normalization import normalize_legacy_pdb
 from atom_openmm.neqti import (
@@ -239,11 +240,21 @@ def _validate_settings(workflow):
     if (
         ligand_forcefield.startswith("espaloma") and charge_model != "nn"
     ) or (
-        ligand_forcefield.startswith("gaff-") and charge_model not in {"am1-bcc", "bcc"}
+        ligand_forcefield.startswith("gaff-")
+        and charge_model not in {"am1-bcc", "bcc", "resp-sigma-hole"}
     ):
         raise HybridWorkflowError(
-            "Espaloma requires ligand_charge_model: nn and GAFF requires am1-bcc"
+            "Espaloma requires ligand_charge_model: nn; GAFF supports am1-bcc or resp-sigma-hole"
         )
+    if charge_model == "resp-sigma-hole":
+        cache = setup.get("ligand_parameter_cache")
+        protocol = setup.get("ligand_parameter_protocol")
+        if not isinstance(cache, str) or not cache.strip():
+            raise HybridWorkflowError(
+                "resp-sigma-hole requires workflow.setup.ligand_parameter_cache"
+            )
+        if protocol is not None and (not isinstance(protocol, str) or not protocol.strip()):
+            raise HybridWorkflowError("ligand_parameter_protocol must be a non-empty string")
     metal = _metal_ion_settings(workflow, resolve_paths=False)
     if metal["model"] == "panteva_m12_6_4":
         if not ligand_forcefield.startswith("gaff-"):
@@ -614,17 +625,30 @@ def _prepare_pair(pair, receptor, workflow, workdir, base_dir=None):
     ligand_forcefield = setup.get("ligand_forcefield", "espaloma-0.3.2")
     charge_model = setup.get("ligand_charge_model", "nn")
     allow_undefined_stereo = bool(setup.get("allow_undefined_stereo", False))
+    parameter_cache = setup.get("ligand_parameter_cache")
+    if parameter_cache is not None:
+        parameter_cache = Path(parameter_cache)
+        if not parameter_cache.is_absolute():
+            parameter_cache = Path(base_dir or Path.cwd()) / parameter_cache
+        parameter_cache = parameter_cache.resolve()
+    parameter_protocol = setup.get(
+        "ligand_parameter_protocol", "gaff2-resp-cl-ep-v1"
+    )
     parameters_a = parameterize_ligand(
         pair["lig1_file"], ligand_forcefield=ligand_forcefield,
         ligand_charge_model=charge_model,
         allow_undefined_stereo=allow_undefined_stereo,
+        ligand_parameter_cache=parameter_cache,
+        ligand_parameter_protocol=parameter_protocol,
     )
     parameters_b = parameterize_ligand(
         pair["lig2_file"], ligand_forcefield=ligand_forcefield,
         ligand_charge_model=charge_model,
         allow_undefined_stereo=allow_undefined_stereo,
+        ligand_parameter_cache=parameter_cache,
+        ligand_parameter_protocol=parameter_protocol,
     )
-    if not np.isclose(parameters_a.charges_e.sum(), parameters_b.charges_e.sum(), atol=1e-6):
+    if not np.isclose(parameters_a.total_charge_e, parameters_b.total_charge_e, atol=1e-6):
         raise HybridWorkflowError("parameterized endpoint ligand charges differ")
     atom_map, mapping_payload = build_hybrid_atom_map(
         parameters_a, parameters_b, mapping_settings
@@ -690,6 +714,7 @@ def _prepare_pair(pair, receptor, workflow, workdir, base_dir=None):
             for entry in (mapping_payload.get("alchemical_bonds") or {}).get("ligand_b", [])
         },
     )
+    hybrid = add_common_sigma_holes(hybrid, parameters_a, parameters_b)
     mapping_payload["inactive_z_matrix_terms"] = inactive_z_matrix_metadata(hybrid)
     mapping_payload["inactive_bonded_branches"] = inactive_branch_metadata(hybrid)
     mapping_payload["alchemical_bond_pair_changes"] = (
@@ -741,6 +766,10 @@ def _prepare_pair(pair, receptor, workflow, workdir, base_dir=None):
         for atom, system_atom in hybrid.map_a_to_hybrid.items():
             if classes_b[system_atom] is None:
                 classes_b[system_atom] = ligand_classes_a[atom]
+        for index in range(hybrid.topology.getNumAtoms()):
+            if hybrid.endpoint_a.isVirtualSite(index):
+                classes_a[index] = "EP"
+                classes_b[index] = "EP"
         if any(value is None for value in classes_a + classes_b + environment_classes):
             raise HybridWorkflowError("Panteva hybrid atom-class assignment is incomplete")
         classes_a.extend(environment_classes)

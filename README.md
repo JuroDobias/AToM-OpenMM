@@ -182,6 +182,14 @@ See the [RBFE user guide](docs/user-guide/rbfe.md) for the complete YAML schema,
 
 For a conventional noncovalent dual-topology comparison, use [`examples/RBFE/cdk2/workflow.hybrid.yaml`](examples/RBFE/cdk2/workflow.hybrid.yaml). It maps the ligands by MCS or SMARTS-constrained MCS, preserves inactive-branch intramolecular interactions, and combines complex and solvent BAR estimates. Hybrid NEQTI can independently select switching durations and stop production for the complex and solvent environments using per-environment overlap, uncertainty, and DG-stability criteria. The covalent hybrid-topology workflow is documented in [`examples/RBFE/covalent-rhino`](examples/RBFE/covalent-rhino).
 
+GAFF2 hybrid workflows can consume separately generated, content-addressed
+multi-conformer RESP parameters with chlorine sigma-hole virtual sites. Run
+`atom-parameterize-ligand` on a CPU node, publish the completed bundle to a
+shared parameter cache, and select `ligand_charge_model: resp-sigma-hole` in
+the MD workflow. Parameter lookup uses molecular identity and protocol rather
+than filenames or atom order. See
+[`examples/parameterization/gaff2_resp_cl_ep`](examples/parameterization/gaff2_resp_cl_ep).
+
 Mapped transmutations can mark a complete endpoint-unique branch with
 `inactive_bonded_atoms_*_0based` or paired-SMARTS labels. `bond_only` preserves
 the branch's internal bonded geometry while removing mixed branch/core angular

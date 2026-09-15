@@ -17,12 +17,30 @@ class CovalentParameterError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class VirtualSiteParameter:
+    name: str
+    kind: str
+    parent_atom_indices: tuple[int, ...]
+    distance_a: float
+    charge_e: float
+    sigma_a: float = 0.0
+    epsilon_kj_mol: float = 0.0
+
+
+@dataclass(frozen=True)
 class CovalentParameterBundle:
     molecule: Molecule
     system: mm.System
     charges_e: np.ndarray
     cache_key: str
     provenance: dict[str, object]
+    virtual_sites: tuple[VirtualSiteParameter, ...] = ()
+
+    @property
+    def total_charge_e(self) -> float:
+        return float(self.charges_e.sum()) + sum(
+            float(site.charge_e) for site in self.virtual_sites
+        )
 
 
 def _canonical_cache_key(molecule: Molecule, model: str, forcefield: str) -> str:

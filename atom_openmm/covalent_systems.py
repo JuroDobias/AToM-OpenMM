@@ -279,6 +279,14 @@ def _copy_virtual_site(site, shift):
             particles[0], particles[1], particles[2],
             site.getWeight12(), site.getWeight13(), site.getWeightCross(),
         )
+    if isinstance(site, mm.LocalCoordinatesSite):
+        return mm.LocalCoordinatesSite(
+            particles,
+            site.getOriginWeights(),
+            site.getXWeights(),
+            site.getYWeights(),
+            site.getLocalPosition(),
+        )
     raise CovalentParameterError(f"unsupported solvent virtual site {type(site).__name__}")
 
 
@@ -291,7 +299,11 @@ def _merge_hybrid_with_environment(
     shift = hybrid_atoms - int(environment_solute_atoms)
     output = mm.System()
     for index in range(hybrid_atoms):
-        output.addParticle(hybrid_system.getParticleMass(index))
+        new_index = output.addParticle(hybrid_system.getParticleMass(index))
+        if hybrid_system.isVirtualSite(index):
+            output.setVirtualSite(
+                new_index, _copy_virtual_site(hybrid_system.getVirtualSite(index), 0)
+            )
     for index in range(environment_solute_atoms, environment_system.getNumParticles()):
         new_index = output.addParticle(environment_system.getParticleMass(index))
         if environment_system.isVirtualSite(index):
@@ -411,6 +423,11 @@ def solvate_capped_reference_hybrid(
         unit.nanometer,
     )
     provenance = dict(physical_a.provenance)
+    common_virtual_sites = [
+        index
+        for index in range(hybrid.topology.getNumAtoms())
+        if hybrid.endpoint_a.isVirtualSite(index)
+    ]
     provenance.update(
         {
             "hybrid_solute_atom_count": hybrid.topology.getNumAtoms(),
@@ -426,11 +443,11 @@ def solvate_capped_reference_hybrid(
             "ligand_a_system_atom_indices": [
                 int(hybrid.map_a_to_hybrid[index])
                 for index in range(len(hybrid.map_a_to_hybrid))
-            ],
+            ] + common_virtual_sites,
             "ligand_b_system_atom_indices": [
                 int(hybrid.map_b_to_hybrid[index])
                 for index in range(len(hybrid.map_b_to_hybrid))
-            ],
+            ] + common_virtual_sites,
             "anchor_pairs": [list(pair) for pair in hybrid.anchor_pairs],
             "attachment_pairs": None if hybrid.attachment_pairs is None else [
                 list(pair) for pair in hybrid.attachment_pairs
