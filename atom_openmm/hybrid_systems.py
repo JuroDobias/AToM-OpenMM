@@ -134,8 +134,8 @@ def create_physical_ligand_environment(
         template_molecule.partial_charges = (
             solvation_charges * offunit.elementary_charge
         )
-    topology = molecule.to_topology().to_openmm()
-    positions = molecule.conformers[0].to_openmm()
+    topology = template_molecule.to_topology().to_openmm()
+    positions = template_molecule.conformers[0].to_openmm()
     modeller = app.Modeller(topology, positions)
     protein_files = _forcefield_files(
         setup.get("protein_forcefield"), ["amber14-all.xml"]
@@ -153,7 +153,7 @@ def create_physical_ligand_environment(
     ligand_forcefield = setup.get("ligand_forcefield", "espaloma-0.3.2")
     if ligand_forcefield.startswith("espaloma"):
         generator = EspalomaTemplateGenerator(
-            molecules=[molecule],
+            molecules=[template_molecule],
             forcefield=ligand_forcefield,
             template_generator_kwargs={"charge_method": "from-molecule"},
         )
