@@ -26,6 +26,7 @@ from atom_openmm.covalent_parameters import (
     CovalentParameterBundle,
     VirtualSiteParameter,
     _system_charges,
+    constrain_charge_sum,
 )
 
 
@@ -585,7 +586,6 @@ def _publish_artifact(config_path: Path, config: dict) -> Path:
         if any(path is None for path in esp_paths):
             raise LigandParameterizationError("one or more Gaussian ESP outputs are missing")
         fitted, diagnostics = _run_resp(staging, molecule, sites, protocol, esp_paths)
-        atom_charges = fitted[:molecule.n_atoms]
         virtual_sites = tuple(
             VirtualSiteParameter(
                 name=f"CL_EP_{index + 1}", kind="sigma_hole",
@@ -594,6 +594,14 @@ def _publish_artifact(config_path: Path, config: dict) -> Path:
                 charge_e=float(fitted[molecule.n_atoms + index]),
             )
             for index, parents in enumerate(sites)
+        )
+        formal_charge = float(
+            molecule.total_charge.m_as(offunit.elementary_charge)
+        )
+        atom_charges, charge_rounding_correction = constrain_charge_sum(
+            fitted[:molecule.n_atoms],
+            np.arange(molecule.n_atoms),
+            formal_charge - sum(site.charge_e for site in virtual_sites),
         )
         system = _gaff_system(
             molecule, atom_charges, protocol["forcefield"], virtual_sites
@@ -617,7 +625,12 @@ def _publish_artifact(config_path: Path, config: dict) -> Path:
             "atomic_charges_e": atom_charges.tolist(),
             "mol2_atomic_charges_e": portable_charges.tolist(),
             "virtual_sites": [asdict(site) for site in virtual_sites],
-            "total_charge_e": float(fitted.sum()),
+            "total_charge_e": float(
+                atom_charges.sum() + sum(site.charge_e for site in virtual_sites)
+            ),
+            "charge_rounding_correction_per_atom_e": float(
+                charge_rounding_correction
+            ),
             "esp_diagnostics": diagnostics,
             "files": {
                 "molecule": "ligand.sdf", "system": "system.xml",
@@ -766,7 +779,6 @@ def load_cached_parameters(
     charges = np.empty_like(stored_charges)
     for old, new in atom_map.items():
         charges[new] = stored_charges[old]
-    requested.partial_charges = charges * offunit.elementary_charge
     sites = []
     for raw in manifest.get("virtual_sites", []):
         parents = tuple(atom_map[int(index)] for index in raw["parent_atom_indices"])
@@ -776,12 +788,27 @@ def load_cached_parameters(
             charge_e=float(raw["charge_e"]), sigma_a=float(raw.get("sigma_a", 0.0)),
             epsilon_kj_mol=float(raw.get("epsilon_kj_mol", 0.0)),
         ))
-    total_charge = float(charges.sum()) + sum(site.charge_e for site in sites)
     formal_charge = float(requested.total_charge.m_as(offunit.elementary_charge))
+    total_charge = float(charges.sum()) + sum(site.charge_e for site in sites)
     if not np.isclose(total_charge, formal_charge, atol=5.0e-5):
         raise LigandParameterizationError(
             "cached atomic and virtual-site charges do not sum to the formal charge"
         )
+    charges, charge_rounding_correction = constrain_charge_sum(
+        charges,
+        np.arange(requested.n_atoms),
+        formal_charge - sum(site.charge_e for site in sites),
+    )
+    nonbonded = next(
+        force for force in system.getForces()
+        if isinstance(force, mm.NonbondedForce)
+    )
+    for index, charge in enumerate(charges):
+        _, sigma, epsilon = nonbonded.getParticleParameters(index)
+        nonbonded.setParticleParameters(
+            index, float(charge) * unit.elementary_charge, sigma, epsilon
+        )
+    requested.partial_charges = charges * offunit.elementary_charge
     return CovalentParameterBundle(
         molecule=requested, system=system, charges_e=charges,
         cache_key=str(manifest["artifact_key"]),
@@ -789,6 +816,9 @@ def load_cached_parameters(
             "charge_model": "resp-sigma-hole", "ligand_forcefield": manifest_protocol["forcefield"],
             "parameter_artifact": str(artifact), "artifact_key": manifest["artifact_key"],
             "protocol_id": protocol_id, "esp_diagnostics": manifest.get("esp_diagnostics", {}),
+            "charge_rounding_correction_per_atom_e": float(
+                charge_rounding_correction
+            ),
         },
         virtual_sites=tuple(sites),
     )

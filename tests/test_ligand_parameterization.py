@@ -188,7 +188,8 @@ def _test_cached_bundle_is_remapped_to_requested_atom_order(tmp_path):
     artifact = tmp_path / "artifacts" / artifact_key
     artifact.mkdir(parents=True)
     stored.to_file(str(artifact / "ligand.sdf"), file_format="SDF")
-    charges = np.linspace(-0.2, 0.2, stored.n_atoms)
+    charges = np.linspace(-0.2, 0.2, stored.n_atoms) + 1.0e-6
+    expected_charges = charges - charges.sum() / stored.n_atoms
     system = mm.System()
     for atom in stored.atoms:
         system.addParticle(float(atom.mass.m_as(offunit.dalton)) * unit.dalton)
@@ -220,7 +221,8 @@ def _test_cached_bundle_is_remapped_to_requested_atom_order(tmp_path):
         requested_path, cache_dir=tmp_path, protocol_id=protocol["id"]
     )
     assert loaded.cache_key == artifact_key
-    assert sorted(loaded.charges_e) == pytest.approx(sorted(charges))
+    assert sorted(loaded.charges_e) == pytest.approx(sorted(expected_charges))
+    assert loaded.total_charge_e == pytest.approx(0.0, abs=1.0e-12)
     observed = next(
         force for force in loaded.system.getForces()
         if isinstance(force, mm.NonbondedForce)
