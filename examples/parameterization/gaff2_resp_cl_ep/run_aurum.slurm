@@ -32,4 +32,4 @@ export PATH="$GAUSS_EXEDIR:$PATH"
 cd "$submission_dir"
 python -m atom_openmm.ligand_parameterization parameterization.yaml
 
-rm -rf "$scratch_root"
+rm -rf "$ATOM_PARAMETERIZATION_WORKDIR" "$GAUSS_SCRDIR"
