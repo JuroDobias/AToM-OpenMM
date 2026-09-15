@@ -300,10 +300,13 @@ def _parse_amber_esp(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     lines = [line for line in Path(path).read_text().splitlines() if line.strip()]
     if not lines:
         raise LigandParameterizationError(f"empty ESP file: {path}")
-    header = lines[0].split()
-    if len(header) < 2:
+    try:
+        # Amber uses two adjacent I5 fields.  Large grids therefore produce
+        # headers such as ``   4311275`` for 43 atoms and 11275 ESP points.
+        natom = int(lines[0][:5])
+        nesp = int(lines[0][5:10])
+    except (TypeError, ValueError):
         raise LigandParameterizationError(f"invalid ESP header: {path}")
-    natom, nesp = int(header[0]), int(header[1])
     if len(lines) != 1 + natom + nesp:
         raise LigandParameterizationError(f"ESP record count differs in {path}")
     atoms = np.asarray([[float(x) for x in line.split()[-3:]] for line in lines[1:1+natom]])

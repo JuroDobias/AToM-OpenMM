@@ -21,6 +21,7 @@ from atom_openmm.ligand_parameterization import (
     LigandParameterizationError,
     _canonical_identity,
     _parse_resp_charges,
+    _parse_amber_esp,
     _resp_input,
     _write_multi_esp,
     cache_identity,
@@ -84,6 +85,19 @@ def _test_parse_resp_charges_accepts_equivalent_repeated_values(tmp_path):
     path.write_text(" 0.10 -0.15 0.05\n 0.10 -0.15 0.05\n")
     observed = _parse_resp_charges(path, 3, 2)
     assert np.allclose(observed, [0.10, -0.15, 0.05])
+
+
+def _test_parse_amber_esp_accepts_adjacent_large_grid_count(tmp_path):
+    centers = np.asarray([[0.0, 0.0, 0.0]])
+    potentials = np.zeros(10000)
+    points = np.ones((10000, 3))
+    path = tmp_path / "large.esp"
+    _write_multi_esp(path, [(centers, potentials, points)])
+
+    parsed_centers, parsed_potentials, parsed_points = _parse_amber_esp(path)
+    assert parsed_centers.shape == (1, 3)
+    assert parsed_potentials.shape == (10000,)
+    assert parsed_points.shape == (10000, 3)
 
 
 @pytest.mark.skipif(shutil.which("resp") is None, reason="AmberTools RESP is unavailable")
