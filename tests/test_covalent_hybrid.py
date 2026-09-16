@@ -183,6 +183,76 @@ def test_annulation_closure_is_absent_only_from_open_dummy_endpoint():
     assert soft_bonds.getNumBonds() == 1
 
 
+def test_paired_endpoint_soft_bonds_build_both_physical_endpoints():
+    left = _bundle("C1CCCCC1")
+    right = _bundle("CC1CCCC1")
+    settings = {
+        "method": "explicit_pairs",
+        "pairs_0based": [[index, index] for index in range(6)],
+        "alchemical_bonds": {
+            "ligand_a": [{"atoms_0based": [0, 5], "mode": "soft_bond"}],
+            "ligand_b": [{"atoms_0based": [1, 5], "mode": "soft_bond"}],
+        },
+    }
+    mapping, metadata = build_hybrid_atom_map(left, right, settings)
+    hybrid = build_covalent_hybrid_molecule(
+        left,
+        right,
+        atom_map=mapping,
+        alchemical_bonds_a={(0, 5)},
+        alchemical_bonds_b={(1, 5)},
+    )
+
+    def harmonic_bonds(system):
+        force = next(
+            force
+            for force in system.getForces()
+            if isinstance(force, mm.HarmonicBondForce)
+        )
+        return {
+            tuple(sorted(map(int, force.getBondParameters(index)[:2])))
+            for index in range(force.getNumBonds())
+        }
+
+    bond_a = tuple(sorted((hybrid.map_a_to_hybrid[0], hybrid.map_a_to_hybrid[5])))
+    bond_b = tuple(sorted((hybrid.map_b_to_hybrid[1], hybrid.map_b_to_hybrid[5])))
+    assert bond_a in harmonic_bonds(hybrid.endpoint_a)
+    assert bond_a not in harmonic_bonds(hybrid.endpoint_b)
+    assert bond_b not in harmonic_bonds(hybrid.endpoint_a)
+    assert bond_b in harmonic_bonds(hybrid.endpoint_b)
+    assert {change.endpoint for change in hybrid.alchemical_bond_pair_changes} == {
+        "a",
+        "b",
+    }
+
+    changes = [
+        {
+            "endpoint": change.endpoint,
+            "system_atoms_0based": list(change.hybrid_atoms),
+            "closed_class": change.closed_class,
+            "open_class": change.open_class,
+        }
+        for change in hybrid.alchemical_bond_pair_changes
+    ]
+    switching = create_softcore_hamiltonian(
+        hybrid.endpoint_a,
+        hybrid.endpoint_b,
+        [hybrid.map_a_to_hybrid[index] for index in hybrid.unique_a],
+        [hybrid.map_b_to_hybrid[index] for index in hybrid.unique_b],
+        total_steps=100,
+        path_mode="scheme1_soft_bond",
+        segments_per_interval=[1, 1],
+        soft_bond_pairs=[bond_a, bond_b],
+        soft_bond_pair_changes=changes,
+    )
+    soft_bonds = next(
+        force
+        for force in switching.system.getForces()
+        if force.getName() == "CovalentSoftBonds"
+    )
+    assert soft_bonds.getNumBonds() == 2
+
+
 def _test_scheme1_soft_bond_preserves_annulation_endpoints_and_tracks_pairs():
     left = _bundle("c1ccccc1")
     right = _bundle("c1ccc2c(c1)CCC2")

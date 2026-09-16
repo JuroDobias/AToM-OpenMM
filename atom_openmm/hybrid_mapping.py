@@ -153,7 +153,7 @@ def normalize_junction_bonds(raw):
 
 
 def normalize_alchemical_bonds(raw):
-    """Validate one endpoint-specific bond for initial soft-bond support."""
+    """Validate at most one endpoint-specific soft bond per endpoint."""
     if raw is None:
         return {"ligand_a": [], "ligand_b": []}
     if not isinstance(raw, dict) or set(raw) - {"ligand_a", "ligand_b"}:
@@ -161,11 +161,14 @@ def normalize_alchemical_bonds(raw):
             "alchemical_bonds must contain only ligand_a and ligand_b lists"
         )
     normalized = {"ligand_a": [], "ligand_b": []}
-    count = 0
     for endpoint in normalized:
         entries = raw.get(endpoint, [])
         if not isinstance(entries, list):
             raise HybridMappingError(f"alchemical_bonds.{endpoint} must be a list")
+        if len(entries) > 1:
+            raise HybridMappingError(
+                f"initial soft-bond support allows one changing bond in {endpoint}"
+            )
         for position, entry in enumerate(entries, start=1):
             field = f"alchemical_bonds.{endpoint} entry {position}"
             if not isinstance(entry, dict) or set(entry) - {"atoms_0based", "mode"}:
@@ -187,9 +190,6 @@ def normalize_alchemical_bonds(raw):
             normalized[endpoint].append(
                 {"atoms_0based": list(atoms), "mode": "soft_bond"}
             )
-            count += 1
-    if count > 1:
-        raise HybridMappingError("initial soft-bond support allows one changing bond per edge")
     return normalized
 
 
