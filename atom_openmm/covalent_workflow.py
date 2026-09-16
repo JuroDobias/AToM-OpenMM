@@ -176,6 +176,13 @@ def _mapping_settings(workflow, pair):
             "'paired_smarts_transmutation', or 'explicit_pairs'"
         )
     normalized = {"method": method}
+    if method != "explicit_pairs" and (
+        "force_unique_atoms_a_0based" in settings
+        or "force_unique_atoms_b_0based" in settings
+    ):
+        raise CovalentWorkflowError(
+            "covalent mapping.force_unique_atoms_*_0based requires explicit_pairs"
+        )
     junctions = settings.get("junction_bonds")
     if junctions is not None:
         legacy = {
@@ -252,6 +259,14 @@ def _mapping_settings(workflow, pair):
                 settings.get("inactive_bonded_atoms_b_0based", []),
                 "covalent mapping.inactive_bonded_atoms_b_0based",
             )
+            force_unique_a = _strict_nonnegative_indices(
+                settings.get("force_unique_atoms_a_0based", []),
+                "covalent mapping.force_unique_atoms_a_0based",
+            )
+            force_unique_b = _strict_nonnegative_indices(
+                settings.get("force_unique_atoms_b_0based", []),
+                "covalent mapping.force_unique_atoms_b_0based",
+            )
         except ValueError as exc:
             raise CovalentWorkflowError(str(exc)) from exc
         geometry = str(settings.get("inactive_bonded_geometry", "bond_only")).lower()
@@ -266,6 +281,8 @@ def _mapping_settings(workflow, pair):
                 "inactive bonded atom"
             )
         normalized["pairs_0based"] = [list(pair) for pair in pairs]
+        normalized["force_unique_atoms_a_0based"] = force_unique_a
+        normalized["force_unique_atoms_b_0based"] = force_unique_b
         if junctions is None and legacy_geometry_requested:
             normalized.update(
                 {
@@ -3861,6 +3878,10 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
     inactive_z_matrix_roots_b = set()
     alchemical_bonds_a = set()
     alchemical_bonds_b = set()
+    force_unique_a = set()
+    force_unique_b = set()
+    force_unique_product_a = set()
+    force_unique_product_b = set()
     inactive_geometry = "bond_only"
     if mapping_settings["method"] == "dataset_core":
         core_a = inputs["ligand_a"]["info"]["core_match_atom_indices_1based"]
@@ -3924,6 +3945,8 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
                 matched_labels_b,
                 requested_pairs,
                 completed_hydrogen_pairs,
+                force_unique_a,
+                force_unique_b,
             ) = _explicit_pairs_map(raw_a, raw_b, mapping_settings)
         else:
             (
@@ -4065,6 +4088,8 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
             (product_a[atom_a], product_b[atom_b])
             for atom_a, atom_b in completed_hydrogen_pairs
         }
+        force_unique_product_a = {product_a[atom] for atom in force_unique_a}
+        force_unique_product_b = {product_b[atom] for atom in force_unique_b}
         modes = {entry["inactive_geometry"] for entry in resolved_junctions}
         inactive_geometry = mapping_settings.get(
             "inactive_bonded_geometry",
@@ -4098,6 +4123,14 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
                 "auto_completed_ligand_hydrogen_pairs_0based": [
                     list(pair) for pair in sorted(completed_hydrogen_pairs)
                 ],
+                "force_unique_ligand_atoms_a_0based": sorted(force_unique_a),
+                "force_unique_ligand_atoms_b_0based": sorted(force_unique_b),
+                "force_unique_product_atoms_a_0based": sorted(
+                    force_unique_product_a
+                ),
+                "force_unique_product_atoms_b_0based": sorted(
+                    force_unique_product_b
+                ),
                 "requested_product_pairs_0based": [
                     list(pair) for pair in requested_product_pairs
                 ],
@@ -4161,6 +4194,8 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
             transmuted_pairs=transmuted_pairs,
             alchemical_bonds_a=alchemical_bonds_a,
             alchemical_bonds_b=alchemical_bonds_b,
+            force_unique_atoms_a=force_unique_product_a,
+            force_unique_atoms_b=force_unique_product_b,
         )
     if mapping_settings["method"] in {"dataset_core", "mcs_core_smarts"}:
         auto_a, auto_z_a, resolved_a, warnings_a = _automatic_junction_bonds(
@@ -4220,6 +4255,8 @@ def _prepare_covalent_atom_map(inputs, mapping_settings):
         inactive_z_matrix_roots_b,
         alchemical_bonds_a,
         alchemical_bonds_b,
+        force_unique_product_a,
+        force_unique_product_b,
     )
 
 
@@ -4528,6 +4565,8 @@ def run_covalent_pair(settings, pair):
             inactive_z_matrix_roots_b,
             alchemical_bonds_a,
             alchemical_bonds_b,
+            force_unique_atoms_a,
+            force_unique_atoms_b,
         ) = (
             _prepare_covalent_atom_map(inputs, mapping_settings)
         )
@@ -4566,6 +4605,8 @@ def run_covalent_pair(settings, pair):
             inactive_z_matrix_root_atoms_b=inactive_z_matrix_roots_b,
             alchemical_bonds_a=alchemical_bonds_a,
             alchemical_bonds_b=alchemical_bonds_b,
+            force_unique_atoms_a=force_unique_atoms_a,
+            force_unique_atoms_b=force_unique_atoms_b,
         )
         physical_reference_a = create_solvated_capped_reference(
             parameters_a,

@@ -124,6 +124,14 @@ def _mapping_settings(workflow):
             "'paired_smarts_transmutation', or 'explicit_pairs'"
         )
     settings["method"] = method
+    if method != "explicit_pairs" and (
+        "force_unique_atoms_a_0based" in settings
+        or "force_unique_atoms_b_0based" in settings
+    ):
+        raise HybridWorkflowError(
+            "workflow.alchemy.mapping.force_unique_atoms_*_0based requires "
+            "explicit_pairs"
+        )
     if "alchemical_bonds" in settings:
         if method != "explicit_pairs":
             raise HybridWorkflowError(
@@ -173,11 +181,21 @@ def _mapping_settings(workflow):
                 settings.get("inactive_bonded_atoms_b_0based", []),
                 "workflow.alchemy.mapping.inactive_bonded_atoms_b_0based",
             )
+            force_unique_a = _strict_nonnegative_indices(
+                settings.get("force_unique_atoms_a_0based", []),
+                "workflow.alchemy.mapping.force_unique_atoms_a_0based",
+            )
+            force_unique_b = _strict_nonnegative_indices(
+                settings.get("force_unique_atoms_b_0based", []),
+                "workflow.alchemy.mapping.force_unique_atoms_b_0based",
+            )
         except ValueError as exc:
             raise HybridWorkflowError(str(exc)) from exc
         settings["pairs_0based"] = [list(pair) for pair in pairs]
         settings["inactive_bonded_atoms_a_0based"] = inactive_a
         settings["inactive_bonded_atoms_b_0based"] = inactive_b
+        settings["force_unique_atoms_a_0based"] = force_unique_a
+        settings["force_unique_atoms_b_0based"] = force_unique_b
     geometry = str(settings.get("inactive_bonded_geometry", "bond_only")).lower()
     if geometry not in {"bond_only", "terminal_z_matrix"}:
         raise HybridWorkflowError(
@@ -745,6 +763,8 @@ def _prepare_pair(pair, receptor, workflow, workdir, base_dir=None):
             tuple(entry["atoms_0based"])
             for entry in (mapping_payload.get("alchemical_bonds") or {}).get("ligand_b", [])
         },
+        force_unique_atoms_a=set(mapping_payload["force_unique_atoms_a_0based"]),
+        force_unique_atoms_b=set(mapping_payload["force_unique_atoms_b_0based"]),
     )
     hybrid = add_common_sigma_holes(hybrid, parameters_a, parameters_b)
     mapping_payload["inactive_z_matrix_terms"] = inactive_z_matrix_metadata(hybrid)

@@ -1270,7 +1270,28 @@ def _test_covalent_mapping_settings_accept_explicit_pairs():
     assert settings == {
         "method": "explicit_pairs",
         "pairs_0based": [[0, 1], [2, 3]],
+        "force_unique_atoms_a_0based": [],
+        "force_unique_atoms_b_0based": [],
     }
+
+
+def _test_covalent_mapping_settings_preserve_force_unique_hydrogens():
+    settings = _mapping_settings(
+        {
+            "alchemy": {
+                "mapping": {
+                    "method": "explicit_pairs",
+                    "pairs_0based": [[0, 1]],
+                    "force_unique_atoms_a_0based": [7],
+                    "force_unique_atoms_b_0based": [9],
+                }
+            }
+        },
+        {},
+    )
+
+    assert settings["force_unique_atoms_a_0based"] == [7]
+    assert settings["force_unique_atoms_b_0based"] == [9]
 
 
 def _test_covalent_mapping_settings_preserve_explicit_legacy_geometry():

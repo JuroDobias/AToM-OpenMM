@@ -120,6 +120,8 @@ def complete_covalent_atom_map(
     transmuted_pairs: set[tuple[int, int]] | None = None,
     alchemical_bonds_a: set[tuple[int, int]] | None = None,
     alchemical_bonds_b: set[tuple[int, int]] | None = None,
+    force_unique_atoms_a: set[int] | None = None,
+    force_unique_atoms_b: set[int] | None = None,
 ) -> dict[int, int]:
     """Complete mapped heavy atoms with compatible hydrogens and validate the map."""
     molecule_a = normalize_mapping_aromaticity(molecule_a)
@@ -129,6 +131,8 @@ def complete_covalent_atom_map(
     transmuted = set(transmuted_pairs or ())
     alchemical_bonds_a = {tuple(sorted(pair)) for pair in (alchemical_bonds_a or ())}
     alchemical_bonds_b = {tuple(sorted(pair)) for pair in (alchemical_bonds_b or ())}
+    force_unique_a = set(force_unique_atoms_a or ())
+    force_unique_b = set(force_unique_atoms_b or ())
     if len(required) != len(required_pairs or ()):
         raise CovalentAlchemyError("required covalent atom pairs contain duplicates")
     if len(set(mapping.values())) != len(mapping):
@@ -141,6 +145,18 @@ def complete_covalent_atom_map(
         for atom_a, atom_b in set(mapping.items()) | required
     ):
         raise CovalentAlchemyError("covalent atom pair is outside the molecule")
+    for label, molecule, selected in (
+        ("ligand-A", molecule_a, force_unique_a),
+        ("ligand-B", molecule_b, force_unique_b),
+    ):
+        if any(atom < 0 or atom >= molecule.GetNumAtoms() for atom in selected):
+            raise CovalentAlchemyError(f"force-unique {label} atom is outside the molecule")
+        if any(molecule.GetAtomWithIdx(atom).GetAtomicNum() != 1 for atom in selected):
+            raise CovalentAlchemyError(f"force-unique {label} atoms must be hydrogens")
+    if force_unique_a & set(mapping):
+        raise CovalentAlchemyError("force-unique ligand-A atom is explicitly mapped")
+    if force_unique_b & set(mapping.values()):
+        raise CovalentAlchemyError("force-unique ligand-B atom is explicitly mapped")
     required_heavy = {
         (atom_a, atom_b)
         for atom_a, atom_b in required
@@ -165,10 +181,13 @@ def complete_covalent_atom_map(
         )
         remaining_a = [
             atom for atom in hydrogens_a
-            if atom not in mapping
+            if atom not in mapping and atom not in force_unique_a
         ]
         mapped_b = set(mapping.values())
-        remaining_b = [atom for atom in hydrogens_b if atom not in mapped_b]
+        remaining_b = [
+            atom for atom in hydrogens_b
+            if atom not in mapped_b and atom not in force_unique_b
+        ]
         if len(remaining_a) != len(remaining_b):
             continue
         best = None
@@ -189,6 +208,8 @@ def complete_covalent_atom_map(
         raise CovalentAlchemyError(
             "covalent atom map could not preserve all required explicit-hydrogen pairs"
         )
+    if force_unique_a & set(mapping) or force_unique_b & set(mapping.values()):
+        raise CovalentAlchemyError("force-unique hydrogen was added to the completed atom map")
     for atom_a, atom_b in mapping.items():
         left = molecule_a.GetAtomWithIdx(atom_a)
         right = molecule_b.GetAtomWithIdx(atom_b)
@@ -1244,6 +1265,8 @@ def build_covalent_hybrid_molecule(
     inactive_z_matrix_root_atoms_b: set[int] | None = None,
     alchemical_bonds_a: set[tuple[int, int]] | None = None,
     alchemical_bonds_b: set[tuple[int, int]] | None = None,
+    force_unique_atoms_a: set[int] | None = None,
+    force_unique_atoms_b: set[int] | None = None,
 ) -> CovalentHybridMolecule:
     molecule_a = _rdkit_molecule(parameters_a)
     molecule_b = _rdkit_molecule(parameters_b)
@@ -1268,6 +1291,8 @@ def build_covalent_hybrid_molecule(
             transmuted_pairs=transmuted_pairs,
             alchemical_bonds_a=alchemical_bonds_a,
             alchemical_bonds_b=alchemical_bonds_b,
+            force_unique_atoms_a=force_unique_atoms_a,
+            force_unique_atoms_b=force_unique_atoms_b,
         )
     inactive_bonded_atoms_a = set(inactive_bonded_atoms_a or ())
     inactive_bonded_atoms_b = set(inactive_bonded_atoms_b or ())
@@ -1297,6 +1322,10 @@ def build_covalent_hybrid_molecule(
             next_index += 1
     unique_a = set(range(molecule_a.GetNumAtoms())) - set(map_a_to_b)
     unique_b = set(range(molecule_b.GetNumAtoms())) - set(map_a_to_b.values())
+    if not set(force_unique_atoms_a or ()) <= unique_a:
+        raise CovalentAlchemyError("force-unique ligand-A atoms must be endpoint-unique")
+    if not set(force_unique_atoms_b or ()) <= unique_b:
+        raise CovalentAlchemyError("force-unique ligand-B atoms must be endpoint-unique")
     alchemical_bonds_a = {tuple(sorted(pair)) for pair in (alchemical_bonds_a or ())}
     alchemical_bonds_b = {tuple(sorted(pair)) for pair in (alchemical_bonds_b or ())}
     _validate_alchemical_bonds(molecule_a, alchemical_bonds_a, unique_a, "a")

@@ -584,6 +584,8 @@ workflow:
         - [0, 0]
         - [1, 1]
         - [2, 2]
+      force_unique_atoms_a_0based: [17]
+      force_unique_atoms_b_0based: [18]
       junction_bonds:
         ligand_b:
           - atoms_0based: [8, 12]
@@ -598,7 +600,14 @@ common heavy-atom pair and form a connected heavy-atom core in both ligands.
 Compatible hydrogens attached to mapped parent atoms are completed
 automatically, but explicitly requested pairs always take precedence. Input
 SDF/MOL files must contain explicit hydrogens when a requested pair references
-one. Element-changing pairs are detected as mapped-atom transmutations and
+one. `force_unique_atoms_a_0based` and `force_unique_atoms_b_0based` exclude
+selected explicit hydrogens from automatic completion, leaving them as
+endpoint-specific dummy atoms. This is useful when a mapped stereocenter must
+carry a different hydrogen branch in each endpoint. Forced atoms must be
+hydrogens, cannot also occur in `pairs_0based`, and are recorded separately in
+the mapping output. This option does not remove a changing heavy-atom bond;
+declare that bond under `alchemical_bonds` when needed. Element-changing pairs
+are detected as mapped-atom transmutations and
 currently require NEQTI. Legacy inactive atom lists remain accepted but cannot
 be combined with `junction_bonds`. The mapping output records requested pairs, automatically
 completed hydrogen pairs, the final map, and detected transmutations separately.

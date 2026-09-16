@@ -176,6 +176,99 @@ def _test_explicit_pairs_preserve_hydrogen_to_fluorine_transmutation():
     )
 
 
+def _test_explicit_pairs_can_force_stereocenter_hydrogens_unique():
+    ligand_a = _parameters("CC(O)C")
+    ligand_b = _parameters("CC(O)C")
+    molecule_a = ligand_a.molecule.to_rdkit()
+    molecule_b = ligand_b.molecule.to_rdkit()
+    heavy_pairs = [
+        [index, index]
+        for index, atom in enumerate(molecule_a.GetAtoms())
+        if atom.GetAtomicNum() != 1
+    ]
+    center = 1
+    hydrogen_a = next(
+        atom.GetIdx() for atom in molecule_a.GetAtomWithIdx(center).GetNeighbors()
+        if atom.GetAtomicNum() == 1
+    )
+    hydrogen_b = next(
+        atom.GetIdx() for atom in molecule_b.GetAtomWithIdx(center).GetNeighbors()
+        if atom.GetAtomicNum() == 1
+    )
+
+    mapping, metadata = build_hybrid_atom_map(
+        ligand_a,
+        ligand_b,
+        {
+            "method": "explicit_pairs",
+            "pairs_0based": heavy_pairs,
+            "force_unique_atoms_a_0based": [hydrogen_a],
+            "force_unique_atoms_b_0based": [hydrogen_b],
+        },
+    )
+
+    assert hydrogen_a not in mapping
+    assert hydrogen_b not in mapping.values()
+    assert metadata["force_unique_atoms_a_0based"] == [hydrogen_a]
+    assert metadata["force_unique_atoms_b_0based"] == [hydrogen_b]
+    assert hydrogen_a in metadata["inactive_bonded_atoms_a_0based"]
+    assert hydrogen_b in metadata["inactive_bonded_atoms_b_0based"]
+    assert all(
+        hydrogen_a != atom_a and hydrogen_b != atom_b
+        for atom_a, atom_b in metadata["auto_completed_hydrogen_pairs_0based"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    (
+        ({"force_unique_atoms_a_0based": [0]}, "must be hydrogens"),
+        ({"force_unique_atoms_b_0based": [0]}, "must be hydrogens"),
+        ({"force_unique_atoms_a_0based": [999]}, "outside the molecule"),
+    ),
+)
+def _test_explicit_pairs_reject_invalid_force_unique_atoms(extra, message):
+    ligand_a = _parameters("CC")
+    ligand_b = _parameters("CC")
+    settings = {
+        "method": "explicit_pairs",
+        "pairs_0based": [[0, 0], [1, 1]],
+        **extra,
+    }
+    with pytest.raises(HybridMappingError, match=message):
+        build_hybrid_atom_map(ligand_a, ligand_b, settings)
+
+
+def _test_explicit_pairs_reject_mapped_force_unique_hydrogen():
+    ligand_a = _parameters("C")
+    ligand_b = _parameters("C")
+    hydrogen = next(
+        atom.molecule_atom_index for atom in ligand_a.molecule.atoms
+        if atom.atomic_number == 1
+    )
+    with pytest.raises(HybridMappingError, match="explicitly mapped"):
+        build_hybrid_atom_map(
+            ligand_a,
+            ligand_b,
+            {
+                "method": "explicit_pairs",
+                "pairs_0based": [[0, 0], [hydrogen, hydrogen]],
+                "force_unique_atoms_a_0based": [hydrogen],
+            },
+        )
+
+
+def _test_force_unique_atoms_require_explicit_pairs():
+    ligand_a = _parameters("CC")
+    ligand_b = _parameters("CC")
+    with pytest.raises(HybridMappingError, match="requires mapping.method explicit_pairs"):
+        build_hybrid_atom_map(
+            ligand_a,
+            ligand_b,
+            {"method": "mcs", "force_unique_atoms_a_0based": [2]},
+        )
+
+
 def _test_explicit_pairs_support_explicit_inactive_atoms():
     ligand_a = _parameters("CC(=O)NC1=CC=CC=C1")
     ligand_b = _parameters("CS(=O)(=O)NC1=CC=CC=C1")

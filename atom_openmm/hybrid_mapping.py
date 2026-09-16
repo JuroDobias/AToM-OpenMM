@@ -523,6 +523,14 @@ def _paired_smarts_transmutation_map(molecule_a, molecule_b, settings):
 
 def _explicit_pairs_map(molecule_a, molecule_b, settings):
     pairs = _strict_explicit_pairs(settings.get("pairs_0based"))
+    force_unique_a = set(_strict_nonnegative_indices(
+        settings.get("force_unique_atoms_a_0based", []),
+        "explicit_pairs force_unique_atoms_a_0based",
+    ))
+    force_unique_b = set(_strict_nonnegative_indices(
+        settings.get("force_unique_atoms_b_0based", []),
+        "explicit_pairs force_unique_atoms_b_0based",
+    ))
     inactive_a = set(
         _strict_nonnegative_indices(
             settings.get("inactive_bonded_atoms_a_0based", []),
@@ -570,6 +578,8 @@ def _explicit_pairs_map(molecule_a, molecule_b, settings):
         transmuted_pairs=transmuted,
         alchemical_bonds_a=alchemical_a,
         alchemical_bonds_b=alchemical_b,
+        force_unique_atoms_a=force_unique_a,
+        force_unique_atoms_b=force_unique_b,
     )
     reverse_mapping = {atom_b: atom_a for atom_a, atom_b in mapping.items()}
     for endpoint, selected in (("ligand_a", alchemical_a), ("ligand_b", alchemical_b)):
@@ -602,6 +612,8 @@ def _explicit_pairs_map(molecule_a, molecule_b, settings):
         )
     unique_a = set(range(molecule_a.GetNumAtoms())) - set(mapping)
     unique_b = set(range(molecule_b.GetNumAtoms())) - set(mapping.values())
+    if not force_unique_a <= unique_a or not force_unique_b <= unique_b:
+        raise HybridMappingError("force-unique hydrogens must remain endpoint-unique")
     if not inactive_a <= unique_a:
         raise HybridMappingError(
             "explicit_pairs inactive ligand-A atoms must be endpoint-unique"
@@ -620,6 +632,8 @@ def _explicit_pairs_map(molecule_a, molecule_b, settings):
         {},
         requested_pairs,
         completed_hydrogens,
+        force_unique_a,
+        force_unique_b,
     )
 
 
@@ -637,8 +651,17 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
         "ligand_b": sum(atom.GetIsAromatic() for atom in molecule_b.GetAtoms()),
     }
     method = settings.get("method", "mcs")
+    if method != "explicit_pairs" and (
+        "force_unique_atoms_a_0based" in settings
+        or "force_unique_atoms_b_0based" in settings
+    ):
+        raise HybridMappingError(
+            "force_unique_atoms_*_0based requires mapping.method explicit_pairs"
+        )
     requested_pairs = ()
     completed_hydrogen_pairs = set()
+    force_unique_a = set()
+    force_unique_b = set()
     if method == "mcs":
         mapping = find_covalent_atom_map(molecule_a, molecule_b)
     elif method == "mcs_core_smarts":
@@ -672,6 +695,8 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
             matched_labels_b,
             requested_pairs,
             completed_hydrogen_pairs,
+            force_unique_a,
+            force_unique_b,
         ) = _explicit_pairs_map(molecule_a, molecule_b, settings)
     else:
         raise HybridMappingError(
@@ -798,6 +823,8 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
         "auto_completed_hydrogen_pairs_0based": [
             list(pair) for pair in sorted(completed_hydrogen_pairs)
         ],
+        "force_unique_atoms_a_0based": sorted(force_unique_a),
+        "force_unique_atoms_b_0based": sorted(force_unique_b),
         "transmuted_pairs_0based": [list(pair) for pair in sorted(transmuted)],
         "transmuted_pairs_1based": [[a + 1, b + 1] for a, b in sorted(transmuted)],
         "inactive_bonded_atoms_a_0based": sorted(inactive_a),
