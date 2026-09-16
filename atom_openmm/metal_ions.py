@@ -17,10 +17,31 @@ class MetalIonParameterError(ValueError):
 PANTEVA_FORCE_NAME = "Panteva modified Mg 12-6-4"
 
 # Amber's distributed polarizability table predates some GAFF2 atom types.
-# ``nu`` is an amine nitrogen type and uses the same elemental nitrogen
-# polarizability as the other standard GAFF/GAFF2 nitrogen classes.
+# Map only to chemically equivalent classes already present in that table.
+# Keep these aliases ahead of the legacy uppercase fallback: for example,
+# GAFF2 ``op`` is a small-ring ether oxygen, not Amber ``OP``.
 PANTEVA_POLARIZABILITY_ALIASES = {
-    "nu": "n",
+    # Carbon: c5/c6 are ring-specific sp3 carbons; cs is an sp2 C=S carbon.
+    "c5": "c3",
+    "c6": "c3",
+    "cs": "c",
+    # Hydrogen in a bridge has the standard non-hydroxyl H polarizability.
+    "hb": "H",
+    # All ordinary GAFF/GAFF2 nitrogen classes use 1.090 in the table.
+    **{
+        atom_type: "n"
+        for atom_type in (
+            "n+", "n5", "n6", "n7", "n8", "n9", "ni", "nj", "nk",
+            "nl", "nm", "nn", "np", "nq", "ns", "nt", "nu", "nv",
+            "nx", "ny", "nz",
+        )
+    },
+    # Three- and four-membered ring oxygens are two-connected ether oxygens.
+    "op": "os",
+    "oq": "os",
+    # Amber assigns the same polarizability to all standard sulfur classes.
+    "sp": "s",
+    "sq": "s",
 }
 
 
@@ -116,12 +137,12 @@ def apply_panteva_m1264(system, topology, *, atom_classes,
         if atom_class == "EP" and system.isVirtualSite(atom.index):
             c4_values.append(0.0)
             continue
-        if atom_class not in polarizabilities and atom_class is not None and atom_class.upper() in polarizabilities:
-            atom_class = atom_class.upper()
         if atom_class not in polarizabilities and atom_class in PANTEVA_POLARIZABILITY_ALIASES:
             original_class = atom_class
             atom_class = PANTEVA_POLARIZABILITY_ALIASES[atom_class]
             aliases_used[original_class] = atom_class
+        if atom_class not in polarizabilities and atom_class is not None and atom_class.upper() in polarizabilities:
+            atom_class = atom_class.upper()
         if atom_class not in polarizabilities:
             raise MetalIonParameterError(
                 f"missing Amber 12-6-4 polarizability for atom {atom.index} "

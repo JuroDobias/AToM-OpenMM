@@ -12,7 +12,8 @@ from atom_openmm.md_validation import (
     _metric_context, _phase_protocol, _run_md_phase, task_spec,
 )
 from atom_openmm.metal_ions import (
-    MetalIonParameterError, PANTEVA_FORCE_NAME, apply_panteva_m1264,
+    MetalIonParameterError, PANTEVA_FORCE_NAME,
+    PANTEVA_POLARIZABILITY_ALIASES, apply_panteva_m1264,
     c4_kcal_a4_to_kj_nm4, merge_panteva_endpoint_forces,
 )
 from atom_openmm.receptor_normalization import normalize_legacy_pdb
@@ -89,6 +90,75 @@ def test_panteva_accepts_gaff2_nu_as_standard_nitrogen(tmp_path):
     expected = c4_kcal_a4_to_kj_nm4(180.5 * 1.090 / 1.444)
     assert custom.getParticleParameters(1)[1] == pytest.approx(expected)
     assert result["polarizability_aliases_used"] == {"nu": "n"}
+
+
+@pytest.mark.parametrize(
+    ("gaff2_type", "target_type", "target_polarizability"),
+    [
+        ("c5", "c3", 1.061),
+        ("c6", "c3", 1.061),
+        ("cs", "c", 1.352),
+        ("hb", "H", 0.387),
+        ("n+", "n", 1.090),
+        ("n5", "n", 1.090),
+        ("n6", "n", 1.090),
+        ("n7", "n", 1.090),
+        ("n8", "n", 1.090),
+        ("n9", "n", 1.090),
+        ("ni", "n", 1.090),
+        ("nj", "n", 1.090),
+        ("nk", "n", 1.090),
+        ("nl", "n", 1.090),
+        ("nm", "n", 1.090),
+        ("nn", "n", 1.090),
+        ("np", "n", 1.090),
+        ("nq", "n", 1.090),
+        ("ns", "n", 1.090),
+        ("nt", "n", 1.090),
+        ("nu", "n", 1.090),
+        ("nv", "n", 1.090),
+        ("nx", "n", 1.090),
+        ("ny", "n", 1.090),
+        ("nz", "n", 1.090),
+        ("op", "os", 0.637),
+        ("oq", "os", 0.637),
+        ("sp", "s", 3.000),
+        ("sq", "s", 3.000),
+    ],
+)
+def test_panteva_gaff2_compatibility_aliases(
+    tmp_path, gaff2_type, target_type, target_polarizability
+):
+    topology = _minimal_topology()
+    system = _minimal_system(topology.getNumAtoms())
+    table = tmp_path / "lj_1264_pol.dat"
+    # Include a conflicting uppercase OP value to guard alias-before-uppercase
+    # resolution for GAFF2 op.
+    table.write_text(
+        "OW 1.444\nO2 0.569\nH 0.387\nc 1.352\nc3 1.061\n"
+        "n 1.090\nos 0.637\nOP 0.569\ns 3.000\n"
+    )
+
+    result = apply_panteva_m1264(
+        system,
+        topology,
+        atom_classes=["O2", gaff2_type, "O2", "OW"],
+        polarizability_table=table,
+    )
+
+    custom = next(
+        force
+        for force in system.getForces()
+        if isinstance(force, mm.CustomNonbondedForce)
+    )
+    expected = c4_kcal_a4_to_kj_nm4(
+        180.5 * target_polarizability / 1.444
+    )
+    assert custom.getParticleParameters(1)[1] == pytest.approx(expected)
+    assert PANTEVA_POLARIZABILITY_ALIASES[gaff2_type] == target_type
+    assert result["polarizability_aliases_used"] == {
+        gaff2_type: target_type
+    }
 
 
 def _test_panteva_exclusions_match_base_nonbonded_force(tmp_path):
