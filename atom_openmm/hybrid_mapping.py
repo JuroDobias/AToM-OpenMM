@@ -15,6 +15,10 @@ from atom_openmm.covalent_hybrid import (
 
 HybridMappingError = CovalentAlchemyError
 INACTIVE_GEOMETRIES = {"bond_only", "terminal_z_matrix"}
+_TETRAHEDRAL_CHIRAL_SIGNS = {
+    Chem.ChiralType.CHI_TETRAHEDRAL_CW: 1,
+    Chem.ChiralType.CHI_TETRAHEDRAL_CCW: -1,
+}
 
 
 def _strict_nonnegative_indices(raw, field, *, allow_empty=True):
@@ -55,6 +59,156 @@ def _strict_explicit_pairs(raw_pairs):
     ) != len(pairs):
         raise HybridMappingError("explicit_pairs atom map must be one-to-one")
     return pairs
+
+
+def _permutation_parity(source, target):
+    """Return +1/-1 for the permutation from source ordering to target."""
+    if len(source) != len(target) or set(source) != set(target):
+        raise HybridMappingError("cannot compare incompatible neighbor orderings")
+    positions = {value: index for index, value in enumerate(target)}
+    permutation = [positions[value] for value in source]
+    inversions = sum(
+        permutation[left] > permutation[right]
+        for left in range(len(permutation))
+        for right in range(left + 1, len(permutation))
+    )
+    return -1 if inversions % 2 else 1
+
+
+def _local_neighbor_compatible(atom_a, atom_b, center_a, center_b, molecule_a, molecule_b):
+    bond_a = molecule_a.GetBondBetweenAtoms(center_a, atom_a.GetIdx())
+    bond_b = molecule_b.GetBondBetweenAtoms(center_b, atom_b.GetIdx())
+    return (
+        atom_a.GetAtomicNum() == atom_b.GetAtomicNum()
+        and atom_a.GetFormalCharge() == atom_b.GetFormalCharge()
+        and atom_a.GetIsAromatic() == atom_b.GetIsAromatic()
+        and bond_a is not None
+        and bond_b is not None
+        and bond_a.GetBondType() == bond_b.GetBondType()
+        and bond_a.GetIsAromatic() == bond_b.GetIsAromatic()
+    )
+
+
+def _complete_local_neighbor_correspondence(
+    molecule_a, molecule_b, center_a, center_b, mapping
+):
+    """Build an unambiguous local correspondence without extending the atom map."""
+    neighbors_a = [atom.GetIdx() for atom in molecule_a.GetAtomWithIdx(center_a).GetNeighbors()]
+    neighbors_b = [atom.GetIdx() for atom in molecule_b.GetAtomWithIdx(center_b).GetNeighbors()]
+    if len(neighbors_a) != 4 or len(neighbors_b) != 4:
+        return None
+    neighbor_set_b = set(neighbors_b)
+    correspondence = {}
+    for atom_a in neighbors_a:
+        if atom_a not in mapping:
+            continue
+        atom_b = mapping[atom_a]
+        if atom_b not in neighbor_set_b or atom_b in correspondence.values():
+            return None
+        correspondence[atom_a] = atom_b
+
+    remaining_a = [atom for atom in neighbors_a if atom not in correspondence]
+    remaining_b = [atom for atom in neighbors_b if atom not in correspondence.values()]
+    while remaining_a:
+        candidates = {
+            atom_a: [
+                atom_b
+                for atom_b in remaining_b
+                if _local_neighbor_compatible(
+                    molecule_a.GetAtomWithIdx(atom_a),
+                    molecule_b.GetAtomWithIdx(atom_b),
+                    center_a,
+                    center_b,
+                    molecule_a,
+                    molecule_b,
+                )
+            ]
+            for atom_a in remaining_a
+        }
+        forced = [
+            (atom_a, values[0])
+            for atom_a, values in candidates.items()
+            if len(values) == 1
+            and sum(values[0] in other for other in candidates.values()) == 1
+        ]
+        if not forced:
+            return None
+        for atom_a, atom_b in forced:
+            correspondence[atom_a] = atom_b
+            remaining_a.remove(atom_a)
+            remaining_b.remove(atom_b)
+    return correspondence
+
+
+def _inverted_mapped_stereocenters(
+    molecule_a,
+    molecule_b,
+    mapping,
+    requested_pairs,
+    force_unique_a,
+    force_unique_b,
+):
+    """Identify unambiguous local inversions and their attached hydrogens."""
+    molecule_a = Chem.Mol(molecule_a)
+    molecule_b = Chem.Mol(molecule_b)
+    Chem.AssignStereochemistry(molecule_a, cleanIt=True, force=True)
+    Chem.AssignStereochemistry(molecule_b, cleanIt=True, force=True)
+    requested = set(requested_pairs)
+    detected = []
+    automatic_a = set()
+    automatic_b = set()
+    for center_a, center_b in sorted(mapping.items()):
+        atom_a = molecule_a.GetAtomWithIdx(center_a)
+        atom_b = molecule_b.GetAtomWithIdx(center_b)
+        sign_a = _TETRAHEDRAL_CHIRAL_SIGNS.get(atom_a.GetChiralTag())
+        sign_b = _TETRAHEDRAL_CHIRAL_SIGNS.get(atom_b.GetChiralTag())
+        if sign_a is None or sign_b is None:
+            continue
+        hydrogens_a = [
+            atom.GetIdx() for atom in atom_a.GetNeighbors() if atom.GetAtomicNum() == 1
+        ]
+        hydrogens_b = [
+            atom.GetIdx() for atom in atom_b.GetNeighbors() if atom.GetAtomicNum() == 1
+        ]
+        if len(hydrogens_a) != 1 or len(hydrogens_b) != 1:
+            continue
+        correspondence = _complete_local_neighbor_correspondence(
+            molecule_a, molecule_b, center_a, center_b, mapping
+        )
+        if correspondence is None:
+            continue
+        order_a_in_b = [
+            correspondence[neighbor.GetIdx()] for neighbor in atom_a.GetNeighbors()
+        ]
+        order_b = [neighbor.GetIdx() for neighbor in atom_b.GetNeighbors()]
+        mapped_sign_b = sign_b * _permutation_parity(order_b, order_a_in_b)
+        if sign_a == mapped_sign_b:
+            continue
+
+        hydrogen_a = hydrogens_a[0]
+        hydrogen_b = hydrogens_b[0]
+        if (hydrogen_a, hydrogen_b) in requested:
+            action = "explicit_mapping_preserved"
+        elif hydrogen_a in force_unique_a or hydrogen_b in force_unique_b:
+            action = "already_force_unique"
+        elif hydrogen_a in mapping or hydrogen_b in mapping.values():
+            # Requested non-H transmutations and nonlocal H mappings remain authoritative.
+            action = "explicit_mapping_preserved"
+        else:
+            automatic_a.add(hydrogen_a)
+            automatic_b.add(hydrogen_b)
+            action = "automatically_forced_unique"
+        detected.append(
+            {
+                "ligand_a_center_0based": center_a,
+                "ligand_b_center_0based": center_b,
+                "ligand_a_hydrogen_0based": hydrogen_a,
+                "ligand_b_hydrogen_0based": hydrogen_b,
+                "comparison": "mapped_local_tetrahedral_parity",
+                "hydrogen_action": action,
+            }
+        )
+    return detected, automatic_a, automatic_b
 
 
 def normalize_junction_bonds(raw):
@@ -570,6 +724,20 @@ def _explicit_pairs_map(molecule_a, molecule_b, settings):
     alchemical_b = {
         tuple(sorted(entry["atoms_0based"])) for entry in alchemical["ligand_b"]
     }
+    (
+        inverted_stereocenters,
+        automatic_stereo_hydrogens_a,
+        automatic_stereo_hydrogens_b,
+    ) = _inverted_mapped_stereocenters(
+        molecule_a,
+        molecule_b,
+        mapping,
+        requested_pairs,
+        force_unique_a,
+        force_unique_b,
+    )
+    force_unique_a.update(automatic_stereo_hydrogens_a)
+    force_unique_b.update(automatic_stereo_hydrogens_b)
     mapping = complete_covalent_atom_map(
         molecule_a,
         molecule_b,
@@ -634,6 +802,9 @@ def _explicit_pairs_map(molecule_a, molecule_b, settings):
         completed_hydrogens,
         force_unique_a,
         force_unique_b,
+        inverted_stereocenters,
+        automatic_stereo_hydrogens_a,
+        automatic_stereo_hydrogens_b,
     )
 
 
@@ -662,6 +833,9 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
     completed_hydrogen_pairs = set()
     force_unique_a = set()
     force_unique_b = set()
+    inverted_stereocenters = []
+    automatic_stereo_hydrogens_a = set()
+    automatic_stereo_hydrogens_b = set()
     if method == "mcs":
         mapping = find_covalent_atom_map(molecule_a, molecule_b)
     elif method == "mcs_core_smarts":
@@ -697,6 +871,9 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
             completed_hydrogen_pairs,
             force_unique_a,
             force_unique_b,
+            inverted_stereocenters,
+            automatic_stereo_hydrogens_a,
+            automatic_stereo_hydrogens_b,
         ) = _explicit_pairs_map(molecule_a, molecule_b, settings)
     else:
         raise HybridMappingError(
@@ -825,6 +1002,11 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
         ],
         "force_unique_atoms_a_0based": sorted(force_unique_a),
         "force_unique_atoms_b_0based": sorted(force_unique_b),
+        "automatically_forced_unique_stereo_hydrogens": {
+            "ligand_a": sorted(automatic_stereo_hydrogens_a),
+            "ligand_b": sorted(automatic_stereo_hydrogens_b),
+        },
+        "inverted_stereocenters_0based": inverted_stereocenters,
         "transmuted_pairs_0based": [list(pair) for pair in sorted(transmuted)],
         "transmuted_pairs_1based": [[a + 1, b + 1] for a, b in sorted(transmuted)],
         "inactive_bonded_atoms_a_0based": sorted(inactive_a),

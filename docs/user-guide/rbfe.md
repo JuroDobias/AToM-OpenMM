@@ -612,14 +612,24 @@ common heavy-atom pair and form a connected heavy-atom core in both ligands.
 Compatible hydrogens attached to mapped parent atoms are completed
 automatically, but explicitly requested pairs always take precedence. Input
 SDF/MOL files must contain explicit hydrogens when a requested pair references
-one. `force_unique_atoms_a_0based` and `force_unique_atoms_b_0based` exclude
-selected explicit hydrogens from automatic completion, leaving them as
-endpoint-specific dummy atoms. This is useful when a mapped stereocenter must
-carry a different hydrogen branch in each endpoint. Forced atoms must be
-hydrogens, cannot also occur in `pairs_0based`, and are recorded separately in
-the mapping output. This option does not remove a changing heavy-atom bond;
-declare that bond under `alchemical_bonds` when needed. Element-changing pairs
-are detected as mapped-atom transmutations and
+one. For mapped tetrahedral centers with opposite mapped local chirality, an
+unrequested attached H-to-H pair is automatically kept endpoint-unique. The
+comparison uses mapped neighbor identities and tetrahedral permutation parity,
+not raw CIP R/S labels, so a priority change alone does not trigger it. Exactly
+one unambiguous unmatched neighboring branch may be used for the local
+comparison without adding that branch to the atom map. Unassigned or ambiguous
+stereochemistry is left unchanged. An explicitly requested hydrogen pair or
+hydrogen-to-element transmutation remains authoritative.
+
+`force_unique_atoms_a_0based` and `force_unique_atoms_b_0based` remain available
+to exclude selected explicit hydrogens from automatic completion, leaving them
+as endpoint-specific dummy atoms. Forced atoms must be hydrogens, cannot also
+occur in `pairs_0based`, and are recorded separately in the mapping output.
+Automatically selected stereochemical hydrogens are reported under
+`automatically_forced_unique_stereo_hydrogens`, with the detected centers and
+actions under `inverted_stereocenters_0based`. This option does not remove a
+changing heavy-atom bond; declare that bond under `alchemical_bonds` when
+needed. Element-changing pairs are detected as mapped-atom transmutations and
 currently require NEQTI. Legacy inactive atom lists remain accepted but cannot
 be combined with `junction_bonds`. The mapping output records requested pairs, automatically
 completed hydrogen pairs, the final map, and detected transmutations separately.
@@ -655,8 +665,8 @@ the closure bond follow the existing sterics path unless the finer
 `scheme1_soft_bond` path is selected. The changing bond may join two mapped
 atoms or a mapped atom to an endpoint-unique annulation branch. It
 must be an unconstrained ring bond whose removal leaves the molecule connected.
-Initial support is limited to one changing bond, authoritative `explicit_pairs`,
-and NEQTI. The publication-style topology-pair schedule currently requires every
+Initial support is limited to at most one changing bond in each endpoint,
+authoritative `explicit_pairs`, and NEQTI. The publication-style topology-pair schedule currently requires every
 changed exclusion/1-4 pair to include an endpoint-unique atom; a topology-only
 closure entirely inside the mapped common core remains unsupported by that path.
 Multi-bond linker contractions and aromatic bond-order rearrangements remain

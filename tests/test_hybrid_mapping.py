@@ -219,6 +219,205 @@ def _test_explicit_pairs_can_force_stereocenter_hydrogens_unique():
     )
 
 
+def _stereocenter_and_hydrogen(parameters):
+    molecule = parameters.molecule.to_rdkit()
+    Chem.AssignStereochemistry(molecule, cleanIt=True, force=True)
+    center = next(
+        atom
+        for atom in molecule.GetAtoms()
+        if atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
+    )
+    hydrogen = next(
+        atom.GetIdx() for atom in center.GetNeighbors() if atom.GetAtomicNum() == 1
+    )
+    return molecule, center.GetIdx(), hydrogen
+
+
+def test_explicit_pairs_automatically_force_inverted_stereo_hydrogens_unique():
+    ligand_a = _parameters("C[C@H](O)F")
+    ligand_b = _parameters("C[C@@H](O)F")
+    molecule_a, center_a, hydrogen_a = _stereocenter_and_hydrogen(ligand_a)
+    molecule_b, center_b, hydrogen_b = _stereocenter_and_hydrogen(ligand_b)
+    heavy_pairs = [
+        [atom_a.GetIdx(), atom_b.GetIdx()]
+        for atom_a, atom_b in zip(molecule_a.GetAtoms(), molecule_b.GetAtoms())
+        if atom_a.GetAtomicNum() != 1 and atom_b.GetAtomicNum() != 1
+    ]
+
+    mapping, metadata = build_hybrid_atom_map(
+        ligand_a,
+        ligand_b,
+        {"method": "explicit_pairs", "pairs_0based": heavy_pairs},
+    )
+
+    assert hydrogen_a not in mapping
+    assert hydrogen_b not in mapping.values()
+    assert metadata["automatically_forced_unique_stereo_hydrogens"] == {
+        "ligand_a": [hydrogen_a],
+        "ligand_b": [hydrogen_b],
+    }
+    assert metadata["force_unique_atoms_a_0based"] == [hydrogen_a]
+    assert metadata["force_unique_atoms_b_0based"] == [hydrogen_b]
+    assert metadata["inverted_stereocenters_0based"] == [{
+        "ligand_a_center_0based": center_a,
+        "ligand_b_center_0based": center_b,
+        "ligand_a_hydrogen_0based": hydrogen_a,
+        "ligand_b_hydrogen_0based": hydrogen_b,
+        "comparison": "mapped_local_tetrahedral_parity",
+        "hydrogen_action": "automatically_forced_unique",
+    }]
+    assert hydrogen_a in metadata["inactive_bonded_atoms_a_0based"]
+    assert hydrogen_b in metadata["inactive_bonded_atoms_b_0based"]
+
+
+def test_inverted_stereo_detection_keeps_unmatched_neighbor_branch_unique():
+    ligand_a = _parameters("C[C@H](O)F")
+    ligand_b = _parameters("C[C@@H](O)F")
+    molecule_a, _center_a, hydrogen_a = _stereocenter_and_hydrogen(ligand_a)
+    molecule_b, _center_b, hydrogen_b = _stereocenter_and_hydrogen(ligand_b)
+    oxygen_a = next(
+        atom.GetIdx() for atom in molecule_a.GetAtoms() if atom.GetAtomicNum() == 8
+    )
+    oxygen_b = next(
+        atom.GetIdx() for atom in molecule_b.GetAtoms() if atom.GetAtomicNum() == 8
+    )
+    heavy_pairs = [
+        [atom_a.GetIdx(), atom_b.GetIdx()]
+        for atom_a, atom_b in zip(molecule_a.GetAtoms(), molecule_b.GetAtoms())
+        if atom_a.GetAtomicNum() != 1
+        and atom_b.GetAtomicNum() != 1
+        and atom_a.GetIdx() != oxygen_a
+        and atom_b.GetIdx() != oxygen_b
+    ]
+
+    mapping, metadata = build_hybrid_atom_map(
+        ligand_a,
+        ligand_b,
+        {"method": "explicit_pairs", "pairs_0based": heavy_pairs},
+    )
+
+    assert oxygen_a not in mapping
+    assert oxygen_b not in mapping.values()
+    assert hydrogen_a not in mapping
+    assert hydrogen_b not in mapping.values()
+    assert metadata["automatically_forced_unique_stereo_hydrogens"] == {
+        "ligand_a": [hydrogen_a],
+        "ligand_b": [hydrogen_b],
+    }
+
+
+def test_explicit_pairs_complete_retained_stereo_hydrogen():
+    ligand_a = _parameters("C[C@H](O)F")
+    ligand_b = _parameters("C[C@H](O)F")
+    molecule_a, _center_a, hydrogen_a = _stereocenter_and_hydrogen(ligand_a)
+    molecule_b, _center_b, hydrogen_b = _stereocenter_and_hydrogen(ligand_b)
+    heavy_pairs = [
+        [atom_a.GetIdx(), atom_b.GetIdx()]
+        for atom_a, atom_b in zip(molecule_a.GetAtoms(), molecule_b.GetAtoms())
+        if atom_a.GetAtomicNum() != 1 and atom_b.GetAtomicNum() != 1
+    ]
+
+    mapping, metadata = build_hybrid_atom_map(
+        ligand_a,
+        ligand_b,
+        {"method": "explicit_pairs", "pairs_0based": heavy_pairs},
+    )
+
+    assert mapping[hydrogen_a] == hydrogen_b
+    assert metadata["automatically_forced_unique_stereo_hydrogens"] == {
+        "ligand_a": [],
+        "ligand_b": [],
+    }
+    assert metadata["inverted_stereocenters_0based"] == []
+
+
+def test_mapped_local_stereo_is_independent_of_endpoint_atom_order():
+    ligand_a = _parameters("C[C@H](O)F")
+    original_b = _parameters("C[C@H](O)F")
+    molecule_b = original_b.molecule.to_rdkit()
+    order = list(reversed(range(molecule_b.GetNumAtoms())))
+    inverse_order = {old: new for new, old in enumerate(order)}
+    reordered_b = Chem.RenumberAtoms(molecule_b, order)
+    ligand_b = SimpleNamespace(
+        molecule=Molecule.from_rdkit(
+            reordered_b,
+            allow_undefined_stereo=False,
+            hydrogens_are_explicit=True,
+        )
+    )
+    molecule_a, _center_a, hydrogen_a = _stereocenter_and_hydrogen(ligand_a)
+    molecule_b, _center_b, hydrogen_b = _stereocenter_and_hydrogen(ligand_b)
+    heavy_pairs = [
+        [atom.GetIdx(), inverse_order[atom.GetIdx()]]
+        for atom in molecule_a.GetAtoms()
+        if atom.GetAtomicNum() != 1
+    ]
+
+    mapping, metadata = build_hybrid_atom_map(
+        ligand_a,
+        ligand_b,
+        {"method": "explicit_pairs", "pairs_0based": heavy_pairs},
+    )
+
+    assert mapping[hydrogen_a] == hydrogen_b
+    assert metadata["inverted_stereocenters_0based"] == []
+
+
+def test_explicit_pairs_ignore_cip_relabeling_without_local_inversion():
+    ligand_a = _parameters("C[C@H](F)Cl")
+    ligand_b = _parameters("C[C@H](F)N")
+    molecule_a, center_a, hydrogen_a = _stereocenter_and_hydrogen(ligand_a)
+    molecule_b, center_b, hydrogen_b = _stereocenter_and_hydrogen(ligand_b)
+    assert molecule_a.GetAtomWithIdx(center_a).GetProp("_CIPCode") == "R"
+    assert molecule_b.GetAtomWithIdx(center_b).GetProp("_CIPCode") == "S"
+    heavy_pairs = [
+        [atom_a.GetIdx(), atom_b.GetIdx()]
+        for atom_a, atom_b in zip(molecule_a.GetAtoms(), molecule_b.GetAtoms())
+        if atom_a.GetAtomicNum() != 1 and atom_b.GetAtomicNum() != 1
+    ]
+
+    mapping, metadata = build_hybrid_atom_map(
+        ligand_a,
+        ligand_b,
+        {"method": "explicit_pairs", "pairs_0based": heavy_pairs},
+    )
+
+    assert mapping[hydrogen_a] == hydrogen_b
+    assert metadata["inverted_stereocenters_0based"] == []
+
+
+def test_explicit_inverted_stereo_hydrogen_pair_remains_authoritative():
+    ligand_a = _parameters("C[C@H](O)F")
+    ligand_b = _parameters("C[C@@H](O)F")
+    molecule_a, center_a, hydrogen_a = _stereocenter_and_hydrogen(ligand_a)
+    molecule_b, center_b, hydrogen_b = _stereocenter_and_hydrogen(ligand_b)
+    pairs = [
+        [atom_a.GetIdx(), atom_b.GetIdx()]
+        for atom_a, atom_b in zip(molecule_a.GetAtoms(), molecule_b.GetAtoms())
+        if atom_a.GetAtomicNum() != 1 and atom_b.GetAtomicNum() != 1
+    ] + [[hydrogen_a, hydrogen_b]]
+
+    mapping, metadata = build_hybrid_atom_map(
+        ligand_a,
+        ligand_b,
+        {"method": "explicit_pairs", "pairs_0based": pairs},
+    )
+
+    assert mapping[hydrogen_a] == hydrogen_b
+    assert metadata["automatically_forced_unique_stereo_hydrogens"] == {
+        "ligand_a": [],
+        "ligand_b": [],
+    }
+    assert metadata["inverted_stereocenters_0based"] == [{
+        "ligand_a_center_0based": center_a,
+        "ligand_b_center_0based": center_b,
+        "ligand_a_hydrogen_0based": hydrogen_a,
+        "ligand_b_hydrogen_0based": hydrogen_b,
+        "comparison": "mapped_local_tetrahedral_parity",
+        "hydrogen_action": "explicit_mapping_preserved",
+    }]
+
+
 @pytest.mark.parametrize(
     ("extra", "message"),
     (
