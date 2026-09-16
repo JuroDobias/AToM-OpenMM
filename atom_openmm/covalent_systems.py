@@ -423,31 +423,45 @@ def solvate_capped_reference_hybrid(
         unit.nanometer,
     )
     provenance = dict(physical_a.provenance)
-    common_virtual_sites = [
+    virtual_sites = [
         index
         for index in range(hybrid.topology.getNumAtoms())
         if hybrid.endpoint_a.isVirtualSite(index)
     ]
+    unique_particles_a = [
+        int(hybrid.map_a_to_hybrid[index]) for index in hybrid.unique_a
+    ] + list(hybrid.unique_particle_indices_a)
+    unique_particles_b = [
+        int(hybrid.map_b_to_hybrid[index]) for index in hybrid.unique_b
+    ] + list(hybrid.unique_particle_indices_b)
     provenance.update(
         {
             "hybrid_solute_atom_count": hybrid.topology.getNumAtoms(),
             "mapped_atom_count": len(hybrid.map_a_to_b),
-            "unique_a_count": len(hybrid.unique_a),
-            "unique_b_count": len(hybrid.unique_b),
-            "unique_a_particle_indices": [
-                int(hybrid.map_a_to_hybrid[index]) for index in hybrid.unique_a
-            ],
-            "unique_b_particle_indices": [
-                int(hybrid.map_b_to_hybrid[index]) for index in hybrid.unique_b
-            ],
+            "unique_a_count": len(unique_particles_a),
+            "unique_b_count": len(unique_particles_b),
+            "unique_a_particle_indices": unique_particles_a,
+            "unique_b_particle_indices": unique_particles_b,
             "ligand_a_system_atom_indices": [
                 int(hybrid.map_a_to_hybrid[index])
                 for index in range(len(hybrid.map_a_to_hybrid))
-            ] + common_virtual_sites,
+            ] + virtual_sites,
             "ligand_b_system_atom_indices": [
                 int(hybrid.map_b_to_hybrid[index])
                 for index in range(len(hybrid.map_b_to_hybrid))
-            ] + common_virtual_sites,
+            ] + virtual_sites,
+            "alchemical_virtual_sites": [
+                {
+                    "particle_index": site.particle_index,
+                    "role": site.role,
+                    "parent_particle_indices": list(site.parent_particle_indices),
+                    "charge_a_e": site.charge_a_e,
+                    "charge_b_e": site.charge_b_e,
+                    "distance_a_angstrom": site.distance_a_angstrom,
+                    "distance_b_angstrom": site.distance_b_angstrom,
+                }
+                for site in hybrid.alchemical_virtual_sites
+            ],
             "anchor_pairs": [list(pair) for pair in hybrid.anchor_pairs],
             "attachment_pairs": None if hybrid.attachment_pairs is None else [
                 list(pair) for pair in hybrid.attachment_pairs

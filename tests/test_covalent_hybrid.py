@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import numpy as np
 import openmm as mm
 from openmm import unit
@@ -16,9 +18,13 @@ from atom_openmm.covalent_hybrid import (
     build_covalent_hybrid_molecule,
     complete_covalent_atom_map,
 )
-from atom_openmm.covalent_parameters import CovalentParameterBundle
+from atom_openmm.covalent_parameters import (
+    CovalentParameterBundle,
+    VirtualSiteParameter,
+)
 from atom_openmm.covalent_softcore import create_softcore_hamiltonian
 from atom_openmm.hybrid_mapping import build_hybrid_atom_map
+from atom_openmm.hybrid_virtual_sites import add_alchemical_sigma_holes
 
 
 def _bundle(smiles):
@@ -82,6 +88,38 @@ def test_endpoint_excludes_all_cross_branch_nonbonded_pairs():
     }
 
     assert expected <= exceptions
+
+
+def test_sigma_hole_on_unique_halogen_uses_endpoint_unique_charge_role():
+    left = _bundle("C")
+    right = _bundle("CCl")
+    molecule = right.molecule.to_rdkit()
+    halogen = next(
+        atom for atom in molecule.GetAtoms() if atom.GetAtomicNum() == 17
+    )
+    carbon = halogen.GetNeighbors()[0]
+    frame = next(
+        atom for atom in carbon.GetNeighbors() if atom.GetIdx() != halogen.GetIdx()
+    )
+    site = VirtualSiteParameter(
+        name="CL_EP_1",
+        kind="sigma_hole",
+        parent_atom_indices=(carbon.GetIdx(), halogen.GetIdx(), frame.GetIdx()),
+        distance_a=1.64,
+        charge_e=0.03,
+    )
+    right = replace(right, virtual_sites=(site,))
+    hybrid = build_covalent_hybrid_molecule(left, right)
+    original_particles = hybrid.endpoint_a.getNumParticles()
+
+    augmented = add_alchemical_sigma_holes(hybrid, left, right)
+
+    assert augmented.unique_particle_indices_a == ()
+    assert augmented.unique_particle_indices_b == (original_particles,)
+    assert augmented.alchemical_virtual_sites[0].role == "b"
+    assert augmented.alchemical_virtual_sites[0].parent_particle_indices[1] in {
+        augmented.map_b_to_hybrid[index] for index in augmented.unique_b
+    }
 
 
 def test_annulation_closure_is_absent_only_from_open_dummy_endpoint():

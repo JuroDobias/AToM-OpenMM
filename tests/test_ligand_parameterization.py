@@ -16,7 +16,12 @@ from atom_openmm.covalent_parameters import (
     CovalentParameterBundle,
     VirtualSiteParameter,
 )
-from atom_openmm.hybrid_virtual_sites import add_common_sigma_holes
+from atom_openmm.covalent_softcore import create_softcore_hamiltonian
+from atom_openmm.hybrid_virtual_sites import (
+    HybridVirtualSiteError,
+    add_alchemical_sigma_holes,
+    add_common_sigma_holes,
+)
 from atom_openmm.hybrid_parameters import _apply_fixed_sigma_holes
 from atom_openmm.ligand_parameterization import (
     LigandParameterizationError,
@@ -323,6 +328,155 @@ def _test_common_sigma_hole_is_added_to_both_endpoints():
     context.setPositions(augmented.positions)
     energy = context.getState(getEnergy=True).getPotentialEnergy()
     assert np.isfinite(energy.value_in_unit(unit.kilojoules_per_mole))
+
+
+def _test_cl_to_br_uses_endpoint_specific_sigma_holes():
+    topology, positions, endpoint_a, site_a = _hybrid_bundle(0.05)
+    _, _, endpoint_b, site_b = _hybrid_bundle(0.07)
+    site_b = VirtualSiteParameter(
+        name="BR_EP_1", kind="sigma_hole", parent_atom_indices=(0, 1, 2),
+        distance_a=1.90, charge_e=site_b.charge_e,
+    )
+    hybrid = CovalentHybridMolecule(
+        topology=topology, positions=positions, endpoint_a=endpoint_a,
+        endpoint_b=endpoint_b, map_a_to_b={0: 0, 1: 1, 2: 2},
+        map_a_to_hybrid={0: 0, 1: 1, 2: 2},
+        map_b_to_hybrid={0: 0, 1: 1, 2: 2}, unique_a=(), unique_b=(),
+        anchor_pairs=(), attachment_pairs=None,
+        dummy_bonded_scales=DummyBondedScales(), dummy_core_nonbonded="off",
+    )
+    parameters_a = CovalentParameterBundle(
+        _molecule("CCl"), endpoint_a, np.asarray([0.1, -0.15, 0.0]),
+        "a", {}, (site_a,),
+    )
+    parameters_b = CovalentParameterBundle(
+        _molecule("CBr"), endpoint_b, np.asarray([0.1, -0.17, 0.0]),
+        "b", {}, (site_b,),
+    )
+
+    augmented = add_alchemical_sigma_holes(hybrid, parameters_a, parameters_b)
+
+    assert augmented.unique_particle_indices_a == ()
+    assert augmented.unique_particle_indices_b == ()
+    assert [site.role for site in augmented.alchemical_virtual_sites] == [
+        "mapped_a", "mapped_b"
+    ]
+    force_a = next(
+        force for force in augmented.endpoint_a.getForces()
+        if isinstance(force, mm.NonbondedForce)
+    )
+    force_b = next(
+        force for force in augmented.endpoint_b.getForces()
+        if isinstance(force, mm.NonbondedForce)
+    )
+    charges_a = [
+        force_a.getParticleParameters(index)[0].value_in_unit(unit.elementary_charge)
+        for index in (3, 4)
+    ]
+    charges_b = [
+        force_b.getParticleParameters(index)[0].value_in_unit(unit.elementary_charge)
+        for index in (3, 4)
+    ]
+    assert charges_a == pytest.approx([0.05, 0.0])
+    assert charges_b == pytest.approx([0.0, 0.07])
+
+    switching = create_softcore_hamiltonian(
+        augmented.endpoint_a,
+        augmented.endpoint_b,
+        (),
+        (),
+        total_steps=20,
+        path_mode="concerted",
+    )
+    integrator = mm.VerletIntegrator(0.001 * unit.picoseconds)
+    context = mm.Context(
+        switching.system, integrator, mm.Platform.getPlatformByName("Reference")
+    )
+    context.setPositions(augmented.positions)
+    observed = []
+    for position in (0, -1):
+        for name, schedule in switching.parameter_values.items():
+            context.setParameter(name, schedule[position])
+        energy = context.getState(getEnergy=True).getPotentialEnergy()
+        observed.append(energy.value_in_unit(unit.kilojoules_per_mole))
+    expected = []
+    for system in (augmented.endpoint_a, augmented.endpoint_b):
+        endpoint_integrator = mm.VerletIntegrator(0.001 * unit.picoseconds)
+        endpoint_context = mm.Context(
+            system, endpoint_integrator, mm.Platform.getPlatformByName("Reference")
+        )
+        endpoint_context.setPositions(augmented.positions)
+        expected.append(
+            endpoint_context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(
+                unit.kilojoules_per_mole
+            )
+        )
+        del endpoint_context, endpoint_integrator
+    assert np.all(np.isfinite(observed))
+    assert observed == pytest.approx(expected, abs=1.0e-5)
+
+
+def _test_sigma_hole_on_mapped_h_to_cl_transmutation_uses_mapped_charge():
+    topology, positions, endpoint_a, _ = _hybrid_bundle(0.0)
+    _, _, endpoint_b, site_b = _hybrid_bundle(0.06)
+    hybrid = CovalentHybridMolecule(
+        topology=topology, positions=positions, endpoint_a=endpoint_a,
+        endpoint_b=endpoint_b, map_a_to_b={0: 0, 1: 1, 2: 2},
+        map_a_to_hybrid={0: 0, 1: 1, 2: 2},
+        map_b_to_hybrid={0: 0, 1: 1, 2: 2}, unique_a=(), unique_b=(),
+        anchor_pairs=(), attachment_pairs=None,
+        dummy_bonded_scales=DummyBondedScales(), dummy_core_nonbonded="off",
+    )
+    parameters_a = CovalentParameterBundle(
+        _molecule("C"), endpoint_a, np.asarray([0.1, -0.15, 0.0]), "a", {}, ()
+    )
+    parameters_b = CovalentParameterBundle(
+        _molecule("CCl"), endpoint_b, np.asarray([0.1, -0.16, 0.0]),
+        "b", {}, (site_b,),
+    )
+
+    augmented = add_alchemical_sigma_holes(hybrid, parameters_a, parameters_b)
+
+    assert augmented.unique_particle_indices_a == ()
+    assert augmented.unique_particle_indices_b == ()
+    assert augmented.alchemical_virtual_sites[0].role == "mapped_b"
+    force_a = next(
+        force for force in augmented.endpoint_a.getForces()
+        if isinstance(force, mm.NonbondedForce)
+    )
+    force_b = next(
+        force for force in augmented.endpoint_b.getForces()
+        if isinstance(force, mm.NonbondedForce)
+    )
+    assert force_a.getParticleParameters(3)[0].value_in_unit(
+        unit.elementary_charge
+    ) == pytest.approx(0.0)
+    assert force_b.getParticleParameters(3)[0].value_in_unit(
+        unit.elementary_charge
+    ) == pytest.approx(0.06)
+
+
+def _test_unchanged_halogen_rejects_missing_endpoint_site():
+    topology, positions, endpoint_a, site_a = _hybrid_bundle(0.05)
+    _, _, endpoint_b, _ = _hybrid_bundle(0.0)
+    hybrid = CovalentHybridMolecule(
+        topology=topology, positions=positions, endpoint_a=endpoint_a,
+        endpoint_b=endpoint_b, map_a_to_b={0: 0, 1: 1, 2: 2},
+        map_a_to_hybrid={0: 0, 1: 1, 2: 2},
+        map_b_to_hybrid={0: 0, 1: 1, 2: 2}, unique_a=(), unique_b=(),
+        anchor_pairs=(), attachment_pairs=None,
+        dummy_bonded_scales=DummyBondedScales(), dummy_core_nonbonded="off",
+    )
+    parameters_a = CovalentParameterBundle(
+        _molecule("CCl"), endpoint_a, np.asarray([0.1, -0.15, 0.0]),
+        "a", {}, (site_a,),
+    )
+    parameters_b = CovalentParameterBundle(
+        _molecule("CCl"), endpoint_b, np.asarray([0.1, -0.15, 0.0]), "b", {}, ()
+    )
+
+    with pytest.raises(HybridVirtualSiteError, match="only endpoint A"):
+        add_alchemical_sigma_holes(hybrid, parameters_a, parameters_b)
 
 
 def _test_fixed_sigma_hole_transfers_charge_from_chlorine():

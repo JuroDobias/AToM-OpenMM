@@ -40,6 +40,22 @@ class CovalentHybridMolecule:
     alchemical_bonds_a: tuple[tuple[int, int], ...] = ()
     alchemical_bonds_b: tuple[tuple[int, int], ...] = ()
     alchemical_bond_pair_changes: tuple["AlchemicalBondPairChange", ...] = ()
+    unique_particle_indices_a: tuple[int, ...] = ()
+    unique_particle_indices_b: tuple[int, ...] = ()
+    alchemical_virtual_sites: tuple["AlchemicalVirtualSite", ...] = ()
+
+
+@dataclass(frozen=True)
+class AlchemicalVirtualSite:
+    particle_index: int
+    role: str
+    parent_particle_indices: tuple[int, int, int]
+    source_name_a: str | None
+    source_name_b: str | None
+    charge_a_e: float
+    charge_b_e: float
+    distance_a_angstrom: float | None
+    distance_b_angstrom: float | None
 
 
 @dataclass(frozen=True)

@@ -28,8 +28,9 @@ workflow:
     ligand_parameter_protocol: gaff2-resp-cl-ep-v1
 ```
 
-The first implementation requires every sigma-hole C-Cl group and its frame
-atom to be mapped between both endpoint ligands. Halogen creation or deletion
-is rejected. `ligand.mol2` and `ligand.frcmod` are interoperability outputs;
+Noncovalent hybrid NEQTI supports unchanged mapped sites, direct halogen
+transmutations such as Cl to Br, and creation or deletion of a halogen site.
+Endpoint-specific sites retain the charge and distance stored in their own
+parameter artifacts. `ligand.mol2` and `ligand.frcmod` are interoperability outputs;
 the manifest and `system.xml` are authoritative because MOL2 cannot represent
 the off-center virtual site.

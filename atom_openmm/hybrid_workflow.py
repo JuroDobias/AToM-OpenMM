@@ -47,7 +47,10 @@ from atom_openmm.hybrid_mapping import (
 )
 from atom_openmm.hybrid_parameters import parameterize_ligand
 from atom_openmm.hybrid_systems import create_physical_ligand_environment
-from atom_openmm.hybrid_virtual_sites import add_common_sigma_holes
+from atom_openmm.hybrid_virtual_sites import (
+    add_alchemical_sigma_holes,
+    alchemical_virtual_site_metadata,
+)
 from atom_openmm.metal_ions import apply_panteva_m1264, gaff2_atom_classes
 from atom_openmm.receptor_normalization import normalize_legacy_pdb
 from atom_openmm.neqti import (
@@ -766,7 +769,10 @@ def _prepare_pair(pair, receptor, workflow, workdir, base_dir=None):
         force_unique_atoms_a=set(mapping_payload["force_unique_atoms_a_0based"]),
         force_unique_atoms_b=set(mapping_payload["force_unique_atoms_b_0based"]),
     )
-    hybrid = add_common_sigma_holes(hybrid, parameters_a, parameters_b)
+    hybrid = add_alchemical_sigma_holes(hybrid, parameters_a, parameters_b)
+    mapping_payload["alchemical_virtual_sites"] = (
+        alchemical_virtual_site_metadata(hybrid)
+    )
     mapping_payload["inactive_z_matrix_terms"] = inactive_z_matrix_metadata(hybrid)
     mapping_payload["inactive_bonded_branches"] = inactive_branch_metadata(hybrid)
     mapping_payload["alchemical_bond_pair_changes"] = (

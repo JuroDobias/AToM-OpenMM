@@ -196,10 +196,22 @@ field, and scientific fitting settings. It does not depend on the input path,
 atom order, Gaussian executable path, or requested CPU resources. Completed
 Gaussian conformers are checkpointed under `cache/work/` and reused after a
 timeout. Only an atomically published artifact with `status: completed` is
-accepted by production. For an alchemical pair, each C-Cl virtual site and its
-three-atom local frame must map between endpoints; creation or deletion of a
-sigma-hole site is currently rejected. See
+accepted by production. For an alchemical pair, unchanged mapped halogens
+share one virtual site. Element transmutations such as Cl to Br use
+endpoint-specific sites, preserving each endpoint's fitted charge and site
+distance. Introducing or removing a halogen likewise creates an
+endpoint-specific site whose charge is zero in the inactive endpoint and
+follows the endpoint charge schedule during NEQTI. The three parent atoms must
+be present in the hybrid topology. A chemically unchanged mapped halogen with
+a site in only one parameter artifact is rejected as inconsistent
+parameterization. See
 `examples/parameterization/gaff2_resp_cl_ep` for the CPU-only Aurum job.
+
+For a direct H to Cl/Br substitution, include the hydrogen-halogen pair in an
+`explicit_pairs` mapping. For Cl to Br, map the two halogens directly. These
+pairs are ordinary mapped-atom transmutations; the associated endpoint-specific
+sigma-hole particles are generated automatically. If the introduced halogen is
+left unmapped, its site instead follows the endpoint-unique branch schedule.
 
 Common combinations include:
 
