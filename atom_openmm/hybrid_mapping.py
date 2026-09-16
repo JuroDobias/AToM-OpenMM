@@ -521,20 +521,11 @@ def _automatic_junction_bonds(
                 )
             continue
         core, root = boundaries[0]
-        root_is_hydrogen = molecule.GetAtomWithIdx(root).GetAtomicNum() == 1
-        has_frame = not root_is_hydrogen and _has_mapped_heavy_z_matrix_chain(
+        has_frame = _has_mapped_heavy_z_matrix_chain(
             molecule, mapped, core, root
         )
         geometry = "terminal_z_matrix" if has_frame else "bond_only"
-        fallback = (
-            None
-            if has_frame
-            else (
-                "terminal_hydrogen_uses_bond_only"
-                if root_is_hydrogen
-                else "no_mapped_heavy_reference_chain"
-            )
-        )
+        fallback = None if has_frame else "no_mapped_heavy_reference_chain"
         selected.update(component)
         if has_frame:
             z_matrix_roots.add(root)

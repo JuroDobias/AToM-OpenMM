@@ -268,19 +268,8 @@ def test_explicit_pairs_automatically_force_inverted_stereo_hydrogens_unique():
     }]
     assert hydrogen_a in metadata["inactive_bonded_atoms_a_0based"]
     assert hydrogen_b in metadata["inactive_bonded_atoms_b_0based"]
-    assert hydrogen_a not in metadata["inactive_z_matrix_root_atoms_a_0based"]
-    assert hydrogen_b not in metadata["inactive_z_matrix_root_atoms_b_0based"]
-    hydrogen_junctions = [
-        junction
-        for junction in metadata["resolved_junction_bonds"]
-        if junction["branch_atoms_0based"] in ([hydrogen_a], [hydrogen_b])
-    ]
-    assert len(hydrogen_junctions) == 2
-    assert all(
-        junction["inactive_geometry"] == "bond_only"
-        and junction["fallback_reason"] == "terminal_hydrogen_uses_bond_only"
-        for junction in hydrogen_junctions
-    )
+    assert hydrogen_a in metadata["inactive_z_matrix_root_atoms_a_0based"]
+    assert hydrogen_b in metadata["inactive_z_matrix_root_atoms_b_0based"]
 
 
 def test_inverted_stereo_detection_keeps_unmatched_neighbor_branch_unique():
@@ -521,12 +510,7 @@ def _test_explicit_pairs_automatically_activate_z_matrix_geometry():
 
     assert 3 in metadata["inactive_bonded_atoms_b_0based"]
     assert 3 in metadata["inactive_z_matrix_root_atoms_b_0based"]
-    assert metadata["inactive_bonded_geometry"] == "mixed"
-    assert any(
-        junction["inactive_geometry"] == "bond_only"
-        and junction["fallback_reason"] == "terminal_hydrogen_uses_bond_only"
-        for junction in metadata["resolved_junction_bonds"]
-    )
+    assert metadata["inactive_bonded_geometry"] == "terminal_z_matrix"
     assert metadata["resolved_junction_bonds"][0]["selection_source"] == "automatic"
 
 

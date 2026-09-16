@@ -12,8 +12,10 @@ from atom_openmm.covalent_hybrid import (
     DummyBondedScales,
     _add_unique_vacuum_nonbonded,
     _hybrid_topology,
+    _inactive_bonded_scalers,
     _inactive_scales,
     _inactive_branch_components,
+    _select_inactive_z_matrix_terms,
     _term_contains_bond,
     build_covalent_hybrid_molecule,
     complete_covalent_atom_map,
@@ -54,6 +56,87 @@ def test_soft_bond_detection_includes_nonsequential_improper_atoms():
     assert _term_contains_bond((88, 89, 90, 91), selected)
     assert _term_contains_bond((89, 88, 90, 93), selected)
     assert not _term_contains_bond((89, 88, 92, 93), selected)
+
+
+def _test_terminal_hydrogen_z_matrix_can_reference_another_unique_branch():
+    molecule = Chem.AddHs(Chem.MolFromSmiles("CCC(C)N"))
+    center = 2
+    root = next(
+        atom.GetIdx()
+        for atom in molecule.GetAtomWithIdx(center).GetNeighbors()
+        if atom.GetAtomicNum() == 1
+    )
+    reference_b = 3
+    reference_a = next(
+        atom.GetIdx()
+        for atom in molecule.GetAtomWithIdx(reference_b).GetNeighbors()
+        if atom.GetAtomicNum() == 1
+    )
+    system = mm.System()
+    for atom in molecule.GetAtoms():
+        system.addParticle(float(atom.GetMass()))
+    angles = mm.HarmonicAngleForce()
+    angles.addAngle(
+        reference_b,
+        center,
+        root,
+        109.5 * unit.degree,
+        300.0 * unit.kilojoule_per_mole / unit.radian**2,
+    )
+    system.addForce(angles)
+    torsions = mm.PeriodicTorsionForce()
+    torsions.addTorsion(
+        reference_a,
+        reference_b,
+        center,
+        root,
+        3,
+        0.0 * unit.radian,
+        1.0 * unit.kilojoule_per_mole,
+    )
+    system.addForce(torsions)
+    unique = {root, reference_a, reference_b}
+    selected = set(unique)
+    component = {"root": root, "center": center, "atoms": (root,)}
+
+    terms = _select_inactive_z_matrix_terms(
+        molecule,
+        system,
+        selected,
+        unique,
+        {index: index for index in range(molecule.GetNumAtoms())},
+        "a",
+        [component],
+        {root},
+    )
+
+    term = terms[root]
+    assert term.angle_atoms == (reference_b, center, root)
+    assert term.torsion_atoms == (reference_a, reference_b, center, root)
+    _, angle_scale, torsion_scale = _inactive_bonded_scalers(
+        molecule,
+        unique,
+        selected,
+        terms,
+        DummyBondedScales(),
+    )
+    assert angle_scale(term.angle_atoms) > 0.0
+    assert torsion_scale(term.torsion_atoms) > 0.0
+
+    with np.testing.assert_raises_regex(
+        Exception, "no usable proper-torsion reference chain"
+    ):
+        _select_inactive_z_matrix_terms(
+            molecule,
+            system,
+            selected,
+            unique,
+            {index: index for index in range(molecule.GetNumAtoms())},
+            "a",
+            [component],
+            {root},
+            {(reference_a, reference_b)},
+        )
 
 
 def test_endpoint_excludes_all_cross_branch_nonbonded_pairs():

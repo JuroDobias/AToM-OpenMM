@@ -651,6 +651,11 @@ def _inactive_bonded_scalers(
         return scales.bond
 
     def angle(atoms):
+        if any(
+            atoms == term.angle_atoms or atoms[::-1] == term.angle_atoms
+            for term in z_matrix.values()
+        ):
+            return base_angle(atoms)
         selected_atoms = set(atoms) & selected
         if not selected_atoms or selected_atoms == set(atoms):
             return base_angle(atoms)
@@ -663,6 +668,11 @@ def _inactive_bonded_scalers(
         return 0.0
 
     def torsion(atoms):
+        if any(
+            _canonical_torsion(atoms) == _canonical_torsion(term.torsion_atoms)
+            for term in z_matrix.values()
+        ):
+            return base_torsion(atoms)
         selected_atoms = set(atoms) & selected
         if not selected_atoms or selected_atoms == set(atoms):
             return base_torsion(atoms)
@@ -777,6 +787,7 @@ def _select_inactive_z_matrix_terms(
     endpoint,
     components=None,
     selected_roots=None,
+    excluded_bonds=(),
 ):
     """Select one nonredundant junction frame per inactive branch."""
     if not selected:
@@ -804,6 +815,7 @@ def _select_inactive_z_matrix_terms(
         torsions.setdefault(key, []).append((periodicity, phase, k))
 
     canonical_ranks = list(Chem.CanonicalRankAtoms(molecule, breakTies=True))
+    excluded_bonds = {tuple(sorted(pair)) for pair in excluded_bonds}
     result = {}
     for component in components:
         dummy = component["root"]
@@ -813,7 +825,7 @@ def _select_inactive_z_matrix_terms(
         candidates = []
         for atom_b_obj in molecule.GetAtomWithIdx(center).GetNeighbors():
             atom_b = atom_b_obj.GetIdx()
-            if atom_b == dummy or atom_b in unique or atom_b_obj.GetAtomicNum() == 1:
+            if atom_b == dummy:
                 continue
             angle_key = (min(atom_b, dummy), center, max(atom_b, dummy))
             if angle_key not in angles:
@@ -821,9 +833,11 @@ def _select_inactive_z_matrix_terms(
             theta, angle_k = angles[angle_key]
             for atom_a_obj in atom_b_obj.GetNeighbors():
                 atom_a = atom_a_obj.GetIdx()
-                if atom_a == center or atom_a in unique or atom_a_obj.GetAtomicNum() == 1:
+                if atom_a == center:
                     continue
                 quartet = (atom_a, atom_b, center, dummy)
+                if _term_contains_bond(quartet, excluded_bonds):
+                    continue
                 key = _canonical_torsion(quartet)
                 grouped = torsions.get(key)
                 if not grouped:
@@ -844,6 +858,15 @@ def _select_inactive_z_matrix_terms(
                     or bond_ab.GetBondType() != Chem.BondType.SINGLE
                 )
                 score = (
+                    int(
+                        atom_a not in unique
+                        and atom_b not in unique
+                        and atom_a_obj.GetAtomicNum() != 1
+                        and atom_b_obj.GetAtomicNum() != 1
+                    ),
+                    int(atom_b_obj.GetAtomicNum() != 1),
+                    int(atom_a_obj.GetAtomicNum() != 1),
+                    int(atom_a not in unique) + int(atom_b not in unique),
                     rigid_ab,
                     int(bond_ab.IsInRing()),
                     barrier,
@@ -861,7 +884,7 @@ def _select_inactive_z_matrix_terms(
         if not candidates:
             raise CovalentAlchemyError(
                 f"terminal_z_matrix atom {dummy} in endpoint {endpoint} has no "
-                "mapped heavy-atom proper-torsion reference chain"
+                "usable proper-torsion reference chain"
             )
         _, quartet, theta, angle_k, numeric_terms, barrier = max(
             candidates, key=lambda item: item[0]
@@ -1399,6 +1422,7 @@ def build_covalent_hybrid_molecule(
             "a",
             inactive_components_a,
             inactive_z_matrix_root_atoms_a,
+            alchemical_bonds_a,
         )
         if inactive_z_matrix_root_atoms_a
         else {}
@@ -1413,6 +1437,7 @@ def build_covalent_hybrid_molecule(
             "b",
             inactive_components_b,
             inactive_z_matrix_root_atoms_b,
+            alchemical_bonds_b,
         )
         if inactive_z_matrix_root_atoms_b
         else {}
