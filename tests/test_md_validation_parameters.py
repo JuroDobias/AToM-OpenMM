@@ -68,6 +68,29 @@ def _test_panteva_c4_units_and_atp_overrides(tmp_path):
     assert custom.getParticleParameters(3)[1] == pytest.approx(c4_kcal_a4_to_kj_nm4(180.5))
 
 
+def test_panteva_accepts_gaff2_nu_as_standard_nitrogen(tmp_path):
+    topology = _minimal_topology()
+    system = _minimal_system(topology.getNumAtoms())
+    table = tmp_path / "lj_1264_pol.dat"
+    table.write_text("OW 1.444\nO2 0.569\nn 1.090\n")
+
+    result = apply_panteva_m1264(
+        system,
+        topology,
+        atom_classes=["O2", "nu", "O2", "OW"],
+        polarizability_table=table,
+    )
+
+    custom = next(
+        force
+        for force in system.getForces()
+        if isinstance(force, mm.CustomNonbondedForce)
+    )
+    expected = c4_kcal_a4_to_kj_nm4(180.5 * 1.090 / 1.444)
+    assert custom.getParticleParameters(1)[1] == pytest.approx(expected)
+    assert result["polarizability_aliases_used"] == {"nu": "n"}
+
+
 def _test_panteva_exclusions_match_base_nonbonded_force(tmp_path):
     topology = _minimal_topology()
     system = _minimal_system(topology.getNumAtoms())

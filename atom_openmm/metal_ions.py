@@ -16,6 +16,13 @@ class MetalIonParameterError(ValueError):
 
 PANTEVA_FORCE_NAME = "Panteva modified Mg 12-6-4"
 
+# Amber's distributed polarizability table predates some GAFF2 atom types.
+# ``nu`` is an amine nitrogen type and uses the same elemental nitrogen
+# polarizability as the other standard GAFF/GAFF2 nitrogen classes.
+PANTEVA_POLARIZABILITY_ALIASES = {
+    "nu": "n",
+}
+
 
 def c4_kcal_a4_to_kj_nm4(value):
     return float(value) * 4.184e-4
@@ -101,6 +108,7 @@ def apply_panteva_m1264(system, topology, *, atom_classes,
         else {int(index) for index in active_atom_indices}
     )
     c4_values = []
+    aliases_used = {}
     for atom, atom_class in zip(atoms, atom_classes):
         if atom.index not in active:
             c4_values.append(0.0)
@@ -110,6 +118,10 @@ def apply_panteva_m1264(system, topology, *, atom_classes,
             continue
         if atom_class not in polarizabilities and atom_class is not None and atom_class.upper() in polarizabilities:
             atom_class = atom_class.upper()
+        if atom_class not in polarizabilities and atom_class in PANTEVA_POLARIZABILITY_ALIASES:
+            original_class = atom_class
+            atom_class = PANTEVA_POLARIZABILITY_ALIASES[atom_class]
+            aliases_used[original_class] = atom_class
         if atom_class not in polarizabilities:
             raise MetalIonParameterError(
                 f"missing Amber 12-6-4 polarizability for atom {atom.index} "
@@ -143,6 +155,7 @@ def apply_panteva_m1264(system, topology, *, atom_classes,
         "model": "Panteva-m12-6-4", "magnesium_count": len(mg_indices),
         "atp_nonbridging_oxygen_c4_kcal_a4": 21.25,
         "atp_n7_c4_kcal_a4": 238.75, "water_oxygen_c4_kcal_a4": 180.5,
+        "polarizability_aliases_used": aliases_used,
     }
 
 
