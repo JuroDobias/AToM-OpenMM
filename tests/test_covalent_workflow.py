@@ -853,6 +853,27 @@ def _test_legacy_explicit_bond_only_mapping_default_resumes(tmp_path):
     assert yaml.safe_load(path.read_text()) == observed
 
 
+def _test_legacy_mapping_without_empty_forced_unique_lists_resumes(tmp_path):
+    config = _normalized_settings({"neqti": {"interpolation": "softcore_linear"}})
+    mapping = {
+        "method": "explicit_pairs",
+        "pairs": [[0, 0]],
+        "force_unique_atoms_a_0based": [],
+        "force_unique_atoms_b_0based": [],
+    }
+    legacy = _switch_protocol(config, mapping)
+    legacy["covalent_mapping"].pop("force_unique_atoms_a_0based")
+    legacy["covalent_mapping"].pop("force_unique_atoms_b_0based")
+    legacy["fingerprint"] = "legacy"
+    path = tmp_path / "switch_protocol.yaml"
+    path.write_text(yaml.safe_dump(legacy, sort_keys=False))
+
+    observed = _ensure_switch_protocol(tmp_path, config, mapping)
+
+    assert observed == _switch_protocol(config, mapping)
+    assert yaml.safe_load(path.read_text()) == observed
+
+
 def _test_legacy_ssc2_protocol_requires_explicit_legacy_name(tmp_path):
     config = _normalized_settings(
         {

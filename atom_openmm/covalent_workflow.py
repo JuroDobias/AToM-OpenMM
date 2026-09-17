@@ -4404,6 +4404,32 @@ def _drop_legacy_default_mapping_geometry(observed, expected, mapping_label):
     return normalized
 
 
+def _add_legacy_empty_mapping_defaults(observed, expected, mapping_label):
+    """Accept newly serialized empty mapping selections on resume."""
+    observed_mapping = observed.get(mapping_label)
+    expected_mapping = expected.get(mapping_label)
+    if not isinstance(observed_mapping, dict) or not isinstance(expected_mapping, dict):
+        return observed
+    missing = [
+        key for key in (
+            "force_unique_atoms_a_0based",
+            "force_unique_atoms_b_0based",
+        )
+        if key not in observed_mapping and expected_mapping.get(key) == []
+    ]
+    if not missing:
+        return observed
+    normalized = dict(observed)
+    normalized_mapping = dict(observed_mapping)
+    for key in missing:
+        normalized_mapping[key] = []
+    normalized[mapping_label] = normalized_mapping
+    normalized.pop("fingerprint", None)
+    serialized = yaml.safe_dump(normalized, sort_keys=True)
+    normalized["fingerprint"] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return normalized
+
+
 def _ensure_switch_protocol(
     workdir,
     config,
@@ -4437,6 +4463,9 @@ def _ensure_switch_protocol(
             observed, expected["dummy_bonded_scales"]
         )
         observed = _drop_legacy_default_mapping_geometry(
+            observed, expected, mapping_label
+        )
+        observed = _add_legacy_empty_mapping_defaults(
             observed, expected, mapping_label
         )
         if observed != expected:
