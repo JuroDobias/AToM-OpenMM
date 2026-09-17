@@ -1149,6 +1149,10 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
     # pass None into OMMSystem.
     options.setdefault("POSRE_FORCE_CONSTANT", 0.0)
     options.setdefault("POSRE_TOLERANCE", 3.5)
+    # YAML workflows do not otherwise need the legacy replica-worker logging
+    # controls.  NEQTI still constructs an OMMWorker, so provide its historical
+    # default instead of passing a missing value to int().
+    options.setdefault("PRNT_FREQUENCY", 10000)
     options["BASENAME"] = pair_plan["jobname"]
     options["WORKDIR"] = str(jobdir.resolve())
     options["LIGAND_FORCE_FIELD"] = setup_options["ligandforcefield"]

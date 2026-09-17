@@ -78,7 +78,7 @@ class OMMWorker(object):
         self.platform = None
         self.logfile_p = None
         self.outfile_p = None
-        self.nprnt = int(self.keywords.get('PRNT_FREQUENCY'))
+        self.nprnt = int(self.keywords.get('PRNT_FREQUENCY') or 10000)
         if self.compute:
             #compute workers are launched as subprocesses
             s = signal.signal(signal.SIGINT, signal.SIG_IGN) #so that children do not respond to ctrl-c
@@ -465,7 +465,7 @@ class OMMWorkerATMSync(OMMWorkerATM):
         self.platform = None
         self.logfile_p = None
         self.outfile_p = None
-        self.nprnt = int(self.keywords.get('PRNT_FREQUENCY'))
+        self.nprnt = int(self.keywords.get('PRNT_FREQUENCY') or 10000)
         #the service worker needs only the context in this process
         self._openmm_worker_body()
         self._openmm_worker_makecontext()
