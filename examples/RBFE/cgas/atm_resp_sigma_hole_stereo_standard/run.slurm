@@ -12,7 +12,7 @@ set -euo pipefail
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate myatom_openmm86
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 cd "$SCRIPT_DIR"
