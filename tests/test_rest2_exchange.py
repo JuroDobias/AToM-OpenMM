@@ -142,6 +142,46 @@ def _test_openmm_native_rest2_sampler_resumes_and_returns_physical_state(tmp_pat
     not hasattr(__import__("openmm.app", fromlist=["app"]), "ReplicaExchangeSampler"),
     reason="OpenMM native replica exchange requires OpenMM 8.6",
 )
+def _test_openmm_native_rest2_sampler_sets_temperature_for_custom_integrator(tmp_path):
+    from atom_openmm.rest2_exchange import create_rest2_exchange_sampler
+
+    rest2, topology, state_file = _simple_rest2_fixture(tmp_path)
+    integrator = mm.CustomIntegrator(0.001)
+    integrator.addUpdateContextState()
+    integrator.addComputePerDof("v", "v+0.5*dt*f/m")
+    integrator.addComputePerDof("x", "x+dt*v")
+    integrator.addComputePerDof("v", "v+0.5*dt*f/m")
+    sampler = create_rest2_exchange_sampler(
+        system=rest2.system,
+        topology=topology,
+        base_integrator=integrator,
+        rest2_system=rest2,
+        state_files={"a": state_file},
+        config={
+            "sampler_backend": "openmm_native",
+            "effective_temperatures_k": [300, 600],
+            "exchange_interval_steps": 1,
+            "execution": "serial",
+        },
+        platform=mm.Platform.getPlatformByName("Reference"),
+        platform_properties={},
+        output_dir=tmp_path / "native_custom_integrator",
+        resume=False,
+    )
+    sampler.activate("a")
+    states = sampler.resources["a"]["sampler"].states
+    assert all(
+        state["temperature"].value_in_unit(unit.kelvin) == pytest.approx(300)
+        for state in states
+    )
+    sampler.run_steps("a", 1)
+    sampler.close()
+
+
+@pytest.mark.skipif(
+    not hasattr(__import__("openmm.app", fromlist=["app"]), "ReplicaExchangeSampler"),
+    reason="OpenMM native replica exchange requires OpenMM 8.6",
+)
 def _test_openmm_native_rest2_sampler_applies_fixed_atm_parameters(tmp_path):
     from atom_openmm.rest2_exchange import create_rest2_exchange_sampler
 

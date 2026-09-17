@@ -783,6 +783,7 @@ class OpenMMREST2ExchangeSampler:
         return [
             {
                 **fixed,
+                "temperature": self.physical_temperature * unit.kelvin,
                 self.rest2_system.scale_parameter: float(scale),
                 self.rest2_system.sqrt_scale_parameter: math.sqrt(float(scale)),
             }
