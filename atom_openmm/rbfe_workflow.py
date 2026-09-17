@@ -1143,6 +1143,12 @@ def run_pair(pair_plan, workflow, atom_options, setup_options, receptor_file, al
     jobdir.mkdir(parents=True, exist_ok=True)
 
     options = deepcopy(atom_options)
+    # Structure preparation may derive a positional atom selection even when
+    # the legacy flat-bottom positional restraint is intentionally disabled.
+    # Keep its numeric controls explicit so minimal wrapper workflows do not
+    # pass None into OMMSystem.
+    options.setdefault("POSRE_FORCE_CONSTANT", 0.0)
+    options.setdefault("POSRE_TOLERANCE", 3.5)
     options["BASENAME"] = pair_plan["jobname"]
     options["WORKDIR"] = str(jobdir.resolve())
     options["LIGAND_FORCE_FIELD"] = setup_options["ligandforcefield"]

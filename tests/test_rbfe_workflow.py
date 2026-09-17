@@ -368,6 +368,8 @@ def _test_prepare_only_writes_final_pair_yaml(tmp_path, monkeypatch):
     assert options["BASENAME"] == "cdk2-H1Q-H1R"
     assert options["WORKDIR"] == str(jobdir.resolve())
     assert options["LIGAND_FORCE_FIELD"] == "espaloma-0.3.2"
+    assert options["POSRE_FORCE_CONSTANT"] == 0.0
+    assert options["POSRE_TOLERANCE"] == 3.5
     assert options["ALIGN_LIGAND1_REF_ATOMS"] == [0, 1, 2]
     assert options["ALIGN_LIGAND2_REF_ATOMS"] == [0, 1, 2]
     assert options["DISPLACEMENT"] == [22.0, 22.0, 22.0]
