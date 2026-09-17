@@ -369,7 +369,7 @@ def generate(root, source):
 #SBATCH --mem=24G
 #SBATCH --gres=gpu:1
 #SBATCH --constraint=gen-d
-#SBATCH --time=12:00:00
+#SBATCH --time=04:00:00
 #SBATCH --signal=B:TERM@180
 set -euo pipefail
 cd "${{SLURM_SUBMIT_DIR}}"
@@ -390,7 +390,7 @@ export PYTHONPATH="{repo}${{PYTHONPATH:+:$PYTHONPATH}}"
         "failures remain infinite work samples; failed optimizer cycles retain\n"
         "the preceding allocation. Endpoint bank failures stop preparation.\n"
         "Bank hashes and saved per-switch records protect resume and provenance.\n"
-        "All jobs use gen-d with 12-hour limits; resubmit the same script to resume.\n")
+        "All jobs use gen-d with 4-hour limits; resubmit the same script to resume.\n")
 
 
 def submit(root):

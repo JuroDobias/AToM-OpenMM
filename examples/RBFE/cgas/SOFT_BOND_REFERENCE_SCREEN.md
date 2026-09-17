@@ -48,7 +48,7 @@ python -m atom_openmm.soft_bond_screen submit /path/to/new-screen
 ```
 
 Submission creates one bank job and 24 independent jobs depending on successful
-bank completion. Each uses one gen-d GPU, no MPS, four CPU cores, and a 12-hour
+bank completion. Each uses one gen-d GPU, no MPS, four CPU cores, and a 4-hour
 limit. Resubmit an individual Slurm script from the screen directory to resume.
 
 Inspect `bank/mapping.yaml`, the endpoint PDB snapshots, and `bank/complete.yaml`.
