@@ -1322,6 +1322,13 @@ def _prepare_run_context(config_file):
         setup_options["ligandparametercache"] = str(
             _resolve_path(setup_options["ligandparametercache"], config["base_dir"])
         )
+    for key in ("proteinforcefield", "solventforcefield"):
+        resolved = []
+        for value in setup_options.get(key, []):
+            candidate = _resolve_path(value, config["base_dir"])
+            resolved.append(str(candidate) if candidate.is_file() else value)
+        if resolved:
+            setup_options[key] = resolved
     alignments = load_or_generate_alignments(config["workflow"], plan)
     return config, plan, setup_options, alignments
 
