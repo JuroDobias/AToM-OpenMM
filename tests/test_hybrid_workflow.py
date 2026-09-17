@@ -124,6 +124,14 @@ def _test_fixed_sigma_hole_settings_are_validated(tmp_path):
         _validate_settings(workflow)
 
 
+def _test_fixed_sigma_hole_defaults_validate_without_numeric_fields(tmp_path):
+    from atom_openmm.hybrid_workflow import _validate_settings
+
+    workflow = yaml.safe_load(_workflow(tmp_path).read_text())["workflow"]
+    workflow["setup"]["ligand_sigma_holes"] = {"halogens": ["Cl", "Br"]}
+    _validate_settings(workflow)
+
+
 def _test_legacy_bond_only_preparation_inputs_match_current_default():
     from atom_openmm.hybrid_workflow import _legacy_preparation_inputs_match
 
@@ -138,6 +146,31 @@ def _test_legacy_bond_only_preparation_inputs_match_current_default():
 
     assert _legacy_preparation_inputs_match(observed, expected)
     observed["mapping"]["method"] = "explicit_pairs"
+    assert not _legacy_preparation_inputs_match(observed, expected)
+
+
+def _test_legacy_fixed_sigma_hole_fingerprint_resumes_after_normalization():
+    from atom_openmm.hybrid_workflow import _legacy_preparation_inputs_match
+
+    observed = {
+        "setup": {
+            "ligand_sigma_holes": {
+                "model": "fixed", "halogens": ["Cl"],
+                "charge_e": 0.03, "distance_a": 1.64,
+                "compensate_on": "halogen",
+            }
+        },
+        "mapping": {"method": "mcs"},
+    }
+    expected = copy.deepcopy(observed)
+    expected["setup"]["ligand_sigma_holes"] = {
+        "halogens": ["Cl"], "charges_e": {"Cl": 0.03},
+        "distances_a": {"Cl": 1.64}, "model": "fixed",
+        "compensate_on": "halogen",
+    }
+    assert _legacy_preparation_inputs_match(observed, expected)
+
+    expected["setup"]["ligand_sigma_holes"]["charges_e"]["Cl"] = 0.033
     assert not _legacy_preparation_inputs_match(observed, expected)
 
 

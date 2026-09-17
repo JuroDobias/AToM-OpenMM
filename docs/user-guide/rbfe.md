@@ -157,6 +157,34 @@ workflow:
 
 `ligand_charge_model: nn` is supported for Espaloma ligand force fields. `ligand_charge_model: am1-bcc` is supported for Espaloma and is the expected GAFF setup behavior. OpenFF charge assignment is controlled by the selected OpenFF/SMIRNOFF force field and generator rather than a separate wrapper charge-model option.
 
+Espaloma NN workflows can add fixed sigma-hole virtual sites by selecting the
+halogen elements. The built-in transferable defaults are `+0.033 e` at 1.64 A
+for Cl and `+0.039 e` at 1.89 A for Br. The site charge is subtracted from the
+parent halogen, so the molecular charge is unchanged. This syntax works for
+both ATM and hybrid-topology workflows:
+
+```yaml
+workflow:
+  setup:
+    ligand_forcefield: espaloma-0.3.2
+    ligand_charge_model: nn
+    ligand_sigma_holes:
+      halogens: [Cl, Br]
+```
+
+The optional scalar fields `charge_e` and `distance_a` override every selected
+element. Use mappings for element-specific overrides:
+
+```yaml
+    ligand_sigma_holes:
+      halogens: [Cl, Br]
+      charges_e: {Cl: 0.033, Br: 0.039}
+      distances_a: {Cl: 1.64, Br: 1.89}
+```
+
+Fixed defaults are currently defined only for Cl and Br. Selecting F or I
+requires explicit charge and distance values.
+
 Noncovalent hybrid workflows can instead consume an offline, content-addressed
 GAFF/RESP parameter artifact:
 

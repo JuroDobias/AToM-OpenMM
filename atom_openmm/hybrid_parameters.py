@@ -20,6 +20,7 @@ from atom_openmm.ligand_parameterization import (
     _find_sigma_holes,
     _sigma_hole_distance_a,
     _sigma_hole_name,
+    normalize_fixed_sigma_hole_settings,
     normalize_sigma_hole_settings,
 )
 
@@ -31,6 +32,7 @@ HybridParameterError = CovalentParameterError
 def _apply_fixed_sigma_holes(molecule, system, charges_e, settings):
     if settings is None:
         return np.asarray(charges_e, dtype=float), ()
+    settings = normalize_fixed_sigma_hole_settings(settings)
     sigma_settings = {
         key: settings[key]
         for key in ("halogens", "smarts", "distance_a", "distances_a")
@@ -40,11 +42,15 @@ def _apply_fixed_sigma_holes(molecule, system, charges_e, settings):
     matches = _find_sigma_holes(molecule, protocol)
     if not matches:
         return np.asarray(charges_e, dtype=float), ()
-    charge = float(settings["charge_e"])
     charges = np.asarray(charges_e, dtype=float).copy()
     sites = []
     for index, parents in enumerate(matches, start=1):
         halogen = int(parents[1])
+        symbol = molecule.atoms[halogen].symbol
+        charge = float(
+            settings["charge_e"]
+            if "charge_e" in settings else settings["charges_e"][symbol]
+        )
         charges[halogen] -= charge
         sites.append(VirtualSiteParameter(
             name=_sigma_hole_name(molecule, parents, index),
@@ -75,6 +81,10 @@ def parameterize_ligand(
     ligand_parameter_protocol: str = "gaff2-resp-cl-ep-v1",
     ligand_sigma_holes: dict | None = None,
 ) -> HybridParameterBundle:
+    if ligand_sigma_holes is not None:
+        ligand_sigma_holes = normalize_fixed_sigma_hole_settings(
+            ligand_sigma_holes
+        )
     if ligand_charge_model == "resp-sigma-hole":
         if ligand_parameter_cache is None:
             raise HybridParameterError(

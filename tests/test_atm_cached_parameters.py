@@ -30,6 +30,26 @@ def _test_normalize_cached_resp_sigma_hole_setup():
     assert result["ligandparameterprotocol"] == "gaff2-resp-halogen-ep-v2"
 
 
+def _test_normalize_atm_fixed_sigma_hole_defaults():
+    result = normalize_setup_options(
+        {
+            "setup": {
+                "ligand_forcefield": "espaloma-0.3.2",
+                "ligand_charge_model": "nn",
+                "ligand_sigma_holes": {"halogens": ["Cl", "Br"]},
+            }
+        },
+        {},
+    )
+    assert result["ligandchargemodel"] == "nn"
+    assert result["ligandsigmaholes"]["charges_e"] == {
+        "Cl": 0.033, "Br": 0.039,
+    }
+    assert result["ligandsigmaholes"]["distances_a"] == {
+        "Cl": 1.64, "Br": 1.89,
+    }
+
+
 def _test_cached_atm_rejects_panteva_until_force_is_alchemical():
     with pytest.raises(WorkflowConfigError, match="integrated into ATMForce"):
         normalize_setup_options(

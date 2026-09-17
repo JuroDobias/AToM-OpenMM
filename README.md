@@ -178,6 +178,12 @@ Role-aware SMARTS leaves can also be embedded in Amber masks used by custom equi
 
 Experimental native endpoint sampling removes `ATMForce` from A/B equilibration and REST2 while retaining ATM for M and all switches. Select `endpoint_system: native` and `rest2.ensembles: [a, b]`. With `sampling_order: interleaved`, both endpoint REST2 ladders remain resident and adaptive pilot scheduling plus automatic convergence stopping are available. Use `sampling_order: batched` when GPU memory permits only one resident ladder. Endpoint ligand roles and restraints are exchanged consistently in B. Existing workflows continue to use ATM endpoints by default.
 
+Espaloma NN workflows can request fixed sigma holes with
+`ligand_sigma_holes: {halogens: [Cl, Br]}`. The built-in defaults are `+0.033 e`
+at 1.64 A for Cl and `+0.039 e` at 1.89 A for Br; the charge is transferred
+from the parent halogen so the ligand's net charge is preserved. The same setup
+is accepted by ATM and hybrid-topology workflows.
+
 See the [RBFE user guide](docs/user-guide/rbfe.md) for the complete YAML schema, force-field examples, custom equilibration, restart behavior, outputs, and swapped-coordinate diagnostics.
 
 For a conventional noncovalent dual-topology comparison, use [`examples/RBFE/cdk2/workflow.hybrid.yaml`](examples/RBFE/cdk2/workflow.hybrid.yaml). It maps the ligands by MCS or SMARTS-constrained MCS, preserves inactive-branch intramolecular interactions, and combines complex and solvent BAR estimates. Hybrid NEQTI can independently select switching durations and stop production for the complex and solvent environments using per-environment overlap, uncertainty, and DG-stability criteria. The covalent hybrid-topology workflow is documented in [`examples/RBFE/covalent-rhino`](examples/RBFE/covalent-rhino).

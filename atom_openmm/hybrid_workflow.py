@@ -275,28 +275,12 @@ def _validate_settings(workflow):
             raise HybridWorkflowError(
                 "fixed ligand_sigma_holes currently require Espaloma with NN charges"
             )
-        if str(fixed_sites.get("model", "fixed")) != "fixed":
-            raise HybridWorkflowError("ligand_sigma_holes.model must be 'fixed'")
-        if str(fixed_sites.get("compensate_on", "halogen")) != "halogen":
-            raise HybridWorkflowError(
-                "ligand_sigma_holes.compensate_on must be 'halogen'"
-            )
-        for field in ("charge_e", "distance_a"):
-            value = fixed_sites.get(field)
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-                raise HybridWorkflowError(
-                    f"ligand_sigma_holes.{field} must be a positive number"
-                )
         from atom_openmm.ligand_parameterization import (
             LigandParameterizationError,
-            normalize_sigma_hole_settings,
+            normalize_fixed_sigma_hole_settings,
         )
         try:
-            normalize_sigma_hole_settings({
-                key: fixed_sites[key]
-                for key in ("halogens", "smarts", "distance_a")
-                if key in fixed_sites
-            })
+            normalize_fixed_sigma_hole_settings(fixed_sites)
         except LigandParameterizationError as exc:
             raise HybridWorkflowError(f"invalid ligand_sigma_holes: {exc}") from exc
     if charge_model == "resp-sigma-hole":
@@ -574,13 +558,21 @@ def _preparation_fingerprint(pair, receptor, workflow, mapping, base_dir=None):
     metal = _metal_ion_settings(workflow, base_dir)
     if metal["model"] == "panteva_m12_6_4":
         files["panteva_polarizability_table"] = metal["polarizability_table"]
+    setup = copy.deepcopy(workflow.get("setup") or {})
+    if setup.get("ligand_sigma_holes") is not None:
+        from atom_openmm.ligand_parameterization import (
+            normalize_fixed_sigma_hole_settings,
+        )
+        setup["ligand_sigma_holes"] = normalize_fixed_sigma_hole_settings(
+            setup["ligand_sigma_holes"]
+        )
     payload = {
         "schema_version": PREPARATION_SCHEMA_VERSION,
         "files": {
             name: {"path": str(Path(value).resolve()), "sha256": _sha256(value)}
             for name, value in files.items()
         },
-        "setup": workflow.get("setup") or {},
+        "setup": setup,
         "mapping": mapping,
     }
     digest = hashlib.sha256(yaml.safe_dump(payload, sort_keys=True).encode()).hexdigest()
@@ -611,15 +603,30 @@ def _legacy_preparation_inputs_match(observed, expected):
     if not isinstance(observed, dict) or not isinstance(expected, dict):
         return False
     normalized = copy.deepcopy(observed)
+    canonical_expected = copy.deepcopy(expected)
+    from atom_openmm.ligand_parameterization import (
+        LigandParameterizationError,
+        normalize_fixed_sigma_hole_settings,
+    )
+    for payload in (normalized, canonical_expected):
+        setup = payload.get("setup")
+        if not isinstance(setup, dict) or setup.get("ligand_sigma_holes") is None:
+            continue
+        try:
+            setup["ligand_sigma_holes"] = normalize_fixed_sigma_hole_settings(
+                setup["ligand_sigma_holes"]
+            )
+        except LigandParameterizationError:
+            return False
     observed_mapping = normalized.get("mapping")
-    expected_mapping = expected.get("mapping")
+    expected_mapping = canonical_expected.get("mapping")
     if isinstance(observed_mapping, dict) and isinstance(expected_mapping, dict):
         if (
             "inactive_bonded_geometry" not in expected_mapping
             and observed_mapping.get("inactive_bonded_geometry") == "bond_only"
         ):
             observed_mapping.pop("inactive_bonded_geometry")
-    return normalized == expected
+    return normalized == canonical_expected
 
 
 def _load_bundle(workdir, fingerprint, fingerprint_inputs=None):

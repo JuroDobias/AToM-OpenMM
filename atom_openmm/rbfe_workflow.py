@@ -210,6 +210,25 @@ def normalize_setup_options(workflow, atom_options):
         "ligandforcefield": ligand_forcefield,
         "template_generator_kwargs": template_generator_kwargs or None,
     }
+    fixed_sites = setup.get("ligand_sigma_holes")
+    if fixed_sites is not None:
+        if ligand_family != "espaloma" or charge_model != "nn":
+            raise WorkflowConfigError(
+                "workflow.setup.ligand_sigma_holes requires Espaloma with ligand_charge_model: nn"
+            )
+        from atom_openmm.ligand_parameterization import (
+            LigandParameterizationError,
+            normalize_fixed_sigma_hole_settings,
+        )
+        try:
+            normalized["ligandsigmaholes"] = normalize_fixed_sigma_hole_settings(
+                fixed_sites
+            )
+            normalized["ligandchargemodel"] = charge_model
+        except LigandParameterizationError as exc:
+            raise WorkflowConfigError(
+                f"invalid workflow.setup.ligand_sigma_holes: {exc}"
+            ) from exc
     if charge_model == "resp-sigma-hole":
         cache = setup.get("ligand_parameter_cache")
         protocol = setup.get("ligand_parameter_protocol")

@@ -140,11 +140,11 @@ def _coulomb_14_scale(force):
     return float(np.median(scales)) if scales else 1.0 / 1.2
 
 
-def _install_cached_ligand_parameters(system, topology, positions, parameters, residue_name):
+def _install_ligand_parameters(system, topology, positions, parameters, residue_name):
     atoms = [atom for atom in topology.atoms() if atom.residue.name == residue_name]
     if len(atoms) != parameters.molecule.n_atoms:
         raise ValueError(
-            f"cached {residue_name} atom count {parameters.molecule.n_atoms} differs from "
+            f"parameterized {residue_name} atom count {parameters.molecule.n_atoms} differs from "
             f"prepared residue count {len(atoms)}"
         )
     force = _nonbonded_force(system)
@@ -162,7 +162,7 @@ def _install_cached_ligand_parameters(system, topology, positions, parameters, r
             atol=1.0e-8,
         ):
             raise ValueError(
-                f"cached {residue_name} GAFF Lennard-Jones parameters differ at atom {source_index}"
+                f"parameterized {residue_name} Lennard-Jones parameters differ at atom {source_index}"
             )
         force.setParticleParameters(
             atom.index,
@@ -196,7 +196,7 @@ def _install_cached_ligand_parameters(system, topology, positions, parameters, r
     source_to_system = [atom.index for atom in atoms]
     for site in parameters.virtual_sites:
         if site.kind != "sigma_hole" or len(site.parent_atom_indices) != 3:
-            raise ValueError(f"unsupported cached ATM virtual site {site.kind!r}")
+            raise ValueError(f"unsupported ATM virtual site {site.kind!r}")
         carbon, halogen, frame = (
             source_to_system[int(index)] for index in site.parent_atom_indices
         )
@@ -256,6 +256,10 @@ def _install_cached_ligand_parameters(system, topology, positions, parameters, r
         site_indices.append(particle)
     return values * mm.unit.nanometer, site_indices
 
+
+# Backward-compatible name for callers that install cached RESP bundles.
+_install_cached_ligand_parameters = _install_ligand_parameters
+
 # Example Usage:
 # from openmm.app import PDBFile
 # pdb = PDBFile('input.pdb')
@@ -283,6 +287,7 @@ def make_system(
         ligandchargemodel=None,
         ligandparametercache=None,
         ligandparameterprotocol=None,
+        ligandsigmaholes=None,
         flagverbose=False
     ):
     print('Generate ATM RBFE OpenMM System')
@@ -355,25 +360,26 @@ def make_system(
             print('Unknown implicit solvent %s' % implsolv)
             sys.exit(1)
 
-    cached_parameters = None
-    if ligandchargemodel == "resp-sigma-hole":
+    ligand_parameters = None
+    if ligandchargemodel == "resp-sigma-hole" or ligandsigmaholes is not None:
         if not rbfe:
-            raise ValueError("cached RESP sigma-hole setup currently requires ATM RBFE")
+            raise ValueError("sigma-hole setup currently requires ATM RBFE")
         from atom_openmm.hybrid_parameters import parameterize_ligand
-        cached_parameters = (
+        parameter_options = {
+            "ligand_forcefield": ligandforcefield,
+            "ligand_charge_model": ligandchargemodel,
+            "ligand_parameter_cache": ligandparametercache,
+            "ligand_parameter_protocol": ligandparameterprotocol,
+            "ligand_sigma_holes": ligandsigmaholes,
+        }
+        ligand_parameters = (
             parameterize_ligand(
                 lig1file,
-                ligand_forcefield=ligandforcefield,
-                ligand_charge_model=ligandchargemodel,
-                ligand_parameter_cache=ligandparametercache,
-                ligand_parameter_protocol=ligandparameterprotocol,
+                **parameter_options,
             ),
             parameterize_ligand(
                 lig2file,
-                ligand_forcefield=ligandforcefield,
-                ligand_charge_model=ligandchargemodel,
-                ligand_parameter_cache=ligandparametercache,
-                ligand_parameter_protocol=ligandparameterprotocol,
+                **parameter_options,
             ),
         )
 
@@ -464,8 +470,8 @@ def make_system(
     if fileext in ('.SDF', '.MOL2'):
         file_format = 'SDF' if fileext == '.SDF' else 'MOL2'
         mollig1 = (
-            _cached_typing_molecule(cached_parameters[0])
-            if cached_parameters is not None
+            _cached_typing_molecule(ligand_parameters[0])
+            if ligand_parameters is not None
             else Molecule.from_file(lig1file, file_format=file_format, allow_undefined_stereo=True)
         )
         ligandmolecules.append(mollig1)
@@ -508,8 +514,8 @@ def make_system(
         if fileext in ('.SDF', '.MOL2'):
             file_format = 'SDF' if fileext == '.SDF' else 'MOL2'
             mollig2 = (
-                _cached_typing_molecule(cached_parameters[1])
-                if cached_parameters is not None
+                _cached_typing_molecule(ligand_parameters[1])
+                if ligand_parameters is not None
                 else Molecule.from_file(lig2file, file_format=file_format, allow_undefined_stereo=True)
             )
             ligandmolecules.append(mollig2)
@@ -619,15 +625,15 @@ def make_system(
                                     constraints=HBonds, rigidWater = True, removeCMMotion = False, hydrogenMass = hmass*amu)
 
     output_positions = modeller.positions
-    if cached_parameters is not None:
-        output_positions, _ = _install_cached_ligand_parameters(
-            system, modeller.topology, output_positions, cached_parameters[0], "L1"
+    if ligand_parameters is not None:
+        output_positions, _ = _install_ligand_parameters(
+            system, modeller.topology, output_positions, ligand_parameters[0], "L1"
         )
-        output_positions, _ = _install_cached_ligand_parameters(
-            system, modeller.topology, output_positions, cached_parameters[1], "L2"
+        output_positions, _ = _install_ligand_parameters(
+            system, modeller.topology, output_positions, ligand_parameters[1], "L2"
         )
         if modeller.topology.getNumAtoms() != system.getNumParticles():
-            raise ValueError("cached ATM topology and System particle counts differ")
+            raise ValueError("parameterized ATM topology and System particle counts differ")
 
     with open(xmloutfile, 'w') as output:
         output.write(XmlSerializer.serialize(system))

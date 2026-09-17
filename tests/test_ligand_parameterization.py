@@ -33,6 +33,7 @@ from atom_openmm.ligand_parameterization import (
     _write_multi_esp,
     cache_identity,
     load_cached_parameters,
+    normalize_fixed_sigma_hole_settings,
     normalize_protocol,
     normalize_sigma_hole_settings,
 )
@@ -114,6 +115,37 @@ def _test_sigma_hole_selector_controls_eligible_elements():
     assert len(chlorine_sites) == 1
     assert molecule.atoms[chlorine_sites[0][1]].symbol == "Cl"
     assert {molecule.atoms[site[1]].symbol for site in both_sites} == {"F", "Cl"}
+
+
+def _test_fixed_sigma_hole_defaults_are_element_specific():
+    normalized = normalize_fixed_sigma_hole_settings({
+        "halogens": ["Cl", "Br"],
+    })
+    assert normalized["charges_e"] == {"Cl": 0.033, "Br": 0.039}
+    assert normalized["distances_a"] == {"Cl": 1.64, "Br": 1.89}
+    assert normalized["model"] == "fixed"
+    assert normalized["compensate_on"] == "halogen"
+
+
+def _test_fixed_sigma_hole_overrides_and_unsupported_defaults():
+    scalar = normalize_fixed_sigma_hole_settings({
+        "halogens": ["Cl", "Br"], "charge_e": 0.04, "distance_a": 1.75,
+    })
+    assert scalar["charges_e"] == {"Cl": 0.04, "Br": 0.04}
+    assert scalar["distances_a"] == {"Cl": 1.75, "Br": 1.75}
+    mapped = normalize_fixed_sigma_hole_settings({
+        "halogens": ["Cl", "Br"],
+        "charges_e": {"cl": 0.031, "BR": 0.041},
+        "distances_a": {"Cl": 1.65, "Br": 1.90},
+    })
+    assert mapped["charges_e"] == {"Cl": 0.031, "Br": 0.041}
+    with pytest.raises(LigandParameterizationError, match="explicit values for: I"):
+        normalize_fixed_sigma_hole_settings({"halogens": ["I"]})
+    with pytest.raises(LigandParameterizationError, match="not both"):
+        normalize_fixed_sigma_hole_settings({
+            "halogens": ["Cl"], "charge_e": 0.03,
+            "charges_e": {"Cl": 0.03},
+        })
 
 
 def _test_legacy_sigma_hole_smarts_remains_supported():
@@ -519,6 +551,29 @@ def _test_fixed_sigma_hole_transfers_charge_from_chlorine():
         unit.elementary_charge
     )
     assert observed == pytest.approx(-0.03)
+
+
+def _test_fixed_sigma_hole_defaults_apply_to_chlorine_and_bromine():
+    molecule = _molecule("ClCBr")
+    system = mm.System()
+    force = mm.NonbondedForce()
+    charges = np.zeros(molecule.n_atoms)
+    for atom in molecule.atoms:
+        system.addParticle(atom.mass.m_as(offunit.dalton) * unit.dalton)
+        force.addParticle(0.0, 0.3, 0.0)
+    system.addForce(force)
+
+    adjusted, sites = _apply_fixed_sigma_holes(
+        molecule, system, charges, {"halogens": ["Cl", "Br"]}
+    )
+    observed = {
+        molecule.atoms[site.parent_atom_indices[1]].symbol: site for site in sites
+    }
+    assert observed["Cl"].charge_e == pytest.approx(0.033)
+    assert observed["Cl"].distance_a == pytest.approx(1.64)
+    assert observed["Br"].charge_e == pytest.approx(0.039)
+    assert observed["Br"].distance_a == pytest.approx(1.89)
+    assert adjusted.sum() + sum(site.charge_e for site in sites) == pytest.approx(0.0)
 
 
 def _test_fixed_sigma_holes_are_a_noop_without_selected_halogen():

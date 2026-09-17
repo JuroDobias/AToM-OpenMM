@@ -35,6 +35,10 @@ DEFAULT_PROTOCOL_ID = "gaff2-resp-cl-ep-v1"
 SIGMA_HOLE_SMARTS = "[#6:1]-[#17X1:2]"
 DEFAULT_SIGMA_HOLE_HALOGENS = ("Cl",)
 SIGMA_HOLE_ATOMIC_NUMBERS = {"F": 9, "Cl": 17, "Br": 35, "I": 53}
+DEFAULT_FIXED_SIGMA_HOLES = {
+    "Cl": {"charge_e": 0.033, "distance_a": 1.64},
+    "Br": {"charge_e": 0.039, "distance_a": 1.89},
+}
 
 
 class LigandParameterizationError(RuntimeError):
@@ -133,6 +137,130 @@ def normalize_sigma_hole_settings(raw: dict | None) -> dict:
                 "sigma_holes.distances_a is missing selected halogens: "
                 + ", ".join(missing)
             )
+    return normalized
+
+
+def _normalize_element_values(values, field: str) -> dict:
+    if not isinstance(values, dict) or not values:
+        raise LigandParameterizationError(
+            f"sigma_holes.{field} must be a non-empty mapping"
+        )
+    symbols_by_lower = {
+        symbol.lower(): symbol for symbol in SIGMA_HOLE_ATOMIC_NUMBERS
+    }
+    normalized = {}
+    for raw_symbol, raw_value in values.items():
+        if (
+            not isinstance(raw_symbol, str)
+            or raw_symbol.strip().lower() not in symbols_by_lower
+        ):
+            supported = ", ".join(SIGMA_HOLE_ATOMIC_NUMBERS)
+            raise LigandParameterizationError(
+                f"unsupported sigma-hole element {raw_symbol!r}; choose from {supported}"
+            )
+        if isinstance(raw_value, bool):
+            raise LigandParameterizationError(
+                f"sigma_holes.{field} values must be positive numbers"
+            )
+        value = float(raw_value)
+        if value <= 0.0:
+            raise LigandParameterizationError(
+                f"sigma_holes.{field} values must be positive numbers"
+            )
+        normalized[symbols_by_lower[raw_symbol.strip().lower()]] = value
+    return normalized
+
+
+def normalize_fixed_sigma_hole_settings(raw: dict | None) -> dict:
+    if not isinstance(raw, dict):
+        raise LigandParameterizationError("fixed sigma-hole settings must be a mapping")
+    raw = dict(raw)
+    if str(raw.get("model", "fixed")) != "fixed":
+        raise LigandParameterizationError("sigma_holes.model must be 'fixed'")
+    if str(raw.get("compensate_on", "halogen")) != "halogen":
+        raise LigandParameterizationError(
+            "sigma_holes.compensate_on must be 'halogen'"
+        )
+    if "charge_e" in raw and "charges_e" in raw:
+        raise LigandParameterizationError(
+            "sigma_holes may specify charge_e or charges_e, not both"
+        )
+
+    selector = {
+        key: raw[key]
+        for key in ("halogens", "smarts", "distance_a", "distances_a")
+        if key in raw
+    }
+    selected = None
+    if "smarts" not in selector:
+        selected = normalize_sigma_hole_settings({
+            "halogens": selector.get("halogens", DEFAULT_SIGMA_HOLE_HALOGENS),
+            "distance_a": 1.0,
+        })["halogens"]
+
+    if "distance_a" not in selector and "distances_a" not in selector:
+        default_symbols = selected or list(DEFAULT_FIXED_SIGMA_HOLES)
+        missing = [
+            symbol for symbol in default_symbols
+            if symbol not in DEFAULT_FIXED_SIGMA_HOLES
+        ]
+        if missing:
+            raise LigandParameterizationError(
+                "fixed sigma-hole distances require explicit values for: "
+                + ", ".join(missing)
+            )
+        selector["distances_a"] = {
+            symbol: DEFAULT_FIXED_SIGMA_HOLES[symbol]["distance_a"]
+            for symbol in default_symbols
+        }
+    normalized = normalize_sigma_hole_settings(selector)
+    if selected is not None and "distance_a" in normalized:
+        distance = normalized.pop("distance_a")
+        normalized["distances_a"] = {
+            symbol: distance for symbol in selected
+        }
+
+    if "charge_e" in raw:
+        if isinstance(raw["charge_e"], bool) or float(raw["charge_e"]) <= 0.0:
+            raise LigandParameterizationError(
+                "sigma_holes.charge_e must be a positive number"
+            )
+        charge = float(raw["charge_e"])
+        if selected is None:
+            normalized["charge_e"] = charge
+        else:
+            normalized["charges_e"] = {
+                symbol: charge for symbol in selected
+            }
+    else:
+        if "charges_e" in raw:
+            charges = _normalize_element_values(raw["charges_e"], "charges_e")
+        else:
+            default_symbols = selected or list(DEFAULT_FIXED_SIGMA_HOLES)
+            missing = [
+                symbol for symbol in default_symbols
+                if symbol not in DEFAULT_FIXED_SIGMA_HOLES
+            ]
+            if missing:
+                raise LigandParameterizationError(
+                    "fixed sigma-hole charges require explicit values for: "
+                    + ", ".join(missing)
+                )
+            charges = {
+                symbol: DEFAULT_FIXED_SIGMA_HOLES[symbol]["charge_e"]
+                for symbol in default_symbols
+            }
+        if selected is not None:
+            missing = [symbol for symbol in selected if symbol not in charges]
+            if missing:
+                raise LigandParameterizationError(
+                    "sigma_holes.charges_e is missing selected halogens: "
+                    + ", ".join(missing)
+                )
+        normalized["charges_e"] = charges
+
+    normalized["model"] = "fixed"
+    normalized["compensate_on"] = "halogen"
     return normalized
 
 
