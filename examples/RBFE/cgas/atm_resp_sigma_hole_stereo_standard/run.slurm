@@ -12,6 +12,9 @@ set -euo pipefail
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate myatom_openmm86
-export PYTHONPATH="$HOME/myAToM/AToM-OpenMM${PYTHONPATH:+:$PYTHONPATH}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+cd "$SCRIPT_DIR"
 
 atom-rbfe workflow.yaml
