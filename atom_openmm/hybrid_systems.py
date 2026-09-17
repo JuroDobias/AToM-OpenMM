@@ -49,10 +49,25 @@ def _resolve_forcefield_file(value: str) -> str:
 
 def _repair_template_bonds(topology, positions, forcefield):
     """Add bonds omitted when PDBFile does not recognize a supplemental residue."""
+    normalized_residues = set()
+    for residue in topology.residues():
+        if residue.name not in {"HD1", "HE2"}:
+            continue
+        atom_names = {atom.name for atom in residue.atoms()}
+        has_hd1 = "HD1" in atom_names
+        has_he2 = "HE2" in atom_names
+        if has_hd1 and has_he2:
+            residue.name = "HIP"
+        elif has_hd1:
+            residue.name = "HID"
+        elif has_he2:
+            residue.name = "HIE"
+        normalized_residues.add(residue)
+
     existing = {
         frozenset((atom1.index, atom2.index)) for atom1, atom2 in topology.bonds()
     }
-    repaired = set()
+    repaired = set(normalized_residues)
     for residue in topology.residues():
         template = forcefield._templates.get(residue.name)
         if template is None:

@@ -46,6 +46,21 @@ def test_supplemental_residue_bonds_are_repaired_from_template():
     assert len(list(topology.bonds())) == len(template.bonds)
 
 
+def _test_legacy_histidine_residue_name_is_normalized():
+    forcefield = app.ForceField("amber14-all.xml")
+    template = forcefield._templates["HID"]
+    topology = app.Topology()
+    residue = topology.addResidue("HD1", topology.addChain())
+    for atom in template.atoms:
+        topology.addAtom(atom.name, atom.element, residue)
+    positions = [Vec3(0, 0, 0) for _ in template.atoms] * unit.nanometer
+
+    _repair_template_bonds(topology, positions, forcefield)
+
+    assert residue.name == "HID"
+    assert len(list(topology.bonds())) == len(template.bonds)
+
+
 def test_rectangular_solvation_box_uses_axis_extents_plus_padding():
     positions = [Vec3(-1, 0, 2), Vec3(3, 5, 4)] * unit.nanometer
 

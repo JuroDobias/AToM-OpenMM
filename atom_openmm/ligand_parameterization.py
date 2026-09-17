@@ -550,10 +550,26 @@ def _gaff_system(
         nonbonded.setParticleParameters(
             index, float(charge) * unit.elementary_charge, sigma, epsilon
         )
+    _synchronize_gaff_exception_charges(nonbonded)
     observed = _system_charges(system)
     if not np.allclose(observed, charges_e, atol=1.0e-6):
         raise LigandParameterizationError("GAFF system did not preserve RESP charges")
     return system
+
+
+def _synchronize_gaff_exception_charges(force: mm.NonbondedForce) -> None:
+    """Rebuild GAFF electrostatic exclusions after replacing particle charges."""
+    for index in range(force.getNumExceptions()):
+        atom1, atom2, _, sigma, epsilon = force.getExceptionParameters(index)
+        q1 = force.getParticleParameters(int(atom1))[0]
+        q2 = force.getParticleParameters(int(atom2))[0]
+        if epsilon.value_in_unit(unit.kilojoules_per_mole) > 0.0:
+            charge_product = q1 * q2 / 1.2
+        else:
+            charge_product = 0.0 * unit.elementary_charge**2
+        force.setExceptionParameters(
+            index, atom1, atom2, charge_product, sigma, epsilon
+        )
 
 
 def _write_mol2_and_frcmod(workdir: Path, source: Path, charges: np.ndarray) -> tuple[Path, Path]:
@@ -863,6 +879,7 @@ def load_cached_parameters(
         nonbonded.setParticleParameters(
             index, float(charge) * unit.elementary_charge, sigma, epsilon
         )
+    _synchronize_gaff_exception_charges(nonbonded)
     requested.partial_charges = charges * offunit.elementary_charge
     return CovalentParameterBundle(
         molecule=requested, system=system, charges_e=charges,
