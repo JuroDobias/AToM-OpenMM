@@ -196,13 +196,45 @@ def normalize_setup_options(workflow, atom_options):
                 )
             if ligand_family == "espaloma":
                 template_generator_kwargs["charge_method"] = "am1-bcc"
+        elif charge_model == "resp-sigma-hole":
+            if ligand_family != "gaff":
+                raise WorkflowConfigError(
+                    "workflow.setup.ligand_charge_model='resp-sigma-hole' requires a GAFF ligand_forcefield"
+                )
         else:
-            raise WorkflowConfigError("workflow.setup.ligand_charge_model must be 'nn' or 'am1-bcc'")
+            raise WorkflowConfigError(
+                "workflow.setup.ligand_charge_model must be 'nn', 'am1-bcc', or 'resp-sigma-hole'"
+            )
 
     normalized = {
         "ligandforcefield": ligand_forcefield,
         "template_generator_kwargs": template_generator_kwargs or None,
     }
+    if charge_model == "resp-sigma-hole":
+        cache = setup.get("ligand_parameter_cache")
+        protocol = setup.get("ligand_parameter_protocol")
+        if not isinstance(cache, str) or not cache:
+            raise WorkflowConfigError(
+                "workflow.setup.ligand_parameter_cache is required for resp-sigma-hole"
+            )
+        if not isinstance(protocol, str) or not protocol:
+            raise WorkflowConfigError(
+                "workflow.setup.ligand_parameter_protocol is required for resp-sigma-hole"
+            )
+        normalized.update({
+            "ligandchargemodel": charge_model,
+            "ligandparametercache": cache,
+            "ligandparameterprotocol": protocol,
+        })
+    metal = setup.get("metal_ions") or {}
+    if not isinstance(metal, dict):
+        raise WorkflowConfigError("workflow.setup.metal_ions must be a mapping")
+    metal_model = str(metal.get("model", "standard_12_6"))
+    if metal_model != "standard_12_6":
+        raise WorkflowConfigError(
+            "ATM cached-ligand setup currently supports only metal_ions.model: standard_12_6; "
+            "Panteva m12-6-4 must be integrated into ATMForce before use"
+        )
     if "protein_forcefield" in setup:
         normalized["proteinforcefield"] = _as_list(setup["protein_forcefield"], "workflow.setup.protein_forcefield")
     if "solvent_forcefield" in setup:
@@ -544,6 +576,7 @@ def generate_smarts_alignments(alignment, plan):
 
 def setup_small_molecule_system(receptor_file, lig1_file, lig2_file, ff_json_file, options, setup_options=None):
     from atom_openmm.make_atm_system_from_rcpt_lig import make_system
+    from atom_openmm.receptor_normalization import normalize_legacy_pdb
 
     if setup_options is None:
         setup_options = {}
@@ -551,8 +584,12 @@ def setup_small_molecule_system(receptor_file, lig1_file, lig2_file, ff_json_fil
         setup_small_molecule_system_ambertools(receptor_file, lig1_file, lig2_file, options, setup_options["ambertools"])
         return
     basename = options["BASENAME"]
+    normalized_receptor = Path(receptor_file)
+    if normalized_receptor.suffix.lower() == ".pdb":
+        normalized_receptor = Path(f"{basename}_receptor_normalized.pdb")
+        normalize_legacy_pdb(receptor_file, normalized_receptor)
     setup = {
-        "receptorfile": str(receptor_file),
+        "receptorfile": str(normalized_receptor),
         "lig1file": str(lig1_file),
         "lig2file": str(lig2_file),
         "displacement": options["DISPLACEMENT"],
@@ -825,6 +862,9 @@ def derive_small_molecule_options(options):
     if res1 is None:
         raise WorkflowConfigError("could not find ligand residue L1 in generated system")
     ligand1_atoms = get_indexes_from_residue(res1)
+    ligand1_atoms.extend(
+        atom.index for atom in topology.atoms() if atom.residue.name == "E1"
+    )
     options["LIGAND1_ATOMS"] = ligand1_atoms
 
     res2 = None
@@ -836,6 +876,9 @@ def derive_small_molecule_options(options):
     if res2 is None:
         raise WorkflowConfigError("could not find ligand residue L2 in generated system")
     ligand2_atoms = get_indexes_from_residue(res2)
+    ligand2_atoms.extend(
+        atom.index for atom in topology.atoms() if atom.residue.name == "E2"
+    )
     options["LIGAND2_ATOMS"] = ligand2_atoms
 
     options["LIGAND1_VAR_ATOMS"] = options["LIGAND1_ATOMS"]
@@ -922,7 +965,11 @@ def prepare_selection_metadata(options, workflow, pair_plan, *, base_dir=None):
             workflow, pair_plan, identity, Path(base_dir or Path.cwd())
         )
         molecule = _load_alignment_mol(source)
-        system_indices = [int(value) for value in options[atom_key]]
+        system_indices = [
+            int(value) for value in options[atom_key]
+            if topology_atoms[int(value)].residue.name not in {"E1", "E2"}
+            and topology_atoms[int(value)].element is not None
+        ]
         expected = [topology_atoms[index].element.symbol for index in system_indices]
         observed = [atom.GetSymbol() for atom in molecule.GetAtoms()]
         if observed != expected:
@@ -1271,6 +1318,10 @@ def _prepare_run_context(config_file):
     config = load_workflow_config(config_file)
     plan = build_small_molecule_plan(config)
     setup_options = normalize_setup_options(config["workflow"], config["atom_options"])
+    if setup_options.get("ligandparametercache"):
+        setup_options["ligandparametercache"] = str(
+            _resolve_path(setup_options["ligandparametercache"], config["base_dir"])
+        )
     alignments = load_or_generate_alignments(config["workflow"], plan)
     return config, plan, setup_options, alignments
 

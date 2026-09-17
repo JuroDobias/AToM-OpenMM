@@ -690,6 +690,14 @@ class OMMSystemRBFE(OMMSystem):
                 base_dir=self.keywords.get("WORKDIR", "."),
             )
             solute_atoms = resolver.resolve(selection, "workflow.neqti.rest2.solute")
+        selected = set(solute_atoms)
+        for index in range(self.system.getNumParticles()):
+            if not self.system.isVirtualSite(index):
+                continue
+            site = self.system.getVirtualSite(index)
+            if any(int(site.getParticle(i)) in selected for i in range(site.getNumParticles())):
+                selected.add(index)
+        solute_atoms = sorted(selected)
         self.rest2_system = create_rest2_system(self.system, solute_atoms)
         self.system = self.rest2_system.system
         lig1_count = len(set(solute_atoms) & set(self.keywords.get("SELECTION_METADATA", {}).get("ligand_a", {}).get("system_atom_indices", self.lig1_atoms)))

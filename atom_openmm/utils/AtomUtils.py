@@ -297,6 +297,13 @@ def _get_solute_coords(solute_fpath: Path):  # pdb or sdf file format
         mol = Chem.SDMolSupplier(str(solute_fpath), removeHs=False)[0]
     else:
         mol = Chem.rdmolfiles.MolFromPDBFile(str(solute_fpath), removeHs=False)
+        if mol is None:
+            pdb = PDBFile(str(solute_fpath))
+            return np.asarray(
+                pdb.positions.value_in_unit(angstrom), dtype=float
+            )
+    if mol is None:
+        raise ValueError(f"could not read coordinates from {solute_fpath}")
     conf = mol.GetConformer()
     N_atoms = mol.GetNumAtoms()
     coords = np.zeros((N_atoms, 3))

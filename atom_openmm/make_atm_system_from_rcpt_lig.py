@@ -11,6 +11,7 @@
 
 import os, sys
 import string
+import numpy as np
 from datetime import datetime
 from time import time
 
@@ -19,6 +20,7 @@ import argparse
 
 # OpenMM components
 from openmm import XmlSerializer
+import openmm as mm
 from openmm import Vec3
 from openmm.app import PDBFile
 from openmm.app import ForceField, Modeller
@@ -26,6 +28,7 @@ from openmm.app import PME, HBonds, NoCutoff
 
 # OpenFF components from the toolkit
 from openff.toolkit.topology import Molecule
+from openff.units import unit as offunit
 
 from openmm.unit import angstrom, nanometer, amu, molar
 
@@ -97,6 +100,162 @@ def assign_chain_ids(topology):
         else:
             print(f"Chain {chain.index} already has ID: '{chain.id}'")
 
+
+def _cached_typing_molecule(parameters):
+    molecule = Molecule(parameters.molecule)
+    charges = np.asarray(parameters.charges_e, dtype=float).copy()
+    for site in parameters.virtual_sites:
+        charges[int(site.parent_atom_indices[1])] += float(site.charge_e)
+    molecule.partial_charges = charges * offunit.elementary_charge
+    return molecule
+
+
+def _nonbonded_force(system):
+    forces = [force for force in system.getForces() if isinstance(force, mm.NonbondedForce)]
+    if len(forces) != 1:
+        raise ValueError(f"cached ATM setup requires one NonbondedForce; found {len(forces)}")
+    return forces[0]
+
+
+def _exception_map(force):
+    output = {}
+    for index in range(force.getNumExceptions()):
+        values = force.getExceptionParameters(index)
+        output[tuple(sorted((int(values[0]), int(values[1]))))] = values[2:]
+    return output
+
+
+def _coulomb_14_scale(force):
+    scales = []
+    for index in range(force.getNumExceptions()):
+        atom1, atom2, charge_product, _, epsilon = force.getExceptionParameters(index)
+        q1 = force.getParticleParameters(int(atom1))[0]
+        q2 = force.getParticleParameters(int(atom2))[0]
+        denominator = (q1 * q2).value_in_unit(mm.unit.elementary_charge**2)
+        product = charge_product.value_in_unit(mm.unit.elementary_charge**2)
+        if abs(denominator) > 1.0e-10 and abs(product) > 1.0e-10:
+            scales.append(product / denominator)
+        elif epsilon.value_in_unit(mm.unit.kilojoules_per_mole) > 0.0:
+            scales.append(1.0 / 1.2)
+    return float(np.median(scales)) if scales else 1.0 / 1.2
+
+
+def _install_cached_ligand_parameters(system, topology, positions, parameters, residue_name):
+    atoms = [atom for atom in topology.atoms() if atom.residue.name == residue_name]
+    if len(atoms) != parameters.molecule.n_atoms:
+        raise ValueError(
+            f"cached {residue_name} atom count {parameters.molecule.n_atoms} differs from "
+            f"prepared residue count {len(atoms)}"
+        )
+    force = _nonbonded_force(system)
+    cached = _nonbonded_force(parameters.system)
+    for source_index, atom in enumerate(atoms):
+        _, sigma, epsilon = force.getParticleParameters(atom.index)
+        _, cached_sigma, cached_epsilon = cached.getParticleParameters(source_index)
+        if not np.isclose(
+            sigma.value_in_unit(mm.unit.nanometer),
+            cached_sigma.value_in_unit(mm.unit.nanometer),
+            atol=1.0e-8,
+        ) or not np.isclose(
+            epsilon.value_in_unit(mm.unit.kilojoules_per_mole),
+            cached_epsilon.value_in_unit(mm.unit.kilojoules_per_mole),
+            atol=1.0e-8,
+        ):
+            raise ValueError(
+                f"cached {residue_name} GAFF Lennard-Jones parameters differ at atom {source_index}"
+            )
+        force.setParticleParameters(
+            atom.index,
+            float(parameters.charges_e[source_index]) * mm.unit.elementary_charge,
+            sigma,
+            epsilon,
+        )
+
+    system_atom_indices = {atom.index for atom in atoms}
+    for exception_index in range(force.getNumExceptions()):
+        atom1, atom2, _, sigma, epsilon = force.getExceptionParameters(exception_index)
+        if int(atom1) not in system_atom_indices or int(atom2) not in system_atom_indices:
+            continue
+        q1 = force.getParticleParameters(int(atom1))[0]
+        q2 = force.getParticleParameters(int(atom2))[0]
+        if epsilon.value_in_unit(mm.unit.kilojoules_per_mole) > 0.0:
+            charge_product = q1 * q2 / 1.2
+        else:
+            charge_product = 0.0 * mm.unit.elementary_charge**2
+        force.setExceptionParameters(
+            exception_index, atom1, atom2, charge_product, sigma, epsilon
+        )
+
+    exception_parameters = _exception_map(force)
+    scale14 = _coulomb_14_scale(force)
+    chain = topology.addChain("X")
+    extra_residue_name = "E1" if residue_name == "L1" else "E2"
+    residue = topology.addResidue(extra_residue_name, chain)
+    values = list(positions.value_in_unit(mm.unit.nanometer))
+    site_indices = []
+    source_to_system = [atom.index for atom in atoms]
+    for site in parameters.virtual_sites:
+        if site.kind != "sigma_hole" or len(site.parent_atom_indices) != 3:
+            raise ValueError(f"unsupported cached ATM virtual site {site.kind!r}")
+        carbon, halogen, frame = (
+            source_to_system[int(index)] for index in site.parent_atom_indices
+        )
+        exception_parameters = _exception_map(force)
+        particle = system.addParticle(0.0 * mm.unit.dalton)
+        system.setVirtualSite(
+            particle,
+            mm.LocalCoordinatesSite(
+                [halogen, carbon, frame],
+                [1.0, 0.0, 0.0],
+                [1.0, -1.0, 0.0],
+                [0.0, -1.0, 1.0],
+                mm.Vec3(float(site.distance_a) / 10.0, 0.0, 0.0),
+            ),
+        )
+        force.addParticle(
+            float(site.charge_e) * mm.unit.elementary_charge,
+            max(float(site.sigma_a), 0.01) * mm.unit.angstrom,
+            float(site.epsilon_kj_mol) * mm.unit.kilojoules_per_mole,
+        )
+        halogen_charge = force.getParticleParameters(halogen)[0]
+        for other in range(particle):
+            if other == halogen:
+                force.addException(
+                    particle, other, 0.0 * mm.unit.elementary_charge**2,
+                    1.0 * mm.unit.nanometer, 0.0 * mm.unit.kilojoules_per_mole,
+                )
+                continue
+            source = exception_parameters.get(tuple(sorted((halogen, other))))
+            if source is None:
+                continue
+            charge_product, sigma, _ = source
+            other_charge = force.getParticleParameters(other)[0]
+            denominator = (halogen_charge * other_charge).value_in_unit(
+                mm.unit.elementary_charge**2
+            )
+            source_product = charge_product.value_in_unit(mm.unit.elementary_charge**2)
+            if abs(source_product) <= 1.0e-12:
+                scale = 0.0
+            elif abs(denominator) > 1.0e-12:
+                scale = source_product / denominator
+            else:
+                scale = scale14
+            force.addException(
+                particle,
+                other,
+                float(site.charge_e) * mm.unit.elementary_charge * other_charge * scale,
+                sigma,
+                0.0 * mm.unit.kilojoules_per_mole,
+            )
+        topology.addAtom(site.name, None, residue)
+        halogen_xyz = np.asarray(values[halogen], dtype=float)
+        carbon_xyz = np.asarray(values[carbon], dtype=float)
+        direction = halogen_xyz - carbon_xyz
+        direction /= np.linalg.norm(direction)
+        values.append(halogen_xyz + direction * float(site.distance_a) / 10.0)
+        site_indices.append(particle)
+    return values * mm.unit.nanometer, site_indices
+
 # Example Usage:
 # from openmm.app import PDBFile
 # pdb = PDBFile('input.pdb')
@@ -121,6 +280,9 @@ def make_system(
         ionicstrength=0.15,
         solvent_model=None,
         template_generator_kwargs=None,
+        ligandchargemodel=None,
+        ligandparametercache=None,
+        ligandparameterprotocol=None,
         flagverbose=False
     ):
     print('Generate ATM RBFE OpenMM System')
@@ -193,6 +355,28 @@ def make_system(
             print('Unknown implicit solvent %s' % implsolv)
             sys.exit(1)
 
+    cached_parameters = None
+    if ligandchargemodel == "resp-sigma-hole":
+        if not rbfe:
+            raise ValueError("cached RESP sigma-hole setup currently requires ATM RBFE")
+        from atom_openmm.hybrid_parameters import parameterize_ligand
+        cached_parameters = (
+            parameterize_ligand(
+                lig1file,
+                ligand_forcefield=ligandforcefield,
+                ligand_charge_model=ligandchargemodel,
+                ligand_parameter_cache=ligandparametercache,
+                ligand_parameter_protocol=ligandparameterprotocol,
+            ),
+            parameterize_ligand(
+                lig2file,
+                ligand_forcefield=ligandforcefield,
+                ligand_charge_model=ligandchargemodel,
+                ligand_parameter_cache=ligandparametercache,
+                ligand_parameter_protocol=ligandparameterprotocol,
+            ),
+        )
+
     # to store OpenFF molecule objects of non-protein units
     ligandmolecules = []
 
@@ -210,6 +394,8 @@ def make_system(
         pdbrcpt = PDBFile(receptorfile)
         rcpt_positions = pdbrcpt.positions
         rcpt_ommtopology = pdbrcpt.topology
+        from atom_openmm.hybrid_systems import _repair_template_bonds
+        _repair_template_bonds(rcpt_ommtopology, rcpt_positions, forcefield)
     elif rcptpext == '.sdf':
         print('Receptor in SDF format')
         molrcpt = Molecule.from_file(receptorfile, file_format='SDF',
@@ -277,7 +463,11 @@ def make_system(
     fileext = (os.path.splitext(lig1file)[1]).upper()
     if fileext in ('.SDF', '.MOL2'):
         file_format = 'SDF' if fileext == '.SDF' else 'MOL2'
-        mollig1 = Molecule.from_file(lig1file, file_format=file_format, allow_undefined_stereo=True)
+        mollig1 = (
+            _cached_typing_molecule(cached_parameters[0])
+            if cached_parameters is not None
+            else Molecule.from_file(lig1file, file_format=file_format, allow_undefined_stereo=True)
+        )
         ligandmolecules.append(mollig1)
         lig1_ommtopology = mollig1.to_topology().to_openmm(ensure_unique_atom_names=True)
         pos = mollig1.conformers[0].to('angstrom').magnitude
@@ -317,7 +507,11 @@ def make_system(
         fileext = (os.path.splitext(lig2file)[1]).upper()
         if fileext in ('.SDF', '.MOL2'):
             file_format = 'SDF' if fileext == '.SDF' else 'MOL2'
-            mollig2 = Molecule.from_file(lig2file, file_format=file_format, allow_undefined_stereo=True)
+            mollig2 = (
+                _cached_typing_molecule(cached_parameters[1])
+                if cached_parameters is not None
+                else Molecule.from_file(lig2file, file_format=file_format, allow_undefined_stereo=True)
+            )
             ligandmolecules.append(mollig2)
             lig2_ommtopology = mollig2.to_topology().to_openmm(ensure_unique_atom_names=True)
             pos = mollig2.conformers[0].to('angstrom').magnitude
@@ -384,7 +578,12 @@ def make_system(
     if ligandforcefield[0:4] == "gaff":
         from openmmforcefields.generators import GAFFTemplateGenerator
         print('Using GAFFTemplateGenerator function for ligands')
-        template_gen = GAFFTemplateGenerator(molecules=ligandmolecules, cache=ffcachefile, template_generator_kwargs=template_generator_kwargs )
+        template_gen = GAFFTemplateGenerator(
+            molecules=ligandmolecules,
+            forcefield=ligandforcefield,
+            cache=ffcachefile,
+            template_generator_kwargs=template_generator_kwargs,
+        )
     elif ligandforcefield[0:6] == "openff":
         from openmmforcefields.generators import SMIRNOFFTemplateGenerator
         print('Call SMIRNOFFTemplateGenerator function for ligands')
@@ -419,11 +618,22 @@ def make_system(
         system=forcefield.createSystem(modeller.topology, nonbondedMethod = NoCutoff,
                                     constraints=HBonds, rigidWater = True, removeCMMotion = False, hydrogenMass = hmass*amu)
 
+    output_positions = modeller.positions
+    if cached_parameters is not None:
+        output_positions, _ = _install_cached_ligand_parameters(
+            system, modeller.topology, output_positions, cached_parameters[0], "L1"
+        )
+        output_positions, _ = _install_cached_ligand_parameters(
+            system, modeller.topology, output_positions, cached_parameters[1], "L2"
+        )
+        if modeller.topology.getNumAtoms() != system.getNumParticles():
+            raise ValueError("cached ATM topology and System particle counts differ")
+
     with open(xmloutfile, 'w') as output:
         output.write(XmlSerializer.serialize(system))
 
     if pdboutfile is not None:
-        PDBFile.writeFile(modeller.topology, modeller.positions,
+        PDBFile.writeFile(modeller.topology, output_positions,
                         open(pdboutfile,'w'), keepIds=True)
 
     today = datetime.today()

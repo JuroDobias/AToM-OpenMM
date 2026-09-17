@@ -1,0 +1,154 @@
+workflow:
+  type: rbfe
+  chemistry: noncovalent
+  alchemy:
+    model: atm
+    cycle: transfer
+  sampling:
+    method: neqti
+  workdir: run
+  receptor: ../hybrid_imidazole_oxazole6O/inputs/protein.pdb
+  ligands_dir: ligands
+  pairs:
+    - [ms_491, ms_492]
+  reference_ligand: ms_491
+  reference_alignment_atoms: [3, 7, 11]
+  alignments_out: alignments.yaml
+  forcefield_cache: ff.json
+  platform: CUDA
+  platform_properties:
+    Precision: mixed
+  run: true
+  analyze: true
+
+  setup:
+    mode: openmmforcefields
+    protein_forcefield:
+      - amber14-all.xml
+      - ../hybrid_imidazole_oxazole6O/inputs/ATP.xml
+    solvent_forcefield:
+      - amber14/tip4pew.xml
+    solvent_model: tip4pew
+    ligand_forcefield: gaff-2.2.20
+    ligand_charge_model: resp-sigma-hole
+    ligand_parameter_cache: /home/jurajdobias/myAToM/ligand_parameter_cache/gaff2_resp_cl_ep
+    ligand_parameter_protocol: gaff2-resp-halogen-ep-v2
+    metal_ions:
+      model: standard_12_6
+
+  equilibration:
+    pre_atm:
+      steps:
+        - id: restrained_minimization
+          type: minimization
+          tolerance_kj_mol_nm: 10.0
+          max_iterations: 1000
+          positional_restraints:
+            mask: '!@H= & !:L1,L2,HOH,WAT,NA,CL,K,CA,MG,ZN'
+            k_kcal_mol_a2: 10.0
+            tolerance_a: 0.05
+        - id: restrained_nvt
+          type: md
+          ensemble: NVT
+          n_steps: 25000
+          timestep_ps: 0.002
+          reset_velocities: true
+          thermostat: {temperature_k: 300.0, friction_per_ps: 1.0}
+          positional_restraints:
+            mask: '!@H= & !:L1,L2,HOH,WAT,NA,CL,K,CA,MG,ZN'
+            k_kcal_mol_a2: 5.0
+            tolerance_a: 0.25
+          reporters:
+            state: {interval: 5000}
+        - id: restrained_npt
+          type: md
+          ensemble: NPT
+          n_steps: 50000
+          timestep_ps: 0.002
+          thermostat: {temperature_k: 300.0, friction_per_ps: 1.0}
+          positional_restraints:
+            mask: '!@H= & !:L1,L2,HOH,WAT,NA,CL,K,CA,MG,ZN'
+            k_kcal_mol_a2: 2.0
+            tolerance_a: 0.5
+          reporters:
+            state: {interval: 5000}
+        - id: unrestrained_npt
+          type: md
+          ensemble: NPT
+          n_steps: 50000
+          timestep_ps: 0.002
+          thermostat: {temperature_k: 300.0, friction_per_ps: 1.0}
+          reporters:
+            state: {interval: 5000}
+    neqti:
+      endpoint:
+        steps:
+          - id: endpoint_minimization
+            type: minimization
+            tolerance_kj_mol_nm: 10.0
+            max_iterations: 1000
+            positional_restraints:
+              mask: '!@H= & !:L1,L2,HOH,WAT,NA,CL,K,CA,MG,ZN'
+              k_kcal_mol_a2: 5.0
+              tolerance_a: 0.1
+          - id: endpoint_nvt
+            type: md
+            ensemble: NVT
+            n_steps: 25000
+            timestep_ps: 0.002
+            reset_velocities: true
+            thermostat: {temperature_k: 300.0, friction_per_ps: 1.0}
+            positional_restraints:
+              mask: '!@H= & !:L1,L2,HOH,WAT,NA,CL,K,CA,MG,ZN'
+              k_kcal_mol_a2: 1.0
+              tolerance_a: 0.5
+            reporters:
+              state: {interval: 5000}
+          - id: endpoint_npt
+            type: md
+            ensemble: NPT
+            n_steps: 50000
+            timestep_ps: 0.002
+            thermostat: {temperature_k: 300.0, friction_per_ps: 1.0}
+            reporters:
+              state: {interval: 5000}
+
+  neqti:
+    initial_equilibration_steps: 5000
+    n_snapshots: 2
+    decorrelation_steps: 5000
+    switch_steps_per_segment: 250
+    preparation_annealing_steps_per_segment: 250
+    switch_integrator: custom
+    validate_switch_integrator: true
+    tolerate_failed_switches: false
+    resume: true
+    bootstrap_samples: 0
+    rest2:
+      enabled: false
+
+atom_options:
+  TEMPERATURES: [300.0]
+  LAMBDAS: [0.00, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00]
+  DIRECTION: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
+  INTERMEDIATE: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  LAMBDA1: [0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.10, 0.20, 0.30, 0.40, 0.50, 0.50, 0.40, 0.30, 0.20, 0.10, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00]
+  LAMBDA2: [0.00, 0.10, 0.20, 0.30, 0.40, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.40, 0.30, 0.20, 0.10, 0.00]
+  ALPHA: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10]
+  U0: [110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0]
+  W0COEFF: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  RCPT_CHAIN_NAMES: [A, B, C, D, E, F, G]
+  MAX_SAMPLES: 1
+  CHECKPOINT_TIME: 1200
+  CM_KF: 25.0
+  CM_TOL: 5
+  ALIGN_KF_SEP: 0.0
+  ALIGN_K_THETA: 25.0
+  ALIGN_K_PSI: 25.0
+  UMAX: 200.0
+  ACORE: 0.0625
+  UBCORE: 100.0
+  FRICTION_COEFF: 0.5
+  HMASS: 1.5
+  TIME_STEP: 0.002
+  VERBOSE: false
