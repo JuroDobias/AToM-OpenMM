@@ -74,9 +74,36 @@ def normalize_sigma_hole_settings(raw: dict | None) -> dict:
         raise LigandParameterizationError(
             "sigma_holes may specify halogens or legacy smarts, not both"
         )
-    normalized = {"distance_a": float(raw.get("distance_a", 1.64))}
-    if normalized["distance_a"] <= 0.0:
-        raise LigandParameterizationError("sigma-hole distance must be positive")
+    if "distance_a" in raw and "distances_a" in raw:
+        raise LigandParameterizationError(
+            "sigma_holes may specify distance_a or distances_a, not both"
+        )
+    normalized = {}
+    if "distances_a" in raw:
+        distances = raw["distances_a"]
+        if not isinstance(distances, dict) or not distances:
+            raise LigandParameterizationError(
+                "sigma_holes.distances_a must be a non-empty mapping"
+            )
+        symbols_by_lower = {
+            symbol.lower(): symbol for symbol in SIGMA_HOLE_ATOMIC_NUMBERS
+        }
+        normalized_distances = {}
+        for value, distance in distances.items():
+            if not isinstance(value, str) or value.strip().lower() not in symbols_by_lower:
+                supported = ", ".join(SIGMA_HOLE_ATOMIC_NUMBERS)
+                raise LigandParameterizationError(
+                    f"unsupported sigma-hole distance element {value!r}; choose from {supported}"
+                )
+            distance = float(distance)
+            if distance <= 0.0:
+                raise LigandParameterizationError("sigma-hole distances must be positive")
+            normalized_distances[symbols_by_lower[value.strip().lower()]] = distance
+        normalized["distances_a"] = normalized_distances
+    else:
+        normalized["distance_a"] = float(raw.get("distance_a", 1.64))
+        if normalized["distance_a"] <= 0.0:
+            raise LigandParameterizationError("sigma-hole distance must be positive")
     if "smarts" in raw:
         smarts = raw["smarts"]
         if not isinstance(smarts, str) or not smarts.strip():
@@ -99,7 +126,26 @@ def normalize_sigma_hole_settings(raw: dict | None) -> dict:
         if symbol not in canonical:
             canonical.append(symbol)
     normalized["halogens"] = canonical
+    if "distances_a" in normalized:
+        missing = [symbol for symbol in canonical if symbol not in normalized["distances_a"]]
+        if missing:
+            raise LigandParameterizationError(
+                "sigma_holes.distances_a is missing selected halogens: "
+                + ", ".join(missing)
+            )
     return normalized
+
+
+def _sigma_hole_distance_a(molecule: Molecule, parents, settings: dict) -> float:
+    if "distances_a" not in settings:
+        return float(settings["distance_a"])
+    symbol = molecule.atoms[int(parents[1])].symbol
+    try:
+        return float(settings["distances_a"][symbol])
+    except KeyError as exc:
+        raise LigandParameterizationError(
+            f"sigma-hole distance is not configured for {symbol}"
+        ) from exc
 
 
 def normalize_protocol(raw: dict | None) -> dict:
@@ -370,15 +416,15 @@ def _parse_amber_esp(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return atoms, records[:, 0], records[:, 1:]
 
 
-def _site_coordinates(atom_coordinates_bohr: np.ndarray, sites, distance_a: float) -> np.ndarray:
-    distance_bohr = float(distance_a) / 0.529177210903
+def _site_coordinates(atom_coordinates_bohr: np.ndarray, sites, distances_a) -> np.ndarray:
     output = []
-    for carbon, chlorine, _ in sites:
-        axis = atom_coordinates_bohr[chlorine] - atom_coordinates_bohr[carbon]
+    for (carbon, halogen, _), distance_a in zip(sites, distances_a):
+        distance_bohr = float(distance_a) / 0.529177210903
+        axis = atom_coordinates_bohr[halogen] - atom_coordinates_bohr[carbon]
         norm = np.linalg.norm(axis)
         if norm <= 1.0e-8:
-            raise LigandParameterizationError("C-Cl distance is zero in ESP geometry")
-        output.append(atom_coordinates_bohr[chlorine] + distance_bohr * axis / norm)
+            raise LigandParameterizationError("C-X distance is zero in ESP geometry")
+        output.append(atom_coordinates_bohr[halogen] + distance_bohr * axis / norm)
     return np.asarray(output)
 
 
@@ -467,11 +513,14 @@ def _run_resp(workdir: Path, molecule: Molecule, sites, protocol, esp_paths) -> 
     expected_atoms = molecule.n_atoms
     if any(len(atoms) != expected_atoms for atoms, _, _ in raw):
         raise LigandParameterizationError("Gaussian ESP atom count differs from the ligand")
-    distance_a = protocol["sigma_holes"]["distance_a"]
+    distances_a = [
+        _sigma_hole_distance_a(molecule, site, protocol["sigma_holes"])
+        for site in sites
+    ]
     augmented = []
     atom_only = []
     for atoms, potentials, points in raw:
-        site_xyz = _site_coordinates(atoms, sites, distance_a)
+        site_xyz = _site_coordinates(atoms, sites, distances_a)
         augmented.append((np.vstack((atoms, site_xyz)), potentials, points))
         atom_only.append((atoms, potentials, points))
     atomic_numbers = [atom.atomic_number for atom in molecule.atoms]
@@ -661,7 +710,9 @@ def _publish_artifact(config_path: Path, config: dict) -> Path:
             VirtualSiteParameter(
                 name=_sigma_hole_name(molecule, parents, index + 1), kind="sigma_hole",
                 parent_atom_indices=tuple(int(value) for value in parents),
-                distance_a=protocol["sigma_holes"]["distance_a"],
+                distance_a=_sigma_hole_distance_a(
+                    molecule, parents, protocol["sigma_holes"]
+                ),
                 charge_e=float(fitted[molecule.n_atoms + index]),
             )
             for index, parents in enumerate(sites)

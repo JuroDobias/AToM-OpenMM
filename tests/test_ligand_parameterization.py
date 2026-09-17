@@ -91,6 +91,17 @@ def _test_sigma_hole_selector_is_normalized_and_validated():
     with pytest.raises(LigandParameterizationError, match="unsupported"):
         normalize_sigma_hole_settings({"halogens": ["At"]})
 
+    mixed = normalize_sigma_hole_settings({
+        "halogens": ["Cl", "Br"],
+        "distances_a": {"cl": 1.64, "BR": 1.89},
+    })
+    assert mixed["distances_a"] == {"Cl": 1.64, "Br": 1.89}
+    with pytest.raises(LigandParameterizationError, match="missing selected"):
+        normalize_sigma_hole_settings({
+            "halogens": ["Cl", "Br"],
+            "distances_a": {"Cl": 1.64},
+        })
+
 
 def _test_sigma_hole_selector_controls_eligible_elements():
     molecule = _molecule("FCCl")

@@ -18,6 +18,7 @@ from atom_openmm.covalent_parameters import (
 )
 from atom_openmm.ligand_parameterization import (
     _find_sigma_holes,
+    _sigma_hole_distance_a,
     _sigma_hole_name,
     normalize_sigma_hole_settings,
 )
@@ -32,7 +33,7 @@ def _apply_fixed_sigma_holes(molecule, system, charges_e, settings):
         return np.asarray(charges_e, dtype=float), ()
     sigma_settings = {
         key: settings[key]
-        for key in ("halogens", "smarts", "distance_a")
+        for key in ("halogens", "smarts", "distance_a", "distances_a")
         if key in settings
     }
     protocol = {"sigma_holes": normalize_sigma_hole_settings(sigma_settings)}
@@ -49,7 +50,7 @@ def _apply_fixed_sigma_holes(molecule, system, charges_e, settings):
             name=_sigma_hole_name(molecule, parents, index),
             kind="sigma_hole",
             parent_atom_indices=tuple(int(value) for value in parents),
-            distance_a=float(settings["distance_a"]),
+            distance_a=_sigma_hole_distance_a(molecule, parents, protocol["sigma_holes"]),
             charge_e=charge,
         ))
     nonbonded = next(
