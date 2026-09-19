@@ -6,6 +6,8 @@ import pytest
 from openmm import unit
 
 from atom_openmm.covalent_softcore import (
+    BRANCH_ANGLE_A_PARAMETER,
+    BRANCH_TORSION_A_PARAMETER,
     BONDED_A_PARAMETER,
     BONDED_B_PARAMETER,
     CHARGE_A_PARAMETER,
@@ -131,6 +133,70 @@ def test_soft_bond_is_exact_at_endpoints_and_bounded_midway():
     assert at_a == 0.0
     assert np.isclose(at_b, expected_b)
     assert midway < 10.0
+
+
+def test_branch_controls_soften_angles_and_proper_torsions_but_not_impropers():
+    endpoint_a = mm.System()
+    endpoint_b = mm.System()
+    for system in (endpoint_a, endpoint_b):
+        for _ in range(5):
+            system.addParticle(12.0)
+        bonds = mm.HarmonicBondForce()
+        for left, right in ((0, 1), (1, 2), (2, 3), (1, 4)):
+            bonds.addBond(left, right, 0.15, 1000.0)
+        system.addForce(bonds)
+        angles = mm.HarmonicAngleForce()
+        angles.addAngle(1, 2, 3, 2.0, 100.0)
+        system.addForce(angles)
+        torsions = mm.PeriodicTorsionForce()
+        torsions.addTorsion(0, 1, 2, 3, 2, 0.0, 4.0)  # proper
+        torsions.addTorsion(0, 2, 3, 4, 2, 0.0, 7.0)  # improper
+        system.addForce(torsions)
+
+    output = mm.System()
+    for _ in range(5):
+        output.addParticle(12.0)
+    _add_bonded_forces(
+        output, endpoint_a, endpoint_b, unique_a=[2, 3], unique_b=[]
+    )
+    positions = np.asarray(
+        [[0, 0, 0], [0.15, 0, 0], [0.24, 0.12, 0],
+         [0.32, 0.17, 0.11], [0.15, -0.08, 0.1]]
+    ) * unit.nanometer
+    full, _ = _energy_forces(output, positions)
+    softened, _ = _energy_forces(
+        output,
+        positions,
+        {BRANCH_ANGLE_A_PARAMETER: 0.0, BRANCH_TORSION_A_PARAMETER: 0.0},
+    )
+    assert softened < full
+
+    force_names = {force.getName() for force in output.getForces()}
+    assert "CovalentBranchAnglesA" in force_names
+    assert "CovalentBranchTorsionsA" in force_names
+    assert "CovalentCommonTorsions" in force_names
+
+
+def test_explicit_nodes_default_new_branch_controls_to_physical_values():
+    controls = {
+        name: value
+        for name, value in EXPLICIT_ENDPOINT_A_CONTROLS.items()
+        if not name.startswith("branch_")
+    }
+    resolved = resolve_softcore_path(
+        total_steps=10,
+        control_nodes=[
+            {"at": 0.0, "controls": controls},
+            {"at": 1.0, "controls": {
+                name: value
+                for name, value in EXPLICIT_ENDPOINT_B_CONTROLS.items()
+                if not name.startswith("branch_")
+            }},
+        ],
+        segments_per_interval=[1],
+    )
+    assert resolved["branch_angles_a"] == [1.0, 1.0]
+    assert resolved["branch_torsions_b"] == [1.0, 1.0]
 
 
 def _test_softcore_nodes_reproduce_endpoint_energies_and_forces():

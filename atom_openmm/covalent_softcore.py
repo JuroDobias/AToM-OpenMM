@@ -31,6 +31,10 @@ SOFT_ANGLE_A_PARAMETER = "COVALENT_SOFT_ANGLE_A"
 SOFT_ANGLE_B_PARAMETER = "COVALENT_SOFT_ANGLE_B"
 SOFT_TORSION_A_PARAMETER = "COVALENT_SOFT_TORSION_A"
 SOFT_TORSION_B_PARAMETER = "COVALENT_SOFT_TORSION_B"
+BRANCH_ANGLE_A_PARAMETER = "COVALENT_BRANCH_ANGLE_A"
+BRANCH_ANGLE_B_PARAMETER = "COVALENT_BRANCH_ANGLE_B"
+BRANCH_TORSION_A_PARAMETER = "COVALENT_BRANCH_TORSION_A"
+BRANCH_TORSION_B_PARAMETER = "COVALENT_BRANCH_TORSION_B"
 BOND_NONBONDED_CHARGE_A_PARAMETER = "COVALENT_BOND_NONBONDED_CHARGE_A"
 BOND_NONBONDED_CHARGE_B_PARAMETER = "COVALENT_BOND_NONBONDED_CHARGE_B"
 BOND_NONBONDED_VDW_A_PARAMETER = "COVALENT_BOND_NONBONDED_VDW_A"
@@ -59,6 +63,8 @@ EXPLICIT_PATH_CONTROLS = (
     "mapped_charge", "mapped_vdw", "bonded_a", "bonded_b",
     "soft_bond_a", "soft_bond_b", "soft_angles_a", "soft_angles_b",
     "soft_torsions_a", "soft_torsions_b",
+    "branch_angles_a", "branch_angles_b",
+    "branch_torsions_a", "branch_torsions_b",
     "bond_nonbonded_charge_a", "bond_nonbonded_charge_b",
     "bond_nonbonded_vdw_a", "bond_nonbonded_vdw_b",
     "bond_one_four_charge_a", "bond_one_four_charge_b",
@@ -73,6 +79,8 @@ EXPLICIT_ENDPOINT_A_CONTROLS = {
     "soft_bond_a": 1.0, "soft_bond_b": 0.0,
     "soft_angles_a": 1.0, "soft_angles_b": 0.0,
     "soft_torsions_a": 1.0, "soft_torsions_b": 0.0,
+    "branch_angles_a": 1.0, "branch_angles_b": 1.0,
+    "branch_torsions_a": 1.0, "branch_torsions_b": 1.0,
     "bond_nonbonded_charge_a": 0.0, "bond_nonbonded_charge_b": 1.0,
     "bond_nonbonded_vdw_a": 0.0, "bond_nonbonded_vdw_b": 1.0,
     "bond_one_four_charge_a": 1.0, "bond_one_four_charge_b": 0.0,
@@ -226,7 +234,21 @@ def _add_bonded_forces(
     *,
     soft_bond_alpha_nm2=100.0,
     soft_bond_pairs=(),
+    unique_a=(),
+    unique_b=(),
 ):
+    unique_a = set(unique_a)
+    unique_b = set(unique_b)
+
+    def branch_role(particles):
+        in_a = bool(set(particles) & unique_a)
+        in_b = bool(set(particles) & unique_b)
+        if in_a and in_b:
+            raise CovalentAlchemyError(
+                "a bonded term cannot contain particles from both unique branches"
+            )
+        return "A" if in_a else "B" if in_b else None
+
     bond_a = _force(endpoint_a, mm.HarmonicBondForce)
     bond_b = _force(endpoint_b, mm.HarmonicBondForce)
     bonds_a = _bond_terms(bond_a)
@@ -290,6 +312,40 @@ def _add_bonded_forces(
     angles_a = _angle_terms(angle_a)
     angles_b = _angle_terms(angle_b)
     common_angles = mm.HarmonicAngleForce()
+    branch_angles = {}
+    for label, parameter in (
+        ("A", BRANCH_ANGLE_A_PARAMETER),
+        ("B", BRANCH_ANGLE_B_PARAMETER),
+    ):
+        force = mm.CustomAngleForce(f"0.5*{parameter}*k*(theta-theta0)^2")
+        force.addGlobalParameter(parameter, 1.0)
+        force.addPerAngleParameter("theta0")
+        force.addPerAngleParameter("k")
+        branch_angles[label] = force
+    branch_changed_angles = {}
+    for label, parameter in (
+        ("A", BRANCH_ANGLE_A_PARAMETER),
+        ("B", BRANCH_ANGLE_B_PARAMETER),
+    ):
+        force = mm.CustomAngleForce(
+            "0.5*branchScale*(wA*kA*(theta-thetaA)^2"
+            "+wB*kB*(theta-thetaB)^2);"
+            "wA=(1-separate)*(1-COVALENT_STERICS)"
+            "+separate*COVALENT_BONDED_A;"
+            "wB=(1-separate)*COVALENT_STERICS"
+            "+separate*COVALENT_BONDED_B;"
+            f"branchScale={parameter};"
+            "separate=COVALENT_SEPARATE_BONDED"
+        )
+        for global_name in (
+            BONDED_A_PARAMETER, BONDED_B_PARAMETER,
+            STERICS_PARAMETER, SEPARATE_BONDED_PARAMETER,
+        ):
+            force.addGlobalParameter(global_name, 0.0)
+        force.addGlobalParameter(parameter, 1.0)
+        for name in ("thetaA", "kA", "thetaB", "kB"):
+            force.addPerAngleParameter(name)
+        branch_changed_angles[label] = force
     changed_angles = mm.CustomAngleForce(
         "0.5*(wA*kA*(theta-thetaA)^2+wB*kB*(theta-thetaB)^2);"
         "wA=(1-separate)*(1-COVALENT_STERICS)+separate*COVALENT_BONDED_A;"
@@ -313,14 +369,26 @@ def _add_bonded_forces(
     for particles in sorted(set(angles_a) | set(angles_b)):
         value_a = angles_a.get(particles)
         value_b = angles_b.get(particles)
-        if value_a == value_b:
+        role = branch_role(particles)
+        crosses_soft_bond = _term_contains_bond(particles, soft_bond_pairs)
+        if value_a == value_b and role is not None and not crosses_soft_bond:
+            branch_angles[role].addAngle(*particles, value_a)
+        elif value_a == value_b:
             common_angles.addAngle(*particles, value_a[0], value_a[1])
         else:
             fallback = value_a or value_b
             theta_a, k_a = value_a or (fallback[0], 0.0)
             theta_b, k_b = value_b or (fallback[0], 0.0)
-            target = soft_angles if _term_contains_bond(particles, soft_bond_pairs) else changed_angles
-            target.addAngle(*particles, [theta_a, k_a, theta_b, k_b])
+            if crosses_soft_bond:
+                soft_angles.addAngle(*particles, [theta_a, k_a, theta_b, k_b])
+            elif role is not None:
+                branch_changed_angles[role].addAngle(
+                    *particles, [theta_a, k_a, theta_b, k_b]
+                )
+            else:
+                changed_angles.addAngle(
+                    *particles, [theta_a, k_a, theta_b, k_b]
+                )
     if common_angles.getNumAngles():
         if angle_a is not None:
             _copy_force_metadata(angle_a, common_angles)
@@ -332,20 +400,62 @@ def _add_bonded_forces(
     if soft_angles.getNumAngles():
         soft_angles.setName("CovalentSoftBondAngles")
         output.addForce(soft_angles)
+    for label, force in branch_angles.items():
+        if force.getNumAngles():
+            force.setName(f"CovalentBranchAngles{label}")
+            output.addForce(force)
+    for label, force in branch_changed_angles.items():
+        if force.getNumAngles():
+            force.setName(f"CovalentInterpolatedBranchAngles{label}")
+            output.addForce(force)
 
     torsion_a = _force(endpoint_a, mm.PeriodicTorsionForce)
     torsion_b = _force(endpoint_b, mm.PeriodicTorsionForce)
     common, only_a, only_b = _split_identical(
         _torsion_terms(torsion_a), _torsion_terms(torsion_b)
     )
+    bond_pairs = set(bonds_a) | set(bonds_b)
+
+    def is_proper(particles):
+        return all(
+            tuple(sorted((particles[index], particles[index + 1]))) in bond_pairs
+            for index in range(3)
+        )
+
     common_torsions = mm.PeriodicTorsionForce()
+    branch_common_torsions = {}
+    for label, parameter in (
+        ("A", BRANCH_TORSION_A_PARAMETER),
+        ("B", BRANCH_TORSION_B_PARAMETER),
+    ):
+        force = mm.CustomTorsionForce(
+            f"{parameter}*k*(1+cos(periodicity*theta-phase))"
+        )
+        force.addGlobalParameter(parameter, 1.0)
+        for name in ("periodicity", "phase", "k"):
+            force.addPerTorsionParameter(name)
+        branch_common_torsions[label] = force
     for particles, periodicity, phase, k in common:
-        common_torsions.addTorsion(*particles, periodicity, phase, k)
+        role = branch_role(particles)
+        if (
+            role is not None
+            and is_proper(particles)
+            and not _term_contains_bond(particles, soft_bond_pairs)
+        ):
+            branch_common_torsions[role].addTorsion(
+                *particles, [periodicity, phase, k]
+            )
+        else:
+            common_torsions.addTorsion(*particles, periodicity, phase, k)
     if common_torsions.getNumTorsions():
         if torsion_a is not None:
             _copy_force_metadata(torsion_a, common_torsions)
         common_torsions.setName("CovalentCommonTorsions")
         output.addForce(common_torsions)
+    for label, force in branch_common_torsions.items():
+        if force.getNumTorsions():
+            force.setName(f"CovalentBranchTorsions{label}")
+            output.addForce(force)
     for label, terms, expression in (
         (
             "A",
@@ -363,11 +473,14 @@ def _add_bonded_forces(
         ),
     ):
         regular_terms = []
+        branch_terms = []
         closure_terms = []
         for term in terms:
             target = (
                 closure_terms
                 if _term_contains_bond(term[0], soft_bond_pairs)
+                else branch_terms
+                if branch_role(term[0]) == label and is_proper(term[0])
                 else regular_terms
             )
             target.append(term)
@@ -388,6 +501,28 @@ def _add_bonded_forces(
         if force.getNumTorsions():
             force.setName(f"CovalentInterpolatedTorsions{label}")
             output.addForce(force)
+        branch_parameter = (
+            BRANCH_TORSION_A_PARAMETER if label == "A"
+            else BRANCH_TORSION_B_PARAMETER
+        )
+        bonded_parameter = BONDED_A_PARAMETER if label == "A" else BONDED_B_PARAMETER
+        sterics_parameter = STERICS_A_PARAMETER if label == "A" else STERICS_B_PARAMETER
+        branch_force = mm.CustomTorsionForce(
+            f"{branch_parameter}*((1-COVALENT_SEPARATE_BONDED)*"
+            f"{sterics_parameter}+COVALENT_SEPARATE_BONDED*{bonded_parameter})"
+            "*k*(1+cos(periodicity*theta-phase))"
+        )
+        branch_force.addGlobalParameter(bonded_parameter, 0.0)
+        branch_force.addGlobalParameter(sterics_parameter, 0.0)
+        branch_force.addGlobalParameter(SEPARATE_BONDED_PARAMETER, 0.0)
+        branch_force.addGlobalParameter(branch_parameter, 1.0)
+        for name in ("periodicity", "phase", "k"):
+            branch_force.addPerTorsionParameter(name)
+        for particles, periodicity, phase, k in branch_terms:
+            branch_force.addTorsion(*particles, [periodicity, phase, k])
+        if branch_force.getNumTorsions():
+            branch_force.setName(f"CovalentInterpolatedBranchTorsions{label}")
+            output.addForce(branch_force)
         soft_scale = SOFT_TORSION_A_PARAMETER if label == "A" else SOFT_TORSION_B_PARAMETER
         soft_force = mm.CustomTorsionForce(
             f"{soft_scale}*k*(1+cos(periodicity*theta-phase))"
@@ -406,6 +541,8 @@ def _add_bonded_forces(
         "+COVALENT_SOFT_BOND_A+COVALENT_SOFT_BOND_B"
         "+COVALENT_SOFT_ANGLE_A+COVALENT_SOFT_ANGLE_B"
         "+COVALENT_SOFT_TORSION_A+COVALENT_SOFT_TORSION_B"
+        "+COVALENT_BRANCH_ANGLE_A+COVALENT_BRANCH_ANGLE_B"
+        "+COVALENT_BRANCH_TORSION_A+COVALENT_BRANCH_TORSION_B"
         "+COVALENT_BOND_NONBONDED_CHARGE_A+COVALENT_BOND_NONBONDED_CHARGE_B"
         "+COVALENT_BOND_NONBONDED_VDW_A+COVALENT_BOND_NONBONDED_VDW_B"
         "+COVALENT_BOND_ONE_FOUR_CHARGE_A+COVALENT_BOND_ONE_FOUR_CHARGE_B"
@@ -418,12 +555,18 @@ def _add_bonded_forces(
         SOFT_BOND_A_PARAMETER, SOFT_BOND_B_PARAMETER,
         SOFT_ANGLE_A_PARAMETER, SOFT_ANGLE_B_PARAMETER,
         SOFT_TORSION_A_PARAMETER, SOFT_TORSION_B_PARAMETER,
+        BRANCH_ANGLE_A_PARAMETER, BRANCH_ANGLE_B_PARAMETER,
+        BRANCH_TORSION_A_PARAMETER, BRANCH_TORSION_B_PARAMETER,
         BOND_NONBONDED_CHARGE_A_PARAMETER, BOND_NONBONDED_CHARGE_B_PARAMETER,
         BOND_NONBONDED_VDW_A_PARAMETER, BOND_NONBONDED_VDW_B_PARAMETER,
         BOND_ONE_FOUR_CHARGE_A_PARAMETER, BOND_ONE_FOUR_CHARGE_B_PARAMETER,
         BOND_ONE_FOUR_VDW_A_PARAMETER, BOND_ONE_FOUR_VDW_B_PARAMETER,
     ):
-        parameter_anchor.addGlobalParameter(parameter, 0.0)
+        default = 1.0 if parameter in {
+            BRANCH_ANGLE_A_PARAMETER, BRANCH_ANGLE_B_PARAMETER,
+            BRANCH_TORSION_A_PARAMETER, BRANCH_TORSION_B_PARAMETER,
+        } else 0.0
+        parameter_anchor.addGlobalParameter(parameter, default)
     if output.getNumParticles():
         parameter_anchor.addParticle(0, [])
     parameter_anchor.setName("CovalentBondedParameterAnchor")
@@ -1798,13 +1941,23 @@ def resolve_softcore_path(
                     f"softcore control node {index + 1} contains invalid controls"
                 )
             if previous is None:
-                missing = set(EXPLICIT_PATH_CONTROLS) - set(controls)
+                branch_defaults = {
+                    "branch_angles_a": 1.0,
+                    "branch_angles_b": 1.0,
+                    "branch_torsions_a": 1.0,
+                    "branch_torsions_b": 1.0,
+                }
+                missing = (
+                    set(EXPLICIT_PATH_CONTROLS)
+                    - set(branch_defaults)
+                    - set(controls)
+                )
                 if missing:
                     raise CovalentAlchemyError(
                         "the first softcore control node must define every control; "
                         f"missing {', '.join(sorted(missing))}"
                     )
-                resolved_controls = {}
+                resolved_controls = branch_defaults
             else:
                 resolved_controls = dict(previous["controls"])
             for name, value in controls.items():
@@ -1874,6 +2027,10 @@ def resolve_softcore_path(
             "soft_angles_b": values["soft_angles_b"],
             "soft_torsions_a": values["soft_torsions_a"],
             "soft_torsions_b": values["soft_torsions_b"],
+            "branch_angles_a": values["branch_angles_a"],
+            "branch_angles_b": values["branch_angles_b"],
+            "branch_torsions_a": values["branch_torsions_a"],
+            "branch_torsions_b": values["branch_torsions_b"],
             "bond_nonbonded_charge_a": values["bond_nonbonded_charge_a"],
             "bond_nonbonded_charge_b": values["bond_nonbonded_charge_b"],
             "bond_nonbonded_vdw_a": values["bond_nonbonded_vdw_a"],
@@ -2047,6 +2204,10 @@ def resolve_softcore_path(
             "soft_angles_b": [0.0, 0.0, 1.0],
             "soft_torsions_a": [1.0, 0.0, 0.0],
             "soft_torsions_b": [0.0, 0.0, 1.0],
+            "branch_angles_a": [1.0, 1.0, 1.0],
+            "branch_angles_b": [1.0, 1.0, 1.0],
+            "branch_torsions_a": [1.0, 1.0, 1.0],
+            "branch_torsions_b": [1.0, 1.0, 1.0],
             "bond_nonbonded_charge_a": [0.0, 0.0, 1.0],
             "bond_nonbonded_charge_b": [1.0, 0.0, 0.0],
             "bond_nonbonded_vdw_a": [0.0, 1.0, 1.0],
@@ -2077,6 +2238,10 @@ def resolve_softcore_path(
             "soft_angles_b": list(result["bonded_b"]),
             "soft_torsions_a": list(result["bonded_a"]),
             "soft_torsions_b": list(result["bonded_b"]),
+            "branch_angles_a": [1.0] * len(result["bonded_a"]),
+            "branch_angles_b": [1.0] * len(result["bonded_b"]),
+            "branch_torsions_a": [1.0] * len(result["bonded_a"]),
+            "branch_torsions_b": [1.0] * len(result["bonded_b"]),
             "bond_nonbonded_charge_a": (
                 topology_b if topology_b is not None
                 else [0.0] * len(result["bonded_a"])
@@ -2142,6 +2307,10 @@ def _expand_path(resolved):
         SOFT_ANGLE_B_PARAMETER: resolved["soft_angles_b"],
         SOFT_TORSION_A_PARAMETER: resolved["soft_torsions_a"],
         SOFT_TORSION_B_PARAMETER: resolved["soft_torsions_b"],
+        BRANCH_ANGLE_A_PARAMETER: resolved["branch_angles_a"],
+        BRANCH_ANGLE_B_PARAMETER: resolved["branch_angles_b"],
+        BRANCH_TORSION_A_PARAMETER: resolved["branch_torsions_a"],
+        BRANCH_TORSION_B_PARAMETER: resolved["branch_torsions_b"],
         BOND_NONBONDED_CHARGE_A_PARAMETER: resolved["bond_nonbonded_charge_a"],
         BOND_NONBONDED_CHARGE_B_PARAMETER: resolved["bond_nonbonded_charge_b"],
         BOND_NONBONDED_VDW_A_PARAMETER: resolved["bond_nonbonded_vdw_a"],
@@ -2343,6 +2512,8 @@ def create_softcore_hamiltonian(
         endpoint_b,
         soft_bond_alpha_nm2=soft_bond_alpha_nm2,
         soft_bond_pairs=soft_bond_pairs,
+        unique_a=unique_a,
+        unique_b=unique_b,
     )
     _add_nonbonded_forces(
         output,
