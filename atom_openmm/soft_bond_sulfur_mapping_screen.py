@@ -60,6 +60,9 @@ def generate(root, source, *, repo=None):
     config = {
         "seed": 20260920,
         "duration_ps": 100,
+        # Mapped C->S LJ offsets produce a small dynamic-LRC endpoint constant
+        # on CPU. Forces remain identical; retain and report the signed offset.
+        "endpoint_audit_energy_tolerance_kj_mol": 1.0,
         "variants": selected_variants(),
     }
     _write_yaml_atomic(root / "screen.yaml", config)

@@ -14,6 +14,47 @@ from atom_openmm.covalent_workflow import (
     _softcore_switch_context, _apply_state, _run_segmented_protocol,
 )
 from atom_openmm.neqti import _allocate_segment_steps
+from atom_openmm.soft_bond_core_screen import variants as core_variants, split_mapped_forces
+
+
+@pytest.mark.parametrize("variant", core_variants(), ids=lambda v: v["name"])
+def _test_core_ordering_endpoints_and_switch(variant):
+    prepared = SimpleNamespace(endpoint_a=_endpoint("a"), endpoint_b=_endpoint("b"))
+    prepared.endpoint_b.getForce(0).setBondParameters(0, 0, 1, 0.16, 120)
+    for end in ("a", "b"):
+        system = getattr(prepared, 'endpoint_' + end)
+        angles = mm.HarmonicAngleForce()
+        angles.addAngle(0, 1, 2, 1.5 if end == 'a' else 1.7, 10)
+        system.addForce(angles)
+        torsions = mm.PeriodicTorsionForce()
+        torsions.addTorsion(0, 1, 2, 3, 2, 0, 1 if end == 'a' else 2)
+        system.addForce(torsions)
+    h = create_softcore_hamiltonian(
+        prepared.endpoint_a, prepared.endpoint_b, [], [],
+        soft_bond_pairs=[], control_nodes=variant['nodes'],
+        total_steps=50000, segments_per_interval=variant['segments_per_interval'])
+    counts = split_mapped_forces(h, set(), variant)
+    assert counts['CovalentInterpolatedBonds'] >= 1
+    assert counts['CovalentInterpolatedAngles'] == 1
+    assert counts['CovalentInterpolatedTorsionsA'] == 1
+    assert all(len(v) == len(h.segment_steps)+1 for v in h.parameter_values.values())
+    plat = mm.Platform.getPlatformByName('Reference')
+    context = mm.Context(prepared.endpoint_a, mm.VerletIntegrator(.001), plat)
+    context.setPositions([[0, 0, 0], [.15, 0, 0], [.15, .15, 0], [0, .15, .1]])
+    context.setVelocitiesToTemperature(300, 17)
+    state = context.getState(positions=True, velocities=True)
+    del context
+    for end in ('a', 'b'):
+        _audit_endpoint(prepared, h, end, state, plat, {})
+        context, integrator, _ = _softcore_switch_context(
+            h, start=end, timestep_fs=1, temperature_k=300, platform=plat,
+            properties={}, seed=17)
+        steps = [1]*len(h.segment_steps)
+        integrator.set_segment_steps(steps)
+        _apply_state(context, state)
+        work, _ = _run_segmented_protocol(integrator, steps)
+        assert np.isfinite(work)
+        del context, integrator
 
 
 def _test_screen_allocations_and_endpoint_controls():

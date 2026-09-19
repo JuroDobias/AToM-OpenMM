@@ -38,7 +38,8 @@ from atom_openmm.hybrid_parameters import parameterize_ligand
 from atom_openmm.hybrid_systems import create_physical_ligand_environment
 from atom_openmm.hybrid_virtual_sites import add_alchemical_sigma_holes
 from atom_openmm.neqti import (
-    _allocate_segment_steps, _optimizer_cycle_scores, analyze_neqti_work,
+    _allocate_segment_steps, _optimizer_cycle_scores,
+    _optimizer_batch_action_scores, _adapt_segment_steps, analyze_neqti_work,
     _bar_overlap_score,
 )
 
@@ -215,7 +216,17 @@ def prepare_bank(root):
                        optimizer_indices=list(range(10)), evaluation_indices=list(range(10, 30))))
 
 
-def _audit_endpoint(prepared, hamiltonian, end, state, plat, props):
+def _audit_endpoint(
+    prepared,
+    hamiltonian,
+    end,
+    state,
+    plat,
+    props,
+    *,
+    energy_tolerance_kj_mol=0.1,
+    force_tolerance_kj_mol_nm=1.0,
+):
     """Compare switched physical endpoints to their prepared endpoint Hamiltonians."""
     energies = []
     forces = []
@@ -230,18 +241,28 @@ def _audit_endpoint(prepared, hamiltonian, end, state, plat, props):
         energies.append(value.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
         forces.append(value.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole/unit.nanometer))
         del context, integrator
-    error = abs(energies[1]-energies[0])
+    signed_error = energies[1] - energies[0]
+    error = abs(signed_error)
     force_error = float(np.max(np.abs(forces[1]-forces[0])))
-    if not np.isfinite(error) or error > 0.1 or not np.isfinite(force_error) or force_error > 1.0:
+    if (
+        not np.isfinite(error)
+        or error > float(energy_tolerance_kj_mol)
+        or not np.isfinite(force_error)
+        or force_error > float(force_tolerance_kj_mol_nm)
+    ):
         raise ValueError(f"Endpoint {end} identity failed: energy={error}, max force={force_error}")
-    return dict(energy_error_kj_mol=error, max_force_error_kj_mol_nm=force_error)
+    return dict(
+        energy_error_kj_mol=error,
+        signed_energy_error_kj_mol=signed_error,
+        max_force_error_kj_mol_nm=force_error,
+    )
 
 
 def run_path(root, name):
     root = Path(root).resolve()
     cfg = yaml.safe_load((root / "screen.yaml").read_text())
     spec = next(v for v in cfg["variants"] if v["name"] == name)
-    bank = root / "bank"
+    bank = Path(cfg.get("bank", root / "bank"))
     manifest = yaml.safe_load((bank / "complete.yaml").read_text())
     for relative, checksum in manifest["snapshots"].items():
         if digest(bank / relative) != checksum:
@@ -249,7 +270,12 @@ def run_path(root, name):
     prepared = load_prepared_hybrid_bundle(bank, yaml.safe_load((bank / "prepared.yaml").read_text()))
     out = root / "paths" / name
     out.mkdir(parents=True, exist_ok=True)
-    record = dict(spec=spec, bank_sha256=digest(bank / "complete.yaml"), optimizer=OPTIMIZER)
+    record = dict(
+        spec=spec,
+        bank_sha256=digest(bank / "complete.yaml"),
+        optimizer=OPTIMIZER,
+        batch_optimizer=cfg.get("batch_optimizer"),
+    )
     protocol = out / "protocol.yaml"
     if protocol.exists() and yaml.safe_load(protocol.read_text()) != record:
         raise ValueError("Screen protocol changed; use a new output directory")
@@ -264,10 +290,37 @@ def run_path(root, name):
         soft_bond_pair_changes=prepared.provenance["soft_bond_pair_changes"],
         control_nodes=spec["nodes"], total_steps=spec["total_steps"],
         segments_per_interval=spec["segments_per_interval"])
+    if "core_nodes" in spec:
+        from .soft_bond_core_screen import split_mapped_forces
+        counts = split_mapped_forces(hamiltonian, set(
+            prepared.provenance["unique_a_particle_indices"]
+        ) | set(prepared.provenance["unique_b_particle_indices"]), spec)
+        _write_yaml_atomic(out / "mapped_bonded_terms.yaml", counts)
     plat, props = platform()
-    audit = {end: _audit_endpoint(prepared, hamiltonian, end,
-             _load_state(bank / end / "snapshot_000.xml"), plat, props) for end in ("a", "b")}
+    audit = {
+        end: _audit_endpoint(
+            prepared,
+            hamiltonian,
+            end,
+            _load_state(bank / end / "snapshot_000.xml"),
+            plat,
+            props,
+            energy_tolerance_kj_mol=float(
+                cfg.get("endpoint_audit_energy_tolerance_kj_mol", 0.1)
+            ),
+            force_tolerance_kj_mol_nm=float(
+                cfg.get("endpoint_audit_force_tolerance_kj_mol_nm", 1.0)
+            ),
+        )
+        for end in ("a", "b")
+    }
     _write_yaml_atomic(out / "endpoint_audit.yaml", audit)
+    optimizer_indices = (
+        [] if cfg.get("skip_optimizer", False)
+        else list(manifest.get("optimizer_indices", range(10)))
+    )
+    evaluation_indices = list(manifest.get("evaluation_indices", range(10, 30)))
+    batch_settings = cfg.get("batch_optimizer")
     state_file = out / "optimizer.yaml"
     state = yaml.safe_load(state_file.read_text()) if state_file.exists() else dict(
         completed=0, steps=list(hamiltonian.segment_steps), scores=None, history=[])
@@ -316,32 +369,178 @@ def run_path(root, name):
                  name, phase, end, index, result["work_kj_mol"], result["ns_day"])
         return result
 
-    for index in range(state["completed"], 10):
-        results = [switch(index, end, "optimizer", state["steps"]) for end in ("a", "b")]
-        previous = list(state["steps"])
-        if all(r["error"] is None for r in results):
-            scores = _optimizer_cycle_scores(
-                np.array(results[0]["segment_work"])/4.184,
-                np.array(results[1]["segment_work"])/4.184, OPTIMIZER)
-            scores = scores if state["scores"] is None else (
-                0.3*scores + 0.7*np.array(state["scores"]))
-            state["steps"] = _allocate_segment_steps(scores, spec["total_steps"], previous, OPTIMIZER)
-            state["scores"] = scores.tolist()
-        state["history"].append(dict(cycle=index+1, previous_steps=previous,
-                                     steps=state["steps"], errors=[r["error"] for r in results]))
-        state["completed"] = index+1
-        _write_yaml_atomic(state_file, state)
+    if batch_settings:
+        batch_size = int(batch_settings["batch_size"])
+        if len(optimizer_indices) % batch_size:
+            raise ValueError("optimizer index count must be divisible by batch_size")
+        completed_batches = int(state.get("completed_batches", 0))
+        action_history = [np.asarray(v, dtype=float) for v in state.get("action_history", [])]
+        for batch_number in range(completed_batches, len(optimizer_indices) // batch_size):
+            if state.get("converged", False):
+                break
+            indices = optimizer_indices[batch_number * batch_size:(batch_number + 1) * batch_size]
+            previous = list(state["steps"])
+            batch_results = {
+                end: [switch(index, end, "optimizer", previous) for index in indices]
+                for end in ("a", "b")
+            }
+            errors = [
+                result["error"] for values in batch_results.values()
+                for result in values if result["error"] is not None
+            ]
+            record = {
+                "batch": batch_number + 1,
+                "indices": indices,
+                "previous_steps": previous,
+                "errors": errors,
+            }
+            if not errors:
+                scored = _optimizer_batch_action_scores(
+                    np.asarray([v["segment_work"] for v in batch_results["a"]]) / 4.184,
+                    np.asarray([v["segment_work"] for v in batch_results["b"]]) / 4.184,
+                    previous,
+                    trim_fraction=float(batch_settings["trim_fraction"]),
+                    dissipation_floor=float(batch_settings["dissipation_floor_kcal_per_mol"]),
+                )
+                action_history.append(scored["action"])
+                aggregate_action = np.median(np.stack(action_history), axis=0)
+                adaptive_length = batch_settings.get("mode", "fixed_total") in {
+                    "monotonic_growth", "adaptive_length"
+                }
+                if adaptive_length:
+                    grown = _adapt_segment_steps(
+                        aggregate_action,
+                        previous,
+                        target_dissipation=float(
+                            batch_settings["target_segment_dissipation_kcal_per_mol"]
+                        ),
+                        min_update_factor=float(batch_settings["min_update_factor"]),
+                        max_growth_factor=float(batch_settings["max_growth_factor"]),
+                        neighbor_growth_fraction=float(
+                            batch_settings["neighbor_growth_fraction"]
+                        ),
+                        max_segment_steps=int(batch_settings["max_segment_steps"]),
+                        min_total_steps=int(batch_settings["min_total_steps"]),
+                        max_total_steps=int(batch_settings["max_total_steps"]),
+                        minimum_growth_fraction=float(
+                            batch_settings.get("minimum_growth_fraction", 0.01)
+                        ),
+                    )
+                    state["steps"] = grown.pop("steps")
+                    record.update({
+                        key: value.tolist() if isinstance(value, np.ndarray) else value
+                        for key, value in grown.items()
+                    })
+                else:
+                    allocation_settings = {
+                        **OPTIMIZER,
+                        "score_power": 1.0,
+                        "min_update_factor": float(batch_settings["min_update_factor"]),
+                        "max_update_factor": float(batch_settings["max_update_factor"]),
+                    }
+                    state["steps"] = _allocate_segment_steps(
+                        np.sqrt(aggregate_action), spec["total_steps"], previous,
+                        allocation_settings,
+                    )
+                normalized = aggregate_action / aggregate_action.sum()
+                prior = state.get("normalized_action")
+                action_change = None if prior is None else float(
+                    np.sum(np.abs(normalized - np.asarray(prior))) / 2.0
+                )
+                change_denominator = sum(previous) * (
+                    1.0 if adaptive_length else 2.0
+                )
+                allocation_change = float(
+                    np.sum(np.abs(np.asarray(state["steps"]) - np.asarray(previous)))
+                    / change_denominator
+                )
+                batch_work = {
+                    end: [value["work_kj_mol"] / 4.184 for value in values]
+                    for end, values in batch_results.items()
+                }
+                batch_analysis = analyze_neqti_work(
+                    batch_work["a"], batch_work["b"], 300, 0, cfg["seed"]
+                )
+                batch_dg = None if batch_analysis is None else batch_analysis["bar_dg_kcal_per_mol"]
+                batch_overlap = _bar_overlap_score(
+                    batch_work["a"], batch_work["b"], batch_dg, 300
+                )
+                record.update({
+                    key: value.tolist() for key, value in scored.items()
+                })
+                record.update({
+                    "aggregate_action": aggregate_action.tolist(),
+                    "normalized_action_change": action_change,
+                    "allocation_change_fraction": allocation_change,
+                    "batch_bar_dg_kcal_per_mol": batch_dg,
+                    "batch_overlap": batch_overlap,
+                })
+                stable = (
+                    action_change is not None
+                    and action_change < float(batch_settings["action_change_tolerance"])
+                    and allocation_change < float(batch_settings["allocation_change_tolerance"])
+                    and (
+                        batch_overlap is not None
+                        and batch_overlap >= float(batch_settings.get("overlap_target", 0.0))
+                    )
+                )
+                state["stable_batches"] = (
+                    int(state.get("stable_batches", 0)) + 1 if stable else 0
+                )
+                state["converged"] = state["stable_batches"] >= int(
+                    batch_settings["consecutive_stable_batches"]
+                )
+                record["stable"] = stable
+                state["normalized_action"] = normalized.tolist()
+                state["scores"] = np.sqrt(aggregate_action).tolist()
+            record["steps"] = list(state["steps"])
+            state["history"].append(record)
+            state["action_history"] = [value.tolist() for value in action_history]
+            state["completed_batches"] = batch_number + 1
+            state["completed"] = (batch_number + 1) * batch_size
+            _write_yaml_atomic(state_file, state)
+            LOG.info(
+                "%s optimizer batch %d complete: %d switch steps (%.3f ps), "
+                "allocation change %.4f, action change %s, overlap %s, converged=%s",
+                name,
+                batch_number + 1,
+                sum(state["steps"]),
+                sum(state["steps"]) * 0.002,
+                record.get("allocation_change_fraction", float("nan")),
+                record.get("normalized_action_change"),
+                record.get("batch_overlap"),
+                state.get("converged", False),
+            )
+    else:
+        for position in range(state["completed"], len(optimizer_indices)):
+            index = optimizer_indices[position]
+            results = [switch(index, end, "optimizer", state["steps"]) for end in ("a", "b")]
+            previous = list(state["steps"])
+            if all(r["error"] is None for r in results):
+                scores = _optimizer_cycle_scores(
+                    np.array(results[0]["segment_work"])/4.184,
+                    np.array(results[1]["segment_work"])/4.184, OPTIMIZER)
+                scores = scores if state["scores"] is None else (
+                    0.3*scores + 0.7*np.array(state["scores"]))
+                state["steps"] = _allocate_segment_steps(scores, spec["total_steps"], previous, OPTIMIZER)
+                state["scores"] = scores.tolist()
+            state["history"].append(dict(cycle=position+1, snapshot=index,
+                                         previous_steps=previous, steps=state["steps"],
+                                         errors=[r["error"] for r in results]))
+            state["completed"] = position+1
+            _write_yaml_atomic(state_file, state)
     _write_yaml_atomic(out / "frozen_schedule.yaml", dict(
         segment_steps=state["steps"], control_nodes=spec["nodes"],
         segments_per_interval=spec["segments_per_interval"], total_steps=sum(state["steps"])))
     work = {end: [] for end in ("a", "b")}
-    for index in range(10, 30):
+    for position, index in enumerate(evaluation_indices, start=1):
         for end in ("a", "b"):
             work[end].append(switch(index, end, "evaluation", state["steps"])["work_kj_mol"]/4.184)
         analysis = analyze_neqti_work(work["a"], work["b"], 300, 500, cfg["seed"])
         dg = None if analysis is None else analysis["bar_dg_kcal_per_mol"]
         _write_yaml_atomic(out / "result.yaml", dict(
-            status="completed" if index == 29 else "running", evaluation_samples_per_direction=index-9,
+            status="completed" if position == len(evaluation_indices) else "running",
+            evaluation_samples_per_direction=position,
             analysis=analysis, overlap=_bar_overlap_score(work["a"], work["b"], dg, 300),
             failed_samples={e: int(np.sum(~np.isfinite(v))) for e, v in work.items()},
             optimizer_failed_cycles=sum(any(h["errors"]) for h in state["history"])))

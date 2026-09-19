@@ -693,19 +693,42 @@ def _pair_parameters_for_class(
     )
 
 
-def _new_soft_bond_topology_pair_force(label):
+def _new_soft_bond_topology_pair_force(label, *, mapped_common=False):
     lower = label.lower()
-    force = mm.CustomBondForce(
-        "ONE_4PI_EPS0*((wcq-baseline*qbranch)*qClosed+woq*qOpen)/r"
-        "+4*(wcv-baseline*vbranch)*eClosed*((sClosed/r)^12-(sClosed/r)^6)"
-        "+4*wov*eOpen*((sOpen/r)^12-(sOpen/r)^6);"
-        f"wcq=qbranch*COVALENT_BOND_ONE_FOUR_CHARGE_{label};"
-        f"wcv=vbranch*COVALENT_BOND_ONE_FOUR_VDW_{label};"
-        f"woq=qbranch*COVALENT_BOND_NONBONDED_CHARGE_{label};"
-        f"wov=vbranch*COVALENT_BOND_NONBONDED_VDW_{label};"
-        f"qbranch=COVALENT_CHARGE_{label};vbranch=COVALENT_STERICS_{label}"
-    )
-    force.setName(f"CovalentSoftBondTopologyPairs{label}")
+    if mapped_common:
+        qactivation = (
+            "COVALENT_MAPPED_CHARGE" if lower == "b"
+            else "1-COVALENT_MAPPED_CHARGE"
+        )
+        vactivation = (
+            "COVALENT_STERICS" if lower == "b" else "1-COVALENT_STERICS"
+        )
+        expression = (
+            "ONE_4PI_EPS0*qactivation*((closedQ-baseline)*qClosed"
+            "+openQ*qOpen)/r"
+            "+4*vactivation*(closedV-baseline)*eClosed"
+            "*((sClosed/r)^12-(sClosed/r)^6)"
+            "+4*vactivation*openV*eOpen*((sOpen/r)^12-(sOpen/r)^6);"
+            f"closedQ=COVALENT_BOND_ONE_FOUR_CHARGE_{label};"
+            f"closedV=COVALENT_BOND_ONE_FOUR_VDW_{label};"
+            f"openQ=COVALENT_BOND_NONBONDED_CHARGE_{label};"
+            f"openV=COVALENT_BOND_NONBONDED_VDW_{label};"
+            f"qactivation={qactivation};vactivation={vactivation}"
+        )
+    else:
+        expression = (
+            "ONE_4PI_EPS0*((wcq-baseline*qbranch)*qClosed+woq*qOpen)/r"
+            "+4*(wcv-baseline*vbranch)*eClosed*((sClosed/r)^12-(sClosed/r)^6)"
+            "+4*wov*eOpen*((sOpen/r)^12-(sOpen/r)^6);"
+            f"wcq=qbranch*COVALENT_BOND_ONE_FOUR_CHARGE_{label};"
+            f"wcv=vbranch*COVALENT_BOND_ONE_FOUR_VDW_{label};"
+            f"woq=qbranch*COVALENT_BOND_NONBONDED_CHARGE_{label};"
+            f"wov=vbranch*COVALENT_BOND_NONBONDED_VDW_{label};"
+            f"qbranch=COVALENT_CHARGE_{label};vbranch=COVALENT_STERICS_{label}"
+        )
+    force = mm.CustomBondForce(expression)
+    suffix = "Mapped" if mapped_common else ""
+    force.setName(f"CovalentSoftBondTopologyPairs{label}{suffix}")
     for parameter in (
         CHARGE_A_PARAMETER if lower == "a" else CHARGE_B_PARAMETER,
         STERICS_A_PARAMETER if lower == "a" else STERICS_B_PARAMETER,
@@ -715,6 +738,9 @@ def _new_soft_bond_topology_pair_force(label):
         BOND_ONE_FOUR_VDW_A_PARAMETER if lower == "a" else BOND_ONE_FOUR_VDW_B_PARAMETER,
     ):
         force.addGlobalParameter(parameter, 0.0)
+    if mapped_common:
+        force.addGlobalParameter(MAPPED_CHARGE_PARAMETER, 0.0)
+        force.addGlobalParameter(STERICS_PARAMETER, 0.0)
     force.addGlobalParameter("ONE_4PI_EPS0", ONE_4PI_EPS0)
     for parameter in (
         "qClosed", "sClosed", "eClosed", "qOpen", "sOpen", "eOpen",
@@ -1340,14 +1366,11 @@ def _add_nonbonded_forces(
         if endpoint not in {"a", "b"} or len(pair) != 2:
             raise CovalentAlchemyError("invalid soft-bond topology-pair metadata")
         endpoint_unique = unique_a if endpoint == "a" else unique_b
-        if not endpoint_unique.intersection(pair):
-            raise CovalentAlchemyError(
-                "soft-bond topology changes between mapped common atoms are not supported"
-            )
         topology_changes[pair] = {
             "endpoint": endpoint,
             "closed_class": int(raw["closed_class"]),
             "open_class": int(raw["open_class"]),
+            "mapped_common": not bool(endpoint_unique.intersection(pair)),
         }
 
     exceptions_a = _exception_dict(source_a)
@@ -1570,6 +1593,12 @@ def _add_nonbonded_forces(
     )
     topology_pair_a = _new_soft_bond_topology_pair_force("A")
     topology_pair_b = _new_soft_bond_topology_pair_force("B")
+    topology_pair_a_mapped = _new_soft_bond_topology_pair_force(
+        "A", mapped_common=True
+    )
+    topology_pair_b_mapped = _new_soft_bond_topology_pair_force(
+        "B", mapped_common=True
+    )
     one_four_a = _infer_one_four_scales(source_a)
     one_four_b = _infer_one_four_scales(source_b)
 
@@ -1675,7 +1704,13 @@ def _add_nonbonded_forces(
                 scales,
                 use_existing_exception=False,
             )
-            target = topology_pair_a if endpoint == "a" else topology_pair_b
+            if topology_change["mapped_common"]:
+                target = (
+                    topology_pair_a_mapped if endpoint == "a"
+                    else topology_pair_b_mapped
+                )
+            else:
+                target = topology_pair_a if endpoint == "a" else topology_pair_b
             target.addBond(p1, p2, [*closed, *opened, 1.0])
         if use_ssc2_coulomb:
             combined_direct.addExclusion(p1, p2)
@@ -1726,6 +1761,10 @@ def _add_nonbonded_forces(
         output.addForce(topology_pair_a)
     if topology_pair_b.getNumBonds():
         output.addForce(topology_pair_b)
+    if topology_pair_a_mapped.getNumBonds():
+        output.addForce(topology_pair_a_mapped)
+    if topology_pair_b_mapped.getNumBonds():
+        output.addForce(topology_pair_b_mapped)
 
 
 def _vacuum_bond_terms(force):

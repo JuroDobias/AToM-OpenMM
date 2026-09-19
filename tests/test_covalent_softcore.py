@@ -199,6 +199,45 @@ def test_explicit_nodes_default_new_branch_controls_to_physical_values():
     assert resolved["branch_torsions_b"] == [1.0, 1.0]
 
 
+def test_mapped_common_topology_pair_preserves_physical_endpoints():
+    endpoint_a = _endpoint("a")
+    endpoint_b = _endpoint("b")
+    hamiltonian = create_softcore_hamiltonian(
+        endpoint_a,
+        endpoint_b,
+        [2],
+        [3],
+        soft_bond_pairs=[(1, 3)],
+        soft_bond_pair_changes=[{
+            "endpoint": "b",
+            "system_atoms_0based": [0, 1],
+            "closed_class": 1,
+            "open_class": 4,
+        }],
+        total_steps=100,
+        path_mode="scheme1_soft_bond",
+        segments_per_interval=[1, 1],
+    )
+    names = {force.getName() for force in hamiltonian.system.getForces()}
+    assert "CovalentSoftBondTopologyPairsBMapped" in names
+
+    positions = np.asarray(
+        [[0, 0, 0], [0.15, 0, 0], [0.28, 0.08, 0],
+         [0.29, -0.09, 0.03], [0.7, 0.4, 0.3]]
+    ) * unit.nanometer
+    for endpoint, node in ((endpoint_a, 0), (endpoint_b, -1)):
+        expected_energy, expected_forces = _energy_forces(endpoint, positions)
+        parameters = {
+            name: values[node]
+            for name, values in hamiltonian.parameter_values.items()
+        }
+        observed_energy, observed_forces = _energy_forces(
+            hamiltonian.system, positions, parameters
+        )
+        assert np.isclose(observed_energy, expected_energy, atol=1.0e-5)
+        assert np.allclose(observed_forces, expected_forces, atol=1.0e-3)
+
+
 def _test_softcore_nodes_reproduce_endpoint_energies_and_forces():
     endpoint_a = _endpoint("a")
     endpoint_b = _endpoint("b")
