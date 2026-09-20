@@ -184,6 +184,7 @@ def prepare_bank(root):
     eq = dict(minimization_tolerance_kj_mol_nm=10, minimization_max_iterations=2000,
               nvt_steps=100000, nvt_timestep_fs=1.0, npt_steps=500000,
               npt_timestep_fs=2.0)
+    eq.update(cfg.get("bank_equilibration", {}))
     for ei, end in enumerate(("a", "b")):
         system = getattr(prepared, f"endpoint_{end}")
         initial = bank / f"equilibrated_{end}.xml"
