@@ -24,7 +24,7 @@ def test_weak_junction_workflow_replaces_z_matrices_and_sets_scales():
     for endpoint, expected in JUNCTIONS.items():
         entries = mapping["junction_bonds"][endpoint]
         assert [tuple(entry["atoms_0based"]) for entry in entries] == list(expected)
-        assert {entry["inactive_geometry"] for entry in entries} == {"bond_only"}
+        assert {entry["inactive_geometry"] for entry in entries} == {"full_junction"}
     scales = workflow["setup"]["dummy_bonded_scales"]
     assert scales["bond"] == 1.0
     assert scales["junction_angle"] == 0.2

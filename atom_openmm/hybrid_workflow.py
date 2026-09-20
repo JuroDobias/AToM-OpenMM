@@ -765,6 +765,12 @@ def _prepare_pair(pair, receptor, workflow, workdir, base_dir=None):
         inactive_z_matrix_root_atoms_b=set(
             mapping_payload["inactive_z_matrix_root_atoms_b_0based"]
         ),
+        inactive_full_junction_root_atoms_a=set(
+            mapping_payload.get("inactive_full_junction_root_atoms_a_0based", [])
+        ),
+        inactive_full_junction_root_atoms_b=set(
+            mapping_payload.get("inactive_full_junction_root_atoms_b_0based", [])
+        ),
         alchemical_bonds_a={
             tuple(entry["atoms_0based"])
             for entry in (mapping_payload.get("alchemical_bonds") or {}).get("ligand_a", [])

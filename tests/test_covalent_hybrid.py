@@ -173,6 +173,84 @@ def test_endpoint_excludes_all_cross_branch_nonbonded_pairs():
     assert expected <= exceptions
 
 
+def test_full_junction_retains_and_scales_cross_boundary_terms():
+    molecule = Chem.MolFromSmiles("CCCC")
+    scales = DummyBondedScales(
+        junction_angle=0.2,
+        junction_proper_torsion=0.2,
+        junction_rotatable_torsion=0.2,
+    )
+    _, bond_only_angle, bond_only_torsion = _inactive_bonded_scalers(
+        molecule, {3}, {3}, {}, scales
+    )
+    _, full_angle, full_torsion = _inactive_bonded_scalers(
+        molecule, {3}, {3}, {}, scales, {3}
+    )
+
+    assert bond_only_angle((1, 2, 3)) == 0.0
+    assert bond_only_torsion((0, 1, 2, 3)) == 0.0
+    assert full_angle((1, 2, 3)) == 0.2
+    assert full_torsion((0, 1, 2, 3)) == 0.2
+
+
+def test_full_junction_builds_retained_dummy_geometry():
+    left = _bundle("CC")
+    right = _bundle("CCC")
+    mapping, metadata = build_hybrid_atom_map(
+        left,
+        right,
+        {
+            "method": "explicit_pairs",
+            "pairs_0based": [[0, 0], [1, 1]],
+            "junction_bonds": {
+                "ligand_b": [
+                    {
+                        "atoms_0based": [1, 2],
+                        "inactive_geometry": "full_junction",
+                    }
+                ]
+            },
+        },
+    )
+    hybrid = build_covalent_hybrid_molecule(
+        left,
+        right,
+        atom_map=mapping,
+        inactive_bonded_atoms_b=set(metadata["inactive_bonded_atoms_b_0based"]),
+        inactive_bonded_geometry=metadata["inactive_bonded_geometry"],
+        inactive_full_junction_root_atoms_b=set(
+            metadata["inactive_full_junction_root_atoms_b_0based"]
+        ),
+        dummy_bonded_scales=DummyBondedScales(junction_angle=0.2),
+    )
+
+    assert hybrid.inactive_full_junction_root_atoms_b == (2,)
+    assert hybrid.inactive_z_matrix_terms == ()
+    source_angles = next(
+        force
+        for force in right.system.getForces()
+        if isinstance(force, mm.HarmonicAngleForce)
+    )
+    endpoint_angles = next(
+        force
+        for force in hybrid.endpoint_a.getForces()
+        if isinstance(force, mm.HarmonicAngleForce)
+    )
+    source_k = source_angles.getAngleParameters(0)[4]
+    retained = [
+        endpoint_angles.getAngleParameters(index)
+        for index in range(endpoint_angles.getNumAngles())
+        if hybrid.map_b_to_hybrid[2] in tuple(
+            map(int, endpoint_angles.getAngleParameters(index)[:3])
+        )
+    ]
+    assert len(retained) == 1
+    assert np.isclose(
+        retained[0][4].value_in_unit(unit.kilojoule_per_mole / unit.radian**2),
+        0.2 * source_k.value_in_unit(unit.kilojoule_per_mole / unit.radian**2),
+    )
+
+
 def test_sigma_hole_on_unique_halogen_uses_endpoint_unique_charge_role():
     left = _bundle("C")
     right = _bundle("CCl")

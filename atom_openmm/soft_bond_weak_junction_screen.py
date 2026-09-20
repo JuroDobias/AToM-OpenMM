@@ -29,7 +29,7 @@ def weak_junction_workflow(document):
         endpoint: [
             {
                 "atoms_0based": list(atoms),
-                "inactive_geometry": "bond_only",
+                "inactive_geometry": "full_junction",
             }
             for atoms in entries
         ]
@@ -40,7 +40,7 @@ def weak_junction_workflow(document):
     mapping.pop("inactive_bonded_geometry", None)
     mapping.pop("ccw_mapping_revision_id", None)
     mapping["mapping_note"] = (
-        "Original ring-contraction mapping; all four junctions use bond_only geometry"
+        "Original ring-contraction mapping; all four junctions retain full geometry"
     )
     workflow.setdefault("setup", {})["dummy_bonded_scales"] = {
         "bond": 1.0,

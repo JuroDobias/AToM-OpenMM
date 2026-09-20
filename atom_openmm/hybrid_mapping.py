@@ -14,7 +14,7 @@ from atom_openmm.covalent_hybrid import (
 
 
 HybridMappingError = CovalentAlchemyError
-INACTIVE_GEOMETRIES = {"bond_only", "terminal_z_matrix"}
+INACTIVE_GEOMETRIES = {"bond_only", "terminal_z_matrix", "full_junction"}
 _TETRAHEDRAL_CHIRAL_SIGNS = {
     Chem.ChiralType.CHI_TETRAHEDRAL_CW: 1,
     Chem.ChiralType.CHI_TETRAHEDRAL_CCW: -1,
@@ -240,8 +240,8 @@ def normalize_junction_bonds(raw):
             geometry = str(entry.get("inactive_geometry", "bond_only")).lower()
             if geometry not in INACTIVE_GEOMETRIES:
                 raise HybridMappingError(
-                    f"{field} inactive_geometry must be 'bond_only' or "
-                    "'terminal_z_matrix'"
+                    f"{field} inactive_geometry must be 'bond_only', "
+                    "'terminal_z_matrix', or 'full_junction'"
                 )
             has_atoms = "atoms_0based" in entry
             has_smarts = "smarts" in entry or "bond_labels" in entry
@@ -985,6 +985,16 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
         raise HybridMappingError(
             f"mapped ligand RMSD {rmsd:.3f} A exceeds max_mapped_rmsd_a {float(maximum):.3f} A"
         )
+    full_junction_roots_a = {
+        entry["boundary_atoms_0based"][1]
+        for entry in resolved_junctions
+        if entry["endpoint"] == "a" and entry["inactive_geometry"] == "full_junction"
+    }
+    full_junction_roots_b = {
+        entry["boundary_atoms_0based"][1]
+        for entry in resolved_junctions
+        if entry["endpoint"] == "b" and entry["inactive_geometry"] == "full_junction"
+    }
     return mapping, {
         "schema_version": 3,
         "aromaticity_model": "rdkit",
@@ -1023,6 +1033,8 @@ def build_hybrid_atom_map(parameters_a, parameters_b, settings):
         "automatic_junction_warnings": junction_warnings,
         "inactive_z_matrix_root_atoms_a_0based": sorted(z_matrix_roots_a),
         "inactive_z_matrix_root_atoms_b_0based": sorted(z_matrix_roots_b),
+        "inactive_full_junction_root_atoms_a_0based": sorted(full_junction_roots_a),
+        "inactive_full_junction_root_atoms_b_0based": sorted(full_junction_roots_b),
         "alchemical_bonds": alchemical_bonds if settings.get("alchemical_bonds") is not None else None,
         "matched_smarts_labels_a_0based": matched_labels_a,
         "matched_smarts_labels_b_0based": matched_labels_b,

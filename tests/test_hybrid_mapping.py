@@ -596,6 +596,32 @@ def test_explicit_junction_bond_derives_branch_and_mode():
     assert metadata["resolved_junction_bonds"][0]["boundary_atoms_0based"] == [1, 3]
 
 
+def test_explicit_full_junction_records_retained_root():
+    ligand_a = _parameters("CC")
+    ligand_b = _parameters("CCC")
+    _, metadata = build_hybrid_atom_map(
+        ligand_a,
+        ligand_b,
+        {
+            "method": "explicit_pairs",
+            "pairs_0based": [[0, 0], [1, 1]],
+            "junction_bonds": {
+                "ligand_b": [
+                    {
+                        "atoms_0based": [1, 2],
+                        "inactive_geometry": "full_junction",
+                    }
+                ]
+            },
+        },
+    )
+
+    assert metadata["inactive_full_junction_root_atoms_a_0based"] == []
+    assert metadata["inactive_full_junction_root_atoms_b_0based"] == [2]
+    assert metadata["inactive_z_matrix_root_atoms_b_0based"] == []
+    assert metadata["inactive_bonded_geometry"] == "full_junction"
+
+
 def test_paired_smarts_junction_uses_resolved_mapping_labels():
     ligand_a = _parameters("CC(=O)NC1=CC=CC=C1")
     ligand_b = _parameters("CS(=O)(=O)NC1=CC=CC=C1")

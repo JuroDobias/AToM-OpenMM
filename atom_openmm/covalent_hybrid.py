@@ -35,6 +35,8 @@ class CovalentHybridMolecule:
     inactive_bonded_geometry: str = "bond_only"
     inactive_z_matrix_root_atoms_a: tuple[int, ...] = ()
     inactive_z_matrix_root_atoms_b: tuple[int, ...] = ()
+    inactive_full_junction_root_atoms_a: tuple[int, ...] = ()
+    inactive_full_junction_root_atoms_b: tuple[int, ...] = ()
     inactive_branch_components: tuple["InactiveBranchComponent", ...] = ()
     inactive_z_matrix_terms: tuple["InactiveZMatrixTerm", ...] = ()
     alchemical_bonds_a: tuple[tuple[int, int], ...] = ()
@@ -639,6 +641,7 @@ def _inactive_bonded_scalers(
     selected,
     z_matrix,
     scales,
+    full_junction_atoms=frozenset(),
 ):
     """Return the bonded-term policy for an inactive branch.
 
@@ -651,6 +654,8 @@ def _inactive_bonded_scalers(
         return scales.bond
 
     def angle(atoms):
+        if set(atoms) & full_junction_atoms:
+            return base_angle(atoms)
         if any(
             atoms == term.angle_atoms or atoms[::-1] == term.angle_atoms
             for term in z_matrix.values()
@@ -668,6 +673,8 @@ def _inactive_bonded_scalers(
         return 0.0
 
     def torsion(atoms):
+        if set(atoms) & full_junction_atoms:
+            return base_torsion(atoms)
         if any(
             _canonical_torsion(atoms) == _canonical_torsion(term.torsion_atoms)
             for term in z_matrix.values()
@@ -1005,6 +1012,8 @@ def _build_endpoint(
     inactive_bonded_atoms_b: set[int],
     inactive_z_matrix_a: dict[int, InactiveZMatrixTerm],
     inactive_z_matrix_b: dict[int, InactiveZMatrixTerm],
+    inactive_full_junction_atoms_a: set[int],
+    inactive_full_junction_atoms_b: set[int],
     alchemical_bonds_a: set[tuple[int, int]],
     alchemical_bonds_b: set[tuple[int, int]],
 ) -> mm.System:
@@ -1042,6 +1051,7 @@ def _build_endpoint(
         inactive_bonded_atoms_a,
         inactive_z_matrix_a,
         dummy_bonded_scales,
+        inactive_full_junction_atoms_a,
     )
     bond_scale_b, angle_scale_b, torsion_scale_b = _inactive_bonded_scalers(
         molecule_b,
@@ -1049,6 +1059,7 @@ def _build_endpoint(
         inactive_bonded_atoms_b,
         inactive_z_matrix_b,
         dummy_bonded_scales,
+        inactive_full_junction_atoms_b,
     )
     if state == "a":
         _add_bonds(bonds, force_a_bond, map_a_to_hybrid, lambda _: True)
@@ -1302,6 +1313,8 @@ def build_covalent_hybrid_molecule(
     inactive_bonded_geometry: str = "bond_only",
     inactive_z_matrix_root_atoms_a: set[int] | None = None,
     inactive_z_matrix_root_atoms_b: set[int] | None = None,
+    inactive_full_junction_root_atoms_a: set[int] | None = None,
+    inactive_full_junction_root_atoms_b: set[int] | None = None,
     alchemical_bonds_a: set[tuple[int, int]] | None = None,
     alchemical_bonds_b: set[tuple[int, int]] | None = None,
     force_unique_atoms_a: set[int] | None = None,
@@ -1337,10 +1350,15 @@ def build_covalent_hybrid_molecule(
     inactive_bonded_atoms_b = set(inactive_bonded_atoms_b or ())
     inactive_z_matrix_root_atoms_a = set(inactive_z_matrix_root_atoms_a or ())
     inactive_z_matrix_root_atoms_b = set(inactive_z_matrix_root_atoms_b or ())
+    inactive_full_junction_root_atoms_a = set(inactive_full_junction_root_atoms_a or ())
+    inactive_full_junction_root_atoms_b = set(inactive_full_junction_root_atoms_b or ())
     inactive_bonded_geometry = str(inactive_bonded_geometry).lower()
-    if inactive_bonded_geometry not in {"bond_only", "terminal_z_matrix", "mixed"}:
+    if inactive_bonded_geometry not in {
+        "bond_only", "terminal_z_matrix", "full_junction", "mixed"
+    }:
         raise CovalentAlchemyError(
-            "inactive_bonded_geometry must be 'bond_only', 'terminal_z_matrix', or 'mixed'"
+            "inactive_bonded_geometry must be 'bond_only', 'terminal_z_matrix', "
+            "'full_junction', or 'mixed'"
         )
     if attachment_pairs is not None:
         sulfur_pair, ligand_pair = attachment_pairs
@@ -1408,10 +1426,33 @@ def build_covalent_hybrid_molecule(
     if inactive_bonded_geometry == "terminal_z_matrix":
         inactive_z_matrix_root_atoms_a = roots_a
         inactive_z_matrix_root_atoms_b = roots_b
+    elif inactive_bonded_geometry == "full_junction":
+        inactive_full_junction_root_atoms_a = roots_a
+        inactive_full_junction_root_atoms_b = roots_b
     if not inactive_z_matrix_root_atoms_a <= roots_a:
         raise CovalentAlchemyError("ligand-A Z-matrix root is not an inactive junction root")
     if not inactive_z_matrix_root_atoms_b <= roots_b:
         raise CovalentAlchemyError("ligand-B Z-matrix root is not an inactive junction root")
+    if not inactive_full_junction_root_atoms_a <= roots_a:
+        raise CovalentAlchemyError("ligand-A full-junction root is not an inactive junction root")
+    if not inactive_full_junction_root_atoms_b <= roots_b:
+        raise CovalentAlchemyError("ligand-B full-junction root is not an inactive junction root")
+    if inactive_z_matrix_root_atoms_a & inactive_full_junction_root_atoms_a:
+        raise CovalentAlchemyError("ligand-A junction cannot use two inactive geometries")
+    if inactive_z_matrix_root_atoms_b & inactive_full_junction_root_atoms_b:
+        raise CovalentAlchemyError("ligand-B junction cannot use two inactive geometries")
+    full_components_a = {
+        atom
+        for component in inactive_components_a
+        if component["root"] in inactive_full_junction_root_atoms_a
+        for atom in component["atoms"]
+    }
+    full_components_b = {
+        atom
+        for component in inactive_components_b
+        if component["root"] in inactive_full_junction_root_atoms_b
+        for atom in component["atoms"]
+    }
     inactive_z_matrix_a = (
         _select_inactive_z_matrix_terms(
             molecule_a,
@@ -1458,6 +1499,8 @@ def build_covalent_hybrid_molecule(
         inactive_bonded_atoms_b,
         inactive_z_matrix_a,
         inactive_z_matrix_b,
+        full_components_a,
+        full_components_b,
         alchemical_bonds_a,
         alchemical_bonds_b,
     )
@@ -1477,6 +1520,8 @@ def build_covalent_hybrid_molecule(
         inactive_bonded_atoms_b,
         inactive_z_matrix_a,
         inactive_z_matrix_b,
+        full_components_a,
+        full_components_b,
         alchemical_bonds_a,
         alchemical_bonds_b,
     )
@@ -1516,6 +1561,12 @@ def build_covalent_hybrid_molecule(
         inactive_bonded_geometry=inactive_bonded_geometry,
         inactive_z_matrix_root_atoms_a=tuple(sorted(inactive_z_matrix_root_atoms_a)),
         inactive_z_matrix_root_atoms_b=tuple(sorted(inactive_z_matrix_root_atoms_b)),
+        inactive_full_junction_root_atoms_a=tuple(
+            sorted(inactive_full_junction_root_atoms_a)
+        ),
+        inactive_full_junction_root_atoms_b=tuple(
+            sorted(inactive_full_junction_root_atoms_b)
+        ),
         inactive_branch_components=tuple(
             InactiveBranchComponent(
                 endpoint=endpoint,
