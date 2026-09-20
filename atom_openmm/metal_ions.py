@@ -67,11 +67,18 @@ def gaff2_atom_classes(sdf, positions):
     """Return GAFF2 atom classes without changing the input atom order."""
     from parmed import load_file
 
+    source = Path(sdf)
+    input_formats = {".sdf": "sdf", ".mol": "sdf", ".mol2": "mol2"}
+    input_format = input_formats.get(source.suffix.lower())
+    if input_format is None:
+        raise MetalIonParameterError(
+            f"GAFF2 C4 typing requires SDF, MOL, or MOL2 input: {source}"
+        )
     with tempfile.TemporaryDirectory(prefix="atom-gaff2-types-") as directory:
         mol2 = Path(directory) / "typing.mol2"
         subprocess.run(
             [
-                "antechamber", "-i", str(sdf), "-fi", "sdf",
+                "antechamber", "-i", str(source), "-fi", input_format,
                 "-o", str(mol2), "-fo", "mol2", "-at", "gaff2",
                 "-seq", "n", "-s", "0", "-pf", "y",
             ],
@@ -97,6 +104,45 @@ def copy_nonbonded_exclusions(nonbonded, custom):
         custom.addExclusion(atom_a, atom_b)
 
 
+def forcefield_atom_classes(forcefield, topology):
+    """Use OpenMM's actual template matching, including termini and patches."""
+    data = forcefield._SystemData(topology)
+    forcefield._matchAllResiduesToTemplates(data, topology, {}, False)
+    classes = []
+    for atom in sorted(topology.atoms(), key=lambda atom: atom.index):
+        atom_class = forcefield._atomTypes[data.atomType[atom]].atomClass
+        if atom.element is None:
+            atom_class = "EP"
+        elif atom.residue.name in {"HOH", "WAT"}:
+            atom_class = "OW" if atom.element.symbol == "O" else "HW"
+        elif len(list(atom.residue.atoms())) == 1 and atom.element.symbol in {"Na", "Cl", "Mg", "Zn"}:
+            atom_class = {"Na": "Na+", "Cl": "Cl-", "Mg": "Mg2+", "Zn": "Zn2+"}[atom.element.symbol]
+        classes.append(atom_class)
+    return classes
+
+
+def scale_panteva_rest2(force, regions):
+    """Scale a physical C4 pair by the product of its REST2 sqrt weights."""
+    if force.getName() != PANTEVA_FORCE_NAME or force.getEnergyFunction() != "-(isMg1*c42+isMg2*c41)/r^4":
+        raise MetalIonParameterError("REST2 requires an unscaled physical Panteva force")
+    result = mm.XmlSerializer.deserialize(mm.XmlSerializer.serialize(force))
+    factors = []
+    selected = set()
+    for number, (atoms, sqrt_parameter) in enumerate(regions):
+        atoms = set(atoms)
+        if selected & atoms:
+            raise MetalIonParameterError("Panteva REST2 regions must be disjoint")
+        selected.update(atoms)
+        name = f"c4hot{number}"
+        result.addGlobalParameter(sqrt_parameter, 1.0)
+        result.addPerParticleParameter(name)
+        for index in range(result.getNumParticles()):
+            result.setParticleParameters(index, [*result.getParticleParameters(index), float(index in atoms)])
+        factors.extend(f"(1-{name}{i}+{name}{i}*{sqrt_parameter})" for i in (1, 2))
+    result.setEnergyFunction("*".join(factors) + "*(" + force.getEnergyFunction() + ")")
+    return result
+
+
 def apply_panteva_m1264(system, topology, *, atom_classes,
                        polarizability_table, atp_residue_name="ATP",
                        water_model="tip4pew", active_atom_indices=None):
@@ -110,7 +156,8 @@ def apply_panteva_m1264(system, topology, *, atom_classes,
     )
     if nonbonded is None:
         raise MetalIonParameterError("system has no NonbondedForce")
-    atoms = list(topology.atoms())
+    # Coefficients are indexed by System particle, including appended extra sites.
+    atoms = sorted(topology.atoms(), key=lambda atom: atom.index)
     if atom_classes is None or len(atom_classes) != len(atoms):
         raise MetalIonParameterError("one Amber/GAFF2 atom class is required for every particle")
     polarizabilities = read_polarizabilities(polarizability_table)

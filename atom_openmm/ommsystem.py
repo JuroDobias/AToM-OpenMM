@@ -258,6 +258,13 @@ class OMMSystem(object):
 
     def add_forces_to_atmforce(self):
         import re
+        from atom_openmm.metal_ions import PANTEVA_FORCE_NAME
+        # C4 must see exactly the same coordinate transfer as electrostatics/LJ.
+        for i in reversed(range(self.system.getNumForces())):
+            force = self.system.getForce(i)
+            if force.getName() == PANTEVA_FORCE_NAME:
+                self.atmforce.addForce(copy.copy(force))
+                self.system.removeForce(i)
         nbpattern = re.compile(".*Nonbonded.*")
         gbpattern = re.compile(".*GB.*")
         harmpattern = re.compile(".*Harmonic.*")
@@ -1134,6 +1141,10 @@ class OMMSystemRBFENativeEndpoint(OMMSystemRBFE):
                 )
             self.nonbondedforcegroup = self.free_force_group()
             nonbonded[0].setForceGroup(self.nonbondedforcegroup)
+            from atom_openmm.metal_ions import PANTEVA_FORCE_NAME
+            for force in self.system.getForces():
+                if force.getName() == PANTEVA_FORCE_NAME:
+                    force.setForceGroup(self.nonbondedforcegroup)
             bonded_frequency = max(1, int(round(MDstepsize/defaultMDstepsize)))
             self.logger.info(
                 "Running native endpoint with a %f fs time-step and bonded forces "

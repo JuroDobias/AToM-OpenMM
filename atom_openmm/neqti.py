@@ -40,6 +40,56 @@ from atom_openmm.rest2_exchange import (
 )
 
 
+class _NativeEndpointSampler:
+    """Single-context native endpoint sampler with portable atomic states."""
+
+    def __init__(self, native_system, initial_state, checkpoint, platform,
+                 platform_properties, logger):
+        self.native_system = native_system
+        self.initial_state = Path(initial_state)
+        self.checkpoint = Path(checkpoint)
+        self.logger = logger
+        self.simulation = app.Simulation(
+            native_system.topology, native_system.system,
+            native_system.integrator, platform, platform_properties,
+        )
+        self._active = False
+
+    def has_bank(self, _ensemble):
+        return self.checkpoint.is_file()
+
+    def activate(self, ensemble):
+        if self._active:
+            return
+        source = self.checkpoint if self.has_bank(ensemble) else self.initial_state
+        self.simulation.loadState(str(source))
+        self._active = True
+
+    def run_steps(self, ensemble, steps, label):
+        self.activate(ensemble)
+        started = time.perf_counter()
+        self.simulation.step(int(steps))
+        elapsed = time.perf_counter() - started
+        temporary = self.checkpoint.with_suffix(self.checkpoint.suffix + ".tmp")
+        self.simulation.saveState(str(temporary))
+        os.replace(temporary, self.checkpoint)
+        timestep_ps = self.simulation.integrator.getStepSize().value_in_unit(picosecond)
+        rate = int(steps) * timestep_ps * 86.4 / elapsed
+        self.logger.info(
+            "%s complete: %d steps in %.3f s, %.3f ns/day",
+            label, int(steps), elapsed, rate,
+        )
+
+    def physical_state(self, ensemble):
+        self.activate(ensemble)
+        return self.simulation.context.getState(
+            positions=True, velocities=True, enforcePeriodicBox=True
+        )
+
+    def close(self):
+        self.simulation = None
+
+
 KCAL_TO_KJ = 4.184
 KB_KCAL_PER_MOL_K = 0.0019872041
 BASE_CSV_FIELDS = [
@@ -364,11 +414,7 @@ def normalize_neqti_options(workflow, atom_options):
                     f"workflow.neqti.{name} must be divisible by rest2.exchange_interval_steps"
                 )
     if endpoint_system == "native":
-        if not rest2_enabled:
-            raise NEQTIConfigError(
-                "workflow.neqti.endpoint_system: native currently requires REST2"
-            )
-        if set(rest2_ensembles) != {"a", "b"}:
+        if rest2_enabled and set(rest2_ensembles) != {"a", "b"}:
             raise NEQTIConfigError(
                 "native endpoint REST2 currently requires rest2.ensembles: [a, b]"
             )
@@ -1588,7 +1634,8 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
             if neqti_options.get("endpoint_system", "atm") == "native":
                 for name in ("a", "b"):
                     native_system = create_native_endpoint_system(
-                        endpoint_system, name, rest2=True, logger=logger
+                        endpoint_system, name,
+                        rest2=neqti_options["rest2"]["enabled"], logger=logger
                     )
                     native_input = Path(f"neqti_endpoint_{name.upper()}_native_input.xml")
                     write_converted_state(
@@ -1716,30 +1763,40 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
         try:
             for ensemble in ("a", "b"):
                 native_system = create_native_endpoint_system(
-                    ommsystem, ensemble, rest2=True, logger=logger
+                    ommsystem, ensemble, rest2=rest2_enabled, logger=logger
                 )
-                sampler = create_rest2_exchange_sampler(
-                    system=native_system.system,
-                    topology=native_system.topology,
-                    base_integrator=native_system.integrator,
-                    rest2_system=native_system.rest2_system,
-                    state_files={ensemble: state_files[ensemble]},
-                    config=neqti_options["rest2"],
-                    platform=worker.platform,
-                    platform_properties=worker.platform_properties,
-                    output_dir="neqti_rest2",
-                    resume=neqti_options["resume"],
-                    random_seed=neqti_options["random_seed"] + (10000 if ensemble == "b" else 0),
-                    logger=logger,
-                )
+                if rest2_enabled:
+                    sampler = create_rest2_exchange_sampler(
+                        system=native_system.system,
+                        topology=native_system.topology,
+                        base_integrator=native_system.integrator,
+                        rest2_system=native_system.rest2_system,
+                        state_files={ensemble: state_files[ensemble]},
+                        config=neqti_options["rest2"],
+                        platform=worker.platform,
+                        platform_properties=worker.platform_properties,
+                        output_dir="neqti_rest2",
+                        resume=neqti_options["resume"],
+                        random_seed=neqti_options["random_seed"] + (10000 if ensemble == "b" else 0),
+                        logger=logger,
+                    )
+                else:
+                    sampler = _NativeEndpointSampler(
+                        native_system, state_files[ensemble],
+                        Path(f"neqti_native_{ensemble}_sampling.chk.xml"),
+                        worker.platform, worker.platform_properties, logger,
+                    )
                 native_endpoint_resources[ensemble] = (native_system, sampler)
-            backend = neqti_options["rest2"].get("sampler_backend", "custom")
+            backend = (
+                neqti_options["rest2"].get("sampler_backend", "custom")
+                if rest2_enabled else "single-context"
+            )
             contexts_per_ladder = (
-                1 if backend == "openmm_native"
+                1 if backend in {"openmm_native", "single-context"}
                 else len(neqti_options["rest2"]["effective_temperatures_k"])
             )
             logger.info(
-                "Native interleaved NEQTI initialized two resident REST2 ladders "
+                "Native interleaved NEQTI initialized two resident endpoint samplers "
                 "(%d context%s each, sampler backend %s) and one ATM worker context",
                 contexts_per_ladder,
                 "" if contexts_per_ladder == 1 else "s",
@@ -1916,22 +1973,28 @@ def run_neqti(options, neqti_options=None, progress_callback=None):
         if len(completed) >= neqti_options["n_snapshots"]:
             return
         native_system = create_native_endpoint_system(
-            ommsystem, ensemble, rest2=True, logger=logger
+            ommsystem, ensemble, rest2=rest2_enabled, logger=logger
         )
-        sampler = create_rest2_exchange_sampler(
-            system=native_system.system,
-            topology=native_system.topology,
-            base_integrator=native_system.integrator,
-            rest2_system=native_system.rest2_system,
-            state_files={ensemble: state_files[ensemble]},
-            config=neqti_options["rest2"],
-            platform=worker.platform,
-            platform_properties=worker.platform_properties,
-            output_dir="neqti_rest2",
-            resume=True,
-            random_seed=neqti_options["random_seed"] + (10000 if ensemble == "b" else 0),
-            logger=logger,
-        )
+        if rest2_enabled:
+            sampler = create_rest2_exchange_sampler(
+                system=native_system.system,
+                topology=native_system.topology,
+                base_integrator=native_system.integrator,
+                rest2_system=native_system.rest2_system,
+                state_files={ensemble: state_files[ensemble]},
+                config=neqti_options["rest2"],
+                platform=worker.platform,
+                platform_properties=worker.platform_properties,
+                output_dir="neqti_rest2", resume=True,
+                random_seed=neqti_options["random_seed"] + (10000 if ensemble == "b" else 0),
+                logger=logger,
+            )
+        else:
+            sampler = _NativeEndpointSampler(
+                native_system, state_files[ensemble],
+                Path(f"neqti_native_{ensemble}_sampling.chk.xml"),
+                worker.platform, worker.platform_properties, logger,
+            )
         try:
             existing_bank = sampler.has_bank(ensemble)
             sampler.activate(ensemble)

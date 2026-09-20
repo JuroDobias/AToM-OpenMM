@@ -109,11 +109,15 @@ def normalize_setup_options(workflow, atom_options):
     if setup is None:
         setup = {}
     _require_mapping(setup, "workflow.setup")
+    if setup.get("metal_ions") is not None and not isinstance(setup["metal_ions"], dict):
+        raise WorkflowConfigError("workflow.setup.metal_ions must be a mapping")
 
     setup_mode = setup.get("mode", "openmmforcefields")
     if not isinstance(setup_mode, str):
         raise WorkflowConfigError("workflow.setup.mode must be a string")
     if setup_mode == "ambertools":
+        if (setup.get("metal_ions") or {}).get("model", "standard_12_6") != "standard_12_6":
+            raise WorkflowConfigError("ATM Panteva setup requires mode: openmmforcefields")
         ambertools = {
             "protein_forcefield": setup.get("protein_forcefield", "leaprc.protein.ff14SB"),
             "additional_forcefields": setup.get("additional_forcefields", []),
@@ -249,11 +253,17 @@ def normalize_setup_options(workflow, atom_options):
     if not isinstance(metal, dict):
         raise WorkflowConfigError("workflow.setup.metal_ions must be a mapping")
     metal_model = str(metal.get("model", "standard_12_6"))
-    if metal_model != "standard_12_6":
+    if metal_model not in {"standard_12_6", "panteva_m12_6_4"}:
         raise WorkflowConfigError(
-            "ATM cached-ligand setup currently supports only metal_ions.model: standard_12_6; "
-            "Panteva m12-6-4 must be integrated into ATMForce before use"
+            f"unsupported ATM metal_ions.model: {metal_model}"
         )
+    if metal_model == "panteva_m12_6_4":
+        if str(setup.get("solvent_model", "")).lower() not in {"tip4pew", "tip4p-ew"}:
+            raise WorkflowConfigError("ATM Panteva parameters require solvent_model: tip4pew")
+        table = metal.get("polarizability_table")
+        if not isinstance(table, str) or not table.strip():
+            raise WorkflowConfigError("ATM Panteva requires metal_ions.polarizability_table")
+        normalized["metalions"] = dict(metal)
     if "protein_forcefield" in setup:
         normalized["proteinforcefield"] = _as_list(setup["protein_forcefield"], "workflow.setup.protein_forcefield")
     if "solvent_forcefield" in setup:
@@ -1347,6 +1357,10 @@ def _prepare_run_context(config_file):
     config = load_workflow_config(config_file)
     plan = build_small_molecule_plan(config)
     setup_options = normalize_setup_options(config["workflow"], config["atom_options"])
+    if setup_options.get("metalions"):
+        table = _resolve_path(setup_options["metalions"]["polarizability_table"], config["base_dir"])
+        _validate_file(table, "Panteva polarizability table")
+        setup_options["metalions"]["polarizability_table"] = str(table)
     if setup_options.get("ligandparametercache"):
         setup_options["ligandparametercache"] = str(
             _resolve_path(setup_options["ligandparametercache"], config["base_dir"])

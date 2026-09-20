@@ -146,10 +146,24 @@ def _test_normalize_neqti_options_accepts_native_endpoint_rest2():
     assert settings["rest2"]["ensembles"] == ["a", "b"]
 
 
+def _test_normalize_neqti_options_accepts_native_endpoint_without_rest2():
+    from atom_openmm.neqti import normalize_neqti_options
+
+    settings = normalize_neqti_options({"neqti": {
+        "endpoint_system": "native",
+        "sampling_order": "interleaved",
+        "switch_steps_per_segment": 5000,
+        "preparation_annealing_steps_per_segment": 10,
+        "rest2": {"enabled": False},
+        "schedule_optimization": {"enabled": True, "pilot_samples": 10},
+    }}, _atom_options())
+    assert settings["endpoint_system"] == "native"
+    assert settings["rest2"]["enabled"] is False
+
+
 @pytest.mark.parametrize(
     "neqti, message",
     [
-        ({"endpoint_system": "native", "sampling_order": "batched"}, "requires REST2"),
         ({
             "endpoint_system": "native", "sampling_order": "batched", "decorrelation_steps": 500,
             "rest2": {"enabled": True},

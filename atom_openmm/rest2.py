@@ -8,6 +8,7 @@ from typing import Iterable, Optional
 
 import openmm as mm
 from openmm import unit
+from atom_openmm.metal_ions import PANTEVA_FORCE_NAME, scale_panteva_rest2
 
 
 class REST2Error(ValueError):
@@ -186,6 +187,8 @@ def create_rest2_system(
         elif isinstance(force, mm.NonbondedForce):
             _transform_nonbonded(force, solute, scale_parameter, sqrt_scale_parameter)
             nonbonded_count += 1
+        elif isinstance(force, mm.CustomNonbondedForce) and force.getName() == PANTEVA_FORCE_NAME:
+            replacements.append((index, scale_panteva_rest2(force, [(solute, sqrt_scale_parameter)])))
         elif isinstance(force, mm.CMAPTorsionForce):
             for torsion_index in range(force.getNumTorsions()):
                 parameters = force.getTorsionParameters(torsion_index)
@@ -349,6 +352,9 @@ def create_multi_rest2_system(
                 custom.addTorsion(a, b, c, d, [periodicity, phase, k, *weights])
             _copy_force_metadata(force, custom)
             replacements.append((force_index, custom))
+        elif isinstance(force, mm.CustomNonbondedForce) and force.getName() == PANTEVA_FORCE_NAME:
+            replacements.append((force_index, scale_panteva_rest2(
+                force, [(normalized[name], parameters[name][1]) for name in normalized])))
         elif isinstance(force, mm.NonbondedForce):
             for scale, sqrt_scale in parameters.values():
                 force.addGlobalParameter(scale, 1.0)

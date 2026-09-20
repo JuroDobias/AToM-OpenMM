@@ -288,6 +288,7 @@ def make_system(
         ligandparametercache=None,
         ligandparameterprotocol=None,
         ligandsigmaholes=None,
+        metalions=None,
         flagverbose=False
     ):
     print('Generate ATM RBFE OpenMM System')
@@ -624,6 +625,26 @@ def make_system(
         system=forcefield.createSystem(modeller.topology, nonbondedMethod = NoCutoff,
                                     constraints=HBonds, rigidWater = True, removeCMMotion = False, hydrogenMass = hmass*amu)
 
+    atom_classes = None
+    if metalions and metalions.get("model") == "panteva_m12_6_4":
+        from atom_openmm.metal_ions import forcefield_atom_classes, gaff2_atom_classes
+        atom_classes = forcefield_atom_classes(forcefield, modeller.topology)
+        ligand_class_sources = (
+            ("L1", lig1file, mollig1.conformers[0].to_openmm()),
+            ("L2", lig2file, mollig2.conformers[0].to_openmm()),
+        )
+        for residue_name, source, coordinates in ligand_class_sources:
+            residue_atoms = [
+                atom for atom in modeller.topology.atoms()
+                if atom.residue.name == residue_name
+            ]
+            ligand_classes = gaff2_atom_classes(source, coordinates)
+            if len(residue_atoms) != len(ligand_classes):
+                raise ValueError(
+                    f"Panteva GAFF2 class count for {residue_name} differs from topology"
+                )
+            for atom, atom_class in zip(residue_atoms, ligand_classes):
+                atom_classes[atom.index] = atom_class
     output_positions = modeller.positions
     if ligand_parameters is not None:
         output_positions, _ = _install_ligand_parameters(
@@ -634,6 +655,17 @@ def make_system(
         )
         if modeller.topology.getNumAtoms() != system.getNumParticles():
             raise ValueError("parameterized ATM topology and System particle counts differ")
+
+    if atom_classes is not None:
+        from atom_openmm.metal_ions import apply_panteva_m1264
+        # Sigma-hole sites appended after force-field matching have zero C4.
+        atom_classes.extend(["EP"] * (system.getNumParticles() - len(atom_classes)))
+        apply_panteva_m1264(
+            system, modeller.topology, atom_classes=atom_classes,
+            polarizability_table=metalions["polarizability_table"],
+            atp_residue_name=metalions.get("atp_residue_name", "ATP"),
+            water_model=solvent_model,
+        )
 
     with open(xmloutfile, 'w') as output:
         output.write(XmlSerializer.serialize(system))

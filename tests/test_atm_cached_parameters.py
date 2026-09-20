@@ -50,8 +50,8 @@ def _test_normalize_atm_fixed_sigma_hole_defaults():
     }
 
 
-def _test_cached_atm_rejects_panteva_until_force_is_alchemical():
-    with pytest.raises(WorkflowConfigError, match="integrated into ATMForce"):
+def _test_cached_atm_rejects_panteva_without_matched_water():
+    with pytest.raises(WorkflowConfigError, match="solvent_model: tip4pew"):
         normalize_setup_options(
             {
                 "setup": {

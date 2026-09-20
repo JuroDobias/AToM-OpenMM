@@ -157,6 +157,42 @@ workflow:
 
 `ligand_charge_model: nn` is supported for Espaloma ligand force fields. `ligand_charge_model: am1-bcc` is supported for Espaloma and is the expected GAFF setup behavior. OpenFF charge assignment is controlled by the selected OpenFF/SMIRNOFF force field and generator rather than a separate wrapper charge-model option.
 
+### Panteva Mg 12-6-4 with ATM
+
+ATM workflows can select the existing TIP4P-Ew Li-Merz Mg 12-6-4 model with
+Panteva ATP overrides. Ligands may use GAFF parameters or Espaloma with NN
+charges; GAFF2 atom classes are assigned independently for the C4 lookup:
+
+```yaml
+workflow:
+  setup:
+    ligand_forcefield: espaloma
+    ligand_charge_model: nn
+    solvent_forcefield: [amber14/tip4pew.xml]
+    solvent_model: tip4pew
+    metal_ions:
+      model: panteva_m12_6_4
+      polarizability_table: inputs/lj_1264_pol.dat
+      atp_residue_name: ATP
+```
+
+The polarizability table path is relative to the workflow file. Include the
+appropriate ATP force-field XML alongside the protein force field as usual.
+Cached `resp-sigma-hole` ligand parameters are supported and do not need to be
+refitted: atom classes determine C4 independently of the cached partial charges.
+All ligand atoms receive their class-specific coefficients; sigma-hole and water
+extra sites have zero C4.
+
+The C4 force is inside ATMForce, so both transferred coordinate states include
+it. Native endpoints retain the same force and Mg Lennard-Jones parameters.
+REST2 scales each C4 pair by the product of the two particles' square-root
+temperature scaling factors. Both single-region and multi-region REST2 are
+supported. Non-TIP4P-Ew solvent models are rejected for this option.
+
+Use a **new work directory** when changing the metal model: existing prepared
+systems and checkpoints must not be resumed under a different Hamiltonian.
+This option changes the metal model, not the ATP charge parameter set.
+
 Espaloma NN workflows can add fixed sigma-hole virtual sites by selecting the
 halogen elements. The built-in transferable defaults are `+0.033 e` at 1.64 A
 for Cl and `+0.039 e` at 1.89 A for Br. The site charge is subtracted from the
