@@ -118,7 +118,7 @@ export PYTHONPATH="{repo}${{PYTHONPATH:+:$PYTHONPATH}}"
     (root / "README.md").write_text(
         "# cGAS weak retained-junction reference experiment\n\n"
         "Original ms_491 -> ms_539 mapping. The four automatically detected "
-        "Z-matrix junctions are explicitly replaced by bond-only junctions. "
+        "Z-matrix junctions are explicitly replaced by full-junction geometry. "
         "Junction bonds remain full strength; junction angles and proper/rotatable "
         "proper torsions are retained at 0.2 in inactive branches. Internal branch "
         "bonded terms remain physical. Each endpoint receives 0.1 ns NVT and 5 ns "
