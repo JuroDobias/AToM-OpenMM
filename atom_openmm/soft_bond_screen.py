@@ -29,7 +29,8 @@ from atom_openmm.covalent_systems import (
 from atom_openmm.covalent_workflow import (
     _normalized_settings, _equilibrate_endpoint, _sample_endpoint,
     _softcore_switch_context, _reset_softcore_context, _apply_state,
-    _run_segmented_protocol, _is_numerical_switch_failure,
+    _run_segmented_protocol, _parameter_values_at_step,
+    _is_numerical_switch_failure,
     _write_yaml_atomic, _load_state, _write_state, _validate_prepared_endpoint_charges,
 )
 from atom_openmm.hybrid_mapping import build_hybrid_atom_map
@@ -41,6 +42,12 @@ from atom_openmm.neqti import (
     _allocate_segment_steps, _optimizer_cycle_scores,
     _optimizer_batch_action_scores, _adapt_segment_steps, analyze_neqti_work,
     _bar_overlap_score,
+)
+from atom_openmm.switch_diagnostics import (
+    analyze_diagnostics,
+    SwitchDiagnosticWriter,
+    build_bonded_manifest,
+    write_manifest,
 )
 
 LOG = logging.getLogger(__name__)
@@ -321,7 +328,18 @@ def run_path(root, name):
         else list(manifest.get("optimizer_indices", range(10)))
     )
     evaluation_indices = list(manifest.get("evaluation_indices", range(10, 30)))
+    if cfg.get("evaluation_count") is not None:
+        evaluation_indices = evaluation_indices[: int(cfg["evaluation_count"])]
     batch_settings = cfg.get("batch_optimizer")
+    diagnostic_settings = cfg.get("diagnostics") or {}
+    diagnostic_enabled = bool(diagnostic_settings.get("enabled", False))
+    diagnostic_phases = set(diagnostic_settings.get("phases", ["evaluation"]))
+    diagnostic_manifest = None
+    if diagnostic_enabled:
+        mapping_file = bank / "mapping.yaml"
+        mapping = yaml.safe_load(mapping_file.read_text()) if mapping_file.exists() else None
+        diagnostic_manifest = build_bonded_manifest(prepared, mapping)
+        write_manifest(out / "switch_diagnostic_terms.yaml", diagnostic_manifest)
     state_file = out / "optimizer.yaml"
     state = yaml.safe_load(state_file.read_text()) if state_file.exists() else dict(
         completed=0, steps=list(hamiltonian.segment_steps), scores=None, history=[])
@@ -332,6 +350,21 @@ def run_path(root, name):
             result = yaml.safe_load(target.read_text())
             if result["forward_segment_steps"] != steps:
                 raise ValueError("Saved switch allocation differs from resumed optimizer")
+            if (
+                diagnostic_enabled
+                and phase in diagnostic_phases
+                and result.get("error") is None
+            ):
+                prefix = out / "diagnostics" / f"{phase}_{index:03d}_{end}"
+                required = [
+                    prefix.with_suffix(".frames.csv.gz"),
+                    prefix.with_suffix(".bonded.csv.gz"),
+                    prefix.with_suffix(".ligand.xtc"),
+                ]
+                if not all(path.exists() for path in required):
+                    raise ValueError(
+                        "Saved switch is missing requested diagnostics; use a new output directory"
+                    )
             return result
         context, integrator, parameters = _softcore_switch_context(
             hamiltonian, start=end, timestep_fs=2, temperature_k=300,
@@ -343,6 +376,62 @@ def run_path(root, name):
         started = time.monotonic()
         segments = []
         completed_segments = []
+        diagnostic = None
+        direction = "forward" if end == "a" else "reverse"
+        stage_labels = hamiltonian.resolved_path[
+            "stage_labels" if end == "a" else "reverse_stage_labels"
+        ]
+        stage_by_segment = []
+        for stage_index, count in enumerate(integrator.get_segments_per_stage()):
+            stage_by_segment.extend([stage_index] * int(count))
+        total_steps = sum(direction_steps)
+
+        def observe(segment, local_step, completed_steps, total_steps,
+                    cumulative_work_kj_per_mol):
+            values = _parameter_values_at_step(
+                parameters,
+                direction_steps,
+                segment,
+                local_step,
+                segments_per_stage=integrator.get_segments_per_stage(),
+                stage_interpolation=integrator.get_stage_interpolation(),
+            )
+            diagnostic.observe(
+                context,
+                step=completed_steps,
+                segment=segment,
+                stage=stage_labels[stage_by_segment[segment]],
+                physical_lambda=(
+                    completed_steps / total_steps
+                    if end == "a"
+                    else 1.0 - completed_steps / total_steps
+                ),
+                cumulative_work_kj_per_mol=cumulative_work_kj_per_mol,
+                parameters={**values, "_total_steps": total_steps},
+            )
+
+        if diagnostic_enabled and phase in diagnostic_phases:
+            diagnostic_dir = out / "diagnostics"
+            diagnostic_dir.mkdir(exist_ok=True)
+            diagnostic = SwitchDiagnosticWriter(
+                diagnostic_dir / f"{phase}_{index:03d}_{end}",
+                prepared,
+                diagnostic_manifest,
+                parameters,
+                timestep_fs=2.0,
+            )
+            diagnostic.observe(
+                context,
+                step=0,
+                segment=0,
+                stage=stage_labels[0],
+                physical_lambda=0.0 if end == "a" else 1.0,
+                cumulative_work_kj_per_mol=0.0,
+                parameters={
+                    **{name: values[0] for name, values in parameters.items()},
+                    "_total_steps": total_steps,
+                },
+            )
         def callback(**progress):
             completed_segments.append(progress)
             _write_yaml_atomic(target.with_suffix(".progress.yaml"), progress)
@@ -351,15 +440,28 @@ def run_path(root, name):
                      progress["completed_steps"], progress["total_steps"],
                      progress["cumulative_work_kj_per_mol"])
         error = None
+        success = False
         try:
-            work, segments = _run_segmented_protocol(integrator, direction_steps,
-                                                     segment_callback=callback)
+            work, segments = _run_segmented_protocol(
+                integrator,
+                direction_steps,
+                segment_callback=callback,
+                observation_interval_steps=(
+                    int(diagnostic_settings.get("interval_steps", 100))
+                    if diagnostic is not None else None
+                ),
+                observation_callback=observe if diagnostic is not None else None,
+            )
             if not np.isfinite(work):
                 raise FloatingPointError("Nonfinite protocol work")
+            success = True
         except Exception as exc:
             if not _is_numerical_switch_failure(exc) and not isinstance(exc, FloatingPointError):
                 raise
             work, error = float("inf"), str(exc)
+        finally:
+            if diagnostic is not None:
+                diagnostic.close(success)
         result = dict(work_kj_mol=float(work), segment_work=[float(v) for v in segments],
                       forward_segment_steps=steps, error=error,
                       completed_segments=completed_segments,
@@ -545,6 +647,8 @@ def run_path(root, name):
             analysis=analysis, overlap=_bar_overlap_score(work["a"], work["b"], dg, 300),
             failed_samples={e: int(np.sum(~np.isfinite(v))) for e, v in work.items()},
             optimizer_failed_cycles=sum(any(h["errors"]) for h in state["history"])))
+    if diagnostic_enabled:
+        analyze_diagnostics(out / "diagnostics")
 
 
 def generate(root, source):

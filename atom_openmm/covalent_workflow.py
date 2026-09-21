@@ -1848,12 +1848,15 @@ def _run_segmented_protocol(
     parameter_values=None,
     profile_metadata=None,
     segment_callback=None,
+    observation_interval_steps=None,
+    observation_callback=None,
 ):
     segment_work = []
     previous = 0.0
     total_step = 0
     total_steps = sum(int(value) for value in segment_steps)
     profiling = profile_rows is not None
+    observing = observation_callback is not None
     if profiling and (
         not profile_interval_steps
         or parameter_values is None
@@ -1862,6 +1865,8 @@ def _run_segmented_protocol(
         raise ValueError(
             "profile interval, parameter values, and metadata are required"
         )
+    if observing and (not observation_interval_steps or observation_interval_steps < 1):
+        raise ValueError("observation interval must be positive")
     profile_metadata = None if profile_metadata is None else dict(profile_metadata)
     stage_labels = None if profile_metadata is None else profile_metadata.pop(
         "stage_labels", None
@@ -1876,13 +1881,19 @@ def _run_segmented_protocol(
         local_step = 0
         cumulative = previous
         while local_step < steps:
+            chunk = steps - local_step
             if profiling:
-                until_interval = int(profile_interval_steps) - (
-                    total_step % int(profile_interval_steps)
+                chunk = min(
+                    chunk,
+                    int(profile_interval_steps)
+                    - total_step % int(profile_interval_steps),
                 )
-                chunk = min(steps - local_step, until_interval)
-            else:
-                chunk = steps - local_step
+            if observing:
+                chunk = min(
+                    chunk,
+                    int(observation_interval_steps)
+                    - total_step % int(observation_interval_steps),
+                )
             window_start_step = total_step
             window_start_work = cumulative
             integrator.step(int(chunk))
@@ -1936,6 +1947,17 @@ def _run_segmented_protocol(
                     }
                 )
                 profile_rows.append(row)
+            if observing and (
+                total_step % int(observation_interval_steps) == 0
+                or total_step == total_steps
+            ):
+                observation_callback(
+                    segment=segment,
+                    local_step=local_step,
+                    completed_steps=total_step,
+                    total_steps=total_steps,
+                    cumulative_work_kj_per_mol=float(cumulative),
+                )
         segment_work.append(float(cumulative - previous))
         previous = cumulative
         if segment_callback is not None:
